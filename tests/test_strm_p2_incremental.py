@@ -110,8 +110,6 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             "app.modules.scheduler.clean_empty_strm_dirs",
             return_value={"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False},
         ), patch(
-            "app.repositories.strm.cancel_retired_strm_metadata_jobs", return_value=0,
-        ), patch(
             "app.modules.scheduler.reconcile_historical_strm",
         ), patch(
             "app.modules.scheduler.get",

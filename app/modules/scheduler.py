@@ -1628,30 +1628,18 @@ class STRMScheduler:
 
         if round_cleanup_safe and active_ids_complete:
             self._set_progress("retirement", 0, 1, "清理已移除的 STRM 来源")
-            try:
-                aggregate["metadata_queue_cancelled"] += (
-                    strm_repo.cancel_retired_strm_metadata_jobs(
-                        {source["id"] for source in sources}
-                    ) or 0
-                )
-            except Exception as exc:
+            retirement = clean_retired_strm_sources(
+                {source["id"] for source in sources},
+                should_stop=self._stop_event.is_set,
+                active_ids_complete=True,
+                clean_empty_dirs=False,
+                refresh_policy=refresh_policy,
+            )
+            if retirement.get("stopped"):
+                stopped = True
                 round_cleanup_safe = False
-                logger.warning(
-                    "跳过退役来源元数据队列维护 type=%s", type(exc).__name__
-                )
-            if round_cleanup_safe:
-                retirement = clean_retired_strm_sources(
-                    {source["id"] for source in sources},
-                    should_stop=self._stop_event.is_set,
-                    active_ids_complete=True,
-                    clean_empty_dirs=False,
-                    refresh_policy=refresh_policy,
-                )
-                if retirement.get("stopped"):
-                    stopped = True
-                    round_cleanup_safe = False
-                if retirement.get("blocked"):
-                    round_cleanup_safe = False
+            if retirement.get("blocked"):
+                round_cleanup_safe = False
             self._set_progress("retirement", 1, 1, "清理已移除的 STRM 来源")
 
         if not round_cleanup_safe:

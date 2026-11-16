@@ -226,12 +226,16 @@ class MediaConfigSaveTests(unittest.TestCase):
     def test_runtime_invalidation_failure_rolls_back_source_retirement_and_config_together(self):
         from app import config
         from app import database as db
+        from app.repositories import strm as strm_repo
+        from tests.test_strm_metadata_queue import _job
 
         self.initialize_publisher()
         self.enterContext(patch.dict(os.environ))
         self.enterContext(patch.object(config, "_cache", None))
         initial = {"GY_STRM_SOURCE_DIRS": '[{"id":"11","name":"旧来源"}]'}
         config.set_and_save(initial)
+        strm_repo.enqueue_strm_metadata_jobs([_job(source_id="11")])
+        before = dict(strm_repo.list_strm_metadata_queue()[0])
         with patch.object(self.api, "require_api_login"), patch(
             "app.agent.feature_gate.invalidate_agent_runtime_generation",
             side_effect=RuntimeError("runtime invalidation failed"),
@@ -241,6 +245,35 @@ class MediaConfigSaveTests(unittest.TestCase):
         self.assertEqual(result.status_code, 500)
         self.assertEqual(config.read_env_snapshot(config.ENV_FILE)[1], initial)
         self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertEqual(dict(strm_repo.list_strm_metadata_queue()[0]), before)
+
+    def test_metadata_cancellation_failure_prevents_source_config_publication(self):
+        from app import config, database as db
+        from app.repositories import strm as strm_repo
+        from tests.test_strm_metadata_queue import _job
+
+        self.initialize_publisher()
+        self.enterContext(patch.dict(os.environ))
+        self.enterContext(patch.object(config, "_cache", None))
+        initial = {"GY_STRM_SOURCE_DIRS": '[{"id":"11","name":"旧来源"}]'}
+        config.set_and_save(initial)
+        strm_repo.enqueue_strm_metadata_jobs([_job(source_id="11")])
+        before = config.ENV_FILE.read_bytes()
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_retirement BEFORE UPDATE OF status ON strm_metadata_queue "
+                "WHEN new.status='cancelled' BEGIN SELECT RAISE(ABORT,'isolated cancellation store failure'); END"
+            )
+        with patch.object(self.api, "require_api_login"):
+            result = self.api.save_config(cast(Request, self.request), {
+                "GY_STRM_SOURCE_DIRS": "[]", "STRM_SKIP_THRESHOLD_MB": "10",
+            })
+        assert isinstance(result, JSONResponse)
+        self.assertEqual(result.status_code, 500)
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+        self.assertEqual(config.get("GY_STRM_SOURCE_DIRS"), initial["GY_STRM_SOURCE_DIRS"])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertEqual(strm_repo.list_strm_metadata_queue()[0]["status"], "queued")
 
     def test_source_save_freezes_legacy_paths_before_publishing_new_config(self):
         from app import config, database as db
@@ -309,6 +342,73 @@ class MediaConfigSaveTests(unittest.TestCase):
             })
         self.assertEqual(result, {"success": True})
         self.assertEqual(db.list_strm_retired_sources(), [])
+
+    def test_removed_source_stops_metadata_when_remaining_source_scan_fails(self):
+        from app import config, database as db
+        from app.clients.guangya import GuangYaClient, GuangYaFile
+        from app.modules.scheduler import STRMScheduler
+        from app.modules.strm import STRM_SUBDIR, configured_strm_source_plans
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+        from app.repositories import strm as strm_repo
+        from tests.test_strm_metadata_queue import _job, _TreeClient
+
+        self.initialize_publisher()
+        self.enterContext(patch.dict(os.environ))
+        self.enterContext(patch.object(config, "_cache", None))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        old_sources = [{"id": "11", "name": "A"}, {"id": "22", "name": "B"}]
+        config.set_and_save({
+            "GY_STRM_SOURCE_DIRS": json.dumps(old_sources), "STRM_ROOT": str(root),
+            "STRM_METADATA_ENABLED": "1", "STRM_METADATA_EXTS": "nfo",
+            "STRM_VIDEO_EXTS": "mkv",
+        })
+        db.reconcile_configured_strm_sources(old_sources, str(root))
+        target = root / STRM_SUBDIR / "A" / "Movie.nfo"
+        preserved = target.with_suffix(".strm")
+        preserved.parent.mkdir(parents=True)
+        preserved.write_text("http://play.invalid/old", encoding="utf-8")
+        strm_repo.enqueue_strm_metadata_jobs([_job(
+            source_id="11", source_name="A", file_id="meta", rel_dir="",
+            filename="Movie.nfo", parent_id="11", size=8,
+            target_rel_path=f"{STRM_SUBDIR}/A/Movie.nfo",
+        )])
+        with patch.object(self.api, "require_api_login"), patch(
+            "app.modules.scheduler.get_scheduler", return_value=MagicMock(),
+        ), patch("app.services.clear_dashboard_cache"):
+            result = self.api.save_config(cast(Request, self.request), {
+                "GY_STRM_SOURCE_DIRS": json.dumps(old_sources[1:]),
+            })
+        self.assertEqual(result, {"success": True})
+
+        scheduler = STRMScheduler()
+        sources, error = configured_strm_source_plans()
+        self.assertEqual(error, "")
+        scheduler._source_runtime = [{"status": "pending", "completed": 0, "total": 0}]
+        scheduler._run_options = {"media_server_refresh_override": False}
+        broken_client = _TreeClient({})
+        with patch("app.modules.strm.GuangYaClient", return_value=broken_client), patch.object(
+            broken_client, "list_dir", side_effect=OSError("isolated source B unavailable"),
+        ):
+            aggregate, source_results, stopped = scheduler._run_full_sources(
+                sources, base_url="http://play.invalid", strm_root=str(root),
+                exts={"mkv"}, metadata_exts={"nfo"}, threshold=0,
+            )
+        self.assertFalse(stopped)
+        self.assertTrue(source_results[0]["stats"]["scan_incomplete"])
+        self.assertTrue(aggregate["clean_skipped"])
+
+        worker = STRMMetadataWorker()
+        worker._client = cast(GuangYaClient, _TreeClient({
+            "11": [GuangYaFile("meta", "Movie.nfo", False, 8, "etag-1", "11")],
+        }))
+        with patch("app.modules.strm.requests.get", side_effect=AssertionError("retired source downloaded")) as download:
+            self.assertFalse(worker._process_one())
+        download.assert_not_called()
+        self.assertEqual(strm_repo.list_strm_metadata_queue()[0]["status"], "cancelled")
+        self.assertEqual([row["source_id"] for row in db.list_strm_retired_sources()], ["11"])
+        self.assertFalse(target.exists())
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "http://play.invalid/old")
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_strm_busy_does_not_reject_unrelated_setting(self):
         from app.modules.strm import STRM_OPERATION_LOCK
@@ -384,6 +484,8 @@ class MediaSourceUiContractTests(unittest.TestCase):
 class StrmRetirementTransactionTests(unittest.TestCase):
     def test_reconcile_transaction_commits_and_rolls_back_as_one_unit(self):
         from app import database as db
+        from app.repositories import strm as strm_repo
+        from tests.test_strm_metadata_queue import _job
 
         previous_path = db.DB_PATH
         previous_test_mode = db._configured_test_mode
@@ -392,30 +494,62 @@ class StrmRetirementTransactionTests(unittest.TestCase):
             try:
                 db.configure_database(path, test_mode=True)
                 db.init_db()
+                strm_repo.enqueue_strm_metadata_jobs([
+                    _job(source_id="11", file_id="running"),
+                    _job(source_id="11", file_id="queued"),
+                    _job(source_id="22", file_id="active"),
+                ])
+                running = strm_repo.claim_due_strm_metadata_jobs(owner="old-worker")[0]
+                before = {row["file_id"]: dict(row) for row in strm_repo.list_strm_metadata_queue()}
                 with self.assertRaisesRegex(RuntimeError, "abort"):
                     with db.reconcile_strm_retired_sources_transaction(
-                        [], [("11", "旧来源", "/data/strm")]
+                        ["22"], [("11", "旧来源", "/data/strm")]
                     ):
                         raise RuntimeError("abort")
                 self.assertEqual(db.list_strm_retired_sources(), [])
+                self.assertEqual(
+                    {row["file_id"]: dict(row) for row in strm_repo.list_strm_metadata_queue()}, before,
+                )
 
                 with db.reconcile_strm_retired_sources_transaction(
-                    [], [("11", "旧来源", "/data/strm")]
+                    ["22"], [("11", "旧来源", "/data/strm")]
                 ) as retired_ids:
                     self.assertEqual(retired_ids, ["11"])
                 self.assertEqual(
                     [row["source_id"] for row in db.list_strm_retired_sources()],
                     ["11"],
                 )
+                rows = {row["file_id"]: dict(row) for row in strm_repo.list_strm_metadata_queue()}
+                self.assertEqual(rows["active"], before["active"])
+                for file_id in ("running", "queued"):
+                    self.assertEqual(rows[file_id]["status"], "cancelled")
+                    self.assertEqual(rows[file_id]["lease_owner"], "")
+                    self.assertEqual(rows[file_id]["attempts"], 0)
+                    self.assertGreater(rows[file_id]["revision"], before[file_id]["revision"])
+                self.assertEqual(strm_repo.settle_strm_metadata_job(
+                    running["id"], expected_owner="old-worker",
+                    expected_lease_generation=running["lease_generation"],
+                    expected_revision=running["revision"],
+                ), "stale")
 
-                with db.reconcile_strm_retired_sources_transaction(["11"], []):
+                with db.reconcile_strm_retired_sources_transaction(["11", "22"], []):
                     pass
                 self.assertEqual(db.list_strm_retired_sources(), [])
+                self.assertEqual(
+                    {row["file_id"]: dict(row) for row in strm_repo.list_strm_metadata_queue()}, rows,
+                )
+                strm_repo.enqueue_strm_metadata_jobs([_job(source_id="11", file_id="queued")])
+                self.assertEqual(
+                    {row["file_id"] for row in strm_repo.claim_due_strm_metadata_jobs(owner="new-worker", limit=10)},
+                    {"queued", "active"},
+                )
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
     def test_source_snapshot_recovers_publish_before_commit_crash_window(self):
         from app import database as db
+        from app.repositories import strm as strm_repo
+        from tests.test_strm_metadata_queue import _job
 
         previous_path = db.DB_PATH
         previous_test_mode = db._configured_test_mode
@@ -430,6 +564,7 @@ class StrmRetirementTransactionTests(unittest.TestCase):
                     ),
                     [],
                 )
+                strm_repo.enqueue_strm_metadata_jobs([_job(source_id="11")])
 
                 # 模拟配置文件已发布、但 SQLite 事务未提交便异常退出。
                 with self.assertRaisesRegex(RuntimeError, "process interrupted"):
@@ -441,12 +576,15 @@ class StrmRetirementTransactionTests(unittest.TestCase):
                     ):
                         raise RuntimeError("process interrupted")
                 self.assertEqual(db.list_strm_retired_sources(), [])
+                self.assertEqual(strm_repo.list_strm_metadata_queue()[0]["status"], "queued")
 
                 recovered = db.reconcile_configured_strm_sources([], "/new/strm")
                 self.assertEqual(recovered, ["11"])
                 rows = db.list_strm_retired_sources()
                 self.assertEqual(rows[0]["source_name"], "旧来源")
                 self.assertEqual(rows[0]["strm_root"], "/old/strm")
+                self.assertEqual(strm_repo.list_strm_metadata_queue()[0]["status"], "cancelled")
+                self.assertEqual(strm_repo.claim_due_strm_metadata_jobs(owner="after-restart"), [])
 
                 # 来源重新加入时，同一次启动对账会撤销尚未执行的退役。
                 self.assertEqual(

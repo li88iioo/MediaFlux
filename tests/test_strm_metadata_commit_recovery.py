@@ -82,6 +82,47 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
             "strm_root": str(self.root), "base_url": "http://play.invalid", "media_server_refresh": True,
         })
 
+    def _assert_removed_source_download_is_discarded(self, *, download_fails):
+        db.reconcile_configured_strm_sources(
+            [{"id": "source", "name": "整理"}], str(self.root),
+        )
+        strm_repo.enqueue_strm_metadata_jobs([self.job])
+
+        def remove_source(*args, **kwargs):
+            # requests.get 在真实领取后、最终文件替换前执行；此时不持有写锁。
+            self.assertTrue(strm.STRM_OPERATION_LOCK.acquire(blocking=False))
+            try:
+                with db.reconcile_strm_retired_sources_transaction(
+                    [], [("source", "整理", str(self.root))],
+                    configured_sources=[], configured_strm_root=str(self.root),
+                ):
+                    pass
+            finally:
+                strm.STRM_OPERATION_LOCK.release()
+            if download_fails:
+                raise OSError("isolated download interrupted after removal")
+            return _Response()
+
+        with patch("app.modules.strm.requests.get", side_effect=remove_source) as download:
+            self.assertTrue(self.worker._process_one())
+        self.assertGreaterEqual(download.call_count, 1)
+        self.assertEqual(self.queue_row()["status"], "cancelled")
+        self.assertEqual(self.queue_row()["attempts"], 0)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.root.rglob("*.part")), [])
+        self.assertEqual(strm_repo.list_strm_index("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+        self.assertEqual(db.list_strm_failures(status="open"), [])
+        self.assertEqual(self.worker._completed_session, 0)
+        self.assertEqual(self.worker._failed_session, 0)
+        self.assertFalse(self.worker._process_one())
+
+    def test_source_removed_during_download_cannot_publish_file(self):
+        self._assert_removed_source_download_is_discarded(download_fails=False)
+
+    def test_source_removed_during_download_cannot_publish_failure(self):
+        self._assert_removed_source_download_is_discarded(download_fails=True)
+
     def test_manual_recovery_closes_failed_job_without_requeuing_installed_file(self):
         self.fail_manual_job()
         with patch("app.modules.strm.requests.get", return_value=_Response()) as download:

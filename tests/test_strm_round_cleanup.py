@@ -48,9 +48,7 @@ class TestStrmRoundCleanup:
                 "removed_dir_paths": ["/tmp/strm/A/empty", "/tmp/strm/B/empty"],
                 "stopped": False,
             },
-        ) as empty_cleanup, patch(
-            "app.repositories.strm.cancel_retired_strm_metadata_jobs", return_value=0,
-        ):
+        ) as empty_cleanup:
             aggregate, source_results, stopped = scheduler._run_full_sources(
                 sources,
                 base_url="http://media.invalid",
@@ -113,8 +111,6 @@ class TestStrmRoundCleanup:
         ), patch(
             "app.modules.scheduler.clean_empty_strm_dirs",
             return_value={"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False},
-        ), patch(
-            "app.repositories.strm.cancel_retired_strm_metadata_jobs", return_value=0,
         ):
             scheduler._run_full_sources(
                 sources, base_url="http://media.invalid", strm_root="/tmp/strm",
@@ -157,9 +153,7 @@ class TestStrmRoundCleanup:
             "app.modules.scheduler.clean_retired_strm_sources",
         ) as retire, patch(
             "app.modules.scheduler.clean_empty_strm_dirs",
-        ) as empty_cleanup, patch(
-            "app.repositories.strm.cancel_retired_strm_metadata_jobs",
-        ) as cancel_retired:
+        ) as empty_cleanup:
             aggregate, source_results, stopped = scheduler._run_full_sources(
                 sources, base_url="http://media.invalid", strm_root="/tmp/strm",
                 exts={"mkv"}, metadata_exts=set(), threshold=0,
@@ -169,7 +163,6 @@ class TestStrmRoundCleanup:
         assert cleanup_events == []
         retire.assert_not_called()
         empty_cleanup.assert_not_called()
-        cancel_retired.assert_not_called()
         assert aggregate["clean_skipped"] is True
         assert all(result["stats"]["clean_skipped"] is True for result in source_results)
         assert any("整轮扫描未完整" in str(item) for item in aggregate["error_samples"])
@@ -189,8 +182,6 @@ class TestStrmRoundCleanup:
         ), patch(
             "app.modules.scheduler.clean_retired_strm_sources",
         ) as retire, patch(
-            "app.repositories.strm.cancel_retired_strm_metadata_jobs",
-        ) as cancel_retired, patch(
             "app.modules.scheduler.clean_empty_strm_dirs",
             return_value={
                 "empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False,
@@ -210,7 +201,6 @@ class TestStrmRoundCleanup:
         assert len(source_results) == 1
         assert aggregate["retired_sources"] == 0
         retire.assert_not_called()
-        cancel_retired.assert_not_called()
         empty_cleanup.assert_called_once()
         assert str(empty_cleanup.call_args.kwargs["owned_root"]).endswith(
             "/光鸭云盘/整理"

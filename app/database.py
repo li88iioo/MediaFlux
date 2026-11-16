@@ -2043,6 +2043,8 @@ def _apply_strm_source_reconciliation(
     active_ids: tuple[str, ...],
     retired_sources: dict[str, tuple[str, str]],
 ) -> None:
+    # 发布活跃集合时同步撤销待办；在途 worker 的旧 revision/租约也随之失效。
+    strm_repo.cancel_retired_strm_metadata_jobs(conn, active_ids)
     if active_ids:
         placeholders = ",".join("?" for _ in active_ids)
         conn.execute(
@@ -2063,11 +2065,11 @@ def reconcile_strm_retired_sources_transaction(
     configured_strm_root: str = "",
     previous_sources: Iterable[object] | None = None,
 ):
-    """在配置发布事务内同步 STRM 退役队列和已发布来源快照。
+    """在配置发布事务内同步 STRM 退役队列、元数据待办和来源快照。
 
     调用方必须在 ``with`` 块内完成配置文件发布。若发布或 SQLite 提交失败，
-    两项数据库状态会一起回滚；进程异常退出后，启动恢复可由旧快照与新配置
-    重建缺失的退役记录。
+    数据库状态会一起回滚；进程异常退出后，启动恢复可由旧快照与新配置
+    重建缺失的退役记录并撤销旧来源的待办。
     """
     active_ids = tuple(
         dict.fromkeys(

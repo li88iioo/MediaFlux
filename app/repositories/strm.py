@@ -945,30 +945,23 @@ def cancel_stale_strm_metadata_jobs(
 
 
 def cancel_retired_strm_metadata_jobs(
-    active_source_ids: Iterable[object] | None, *, provider: str = "guangya",
+    conn: sqlite3.Connection, active_source_ids: Iterable[object] | None, *,
+    provider: str = "guangya",
 ) -> int:
-    """取消已不在配置来源集中的元数据任务，防止退役清理后被后台复活。"""
-    active = {str(item) for item in (active_source_ids or []) if str(item)}
-    stamp = db.now()
-    cancelled = 0
-    with db.get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id,source_id FROM strm_metadata_queue WHERE provider=? "
-            "AND status<>'cancelled'",
-            ((provider or "guangya"),),
-        ).fetchall()
-        for row in rows:
-            if str(row["source_id"]) in active:
-                continue
-            cur = conn.execute(
-                "UPDATE strm_metadata_queue SET status='cancelled',dirty=0,"
-                "revision=revision+1,lease_owner='',lease_until=0,"
-                "last_error_type='Cancelled',last_error='STRM 来源已从配置中移除',"
-                "updated_at=? WHERE id=? AND status<>'cancelled'",
-                (stamp, int(row["id"])),
-            )
-            cancelled += (cur.rowcount or 0)
-    return cancelled
+    """在来源发布事务中撤销非活跃来源的待办和租约，不依赖扫描或文件清理。"""
+    active = tuple(dict.fromkeys(str(item) for item in (active_source_ids or []) if str(item)))
+    where = "provider=? AND status<>'cancelled'"
+    params: list[object] = [db.now(), (provider or "guangya")]
+    if active:
+        where += f" AND source_id NOT IN ({','.join('?' for _ in active)})"
+        params.extend(active)
+    cur = conn.execute(
+        "UPDATE strm_metadata_queue SET status='cancelled',dirty=0,revision=revision+1,"
+        "lease_owner='',lease_until=0,last_error_type='Cancelled',"
+        "last_error='STRM 来源已从配置中移除',updated_at=? WHERE " + where,
+        params,
+    )
+    return cur.rowcount or 0
 
 
 def count_strm_metadata_jobs(*, provider: str = "guangya") -> dict[str, int]:
