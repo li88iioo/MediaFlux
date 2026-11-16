@@ -103,6 +103,68 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
         return subscription_id, candidate_id, admission_id, request_id, media_key
 
+    def test_cancelled_candidate_stays_locked_and_new_search_requires_explicit_selection(self):
+        from types import SimpleNamespace
+        from starlette.requests import Request
+        from app.routes import downloads_api
+        from app.modules.media_subscriptions import MediaSubscriptionError
+        from tests.support import authenticated_session
+
+        for offset, target in enumerate(("qb", "both")):
+            with self.subTest(target=target):
+                subscription, candidate_id, admission_id, request_id, media_key = (
+                    self._seed_failed_subscription_request(86200 + offset)
+                )
+                task_hash = f"{86200 + offset:040x}"
+                download_requests_repo.update_download_request(
+                    request_id, targets=target, status="submitted", qb_status="submitted",
+                    qb_task_id=task_hash, gy_status="downloading" if target == "both" else "", error="",
+                )
+                media_subscriptions_repo.update_media_download_admission(admission_id, status="submitted", error="")
+                media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
+                fake_qb = SimpleNamespace(delete_torrents=Mock(return_value=True), close=Mock())
+                with patch.object(downloads_api, "_qb", return_value=fake_qb):
+                    response = downloads_api.qb_action(
+                        "delete", Request({"type": "http", "session": authenticated_session()}),
+                        {"hashes": [task_hash]},
+                    )
+                self.assertEqual(response.status_code, 200)
+                fake_qb.delete_torrents.assert_called_once_with(task_hash, delete_files=False)
+                service = MediaSubscriptionService()
+                candidate = service.list_candidates(subscription)[0]
+                self.assertEqual(candidate["status"], "submitted")
+                self.assertEqual(candidate["delivery"]["qb_status"], "cancelled")
+                self.assertEqual(candidate["delivery"]["request_status"], "downloading" if target == "both" else "cancelled")
+                self.assertEqual(candidate["delivery"]["status"], "downloading" if target == "both" else "cancelled")
+                self.assertEqual(len(media_subscriptions_repo.list_active_media_download_admissions(subscription)), int(target == "both"))
+                with self.assertRaises(MediaSubscriptionError) as failure:
+                    asyncio.run(service.download_candidate(candidate_id, target))
+                self.assertEqual(failure.exception.code, "unavailable")
+
+                same_id = seed_media_subscription_candidates(
+                    subscription, media_key, season=1, episode=1,
+                    candidates=[{"result_id": candidate["result_id"], "title": "缓存候选", "download_state": "ready"}],
+                    expires_at="2099-01-01 00:00:00",
+                )[0]
+                self.assertEqual(same_id, candidate_id)
+                self.assertEqual(media_subscriptions_repo.get_media_subscription_candidate(same_id)["status"], "submitted")
+                new_id = seed_media_subscription_candidates(
+                    subscription, media_key, season=1, episode=1,
+                    candidates=[{"result_id": "fresh-result", "title": "新检索候选", "download_state": "ready"}],
+                    expires_at="2099-01-01 00:00:00",
+                )[0]
+                self.assertNotEqual(new_id, same_id)
+                self.assertEqual(media_subscriptions_repo.get_media_subscription_candidate(new_id)["status"], "available")
+                self.assertEqual(media_subscriptions_repo.get_media_subscription_candidate(candidate_id)["request_id"], request_id)
+                if target == "qb":
+                    source = download_requests_repo.get_download_request(request_id)
+                    capability = download_dispatcher.download_resubmit_capabilities(source)["qb"]
+                    self.assertFalse(capability["enabled"])
+                    self.assertIn("当前没有下载失败或待核对事项", capability["reason"])
+                    with patch.object(download_dispatcher, "_submit_qb") as backend:
+                        self.assertFalse(download_dispatcher.resubmit_download_request(request_id, "qb")["ok"])
+                    backend.assert_not_called()
+
     def test_new_subscription_admission_binds_when_same_hash_failed_owner_is_archived(self):
         subscription, _old_candidate, old_admission, old_request, media_key = (
             self._seed_failed_subscription_request(86080)
@@ -731,6 +793,10 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         get_download_request_result = download_requests_repo.get_download_request(successor_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["status"], "submitted")
+        public_candidate = MediaSubscriptionService().list_candidates(subscription_id)[0]
+        self.assertEqual(public_candidate["request_id"], successor_id)
+        self.assertEqual(public_candidate["delivery"]["request_id"], successor_id)
+        self.assertEqual(public_candidate["delivery"]["request_status"], "submitted")
 
         second_candidate_id = seed_media_subscription_candidates(
             subscription_id, media_key, season=1, episode=1,

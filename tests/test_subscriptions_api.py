@@ -101,7 +101,11 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
         })
 
     def _open(self, tab="media"):
-        self.page.goto(f"http://app.test/rss#{tab}")
+        url = "http://app.test/rss" + (f"#{tab}" if tab != "media" else "")
+        if self.page.url == url:
+            self.page.reload()
+        else:
+            self.page.goto(url)
         self.page.wait_for_selector("#mediaSubscriptionList .media-subscription-card" if tab == "media"
                                     else "#subscriptionRunList .subscription-run-row")
         self.page.evaluate("""() => {
@@ -146,6 +150,129 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
                 "type": "warning", "title": "媒体巡检未完成", "message": "检查被拒绝",
             })
             self.page.locator("#appMessageClose").click()
+
+    def test_download_receipts_keep_accepted_targets_and_refresh_candidates(self):
+        from app.modules.media_subscriptions import MediaSubscriptionError, MediaSubscriptionService
+        from playwright.sync_api import expect
+
+        candidate_id = seed_media_subscription_candidates(
+            self.subscription_id, "tmdb:86034:movie", season=None, episode=None,
+            candidates=[{"result_id": "receipt-candidate", "title": "回执候选", "download_state": "ready"}],
+            expires_at="2099-01-01 00:00:00",
+        )[0]
+        cases = (
+            ({"ok": True, "status": "submitted", "request_id": 1}, "success", "已发送", ()),
+            ({"ok": True, "status": "partial", "request_id": 2, "succeeded": ["qb"],
+              "failed": ["guangya"], "error": "光鸭提交失败"}, "warning", "部分目标提交失败",
+             ("已提交：qBittorrent", "失败：光鸭云盘")),
+            ({"ok": True, "status": "partial", "request_id": 3, "succeeded": ["guangya"],
+              "failed": ["qb"], "error": "qB提交失败"}, "warning", "部分目标提交失败",
+             ("已提交：光鸭云盘", "失败：qBittorrent")),
+            ({"ok": False, "status": "manual_review", "request_id": 4,
+              "error": "下载提交结果未知，勿直接重复提交"}, "warning", "提交结果待核验", ("勿直接重复提交",)),
+            ({"ok": False, "duplicate": True, "status": "duplicate", "error": "已在下载"},
+             "info", "未重复提交", ("未重复提交",)),
+            (MediaSubscriptionError("所有目标提交失败", status_code=502, code="download_failed"),
+             "error", "发送到", ("所有目标提交失败",)),
+        )
+        self._open()
+        for receipt, tone, title, fragments in cases:
+            with self.subTest(tone=tone, title=title):
+                media_subscriptions_repo.update_media_subscription_candidate(candidate_id, status="available")
+                self.page.evaluate("window.receipts = []")
+                self.page.locator('[data-media-action="candidates"]').click()
+                button = self.page.locator(f'[data-candidate-id="{candidate_id}"]')
+                expect(button).to_be_visible()
+                before = len(self.requests)
+
+                async def submit(*_args):
+                    if isinstance(receipt, Exception):
+                        raise receipt
+                    if not receipt.get("duplicate"):
+                        media_subscriptions_repo.update_media_subscription_candidate(candidate_id, status="submitted")
+                    return receipt
+
+                with patch.object(MediaSubscriptionService, "download_candidate", side_effect=submit):
+                    button.click()
+                    self.page.wait_for_function("window.receipts.length === 1")
+                    expect(self.page.locator("#appMessageModal")).to_have_class(re.compile(f"is-{tone}"))
+                    expect(self.page.locator("#appMessageTitle")).to_contain_text(title)
+                    for fragment in fragments:
+                        expect(self.page.locator("#appMessageText")).to_contain_text(fragment)
+                    self.page.locator("#appMessageClose").click()
+                    if isinstance(receipt, Exception) or receipt.get("duplicate"):
+                        expect(button).to_be_enabled()
+                    else:
+                        expect(button).to_have_count(0)
+                        expect(self.page.locator(".subscription-candidate-locked")).to_have_count(1)
+                sent = self.requests[before:]
+                self.assertIn(("GET", f"/api/subscriptions/media/{self.subscription_id}/candidates"), sent)
+                self.assertIn(("GET", "/api/subscriptions/stats"), sent)
+                self.page.locator('[data-media-candidate-close]').click()
+
+    def test_candidate_terminal_states_and_existing_download_center_recovery(self):
+        from app.repositories import download_requests as downloads_repo
+        from playwright.sync_api import expect
+
+        candidate_id = seed_media_subscription_candidates(
+            self.subscription_id, "tmdb:86034:movie", season=None, episode=None,
+            candidates=[{"result_id": "delivery-candidate", "title": "状态候选", "download_state": "ready"}],
+            expires_at="2099-01-01 00:00:00",
+        )[0]
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
+            media_key="tmdb:86034:movie", tmdb_id="86034", media_type="movie",
+            subscription_id=self.subscription_id, candidate_id=candidate_id,
+            season=None, episode=None, subscription_revision=1,
+        )
+        self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
+            admission_id, subscription_id=self.subscription_id, subscription_revision=1,
+        ))
+        request_id, _ = downloads_repo.create_download_request(
+            "delivery-projection", "magnet", title="状态候选", admission_id=admission_id,
+        )
+        downloads_repo.add_download_log("qb", title="状态候选", request_id=request_id, status="success")
+        media_subscriptions_repo.update_media_subscription_candidate(candidate_id, status="submitted", request_id=request_id)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE media_subscriptions SET status='missing',missing_count=1 WHERE id=?", (self.subscription_id,))
+        cases = (
+            ("cancelled", "cancelled", "", "", "已停止跟踪", "", 1280),
+            ("failed", "failed", "", "", "下载失败", "issues", 390),
+            ("submitted", "outcome_unknown", "", "", "需要核验", "issues", 1280),
+            ("downloading", "cancelled", "downloading", "", "下载中", "", 1280),
+            ("completed", "completed", "", "failed", "处理失败", "logs", 1280),
+        )
+        for status, qb_status, gy_status, organize_status, label, request_view, width in cases:
+            with self.subTest(status=status, label=label):
+                downloads_repo.update_download_request(
+                    request_id, status=status, targets="both" if gy_status else "qb",
+                    qb_status=qb_status, gy_status=gy_status, organize_status=organize_status, error="",
+                )
+                media_subscriptions_repo.update_media_download_admission(admission_id, status="submitted")
+                media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
+                self.page.set_viewport_size({"width": width, "height": 900})
+                self._open()
+                if status == "failed":
+                    expect(self.page.locator(".media-subscription-summary")).to_contain_text("请在下载中心处理对应请求")
+                self.page.locator('[data-media-action="candidates"]').click()
+                expect(self.page.locator(".subscription-candidate-delivery")).to_have_text(label)
+                expect(self.page.locator("[data-candidate-id]")).to_have_count(0)
+                link = self.page.locator('.subscription-candidate-actions a')
+                expect(link).to_have_count(int(bool(request_view)))
+                if request_view:
+                    expect(link).to_be_visible()
+                    expect(link).to_have_attribute("href", f"/downloads?view={request_view}")
+                    expect(link).to_contain_text(f"请求 #{request_id}")
+                    if request_view == "logs":
+                        logs = self.client.get("/api/downloads/logs").json()["items"]
+                        record = next(item for item in logs if item["request_id"] == request_id)
+                        self.assertEqual(record["postprocess_issues"][0]["key"], "organize")
+                        issues = self.client.get("/api/downloads/issues").json()["items"]
+                        self.assertFalse(any(item["id"] == request_id for item in issues))
+                if status == "cancelled":
+                    expect(self.page.locator(".subscription-candidate-reason")).to_contain_text("不会自动重启")
+                    expect(self.page.locator(".subscription-candidate-reason")).to_contain_text("手动选择新资源")
+                self.assertLessEqual(self.page.evaluate("document.documentElement.scrollWidth"), width)
+                self.page.locator('[data-media-candidate-close]').click()
 
     def test_run_history_uses_shared_chinese_statuses_and_preserves_legacy(self):
         from app.modules.media_subscriptions import MediaSubscriptionService
@@ -736,7 +863,6 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         self.assertIn('.media-subscription-candidate-count {', styles)
         self.assertNotIn('media-subscription-facts', scripts)
         self.assertIn("void window.appAlert?.({", scripts)
-        self.assertIn("partial ? '部分目标提交失败' : `已发送到${targetLabel}`", scripts)
         self.assertIn("title: duplicate ? '未重复提交' : `发送到${targetLabel}失败`", scripts)
         self.assertIn('const contextActive = state.candidateSubscriptionId === subscriptionId', scripts)
         self.assertIn("const target = subscription.download_target || 'guangya'", scripts)

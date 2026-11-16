@@ -116,7 +116,11 @@
         const response = await fetch(path, {...options, headers, signal});
         let payload = {};
         try { payload = await response.json(); } catch (_) { payload = {}; }
-        if (!response.ok || payload?.error) {
+        // 已受理回执的 error 可描述部分失败或待核验，不等于整次请求失败。
+        const acceptedReceipt = Number(payload?.request_id) > 0 && (
+            (payload?.status === 'partial' && payload?.ok === true) || payload?.status === 'manual_review'
+        );
+        if (!response.ok || (payload?.error && !acceptedReceipt)) {
             const error = new Error(payload?.error || `请求失败（HTTP ${response.status}）`);
             error.status = response.status;
             error.payload = payload;
@@ -226,7 +230,7 @@
         if (primary === 'downloading') return `缺失 ${missing || active} ${unit} · ${target} 正在下载，完成后将自动整理入库`;
         if (primary === 'processing') return `缺失 ${missing || active} ${unit} · 下载已完成，正在整理并等待媒体库入库`;
         if (primary === 'manual_review') return (workflow.attention_reasons || []).join('；') || `有 ${Number(workflow.manual_review_count || active)} 个任务需要人工核验，请查看资源候选或下载任务`;
-        if (primary === 'delivery_failed') return `缺失 ${missing} ${unit} · 最近一次下载失败，可打开候选重新提交`;
+        if (primary === 'delivery_failed') return `缺失 ${missing} ${unit} · 最近一次下载失败，请在下载中心处理对应请求`;
         if (primary === 'candidate_waiting_auto') return `缺失 ${missing} ${unit} · 已找到 ${available} 个候选，尚未满足自动下载条件`;
         if (primary === 'candidate_waiting_confirm') return `缺失 ${missing} ${unit} · ${available} 个候选等待你确认后推送`;
         if (primary === 'candidate_available') return `缺失 ${missing} ${unit} · 已找到 ${available} 个资源候选`;
@@ -1118,12 +1122,17 @@
         const delivery = item.delivery || {};
         const requestStatus = String(delivery.request_status || '');
         const admissionStatus = String(delivery.status || '');
+        if (requestStatus === 'cancelled' || admissionStatus === 'cancelled') {
+            return {label: '已停止跟踪', tone: 'warning', hint: '取消后不会自动重启。请重新检查或搜索，并手动选择新资源。'};
+        }
         const postFailed = ['failed', 'requires_manual'].includes(String(delivery.organize_status || ''))
             || ['failed', 'requires_manual'].includes(String(delivery.local_import_status || ''))
             || ['failed'].includes(String(delivery.strm_status || ''));
-        if (postFailed) return {label: '处理失败', tone: 'error'};
-        if (requestStatus === 'manual_review') return {label: '需要核验', tone: 'warning'};
-        if (requestStatus === 'failed' || admissionStatus === 'failed') return {label: '下载失败', tone: 'error'};
+        if (postFailed) return {label: '处理失败', tone: 'error', requestView: 'logs'};
+        if (requestStatus === 'manual_review' || [delivery.qb_status, delivery.gy_status].some((status) => ['outcome_unknown', 'manual_review'].includes(status))) {
+            return {label: '需要核验', tone: 'warning', requestView: 'issues'};
+        }
+        if (requestStatus === 'failed' || admissionStatus === 'failed') return {label: '下载失败', tone: 'error', requestView: 'issues'};
         if (admissionStatus === 'completed') return {label: '已入库', tone: 'success'};
         if (requestStatus === 'completed' || admissionStatus === 'processing') return {label: '等待入库', tone: 'processing'};
         if (requestStatus === 'downloading' || admissionStatus === 'downloading') return {label: '下载中', tone: 'downloading'};
@@ -1151,6 +1160,7 @@
             body.append(top, title, meta);
             if (Array.isArray(item.match_reasons) && item.match_reasons.length) body.append(node('p', 'subscription-candidate-reason', item.match_reasons.join(' · ')));
             if (item.delivery?.error) body.append(node('p', 'subscription-candidate-error', item.delivery.error));
+            if (deliveryView?.hint) body.append(node('p', 'subscription-candidate-reason', deliveryView.hint));
             const actions = node('div', 'subscription-candidate-actions');
             if (item.status === 'available') {
                 const target = subscription.download_target || 'guangya';
@@ -1161,6 +1171,13 @@
                 const locked = node('span', 'subscription-candidate-locked', deliveryView?.label || '已提交');
                 locked.prepend(icon(deliveryView?.tone === 'error' ? 'triangle-alert' : 'activity'));
                 actions.append(locked);
+                const requestId = Number(item.delivery?.request_id || item.request_id || 0);
+                if (deliveryView?.requestView && requestId > 0) {
+                    const recovery = node('a', 'rss-btn', `下载中心 · 请求 #${requestId}`);
+                    recovery.href = `/downloads?view=${deliveryView.requestView}`;
+                    recovery.prepend(icon('external-link'));
+                    actions.append(recovery);
+                }
             }
             row.append(body, actions);
             elements.candidateList.append(row);
@@ -1207,22 +1224,20 @@
             const result = await apiJSON(`/api/subscriptions/media/${subscriptionId}/download`, {method: 'POST', body: JSON.stringify({candidate_id: candidateId, target})});
             const duplicate = Boolean(result.duplicate);
             const partial = result.status === 'partial';
-            const succeeded = Array.isArray(result.succeeded) ? result.succeeded.join('、') : '';
-            const failed = Array.isArray(result.failed) ? result.failed.join('、') : '';
-            const message = duplicate ? '该季集已有下载或入库任务，未重复提交。' : partial ? `已提交：${succeeded || '部分目标'}；失败：${failed || '部分目标'}。` : `任务已提交到${targetLabel}。`;
+            const manualReview = result.status === 'manual_review';
+            const succeeded = Array.isArray(result.succeeded) ? result.succeeded.map(downloadTargetLabel).join('、') : '';
+            const failed = Array.isArray(result.failed) ? result.failed.map(downloadTargetLabel).join('、') : '';
+            const message = duplicate ? '该季集已有下载或入库任务，未重复提交。'
+                : manualReview ? (result.error || '下载提交结果待核验，请先核对下载器，勿直接重复提交。')
+                : partial ? `已提交：${succeeded || '部分目标'}；失败：${failed || '部分目标'}。${result.error || ''}`
+                : `任务已提交到${targetLabel}。`;
             const contextActive = state.candidateSubscriptionId === subscriptionId;
             if (contextActive) elements.candidateStatus.textContent = message;
             void window.appAlert?.({
-                type: duplicate ? 'info' : partial ? 'warning' : 'success',
-                title: duplicate ? '未重复提交' : partial ? '部分目标提交失败' : `已发送到${targetLabel}`,
+                type: duplicate ? 'info' : partial || manualReview ? 'warning' : 'success',
+                title: duplicate ? '未重复提交' : manualReview ? '提交结果待核验' : partial ? '部分目标提交失败' : `已发送到${targetLabel}`,
                 message,
             });
-            const subscription = contextActive ? state.media.find((item) => Number(item.id) === subscriptionId) : null;
-            if (subscription && contextActive) {
-                const rows = await apiJSON(`/api/subscriptions/media/${subscription.id}/candidates`);
-                if (state.candidateSubscriptionId === subscriptionId) renderCandidates(subscription, Array.isArray(rows) ? rows : []);
-            }
-            void loadStats();
         } catch (error) {
             const duplicate = Boolean(error.payload?.duplicate);
             const message = duplicate ? '该季集已有下载或入库任务，未重复提交。' : (error.message || `发送到${targetLabel}失败`);
@@ -1232,7 +1247,20 @@
                 title: duplicate ? '未重复提交' : `发送到${targetLabel}失败`,
                 message,
             });
-        } finally { buttonBusy(trigger, false); }
+        } finally {
+            const subscription = state.media.find((item) => Number(item.id) === subscriptionId);
+            const refreshes = [loadMedia({preserve: true}), loadStats()];
+            if (subscription && state.candidateSubscriptionId === subscriptionId) {
+                refreshes.push(apiJSON(`/api/subscriptions/media/${subscriptionId}/candidates`).then((rows) => {
+                    if (state.candidateSubscriptionId === subscriptionId) renderCandidates(subscription, Array.isArray(rows) ? rows : []);
+                }));
+            }
+            const refreshed = await Promise.allSettled(refreshes);
+            if (refreshed.some((item) => item.status === 'rejected') && state.candidateSubscriptionId === subscriptionId) {
+                elements.candidateStatus.textContent += '\n任务状态刷新失败，请刷新候选核对后再操作。';
+            }
+            buttonBusy(trigger, false);
+        }
     }
 
     async function removeWatchlist(item) {
