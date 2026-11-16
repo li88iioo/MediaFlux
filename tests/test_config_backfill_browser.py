@@ -246,6 +246,7 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
                 self.assertNotIn("TG_QB_CATEGORY", config.all_items())
                 self.assertNotIn("TG_QB_SAVE_PATH", config.all_items())
                 self.assertEqual(field("TG_QB_CATEGORY").input_value(), "rss-new")
+                self.assertEqual(page.locator("#qbCategoryPreview").inner_text(), "rss-new")
                 self.assertEqual(field("TG_QB_SAVE_PATH").input_value(), "/rss-new")
                 field("TG_QB_CATEGORY").fill("tg")
                 field("TG_QB_SAVE_PATH").fill("")

@@ -238,6 +238,7 @@
                         field.dataset.configInitialValue=field.value;
                     }
                 });
+                syncTelemetryWidgets();
             }
             const hasPendingChanges=result?.__hasPendingConfigChanges===true
                 || Object.keys(collectConfigFields(panel)).length>0;
