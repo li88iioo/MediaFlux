@@ -996,6 +996,50 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertTrue(_FakeAsyncClient.instances[0].closed)
 
+    def test_shared_upstream_client_never_inherits_another_users_cookie(self):
+        real_client = httpx.AsyncClient
+
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"{}"
+
+        for status in (200, 302):
+            with self.subTest(status=status):
+                requests = []
+
+                def upstream(request):
+                    requests.append(request)
+                    if request.url.path == "/System/Info":
+                        return httpx.Response(status, stream=Body(), headers={
+                            "Set-Cookie": "connect.sid=user-a; Path=/; HttpOnly",
+                            "Location": "/Items", "Content-Type": "application/json",
+                        })
+                    return httpx.Response(200 if request.headers.get("cookie") else 401, stream=Body())
+
+                def make_client(**kwargs):
+                    return real_client(transport=httpx.MockTransport(upstream), **kwargs)
+
+                app = media_proxy.create_proxy_app(self._instance())
+                with (
+                    patch.object(media_proxy.media_proxy_repo, "get_media_proxy_instance", return_value=self._instance()),
+                    patch.object(media_proxy.httpx, "AsyncClient", side_effect=make_client),
+                    TestClient(app) as first,
+                ):
+                    response = first.get("/System/Info", headers={"X-Emby-Token": "user-a"}, follow_redirects=False)
+                    self.assertEqual(response.status_code, status)
+                    self.assertNotIn("set-cookie", response.headers)
+                    other = TestClient(app)
+                    try:
+                        self.assertFalse(other.cookies)
+                        self.assertEqual(other.get("/Items").status_code, 401)
+                        self.assertEqual(other.get("/Items", headers={"X-Emby-Token": "user-b"}).status_code, 401)
+                        self.assertEqual(other.get("/Items", headers={"Cookie": "connect.sid=user-b"}).status_code, 200)
+                    finally:
+                        other.close()
+                self.assertNotIn("cookie", requests[1].headers)
+                self.assertNotIn("cookie", requests[2].headers)
+                self.assertEqual(requests[3].headers["cookie"], "connect.sid=user-b")
+
     def test_oversized_request_body_is_rejected_before_contacting_upstream(self):
         app = media_proxy.create_proxy_app(self._instance())
         with (

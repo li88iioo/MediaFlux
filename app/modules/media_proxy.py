@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
@@ -2472,53 +2473,29 @@ class _PinnedUpstreamTarget:
     addresses: tuple[str, ...]
 
 
-class _UpstreamClientPool:
-    """按逻辑上游 authority 复用连接，并由代理应用生命周期统一关闭。"""
+class _UpstreamClient:
+    """实例固定上游的连接由 app 复用，用户 Cookie 只取自当前请求。"""
 
     def __init__(self) -> None:
-        self._clients: dict[tuple[str, str, int], httpx.AsyncClient] = {}
+        self._client: httpx.AsyncClient | None = None
 
-    @staticmethod
-    def _key(pinned: _PinnedUpstreamTarget) -> tuple[str, str, int]:
-        logical = httpx.URL(pinned.logical_url)
-        default_port = 443 if logical.scheme == "https" else 80
-        return (logical.scheme, (logical.host or ""), (logical.port or default_port))
-
-    def get(self, pinned: _PinnedUpstreamTarget) -> httpx.AsyncClient:
-        key = self._key(pinned)
-        client = self._clients.get(key)
-        if client is None:
-            client = httpx.AsyncClient(
+    def get(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
                 follow_redirects=False,
                 timeout=_upstream_timeout(),
                 trust_env=False,
+                cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=())),
             )
-            self._clients[key] = client
-        return client
+        return self._client
 
     async def aclose(self) -> None:
-        clients = tuple(self._clients.items())
-        if not clients:
-            return
-        results = await asyncio.gather(
-            *(client.aclose() for _key, client in clients),
-            return_exceptions=True,
-        )
-        failures: list[BaseException] = []
-        for (key, client), result in zip(clients, results, strict=True):
-            if isinstance(result, BaseException):
-                failures.append(result)
-                logger.warning(
-                    "媒体反代上游连接池关闭失败 type=%s",
-                    type(result).__name__,
-                )
-                continue
-            if self._clients.get(key) is client:
-                self._clients.pop(key, None)
-        if failures:
-            raise RuntimeError(
-                f"媒体反代上游连接池仍有 {len(failures)} 个客户端关闭失败"
-            ) from failures[0]
+        client = self._client
+        if client is not None:
+            # 关闭失败/取消时保留句柄，运行时停止流程可继续收敛。
+            await client.aclose()
+            if self._client is client:
+                self._client = None
 
 
 def _pin_upstream_target(upstream: str, request_path: str) -> _PinnedUpstreamTarget:
@@ -4269,7 +4246,7 @@ def create_proxy_app(
     recorder = playback_record_writer or PlaybackRecordWriter(
         task_name=f"media-proxy-playback-records-{instance_id}"
     )
-    upstream_clients = _UpstreamClientPool()
+    upstream_client = _UpstreamClient()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -4279,7 +4256,7 @@ def create_proxy_app(
         finally:
             app.state.playback_accepting = False
             try:
-                await upstream_clients.aclose()
+                await upstream_client.aclose()
             finally:
                 try:
                     await recorder.stop()
@@ -4302,7 +4279,7 @@ def create_proxy_app(
     app.state.playback_grants = playback_grants
     app.state.playback_sessions = playback_sessions
     app.state.playback_record_writer = recorder
-    app.state.upstream_clients = upstream_clients
+    app.state.upstream_client = upstream_client
     signed_urls = signed_urls or SignedUrlCache()
     browser_direct_targets = BrowserDirectTargetCache()
     _register_signed_url_cache(instance_id, signed_urls)
@@ -5420,7 +5397,7 @@ def create_proxy_app(
         )
         if sanitized_query:
             target = f"{target}?{sanitized_query}"
-        client = upstream_clients.get(pinned)
+        client = upstream_client.get()
         upstream_headers = _upstream_request_headers(
             request,
             str(instance.get("server_type") or ""),
@@ -6285,7 +6262,7 @@ class MediaProxyManager:
         # lifespan 首次关闭失败时，连接池会保留失败句柄；即使当前 stop
         # 被取消，也要让真实关闭任务收敛后再传播取消。
         close_task = asyncio.create_task(
-            runtime.app.state.upstream_clients.aclose(),
+            runtime.app.state.upstream_client.aclose(),
             name=f"media-proxy-upstream-close-{runtime.instance_id}",
         )
         try:

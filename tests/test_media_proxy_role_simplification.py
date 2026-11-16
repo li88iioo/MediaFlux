@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import httpx
 from starlette.requests import Request
 
-from app.modules.media_proxy import _UpstreamClientPool
+from app.modules.media_proxy import _UpstreamClient
 from tests.support import InitializedWebTestCase, IsolatedDatabaseTestCase
 
 
@@ -36,7 +36,7 @@ def _runtime_app(instance_id=9, pool=None):
         }
     )
     if pool is not None:
-        app.state.upstream_clients = pool
+        app.state.upstream_client = pool
     return app
 
 
@@ -471,7 +471,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         app = _runtime_app(9)
         pool = FailOncePool()
-        app.state.upstream_clients = pool
+        app.state.upstream_client = pool
         server = SimpleNamespace(should_exit=False)
 
         async def serve():
@@ -890,7 +890,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         reconcile.close.assert_called_once_with()
         restart.close.assert_called_once_with()
 
-    async def test_upstream_pool_retains_only_failed_clients_for_retry(self):
+    async def test_upstream_client_retains_failed_handle_for_retry(self):
         from app.modules import media_proxy
 
         class Client:
@@ -903,20 +903,17 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 if self.fail_once and self.close_calls == 1:
                     raise RuntimeError("simulated close failure")
 
-        pool = media_proxy._UpstreamClientPool()
+        pool = media_proxy._UpstreamClient()
         failed = Client(fail_once=True)
-        closed = Client(fail_once=False)
-        failed_key = ("http", "failed.invalid", 80)
-        closed_key = ("http", "closed.invalid", 80)
-        pool._clients = {failed_key: cast(httpx.AsyncClient, failed), closed_key: cast(httpx.AsyncClient, closed)}
+        pool._client = cast(httpx.AsyncClient, failed)
 
-        with self.assertRaisesRegex(RuntimeError, "1 个客户端关闭失败"):
+        with self.assertRaisesRegex(RuntimeError, "simulated close failure"):
             await pool.aclose()
-        self.assertEqual(pool._clients, {failed_key: failed})
-        self.assertEqual(closed.close_calls, 1)
+        self.assertIs(pool._client, failed)
 
         await pool.aclose()
-        self.assertEqual(pool._clients, {})
+        self.assertIsNone(pool._client)
+        await pool.aclose()
         self.assertEqual(failed.close_calls, 2)
 
     async def test_stop_runtime_retries_pool_retained_by_lifespan_failure(self):
@@ -931,9 +928,9 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 if self.close_calls == 1:
                     raise RuntimeError("simulated close failure")
 
-        pool = media_proxy._UpstreamClientPool()
+        pool = media_proxy._UpstreamClient()
         client = FailOnceClient()
-        pool._clients[("http", "upstream.invalid", 80)] = cast(httpx.AsyncClient, client)
+        pool._client = cast(httpx.AsyncClient, client)
         with self.assertRaises(RuntimeError):
             await pool.aclose()
 
@@ -952,7 +949,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await media_proxy.MediaProxyManager._stop_runtime(runtime)
 
         self.assertEqual(client.close_calls, 2)
-        self.assertEqual(pool._clients, {})
+        self.assertIsNone(pool._client)
 
 
     async def test_stop_runtime_cancellation_still_closes_upstream_pool(self):
@@ -975,7 +972,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=runtime_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            app=_runtime_app(14, pool=cast(_UpstreamClientPool, pool)),
+            app=_runtime_app(14, pool=cast(_UpstreamClient, pool)),
         )
         with patch.object(media_proxy, "_release_signed_url_cache"):
             stop_task = asyncio.create_task(
@@ -1012,7 +1009,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=runtime_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            app=_runtime_app(16, pool=cast(_UpstreamClientPool, pool)),
+            app=_runtime_app(16, pool=cast(_UpstreamClient, pool)),
         )
         manager._runtimes = {16: runtime}
 
@@ -1122,7 +1119,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=runtime_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            app=_runtime_app(15, pool=cast(_UpstreamClientPool, pool)),
+            app=_runtime_app(15, pool=cast(_UpstreamClient, pool)),
         )
         manager._runtimes = {15: runtime}
 
