@@ -76,6 +76,10 @@ internal sealed class TestFixture : IDisposable
         var fileSystem = new Mock<IFileSystem>();
         fileSystem.Setup(fs => fs.GetFileSystemInfo(It.IsAny<string>())).Returns((string p) =>
             new FileSystemMetadata { FullName = p, IsDirectory = Directory.Exists(p), Exists = File.Exists(p) || Directory.Exists(p) });
+        fileSystem.Setup(fs => fs.GetFiles(It.IsAny<string>(), It.IsAny<IReadOnlyList<string>>(), false, false))
+            .Returns((string path, IReadOnlyList<string> extensions, bool _, bool __) => Directory.EnumerateFiles(path)
+                .Where(p => extensions.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+                .Select(p => new FileSystemMetadata { FullName = p, Exists = true }).ToArray());
         BaseItem.FileSystem = fileSystem.Object;
         Library.Setup(l => l.GetLocalAlternateVersionIds(It.IsAny<Video>())).Returns([]);
         Library.Setup(l => l.GetLinkedAlternateVersions(It.IsAny<Video>())).Returns([]);

@@ -128,6 +128,11 @@ public static class DeletePlanner
                 if (old is not null && (old.Scope is null || old.Scope.Kind != scope.Kind || !PathComparer.Equals(old.Scope.Root, scope.Root)))
                     throw new PluginFault("等待期间纳管删除范围发生变化；本地删除已取消。请核对 MF 日志。");
                 var nativeIds = nativeItems.Select(i => i.Id).ToHashSet();
+                var companionMedia = scope.Root is null && scan.Entries.Any(e => !IsStrm(e.FullName))
+                    ? Directory.EnumerateFiles(Path.GetDirectoryName(item.Path)!)
+                        .Where(p => IsStrm(p) || MediaExtensions.Contains(Path.GetExtension(p)))
+                        .Select(PathKey).Append(PathKey(item.Path)).Distinct(PathComparer).ToArray()
+                    : [];
                 foreach (var entry in scan.Entries)
                 {
                     if (IsStrm(entry.FullName) && !entry.IsDirectory)
@@ -138,7 +143,7 @@ public static class DeletePlanner
                     }
                     if (!entry.IsDirectory && MediaExtensions.Contains(Path.GetExtension(entry.FullName)))
                         throw new PluginFault("原生删除范围混放本地视频或其它媒体文件；不能扩大目录删除。");
-                    if (scope.Root is null && !IsCompanion(entry.FullName, item.Path))
+                    if (scope.Root is null && !IsCompanion(entry.FullName, item.Path, companionMedia))
                         throw new PluginFault("原生文件删除含非自身路径或无法确认归属的伴随文件；本地删除已取消。");
                     var owner = library.FindByPath(entry.FullName, null);
                     if (owner is not null && (!entry.IsDirectory || !nativeIds.Contains(owner.Id)))
@@ -341,14 +346,25 @@ public static class DeletePlanner
     private static string PathKey(string? path) => string.IsNullOrEmpty(path) ? "" : MappingSet.IsAbsolute(path) ? MappingSet.Normalize(path) : path;
     private static ItemIdentity Identity(BaseItem item) => new(item.Id, PathKey(item.Path), item.GetType().FullName!);
     private static FileSystemMetadata CopyPath(FileSystemMetadata path) => new() { FullName = PathKey(path.FullName), IsDirectory = path.IsDirectory };
-    private static bool IsCompanion(string path, string itemPath)
+    private static bool IsCompanion(string path, string itemPath, string[] mediaPaths)
     {
         path = PathKey(path); itemPath = PathKey(itemPath);
         if (!PathComparer.Equals(Path.GetDirectoryName(path), Path.GetDirectoryName(itemPath))) return false;
-        var stem = Path.GetFileNameWithoutExtension(itemPath);
         var name = Path.GetFileNameWithoutExtension(path);
-        return PathComparer.Equals(stem, name) || new[] { ".", "-", "_" }.Any(separator =>
-            name.StartsWith(stem + separator, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal));
+        string? owner = null;
+        var longest = -1;
+        // 原生伴随名称匹配不区分大小写；只接纳唯一的最长媒体名归属，
+        // 不能让大小写双媒体或更长的另一媒体名共享同一份伴随授权。
+        foreach (var mediaPath in mediaPaths)
+        {
+            var stem = Path.GetFileNameWithoutExtension(mediaPath);
+            if (stem.Length < longest || !(name.Equals(stem, StringComparison.OrdinalIgnoreCase)
+                || (name.Length > stem.Length && name.StartsWith(stem, StringComparison.OrdinalIgnoreCase)
+                    && name[stem.Length] is '.' or '-' or '_'))) continue;
+            owner = stem.Length == longest ? null : mediaPath;
+            longest = stem.Length;
+        }
+        return owner is not null && PathComparer.Equals(owner, itemPath);
     }
     private static bool Within(string path, string root) => MappingSet.Within(MappingSet.Normalize(path), MappingSet.Normalize(root));
     private static bool IsManaged(string? path, MappingSet mappings) => IsStrm(path) && mappings.Match(path!) is not null;

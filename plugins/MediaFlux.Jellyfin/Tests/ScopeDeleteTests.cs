@@ -386,6 +386,51 @@ public sealed class ScopeDeleteTests
         Assert.Equal(companion ? 1 : 0, f.Handler.DeletePosts); Assert.Equal(companion ? 1 : 0, f.NativeDeletes);
     }
 
+    [Theory]
+    [InlineData("episode", "show.s01e01.nfo", null, true)]
+    [InlineData("movie", "show.s01e01.nfo", null, true)]
+    [InlineData("episode", "show.s01e01.zh.srt", null, true)]
+    [InlineData("episode", "show.s01e01.zh.srt", "Show.strm", true)]
+    [InlineData("episode", "Show.S01E010.nfo", "Show.S01E010.strm", false)]
+    [InlineData("episode", "Show.S01E01.nfo", "show.s01e01.strm", false)]
+    [InlineData("episode", "show.s01e01.zh.srt", "Show.S01E01.zh.strm", false)]
+    public async Task NativeCompanionsRequireUniqueMediaOwner(string kind, string companion, string? neighbor, bool allowed)
+    {
+        using var f = new TestFixture();
+        Video item;
+        if (kind == "movie")
+        {
+            var movie = f.Movie("Show.S01E01.strm", directoryDelete: false);
+            movie.Setup(i => i.GetDeletePaths()).CallBase(); item = movie.Object;
+        }
+        else
+        {
+            var episode = f.Episode("Show.S01E01.strm");
+            episode.Object.IsInMixedFolder = true;
+            episode.Setup(i => i.GetDeletePaths()).CallBase(); item = episode.Object;
+        }
+        var companionPath = Path.Combine(f.Root, companion); File.WriteAllText(companionPath, "metadata");
+        if (neighbor is not null) File.WriteAllText(Path.Combine(f.Root, neighbor), "unindexed neighbor");
+        Assert.Contains(item.GetDeletePaths(), path => path.FullName == companionPath);
+        using var response = await f.Delete(item);
+        Assert.Equal(allowed ? HttpStatusCode.NoContent : HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal(allowed ? 1 : 0, f.Handler.DeletePosts); Assert.Equal(allowed ? 1 : 0, f.NativeDeletes);
+    }
+
+    [Theory]
+    [InlineData("show.s01e01.strm")]
+    [InlineData("Show.S01E01.zh.strm")]
+    public async Task NativeCompanionOwnerIsRecheckedAfterMf(string neighbor)
+    {
+        using var f = new TestFixture(); var episode = f.Episode("Show.S01E01.strm");
+        episode.Object.IsInMixedFolder = true; episode.Setup(i => i.GetDeletePaths()).CallBase();
+        File.WriteAllText(Path.Combine(f.Root, "show.s01e01.zh.srt"), "metadata");
+        f.Handler.OnPoll = () => File.WriteAllText(Path.Combine(f.Root, neighbor), "new neighbor");
+        using var response = await f.Delete(episode.Object);
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(0, f.NativeDeletes);
+    }
+
     [Fact]
     public async Task OtherLibraryObjectsAreNotCompanionsEvenWithNonMediaExtension()
     {
