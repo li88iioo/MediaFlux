@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from app import config
 from app import database as db
 from app.clients.guangya import GuangYaFile
 from app.modules.scheduler import STRMScheduler
@@ -13,6 +14,39 @@ from app.modules.strm_notifications import (
     cleanup_notice_lines,
 )
 from tests.support import isolated_test_database
+
+
+@pytest.mark.parametrize('kind', ['summary', 'failure', 'detail'])
+@pytest.mark.parametrize('enabled,override,expected', [
+    (False, True, False), (True, False, False), (True, True, True), (False, None, False),
+])
+def test_strm_switch_also_controls_organize_notifications(kind, enabled, override, expected):
+    values = {'STRM_NOTIFY_ENABLED': str(int(enabled)), 'TG_NOTIFICATION_ENABLED': '1',
+              'TG_NOTIFICATION_LEVEL': 'detailed'}
+    options = {'chat_ids': ['fixture-chat'], 'uses_default_notification_scope': False}
+    with patch.object(config, 'get', side_effect=lambda key, default='': values.get(key, default)), patch(
+        'app.modules.telegram_notification_center.publish_notification_event',
+    ) as publish:
+        if kind == 'summary':
+            STRMScheduler._notify_success({}, {}, 1, 'organize', [], '/fixture',
+                                          notify_override=override, **options)
+        elif kind == 'failure':
+            STRMScheduler._notify_failure('fixture error', 'organize', notify_override=override, **options)
+        else:
+            STRMScheduler._notify_details({'changes': [{'action': 'create', 'path': 'Film/Movie.strm'}]},
+                                          'organize', enabled_override=override, **options)
+    assert bool(publish.call_count) is expected
+
+
+@pytest.mark.parametrize('trigger,label', [('manual', '手动执行'), ('cron', '定时任务'),
+                                          ('organize', '整理联动'), ('future-trigger', 'future-trigger')])
+def test_failure_uses_same_trigger_labels_as_success(trigger, label):
+    with patch('app.modules.scheduler.get_bool', return_value=True), patch(
+        'app.modules.telegram_notification_center.publish_notification_event',
+    ) as publish:
+        STRMScheduler._notify_failure('fixture error', trigger,
+                                      chat_ids=['fixture-chat'], uses_default_notification_scope=False)
+    assert dict(publish.call_args.args[1].fields)['触发方式'] == label
 
 
 def test_round_guard_reason_is_not_repeated_with_source_prefixes():

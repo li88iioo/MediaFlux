@@ -2510,7 +2510,7 @@ class STRMScheduler:
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
                         has_silent_notification_scope: bool = False) -> None:
-        enabled = get_bool("STRM_NOTIFY_ENABLED", True) if notify_override is None else notify_override
+        enabled = get_bool("STRM_NOTIFY_ENABLED", True) and notify_override is not False
         if trigger_type == "telegram" or not enabled:
             return
         recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
@@ -2572,8 +2572,8 @@ class STRMScheduler:
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
                         has_silent_notification_scope: bool = False) -> None:
-        """仅为整理联动发送有界文件明细，汇总通知开关与其相互独立。"""
-        if trigger_type != "organize":
+        """仅为整理联动发送有界文件明细，同时遵守 STRM 通知总开关。"""
+        if trigger_type != "organize" or not get_bool("STRM_NOTIFY_ENABLED", True):
             return
         enabled = (
             get_bool("GY_ORGANIZE_STRM_DETAIL_NOTIFY", True)
@@ -2632,11 +2632,11 @@ class STRMScheduler:
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
                         has_silent_notification_scope: bool = False) -> None:
-        enabled = get_bool("STRM_NOTIFY_ENABLED", True) if notify_override is None else notify_override
+        enabled = get_bool("STRM_NOTIFY_ENABLED", True) and notify_override is not False
         if trigger_type != "telegram" and enabled:
             event = NotificationEvent(
                 "❌ STRM 同步失败",
-                fields=(("触发方式", trigger_type), ("错误原因", error[:500])),
+                fields=(("触发方式", STRMScheduler._trigger_label(trigger_type)), ("错误原因", error[:500])),
                 layout="relaxed",
             )
             recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
