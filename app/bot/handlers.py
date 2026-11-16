@@ -70,6 +70,7 @@ _sync_running = False
 _organize_running = False
 _local_organize_running = False
 _ORGANIZE_LIFECYCLE_WAIT_SECONDS = 30 * 60
+_BOTH_DOWNLOAD_LABEL = "光鸭默认 + qBittorrent"
 
 
 def _organize_group_progress(task_state: dict) -> tuple[int, int, str, str]:
@@ -215,12 +216,12 @@ def _download_target_picker_markup(
     ordinary = [
         ("光鸭云盘", "confirm", {"request_id": request_id, "target": "guangya"}),
         ("qBittorrent", "confirm", {"request_id": request_id, "target": "qb"}),
-        ("两者", "confirm", {"request_id": request_id, "target": "both"}),
+        (_BOTH_DOWNLOAD_LABEL, "confirm", {"request_id": request_id, "target": "both"}),
         ("取消", "cancel", {"request_id": request_id}),
     ]
     if allow_guangya:
         sources = _nsfw_download_sources()
-        choices = [ordinary[0]]
+        rows = [ordinary[:2]]
         if sources:
             name_counts: dict[str, int] = {}
             for source in sources:
@@ -235,7 +236,7 @@ def _download_target_picker_markup(
                     seen_names[name] = seen_names.get(name, 0) + 1
                     suffix = f" #{seen_names[name]}"
                 label_name = name[: max(1, 40 - len(suffix))].rstrip() + suffix
-                choices.append(
+                rows.append([
                     (
                         f"光鸭·NSFW · {label_name}",
                         "confirm",
@@ -245,9 +246,9 @@ def _download_target_picker_markup(
                             "nsfw_source_id": source_id,
                         },
                     )
-                )
+                ])
         else:
-            choices.append(
+            rows.append([
                 (
                     "光鸭·NSFW",
                     "confirm",
@@ -257,25 +258,25 @@ def _download_target_picker_markup(
                         "nsfw_source_id": "",
                     },
                 )
-            )
-        choices.extend(ordinary[1:])
+            ])
+        rows.extend([[choice] for choice in ordinary[2:]])
     else:
-        choices = [ordinary[1], ordinary[3]]
+        rows = [[ordinary[1]], [ordinary[3]]]
 
     action_ids = get_telegram_write_confirmation_store().create_group(
         chat_id=chat_id,
         user_id=user_id,
         operation="download_request",
-        actions=[(decision, value) for _label, decision, value in choices],
+        actions=[(decision, value) for row in rows for _label, decision, value in row],
         message_thread_id=message_thread_id,
     )
     keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        *[
-            telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{action_id}")
-            for (label, _decision, _value), action_id in zip(choices, action_ids)
-        ]
-    )
+    action_iter = iter(action_ids)
+    for row in rows:
+        keyboard.add(*[
+            telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{next(action_iter)}")
+            for label, _decision, _value in row
+        ])
     return keyboard
 
 
@@ -663,7 +664,7 @@ def _resource_target_view(
     for label, target in (
         ("qBittorrent", "qb"),
         ("光鸭云盘", "guangya"),
-        ("全部", "both"),
+        (_BOTH_DOWNLOAD_LABEL, "both"),
     ):
         markup.add(
             _resource_action_button(
@@ -1610,7 +1611,7 @@ def _register_commands(bot, telebot):
         sections = [
             "<b>MediaFlux Bot</b>\n\n"
             "发送磁力、ED2K、HTTP(S) 链接或 .torrent 文件，"
-            "可选择推送到光鸭、qBittorrent 或两者。",
+            "可单独下载到光鸭或 qBittorrent，也可同时下载到光鸭默认目录和 qBittorrent。",
             "<b>资源搜索</b>\n"
             "/media_search 片名 — 搜索媒体资源\n"
             "/媒体搜索 片名 — 搜索媒体资源",
@@ -2392,7 +2393,7 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
             labels = {
                 "qb": "qBittorrent",
                 "guangya": "光鸭云盘",
-                "both": "全部目标",
+                "both": _BOTH_DOWNLOAD_LABEL,
             }
             markup = _write_confirmation_markup(
                 telebot,

@@ -412,7 +412,7 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertIn("选择下载目标", text)
         self.assertEqual(
             [button.text for button in markup.buttons],
-            ["qBittorrent", "光鸭云盘", "全部", "返回资源列表"],
+            ["qBittorrent", "光鸭云盘", "光鸭默认 + qBittorrent", "返回资源列表"],
         )
         resolved = [
             self.store.resolve_action(button.callback_data.split(":", 1)[1], "100", "9")

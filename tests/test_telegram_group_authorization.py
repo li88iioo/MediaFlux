@@ -784,7 +784,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         self.assertIn("未配置 NSFW", bot.answers[-1][0][1])
         replacement = bot.edits[-1][1]["reply_markup"]
         self.assertTrue(any(item.text == "qBittorrent" for item in replacement.buttons))
-        self.assertTrue(any(item.text == "两者" for item in replacement.buttons))
+        self.assertTrue(any(item.text == "光鸭默认 + qBittorrent" for item in replacement.buttons))
         self.assertTrue(any(item.text == "光鸭·NSFW" for item in replacement.buttons))
 
     def test_stale_nsfw_choice_refreshes_picker_without_submitting(self):
