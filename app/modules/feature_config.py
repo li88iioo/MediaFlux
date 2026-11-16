@@ -100,6 +100,15 @@ def _prepare(feature: str, enabled: bool) -> tuple[bytes | None, dict[str, Any]]
         status, ok, message = "not_configured", False, "当前没有可用资源站点，请先在设置页选择"
     elif enabled and feature == "web_search" and not facts["tavily_configured"]:
         status, ok, message = "not_configured", False, "联网搜索供应商尚未配置，请先在设置页配置 Tavily API Key"
+    elif enabled and feature == "strm_metadata":
+        from app.modules.strm import DEFAULT_METADATA_EXTS, parse_strm_extensions, validate_strm_extensions
+
+        try:
+            validate_strm_extensions(config.get("STRM_VIDEO_EXTS", ""), parse_strm_extensions(
+                config.get("STRM_METADATA_EXTS", ""), defaults=DEFAULT_METADATA_EXTS,
+            ))
+        except ValueError as exc:
+            status, ok, message = "not_configured", False, str(exc)
     fingerprint = hashlib.sha256(json.dumps({"feature": feature, "enabled": enabled, "facts": facts,
         "file_present": raw is not None, "file_sha256": hashlib.sha256(raw or b"").hexdigest()},
         ensure_ascii=False, sort_keys=True).encode()).hexdigest()

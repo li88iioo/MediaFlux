@@ -59,6 +59,61 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
+    def test_strm_extension_conflicts_reject_partial_and_default_updates_atomically(self):
+        self._write_raw(STRM_VIDEO_EXTS="mkv,mp4", STRM_METADATA_EXTS="nfo,srt", STRM_METADATA_ENABLED="1")
+        for updates in (
+            {"STRM_METADATA_EXTS": ".MKV，nfo"},
+            {"STRM_VIDEO_EXTS": "mkv, .NFO"},
+            {"STRM_VIDEO_EXTS": "", "STRM_METADATA_EXTS": "mkv"},
+        ):
+            with self.subTest(updates=updates):
+                before = config.ENV_FILE.read_bytes()
+                response = self.client.post("/api/config", json={**updates, "STRM_SKIP_THRESHOLD_MB": "20"}, headers=self.headers)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn("不能重复", response.json()["error"])
+                self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_legacy_strm_conflict_blocks_running_and_enabling_but_allows_switching_off(self):
+        from app.modules.scheduler import get_scheduler
+        from app.modules import feature_config, strm_metadata_management
+
+        self._write_raw(STRM_VIDEO_EXTS="mkv", STRM_METADATA_EXTS="mkv,nfo", STRM_METADATA_ENABLED="1",
+                        GY_STRM_SOURCE_DIRS='[{"id":"source","name":"Source"}]', GY_STRM_BASE_URL="http://play.invalid")
+        with patch.object(get_scheduler(), "trigger", return_value={"ok": True}) as trigger:
+            response = self.client.post("/api/strm/run/full", headers=self.headers)
+        self.assertEqual(response.status_code, 400, response.text)
+        trigger.assert_not_called()
+        response = self.client.post("/api/config", json={
+            "STRM_VIDEO_EXTS": "mkv", "STRM_METADATA_EXTS": "mkv,nfo", "STRM_METADATA_ENABLED": "0",
+        }, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(config.get_bool("STRM_METADATA_ENABLED"))
+        before = config.ENV_FILE.read_bytes()
+        with self.assertRaisesRegex(ValueError, "不能重复"):
+            strm_metadata_management.prepare_policy(True, "owner")
+        preview = feature_config.prepare_feature("strm_metadata", True)
+        self.assertFalse(preview["preview"]["ok"])
+        self.assertIn("不能重复", preview["preview"]["error"])
+        response = self.client.post("/api/config", json={"STRM_METADATA_ENABLED": "1"}, headers=self.headers)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_strm_extensions_save_and_runtime_share_normalization(self):
+        from app.modules.scheduler import STRMScheduler
+
+        response = self.client.post("/api/config", json={
+            "STRM_VIDEO_EXTS": ".MKV，mp4 MKV", "STRM_METADATA_EXTS": ".NFO，srt", "STRM_METADATA_ENABLED": "1",
+        }, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(config.get("STRM_VIDEO_EXTS"), "mkv,mp4")
+        self.assertEqual(config.get("STRM_METADATA_EXTS"), "nfo,srt")
+        self.assertEqual(STRMScheduler._video_exts(), {"mkv", "mp4"})
+        self.assertEqual(STRMScheduler._metadata_exts(), {"nfo", "srt"})
+        response = self.client.post("/api/config", json={"STRM_METADATA_ENABLED": ""}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(config.get("STRM_METADATA_ENABLED"), "")
+        self.assertEqual(STRMScheduler._metadata_exts(), set())
+
     def test_rss_save_checks_current_qb_setup_without_changing_existing_subscription(self):
         from app.repositories import rss as rss_repo
 

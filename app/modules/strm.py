@@ -44,7 +44,7 @@ from app.clients.guangya import (
     GuangYaFile,
     close_guangya_client,
 )
-from app.config import get, get_int
+from app.config import get, get_bool, get_int
 from app.defaults import DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
@@ -284,6 +284,38 @@ def finalize_changed_paths(stats: dict) -> dict:
 DEFAULT_VIDEO_EXTS = set(DEFAULT_STRM_VIDEO_EXTS)
 
 DEFAULT_METADATA_EXTS = set(DEFAULT_STRM_METADATA_EXTS)
+
+
+def parse_strm_extensions(
+    value: str | Iterable[str] | None, *, defaults: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """配置和执行共用扩展名解析，保留顺序，空值沿用调用方默认。"""
+    if isinstance(value, str):
+        parts = re.split(r"[,，\s]+", value)
+    elif value is None:
+        parts = ()
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        parts = value
+    else:
+        raise ValueError("STRM 文件类型必须是扩展名字符串或数组")
+    if any(not isinstance(part, str) for part in parts):
+        raise ValueError("STRM 文件类型只能包含扩展名字符串")
+    normalized = (part.strip().lower().lstrip(".") for part in parts)
+    return tuple(dict.fromkeys(part for part in normalized if part)) or tuple(defaults)
+
+
+def validate_strm_extensions(
+    video_exts: str | Iterable[str] | None,
+    metadata_exts: str | Iterable[str] | None,
+) -> tuple[set[str], set[str]]:
+    """视频和正在同步的伴随类型必须互斥，分类前拒绝冲突以保护已生成文件。"""
+    video = set(parse_strm_extensions(video_exts, defaults=DEFAULT_STRM_VIDEO_EXTS))
+    metadata = set(parse_strm_extensions(metadata_exts))
+    overlap = video & metadata
+    if overlap:
+        raise ValueError(f"STRM 视频与伴随文件类型不能重复: {', '.join(sorted(overlap))}")
+    return video, metadata
+
 
 STRM_SUBDIR = "光鸭云盘"
 MAX_PATH_COMPONENT_BYTES = 255
@@ -1205,6 +1237,10 @@ def _prepare_strm_metadata_job_with_client(
     file_id = str(job.get("file_id") or "")
     if not file_id:
         raise ValueError("元数据任务缺少 file_id")
+    video_exts, _ = validate_strm_extensions(get("STRM_VIDEO_EXTS", ""), ())
+    extension = str(job.get("filename") or "").rsplit(".", 1)[-1].lower()
+    if extension in video_exts:
+        raise ValueError("视频文件不能作为 STRM 伴随元数据下载")
     if should_stop and should_stop():
         raise _STRMStopped("元数据后台任务已停止")
     remote = remote if remote is not None else runtime_client.file_info(file_id)
@@ -1735,8 +1771,7 @@ def _sync_strm_incremental_impl(
     refresh_policy: StrmRefreshPolicy | None = None,
 ) -> dict:
     """只处理整理成功的最终对象；Client 生命周期由公开入口统一管理。"""
-    exts = video_exts or DEFAULT_VIDEO_EXTS
-    metadata = metadata_exts or set()
+    exts, metadata = validate_strm_extensions(video_exts, metadata_exts)
     threshold_bytes = skip_threshold_mb * 1024 * 1024
     display_source_name = (source_name or rel_prefix or source_dir_id)
     progress = _BoundedProgress(on_progress)
@@ -2119,8 +2154,7 @@ def _sync_strm_impl(
     refresh_policy: StrmRefreshPolicy | None = None,
 ) -> dict:
     """递归扫描光鸭目录，为视频生成 STRM；Client 由公开入口持有。"""
-    exts = video_exts or DEFAULT_VIDEO_EXTS
-    metadata = metadata_exts or set()
+    exts, metadata = validate_strm_extensions(video_exts, metadata_exts)
     threshold_bytes = skip_threshold_mb * 1024 * 1024
     scan_worker_count = max(
         1,
@@ -3209,6 +3243,12 @@ def _retry_runtime_config() -> tuple[dict, str]:
     base_url = get("GY_STRM_BASE_URL", "").strip()
     if not base_url:
         return {}, "未配置 STRM 播放服务地址"
+    try:
+        validate_strm_extensions(get("STRM_VIDEO_EXTS", ""), parse_strm_extensions(
+            get("STRM_METADATA_EXTS", ""), defaults=DEFAULT_STRM_METADATA_EXTS,
+        ) if get_bool("STRM_METADATA_ENABLED", False) else ())
+    except ValueError as exc:
+        return {}, str(exc)
     root = Path(root_text).expanduser().resolve(strict=False)
     if root.exists() and not root.is_dir():
         return {}, "STRM 本地根目录不是目录"

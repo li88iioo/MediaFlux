@@ -1266,6 +1266,28 @@ def save_config(request: Request, data: Any = Body(default=None)):
                     raise ValueError(f"视频与伴随文件类型不能重复: {', '.join(sorted(overlap))}")
             except ValueError as exc:
                 return api_error(str(exc), 400)
+        strm_extension_keys = {"STRM_VIDEO_EXTS", "STRM_METADATA_EXTS", "STRM_METADATA_ENABLED"}
+        if strm_extension_keys & data.keys():
+            from app.defaults import DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
+            from app.modules.strm import parse_strm_extensions, validate_strm_extensions
+
+            try:
+                video_exts = parse_strm_extensions(
+                    data.get("STRM_VIDEO_EXTS", config.get("STRM_VIDEO_EXTS", "")),
+                    defaults=DEFAULT_STRM_VIDEO_EXTS,
+                )
+                metadata_exts = parse_strm_extensions(
+                    data.get("STRM_METADATA_EXTS", config.get("STRM_METADATA_EXTS", "")),
+                    defaults=DEFAULT_STRM_METADATA_EXTS,
+                )
+                enabled = str(data.get("STRM_METADATA_ENABLED", config.get("STRM_METADATA_ENABLED", ""))).strip().lower()
+                # 允许先关闭遗留冲突配置，重新开启时再按前瞻配置完整校验。
+                validate_strm_extensions(video_exts, metadata_exts if enabled in {"1", "true", "yes", "on", "y"} else ())
+                for key, values in (("STRM_VIDEO_EXTS", video_exts), ("STRM_METADATA_EXTS", metadata_exts)):
+                    if key in data:
+                        media_workflow_updates[key] = ",".join(values)
+            except ValueError as exc:
+                return api_error(str(exc), 400)
         old_strm_sources: list[dict[str, str]] = []
         new_strm_sources: list[dict[str, str]] | None = None
         old_strm_root = config.get("STRM_ROOT", "").strip()

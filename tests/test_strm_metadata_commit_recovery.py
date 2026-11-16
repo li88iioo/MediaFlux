@@ -163,17 +163,19 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
                     conn.execute("DELETE FROM strm_metadata_queue")
                 strm_repo.enqueue_strm_metadata_jobs([{**self.job, "filename": "Movie.jpg", "target_rel_path": "整理/Movie/Movie.jpg"}])
                 successor = []
-                def settings(key, default="", *, change=change, successor=successor):
-                    if key == "STRM_METADATA_EXTS":
-                        if change == "revision":
-                            strm_repo.enqueue_strm_metadata_jobs([self.job])
-                        elif change == "lease":
-                            strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
-                            successor.extend(strm_repo.claim_due_strm_metadata_jobs(owner="successor"))
-                        return "nfo"
-                    return str(self.root) if key == "STRM_ROOT" else default
+                claim = strm_repo.claim_due_strm_metadata_jobs
+
+                def claim_then_change(*args, **kwargs):
+                    jobs = claim(*args, **kwargs)
+                    # 在真实领取后制造版本/租约变化，不依赖配置预检的读取顺序。
+                    if change == "revision":
+                        strm_repo.enqueue_strm_metadata_jobs([self.job])
+                    elif change == "lease":
+                        strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
+                        successor.extend(claim(owner="successor"))
+                    return jobs
                 with (
-                    patch("app.modules.strm_metadata_worker.get", side_effect=settings),
+                    patch.object(strm_repo, "claim_due_strm_metadata_jobs", side_effect=claim_then_change),
                     patch("app.modules.strm_metadata_worker.prepare_strm_metadata_job") as prepare,
                 ):
                     self.assertTrue(self.worker._process_one())

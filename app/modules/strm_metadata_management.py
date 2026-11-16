@@ -157,6 +157,12 @@ def prepare_policy(enabled: bool, owner: str) -> tuple[dict[str, Any], str]:
         raise ValueError("enabled 必须为布尔值")
     if config.has_external_override(_POLICY_KEY):
         raise ValueError("伴随同步由部署环境控制，不能在此覆盖")
+    if enabled:
+        from app.modules.strm import DEFAULT_METADATA_EXTS, parse_strm_extensions, validate_strm_extensions
+
+        validate_strm_extensions(config.get("STRM_VIDEO_EXTS", ""), parse_strm_extensions(
+            config.get("STRM_METADATA_EXTS", ""), defaults=DEFAULT_METADATA_EXTS,
+        ))
     snapshot, _ = _policy_snapshot()
     view = {
         "before": snapshot["enabled"],

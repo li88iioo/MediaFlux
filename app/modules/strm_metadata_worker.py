@@ -19,10 +19,13 @@ from app.config import get, get_bool, get_int
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.modules.strm import (
+    DEFAULT_METADATA_EXTS,
     STRM_OPERATION_LOCK,
     _STRMStopped,
     commit_strm_metadata_job,
+    parse_strm_extensions,
     prepare_strm_metadata_job,
+    validate_strm_extensions,
 )
 
 logger = get_logger(__name__)
@@ -169,6 +172,10 @@ class STRMMetadataWorker:
         root_text = get("STRM_ROOT", "").strip()
         if not root_text:
             return False
+        _, metadata_exts = validate_strm_extensions(
+            get("STRM_VIDEO_EXTS", ""),
+            parse_strm_extensions(get("STRM_METADATA_EXTS", ""), defaults=DEFAULT_METADATA_EXTS),
+        )
         # 登录不可用是整个消费者的条件，不是每个文件各自下载失败。
         # 先检查再领租约；重新登录后，即使旧熔断尚未结束也可以自动恢复。
         client = self._runtime_client()
@@ -229,12 +236,7 @@ class STRMMetadataWorker:
             if media_root:
                 root_text = str(Path(media_root).expanduser().parent)
             extension = str(job.get("filename") or "").rsplit(".", 1)[-1].lower()
-            configured = {
-                item.strip().lower().lstrip(".")
-                for item in get("STRM_METADATA_EXTS", "").replace("，", ",").split(",")
-                if item.strip()
-            }
-            if configured and extension not in configured:
+            if extension not in metadata_exts:
                 strm_repo.settle_strm_metadata_job(
                     job_id,
                     expected_lease_generation=lease_generation,

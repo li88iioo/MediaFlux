@@ -46,9 +46,11 @@ from app.modules.strm import (
     clean_retired_strm_sources,
     configured_strm_source_plans,
     finalize_changed_paths,
+    parse_strm_extensions,
     safe_path_component,
     sync_strm,
     sync_strm_incremental,
+    validate_strm_extensions,
 )
 from app.modules.strm_notifications import (
     ROUND_CLEANUP_BLOCKED_REASON,
@@ -1180,6 +1182,10 @@ class STRMScheduler:
             return "未配置 STRM 本地根目录"
         if sources and not base_url:
             return "未配置 STRM 播放服务地址"
+        try:
+            validate_strm_extensions(STRMScheduler._video_exts(), STRMScheduler._metadata_exts())
+        except ValueError as exc:
+            return str(exc)
         cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
         if not STRMScheduler.validate_cron(cron_expr):
             return "cron 表达式无效，需使用 5 段格式：分 时 日 月 周"
@@ -2172,27 +2178,13 @@ class STRMScheduler:
 
     @staticmethod
     def _video_exts() -> set[str]:
-        raw = get("STRM_VIDEO_EXTS", "").strip()
-        if not raw:
-            return set(DEFAULT_VIDEO_EXTS)
-        return {
-            item.strip().lower().lstrip(".")
-            for item in raw.replace("，", ",").split(",")
-            if item.strip()
-        }
+        return set(parse_strm_extensions(get("STRM_VIDEO_EXTS", ""), defaults=DEFAULT_VIDEO_EXTS))
 
     @staticmethod
     def _metadata_exts() -> set[str]:
         if not get_bool("STRM_METADATA_ENABLED", False):
             return set()
-        raw = get("STRM_METADATA_EXTS", "").strip()
-        if not raw:
-            return set(DEFAULT_METADATA_EXTS)
-        return {
-            item.strip().lower().lstrip(".")
-            for item in raw.replace("，", ",").split(",")
-            if item.strip()
-        }
+        return set(parse_strm_extensions(get("STRM_METADATA_EXTS", ""), defaults=DEFAULT_METADATA_EXTS))
 
     @staticmethod
     def _refresh_media_servers(

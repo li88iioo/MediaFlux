@@ -119,6 +119,34 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM strm_metadata_queue")
             conn.execute("DELETE FROM strm_refresh_outbox")
 
+    def test_conflicting_extensions_stop_full_and_incremental_before_touching_media(self):
+        for mode in ("full", "incremental"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                source_id = "conflict-" + mode
+                file = GuangYaFile("video", "Movie.mkv", False, 100, "e", source_id)
+                client = _TreeClient({source_id: [file]})
+                sync_strm(source_id, "http://play.invalid", root, client=cast(GuangYaClient, client))
+                target = Path(root) / STRM_SUBDIR / "Movie.strm"
+                before = target.read_bytes()
+                index = [dict(row) for row in strm_repo.list_strm_index(f"guangya:{source_id}")]
+                options = dict(source_dir_id=source_id, base_url="http://play.invalid", strm_root=root,
+                               client=cast(GuangYaClient, client), video_exts={".MKV"}, metadata_exts={"mkv", "nfo"})
+                with patch.object(client, "iter_dir", wraps=client.iter_dir) as scan, \
+                     patch.object(client, "file_info", wraps=client.file_info) as lookup:
+                    with self.assertRaisesRegex(ValueError, "不能重复"):
+                        if mode == "full":
+                            sync_strm(**options)
+                        else:
+                            strm_module.sync_strm_incremental(**options, changes=[{
+                                "source_id": source_id, "file_id": "video", "name": file.name,
+                                "parent_id": source_id, "kind": "video", "action": "upsert",
+                            }])
+                scan.assert_not_called()
+                lookup.assert_not_called()
+                self.assertEqual(target.read_bytes(), before)
+                self.assertEqual([dict(row) for row in strm_repo.list_strm_index(f"guangya:{source_id}")], index)
+                self.assertEqual(strm_repo.list_strm_metadata_queue(), [])
+
     def test_source_prefix_collision_keeps_legacy_owner_and_is_order_stable(self):
         raw = [
             {"id": "directory-ABC123", "name": "Series"},

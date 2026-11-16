@@ -426,6 +426,53 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM strm_index")
             conn.execute("DELETE FROM strm_failures")
 
+    def test_extension_conflict_pauses_before_metadata_client_or_lease(self):
+        worker = metadata.STRMMetadataWorker()
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        settings = {"STRM_ROOT": "/synthetic/output", "STRM_VIDEO_EXTS": "mkv", "STRM_METADATA_EXTS": "mkv,nfo"}
+        with patch.object(metadata, "get_bool", return_value=True), patch.object(
+            metadata, "get", side_effect=lambda key, default="": settings.get(key, default),
+        ), patch.object(worker, "_runtime_client") as client:
+            with self.assertRaisesRegex(ValueError, "不能重复"):
+                worker._process_one()
+        client.assert_not_called()
+        row = strm_repo.list_strm_metadata_queue()[0]
+        self.assertEqual((row["status"], row["attempts"]), ("queued", 0))
+
+    def test_legacy_video_job_is_cancelled_when_metadata_extensions_use_defaults(self):
+        from unittest.mock import Mock
+        from app.clients.guangya import GuangYaFile
+
+        with tempfile.TemporaryDirectory() as root:
+            worker = metadata.STRMMetadataWorker()
+            file = GuangYaFile("video", "Movie.mkv", False, 8, "v", "parent")
+            client = _TreeClient({"parent": [file]})
+            client.get_download_url = Mock(return_value="https://download.invalid/video")
+            worker._client = cast(GuangYaClient, client)
+            strm_repo.enqueue_strm_metadata_jobs([_job(file_id="video", filename=file.name, etag="v", size=8)])
+            settings = {"STRM_ROOT": root, "STRM_VIDEO_EXTS": "mkv", "STRM_METADATA_EXTS": ""}
+            with patch.object(metadata, "get_bool", return_value=True), patch.object(
+                metadata, "get", side_effect=lambda key, default="": settings.get(key, default),
+            ), patch("app.modules.strm.requests.get", return_value=_Response()) as download, patch.object(worker, "_flush_media_refresh"):
+                self.assertTrue(worker._process_one())
+            row = strm_repo.list_strm_metadata_queue()[0]
+            self.assertEqual((row["status"], row["attempts"]), ("cancelled", 0))
+            client.get_download_url.assert_not_called()
+            download.assert_not_called()
+            self.assertEqual(list(Path(root).rglob("*.mkv")), [])
+
+    def test_manual_metadata_prepare_cannot_download_a_configured_video_type(self):
+        from app.clients.guangya import GuangYaFile
+        from app.modules import strm
+
+        file = GuangYaFile("video", "Movie.mkv", False, 8, "v", "parent")
+        job = _job(file_id="video", filename=file.name, etag="v", size=8)
+        with tempfile.TemporaryDirectory() as root, patch.object(strm, "get", return_value="mkv"), \
+             patch("app.modules.strm.requests.get", return_value=_Response()) as download:
+            with self.assertRaisesRegex(ValueError, "视频文件"):
+                strm.prepare_strm_metadata_job(job, root, client=cast(GuangYaClient, _TreeClient({"parent": [file]})))
+        download.assert_not_called()
+
     def test_full_sync_queues_metadata_without_resolving_download_url(self):
         import tempfile
         from pathlib import Path
