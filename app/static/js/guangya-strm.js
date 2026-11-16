@@ -39,7 +39,7 @@
     const failurePageInfo=document.getElementById('strmFailurePageInfo');
     const failurePrevBtn=document.getElementById('strmFailurePrev');
     const failureNextBtn=document.getElementById('strmFailureNext');
-    let failurePage=1;const FAILURE_PAGE_SIZE=120;let failureTotalPages=1;let failureTotalCount=0;
+    let failurePage=1;const FAILURE_PAGE_SIZE=100;let failureTotalPages=1;let failureTotalCount=0;
     let sources=[];let pollTimer=null;let diagnosticSnapshot=null;let diagnosticLoading=false;let diagnosticCleanupBusy=false;let failureSnapshot=[];let failureSummary={};let failureLoading=false;let failureRetrying=false;let selectedFailures=new Set();let failureRequestGeneration=0;let failureAbortController=null;
     const STRM_STATUS_POLL_MS=2500;
     const STRM_STATUS_RETRY_MS=5000;
@@ -641,7 +641,7 @@
                 });
                 const singleRetry=tr.querySelector('[data-retry-single]');
                 if(singleRetry){
-                    singleRetry.addEventListener('click',()=>retrySingleFailure(row.id));
+                    singleRetry.addEventListener('click',()=>retryFailures({ids:[Number(row.id)]}));
                 }
                 const singleDelete=tr.querySelector('[data-delete-single]');
                 if(singleDelete){
@@ -741,7 +741,41 @@
             }
         }
     }
-    async function retryFailures(all){if(failureRetrying)return;const ids=[...selectedFailures];if(!all&&!ids.length)return;const confirmed=await appConfirm({title:all?'重试当前全部失败项':'重试选中失败项',message:'将重新解析云端文件状态并仅执行失败动作，不复用历史签名直链。',confirmText:'开始重试'});if(!confirmed)return;failureRetrying=true;syncFailureActions();failureState.textContent='正在重新解析云端状态并重试…';const body=all?{all:true,source_id:failureSourceFilter.value,action:failureActionFilter.value}:{ids};try{const response=await fetch('/api/strm/failures/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok||data.ok===false)throw new Error(data.error||'重试失败');selectedFailures.clear();await loadFailures();const deferred=Number(data.deferred||0);failureState.textContent=`重试完成：解决 ${Number(data.resolved||0)}，仍失败 ${Number(data.failed||0)}${deferred?`，扫描未完成暂缓 ${deferred}`:''}，当前剩余 ${Number(data.remaining||0)}`;}catch(error){failureState.textContent=error.message||'重试失败';}finally{failureRetrying=false;syncFailureActions();}}
+    async function retryFailures(payload){
+        const action=Object.freeze({
+            all:payload.all===true,
+            ids:Object.freeze([...(payload.ids??selectedFailures)]),
+            body:JSON.stringify(payload),
+        });
+        if(failureRetrying||!action.all&&!action.ids.length)return;
+        failureRetrying=true;
+        syncFailureActions();
+        try{
+            const confirmed=await appConfirm({
+                title:action.all?'重试当前全部失败项':'重试选中失败项',
+                message:'将重新解析云端文件状态并仅执行失败动作，不复用历史签名直链。',
+                confirmText:'开始重试',
+            });
+            if(!confirmed)return;
+            failureState.textContent='正在重新解析云端状态并重试…';
+            const response=await fetch('/api/strm/failures/retry',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:action.body,
+            });
+            const data=await response.json();
+            if(!response.ok||data.ok===false)throw new Error(data.error||'重试失败');
+            for(const id of action.ids)selectedFailures.delete(id);
+            await loadFailures();
+            const deferred=Number(data.deferred||0);
+            failureState.textContent=`重试完成：解决 ${Number(data.resolved||0)}，仍失败 ${Number(data.failed||0)}${deferred?`，扫描未完成暂缓 ${deferred}`:''}，当前剩余 ${Number(data.remaining||0)}`;
+        }catch(error){
+            failureState.textContent=error.message||'重试失败';
+        }finally{
+            failureRetrying=false;
+            syncFailureActions();
+        }
+    }
     async function clearFailures(){
         if(failureRetrying||failureLoading)return;
         const ids=[...selectedFailures];
@@ -808,12 +842,6 @@
         }catch(error){
             failureState.textContent=error.message||'删除失败';
         }
-    }
-    async function retrySingleFailure(id){
-        if(failureRetrying)return;
-        selectedFailures.clear();
-        selectedFailures.add(Number(id));
-        await retryFailures(false);
     }
     async function validateCron(){const value=cron.value.trim();const box=document.getElementById('cronPreview');if(!value){box.innerHTML='';box.style.display='none';return;}try{const response=await fetch('/api/strm/schedule/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cron:value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Cron 校验失败');box.style.display='inline-flex';if(data.valid){box.style.color='var(--accent)';box.style.borderColor='var(--accent-border)';box.style.background='var(--accent-soft)';box.innerHTML=`<i data-lucide="clock" style="width:13px;height:13px;"></i><span>下次运行：${esc(data.next_run)}</span>`;}else{box.style.color='var(--danger)';box.style.borderColor='var(--danger-border)';box.style.background='var(--danger-soft)';box.innerHTML=`<i data-lucide="alert-circle" style="width:13px;height:13px;"></i><span>格式无效：需要 5 段 cron 表达式</span>`;}}catch(error){box.style.display='inline-flex';box.style.color='var(--danger)';box.style.borderColor='var(--danger-border)';box.style.background='var(--danger-soft)';box.textContent=error.message||'Cron 校验失败';}window.renderLucideIcons?.(box);}
 
@@ -912,8 +940,8 @@
     diagnosticCleanupBtn.addEventListener('click',cleanupConfirmedTestIndexes);
     document.getElementById('refreshStrmFailuresBtn').addEventListener('click',()=>loadFailures(failurePage));
     [failureSourceFilter,failureActionFilter,failureStatusFilter].forEach(node=>node.addEventListener('change',()=>{failurePage=1;loadFailures(1);}));
-    retrySelectedBtn.addEventListener('click',()=>retryFailures(false));
-    retryAllBtn.addEventListener('click',()=>retryFailures(true));
+    retrySelectedBtn.addEventListener('click',()=>retryFailures({ids:[...selectedFailures]}));
+    retryAllBtn.addEventListener('click',()=>retryFailures({all:true,source_id:failureSourceFilter.value,action:failureActionFilter.value}));
     if(failurePrevBtn)failurePrevBtn.addEventListener('click',()=>{if(failurePage>1)loadFailures(failurePage-1);});
     if(failureNextBtn)failureNextBtn.addEventListener('click',()=>{if(failurePage<failureTotalPages)loadFailures(failurePage+1);});
     if(clearFailuresBtn)clearFailuresBtn.addEventListener('click',clearFailures);

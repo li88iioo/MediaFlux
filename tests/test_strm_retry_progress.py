@@ -1676,7 +1676,7 @@ globalThis.__MEDIAFLUX_STRM_TEST_HOOK__=true;
               api.renderFailures(openPayload);
               let checkbox=node('strmFailureList').children[0].querySelector('input');
               checkbox.checked=true; checkbox.fire('change');
-              await api.retryFailures(false);
+              await api.retryFailures({ids:[7]});
               checkbox=node('strmFailureList').children[0].querySelector('input');
               if(checkbox.disabled)throw new Error('checkbox remained disabled after retry');
             })().catch(error=>{console.error(error);process.exitCode=1;});

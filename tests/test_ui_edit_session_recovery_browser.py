@@ -12,6 +12,7 @@ import mimetypes
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
 
 from jinja2 import Environment, FileSystemLoader
@@ -122,13 +123,14 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 static_url=lambda value: "/static/" + value,
                 url_for=lambda name: "/" + name.split(".")[-1],
             )
-            for name in ("rss", "guangya", "media_proxy")
+            for name in ("rss", "guangya", "media_proxy", "guangya_strm")
         }
 
     def setUp(self):
         self.requests, self.unexpected, self.errors = [], [], []
         self.replies, self.pending, self.hold_transport = {}, {}, {}
         self.context = None
+        self.strm_client = None
         self.observations = {}
 
     def tearDown(self):
@@ -179,6 +181,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             "rss": '[data-subscription-id="1"]',
             "guangya": '[data-media-id="A"]',
             "media_proxy": '[data-select-instance="1"]',
+            "guangya_strm": '#saveStrmBtn:not(:disabled)',
         }[template]
         self.page.locator(ready).wait_for()
         return self.page
@@ -203,14 +206,37 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                     )
                     return
             body = request.post_data_json if request.post_data else None
-            self.requests.append(dict(method=request.method, path=path, query=url.query, body=body))
+            entry = dict(method=request.method, path=path, query=url.query, body=body)
+            self.requests.append(entry)
             key = (request.method, path)
             if key in self.hold_transport:
                 self.pending[self.hold_transport.pop(key)] = route
                 return
             if self.replies.get(key):
                 status, payload = self.replies[key].pop(0)
+                entry["status"] = status
                 route.fulfill(status=status, json=payload)
+                return
+            if path.startswith("/api/strm/failures"):
+                assert self.strm_client is not None
+                response = self.strm_client.request(
+                    request.method, path + ("?" + url.query if url.query else ""), json=body,
+                )
+                entry["status"] = response.status_code
+                route.fulfill(status=response.status_code, json=response.json())
+                return
+            if path == "/api/config":
+                route.fulfill(json={
+                    "GY_STRM_SOURCE_DIRS": "[]",
+                    "GY_STRM_BASE_URL": "http://fixture.invalid:1258",
+                    "STRM_SCHEDULE_CRON": "0 4 * * *",
+                })
+                return
+            if path == "/api/strm/index-diagnostics":
+                route.fulfill(json={
+                    "confirmed_test_artifact": 0, "metadata_queue": {},
+                    "video": {}, "metadata": {},
+                })
                 return
             if path == PROXY + "/profiles":
                 route.fulfill(json=[])
@@ -299,6 +325,153 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.page.evaluate(
             "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
         )
+
+    def make_strm_page(self, width, count=241):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app import database as db
+        from app.routes import strm_api
+        from tests.support import isolated_test_database
+
+        self.enterContext(isolated_test_database())
+        for number in range(count):
+            db.record_strm_failure(
+                source_id="fixture-a", source_name="隔离来源 A",
+                file_id=f"fixture-{number}", parent_id="fixture-a",
+                filename=f"fixture-{number}.mkv", action="generate",
+                rel_dir="fixture", target_rel_path=f"fixture/{number}.strm", error="fixture failure",
+            )
+        self.enterContext(patch.object(strm_api, "require_api_login"))
+        self.strm_selected_retry = self.enterContext(patch.object(
+            strm_api, "retry_strm_failures",
+            side_effect=lambda ids, trigger: {"ok": True, "resolved": 0, "failed": len(ids)},
+        ))
+        self.strm_all_retry = self.enterContext(patch.object(
+            strm_api, "retry_all_strm_failures", return_value={"ok": True, "resolved": 0, "failed": 0},
+        ))
+        app = FastAPI()
+        app.include_router(strm_api.router)
+        self.strm_client = self.enterContext(TestClient(app))
+        page = self.make_page("guangya_strm", width)
+        page.locator("#strmTabButton_diagnostics").click()
+        page.locator("#strmFailureList tr[data-id]").first.wait_for()
+        self.settle()
+        return page
+
+    def strm_retry_pages(self, width):
+        page = self.make_strm_page(width)
+        pages = []
+        for number, count in ((1, 100), (2, 100), (3, 41)):
+            page.wait_for_function(
+                "([number,count]) => document.querySelector('#strmFailurePageInfo').textContent.includes(`第 ${number} / 3 页`) && document.querySelectorAll('#strmFailureList tr[data-id]').length === count",
+                arg=[number, count],
+            )
+            pages.append(page.locator("#strmFailureList tr[data-id]").evaluate_all(
+                "rows => rows.map(row => Number(row.dataset.id))",
+            ))
+            if number < 3:
+                page.locator("#strmFailureNext").click()
+        self.assertEqual(len(set(sum(pages, []))), 241)
+        self.assertTrue(page.locator("#strmFailureNext").is_disabled())
+        self.assertTrue(all("page_size=100" in row["query"] for row in self.requests if row["path"] == "/api/strm/failures"))
+        assert self.strm_client is not None
+        self.assertEqual(self.strm_client.post("/api/strm/failures/retry", json={"ids": pages[0]}).status_code, 200)
+        self.assertEqual(self.strm_client.post("/api/strm/failures/retry", json={"ids": pages[0] + [pages[1][0]]}).status_code, 400)
+        self.strm_selected_retry.reset_mock()
+        page.locator("#strmFailurePrev").click()
+        page.wait_for_function("document.querySelector('#strmFailurePageInfo').textContent.includes('第 2 / 3 页')")
+        page.locator("#strmFailurePrev").click()
+        page.wait_for_function("document.querySelector('#strmFailurePageInfo').textContent.includes('第 1 / 3 页')")
+        page.locator("#selectAllStrmFailures").check()
+        self.hold_reply("/api/strm/failures/retry", "page-retry")
+        page.locator("#retrySelectedStrmFailuresBtn").click()
+        page.locator("#appConfirmSubmit").click()
+        self.wait_reply("page-retry")
+        self.strm_selected_retry.assert_called_once_with(pages[0], "web")
+        self.assertEqual(self.requests[-1]["status"], 200)
+        self.release_reply("page-retry")
+        page.wait_for_function("!document.querySelector('#retryAllStrmFailuresBtn').disabled")
+        self.strm_all_retry.assert_not_called()
+        self.observations = {"width": width, "page_counts": list(map(len, pages)), "unique_ids": 241}
+
+    def test_strm_retry_pages_are_complete_and_within_api_limit_desktop(self):
+        self.strm_retry_pages(1280)
+
+    def test_strm_retry_pages_are_complete_and_within_api_limit_mobile(self):
+        self.strm_retry_pages(390)
+
+    def strm_single_retry_selection(self, width):
+        page = self.make_strm_page(width, count=3)
+        ids = page.locator("#strmFailureList tr[data-id]").evaluate_all("rows => rows.map(row => Number(row.dataset.id))")
+        first = page.locator(f'#strmFailureList tr[data-id="{ids[0]}"]')
+        other = page.locator(f'#strmFailureList tr[data-id="{ids[1]}"] input')
+        other.check()
+        first.locator("[data-retry-single]").click()
+        page.locator("#appConfirmSubmit").wait_for(state="visible")
+        self.assertTrue(other.is_checked())
+        self.assertFalse(first.locator("input").is_checked())
+        page.locator("#appConfirmCancel").click()
+        self.assertFalse(any(row["method"] == "POST" for row in self.requests))
+        self.hold_reply("/api/strm/failures/retry", "single-retry")
+        before = page.locator("#retrySelectedStrmFailuresBtn").bounding_box()
+        first.locator("[data-retry-single]").click()
+        page.locator("#appConfirmSubmit").click()
+        self.wait_reply("single-retry")
+        self.assertTrue(other.is_checked())
+        first.locator("[data-retry-single]").click()
+        self.strm_selected_retry.assert_called_once_with([ids[0]], "web")
+        after = page.locator("#retrySelectedStrmFailuresBtn").bounding_box()
+        assert before is not None and after is not None
+        self.assertEqual((before["width"], before["height"]), (after["width"], after["height"]))
+        self.release_reply("single-retry")
+        page.wait_for_function("!document.querySelector('#retrySelectedStrmFailuresBtn').disabled")
+        self.assertTrue(other.is_checked())
+        self.replies[("POST", "/api/strm/failures/retry")] = [(503, {"error": "fixture retry unavailable"})]
+        first.locator("[data-retry-single]").click()
+        page.locator("#appConfirmSubmit").click()
+        page.wait_for_function("document.querySelector('#strmFailureState').textContent.includes('fixture retry unavailable')")
+        self.assertTrue(other.is_checked())
+        self.assertFalse(other.is_disabled())
+        self.assertFalse(first.locator("input").is_checked())
+        self.assertEqual([row["body"] for row in self.requests if row["method"] == "POST"], [{"ids": [ids[0]]}] * 2)
+        self.observations = {"width": width, "retried_id": ids[0], "retained_selection": ids[1]}
+
+    def test_strm_single_retry_keeps_other_selection_desktop(self):
+        self.strm_single_retry_selection(1280)
+
+    def test_strm_single_retry_keeps_other_selection_mobile(self):
+        self.strm_single_retry_selection(390)
+
+    def strm_all_retry_snapshot(self, width):
+        from app import database as db
+
+        page = self.make_strm_page(width, count=3)
+        for selector, value in (("#strmFailureSourceFilter", "fixture-a"), ("#strmFailureActionFilter", "generate")):
+            page.locator(selector).select_option(value)
+            page.wait_for_function("document.querySelector('#strmFailureList').getAttribute('aria-busy') === 'false'")
+        # 另一写入者清空了台账，列表回应先到传输层、晚到 UI；确认期间会重建来源选项。
+        with db.get_conn() as connection:
+            connection.execute("DELETE FROM strm_failures")
+        self.hold_reply("/api/strm/failures", "empty-list", method="GET")
+        page.locator("#refreshStrmFailuresBtn").click()
+        self.wait_reply("empty-list")
+        page.locator("#retryAllStrmFailuresBtn").click()
+        self.release_reply("empty-list")
+        self.assertEqual(page.locator("#strmFailureSourceFilter").input_value(), "")
+        self.hold_reply("/api/strm/failures/retry", "all-retry")
+        page.locator("#appConfirmSubmit").click()
+        self.wait_reply("all-retry")
+        self.strm_all_retry.assert_called_once_with("fixture-a", "generate", "web")
+        self.strm_selected_retry.assert_not_called()
+        self.assertEqual(self.requests[-1]["body"], {"all": True, "source_id": "fixture-a", "action": "generate"})
+        self.release_reply("all-retry")
+        self.observations = {"width": width, "frozen_source_id": "fixture-a", "visible_source_id": ""}
+
+    def test_strm_retry_all_uses_confirmed_filter_desktop(self):
+        self.strm_all_retry_snapshot(1280)
+
+    def test_strm_retry_all_uses_confirmed_filter_mobile(self):
+        self.strm_all_retry_snapshot(390)
 
     def proxy_late_save(self, *, binding=False, status=200, new_pending=False, width=1280, same_object=False):
         page = self.make_page("media_proxy", width)
