@@ -7,6 +7,7 @@ from typing import cast
 from app.clients.guangya import GuangYaClient
 from app.clients.tmdb import TMDBClient
 
+import asyncio
 import json
 import re
 import time
@@ -2121,9 +2122,11 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                 self.assertNotIn("preview_id", built["preview"])
 
     def test_native_submission_restores_in_cold_store_and_replays_original_durable_receipt(self):
+        from app.agent.kernel.persistence import SQLiteKernelStore
         from app.modules.directory_scrape import DirectoryScrapeService, DirectoryScrapeStore
         from app.modules.organize_tasks import OrganizeTaskManager
         from app.repositories.organize_operation_jobs import (
+            OrganizeOperationAdmissionError,
             claim_organize_operation_job, finish_organize_operation_job, get_organize_operation_job,
             organize_operation_job_id_from_public_ref,
         )
@@ -2135,8 +2138,13 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             store=DirectoryScrapeStore(), rules_loader=lambda: self.rules)
         self.addCleanup(fresh.close)
         manager = OrganizeTaskManager()
+        state_store = SQLiteKernelStore(secret_provider=lambda: "scrape-admission-test")
+        asyncio.run(state_store.begin_turn(owner="owner", session_id="scrape", request_id="seed"))
         admitted = []
         def on_admitted(conn, row, replayed):
+            # 必须在任何哨兵 DML 之前进入真实 store，避免隐式事务掩盖重放缺陷。
+            state_store.update_effect_state_in_transaction(conn, owner="owner", session_id="scrape",
+                change=lambda state: state.metadata.update(scrape_job=row["job_id"]))
             self.assertIsNotNone(conn.execute("SELECT job_id FROM organize_operation_jobs WHERE job_id=?", (row["job_id"],)).fetchone())
             admitted.append((row["job_id"], replayed))
         self.scraper.confirm = Mock()
@@ -2159,6 +2167,20 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             pending = fresh.submit_execution("owner", payload, on_admitted=on_admitted)
             self.assertTrue(pending["data"]["replayed"])
             self.assertEqual(pending["data"]["operation_ref"], first["data"]["operation_ref"])
+            checkpoint = state_store.load_existing_session(owner="owner", session_id="scrape")
+            assert checkpoint is not None
+            self.assertEqual(checkpoint.metadata["scrape_job"], job_id)
+            def rejected_admission(conn, row, replayed):
+                self.assertTrue(replayed)
+                state_store.update_effect_state_in_transaction(conn, owner="owner", session_id="scrape",
+                    change=lambda state: state.metadata.update(scrape_job="must-roll-back"))
+                raise ValueError("synthetic admission refusal")
+            with self.assertRaises(OrganizeOperationAdmissionError):
+                fresh.submit_execution("owner", payload, on_admitted=rejected_admission)
+            self.assertEqual(state_store.load_existing_session(owner="owner", session_id="scrape"), checkpoint)
+            unchanged = get_organize_operation_job(job_id)
+            assert unchanged is not None
+            self.assertEqual(dict(unchanged), dict(saved))
             claimed = claim_organize_operation_job(job_id)
             assert claimed is not None
             result = OrganizeTaskManager._execute_durable_operation(dict(claimed))
@@ -2173,6 +2195,35 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             self.assertEqual(self.client.infos, after)
         self.assertEqual(admitted, [(job_id, False), (job_id, True), (job_id, True)])
         self.scraper.confirm.assert_not_called()
+
+    def test_native_submission_recovers_lost_receipt_without_readmitting(self):
+        from app.modules.organize_tasks import OrganizeTaskManager
+
+        self.enterContext(isolated_test_database("lost-scrape-receipt.db"))
+        owner = self.id()
+        payload = self.service.build_execution(owner, "movie-dir", "movie", tmdb_id="1726")["execution_payload"]
+        manager = OrganizeTaskManager()
+        start = manager.start_durable_operation
+        accepted = []
+        callbacks = []
+        def lost_reply(*args, **kwargs):
+            task = start(*args, **kwargs)
+            self.assertTrue(task["ok"])
+            accepted.append(task["task_id"])
+            return {"ok": False, "error_code": "synthetic_missing_reply"}
+        def on_admitted(conn, row, replayed):
+            self.assertTrue(conn.in_transaction)
+            callbacks.append((row["job_id"], replayed))
+        with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), \
+            patch.object(manager._lock, "acquire", return_value=False), patch.object(manager, "_ensure_operation_dispatcher"), \
+            patch.object(manager, "start_durable_operation", side_effect=lost_reply):
+            before = dict(self.client.infos)
+            result = self.service.submit_execution(owner, payload, on_admitted=on_admitted)
+        from app.repositories.organize_operation_jobs import organize_operation_job_id_from_public_ref
+        self.assertEqual(organize_operation_job_id_from_public_ref(result["data"]["operation_ref"]), accepted[0])
+        self.assertFalse(result["data"]["replayed"])
+        self.assertEqual(callbacks, [(accepted[0], False)])
+        self.assertEqual(self.client.infos, before)
 
     def test_native_payload_rejects_owner_or_object_drift_before_admission(self):
         from app.modules.directory_scrape_errors import DirectoryScrapeConflictError

@@ -1030,24 +1030,27 @@ class DirectoryScrapeService:
         dedupe_key = f"agent-directory-scrape:{owner}:{expected}"
         owner_digest = organize_operation_owner_digest(owner)
         digest = organize_operation_dedupe_digest(owner_digest, dedupe_key)
-        def existing_job(*, admit=False):
+        def existing_receipt(*, admit=False):
             with db.get_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
                     "SELECT * FROM organize_operation_jobs WHERE owner_digest=? AND dedupe_digest=? "
                     "AND job_kind='agent_directory_scrape' ORDER BY created_at,job_id LIMIT 1",
                     (owner_digest, digest),
                 ).fetchone()
-                if row is not None and admit and on_admitted is not None:
+                if row is None:
+                    return None
+                if admit and on_admitted is not None:
                     try:
                         on_admitted(conn, row, True)
                     except Exception as exc:
                         raise OrganizeOperationAdmissionError() from exc
-                return row
-        existing = existing_job(admit=True)
-        if existing is not None:
-            result = get_organize_operation_status(organize_operation_public_ref(existing["job_id"]), owner=owner)
-            result["data"].update(replayed=True, operation_ref=organize_operation_public_ref(existing["job_id"]))
+            result = get_organize_operation_status(organize_operation_public_ref(row["job_id"]), owner=owner)
+            result["data"].update(replayed=admit, operation_ref=organize_operation_public_ref(row["job_id"]))
             return result
+        existing = existing_receipt(admit=True)
+        if existing is not None:
+            return existing
         _, restored_owner, preview_id = _restore_directory_scrape_preview(self, payload)
         self.store.consume_preview(restored_owner, preview_id)
         task = get_organize_manager().start_durable_operation(
@@ -1055,12 +1058,7 @@ class DirectoryScrapeService:
             payload=payload, dedupe_key=dedupe_key, on_admitted=on_admitted,
         )
         if not task.get("ok"):
-            admitted = existing_job()
-            if admitted is not None:
-                result = get_organize_operation_status(organize_operation_public_ref(admitted["job_id"]), owner=owner)
-                result["data"].update(replayed=False, operation_ref=organize_operation_public_ref(admitted["job_id"]))
-                return result
-            return {"ok": False, "status": str(task.get("error_code") or "unavailable"),
+            return existing_receipt() or {"ok": False, "status": str(task.get("error_code") or "unavailable"),
                     "summary": str(task.get("error") or "光鸭整理队列当前不可用"), "data": {}}
         reference = organize_operation_public_ref(task["task_id"])
         return {"ok": True, "status": "accepted", "summary": "目录刮削已排队" if task.get("queued") else "目录刮削任务已启动",
