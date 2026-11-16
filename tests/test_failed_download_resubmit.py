@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.clients.qbittorrent import TorrentAddResult
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import rss as rss_repo
 from app.modules import download_dispatcher as dispatcher
@@ -127,6 +128,52 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertEqual(body["succeeded"], 1, body)
         self.assertEqual(body["skipped"], 0, body)
         backend.assert_called_once()
+
+    def test_download_center_qb_retry_keeps_rss_save_path_across_successors(self):
+        source = "magnet:?xt=urn:btih:" + "c" * 40
+        sub_id = rss_repo.add_rss_subscription(
+            "qB explicit path", "https://example.invalid/qb.xml",
+            download_method="qb", qb_save_path="/downloads/rss-specific",
+        )
+        entry_id = int(rss_repo.add_rss_entry_with_media(
+            sub_id, "Episode", "qb-path", payload=json.dumps({"torrent_url": source}),
+        )["id"])
+        client = SimpleNamespace(
+            add_torrent_detailed=lambda **_kwargs: None, close=lambda: None,
+        )
+        with (
+            patch.object(dispatcher, "QBittorrentClient", return_value=client),
+            patch.object(client, "add_torrent_detailed", side_effect=[
+                TorrentAddResult(False, "qb_auth_failed", False),
+                TorrentAddResult(False, "qb_rejected", False),
+                TorrentAddResult(True),
+            ]) as backend,
+            patch.object(dispatcher, "get", side_effect=lambda key, default="": {
+                "QB_URL": "http://qb.invalid", "QB_CATEGORY": "unified-category",
+            }.get(key, default)),
+            patch("app.modules.rss.rss_download_defaults", return_value={
+                "category": "unified-category", "default_method": "qb",
+            }),
+        ):
+            engine = RSSEngine()
+            self.addCleanup(engine.close)
+            first = engine.download(entry_id)
+            self.assertFalse(first["ok"], first)
+            original_id = first["request_id"]
+            for accepted in (False, True):
+                response = downloads_api.resubmit_issue(
+                    original_id, cast(Request, None), {"target": "qb"},
+                )
+                result = json.loads(bytes(response.body))
+                self.assertEqual(result["ok"], accepted, result)
+                self.assertNotEqual(result["request_id"], original_id)
+                original_id = result["request_id"]
+                entry = assert_present(rss_repo.get_rss_entry(entry_id))
+                self.assertEqual(entry["download_request_id"], original_id)
+        self.assertEqual(backend.call_count, 3)
+        for call in backend.call_args_list:
+            self.assertEqual(call.kwargs["save_path"], "/downloads/rss-specific")
+            self.assertEqual(call.kwargs["category"], "unified-category")
 
     def test_normal_completed_backend_stays_nonretryable(self):
         request_id, _entry_id = self.resource(status="completed", gy_status="completed", organize_status="completed", organize_started=1)

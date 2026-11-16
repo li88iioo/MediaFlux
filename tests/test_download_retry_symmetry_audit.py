@@ -18,7 +18,7 @@ from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
 from app.modules.download_tracker import DownloadTracker
 from app.modules.rss import RSSEngine, rss_entry_delivery
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, seed_rss_entry_state
 
 
 class DownloadRetrySymmetryAuditTests(unittest.TestCase):
@@ -71,6 +71,45 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
         fields[("gy" if peer == "guangya" else peer) + "_status"] = peer_status
         download_requests_repo.update_download_request(request_id, **fields)
         return request_id
+
+    def test_in_place_qb_retry_restores_only_unambiguous_rss_directory(self):
+        cases = (
+            (("qb",), {}, "/downloads/rss"),
+            (("qb",), {"qb_save_path": "/downloads/manual"}, "/downloads/manual"),
+            (("qb",), {"qb_save_path": ""}, ""),
+            (("guangya",), {}, None),
+            ((), {}, None),
+            (("qb", "qb"), {}, None),
+        )
+        for backends, options, expected in cases:
+            with self.subTest(backends=backends, options=options):
+                request_id = self.request()
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                for index, backend in enumerate(backends):
+                    sub_id = rss_repo.add_rss_subscription(
+                        f"path-{request_id}-{index}", f"https://example.invalid/{request_id}/{index}",
+                        download_method=backend,
+                        qb_save_path="/downloads/rss" if index == 0 else "/downloads/other",
+                    )
+                    entry_id = int(rss_repo.add_rss_entry_with_media(
+                        sub_id, "Episode", f"path-{request_id}-{index}",
+                        payload=json.dumps({"torrent_url": row["source_value"]}),
+                    )["id"])
+                    seed_rss_entry_state(entry_id, "submitting")
+                    rss_repo.bind_rss_entry_download(entry_id, row["request_key"], backend)
+                with patch.object(dispatcher, "_submit_qb", return_value={
+                    "ok": True, "task_id": "b" * 40,
+                }) as submit:
+                    result = dispatcher.resubmit_download_request(request_id, "qb", **options)
+                self.assertTrue(result["ok"], result)
+                self.assertFalse(result["created"])
+                self.assertEqual(result["request_id"], request_id)
+                self.assertEqual(submit.call_args.kwargs.get("save_path"), expected)
+                after = download_requests_repo.get_download_request(request_id)
+                assert after is not None
+                self.assertEqual(after["gy_status"], "downloading")
+                self.assertEqual(after["gy_task_id"], "gy-kept")
 
     def test_either_failed_target_retries_in_place_while_peer_is_tracked(self):
         for target in ("qb", "guangya"):

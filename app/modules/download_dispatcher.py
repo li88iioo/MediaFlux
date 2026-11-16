@@ -937,6 +937,8 @@ def resubmit_download_request(
     if check_cancelled is not None:
         check_cancelled()
         dispatch_kwargs["check_cancelled"] = check_cancelled
+    if qb_save_path is None and targets in {"qb", "both"}:
+        qb_save_path = download_requests_repo.get_download_request_rss_qb_save_path(source_request_id)
     if qb_save_path is not None:
         dispatch_kwargs["qb_save_path"] = qb_save_path
     if qb_category is not None:

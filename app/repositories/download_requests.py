@@ -971,6 +971,18 @@ def get_download_request(request_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def get_download_request_rss_qb_save_path(request_id: int) -> str | None:
+    """从持久化交付归属恢复 RSS 目录；无关联或目录冲突时沿用下载器默认值。"""
+    with db.get_conn() as conn:
+        paths = conn.execute(
+            "SELECT DISTINCT COALESCE(i.qb_save_path,'') FROM rss_entries e "
+            "JOIN rss_items i ON i.id=e.rss_item_id "
+            "WHERE e.download_request_id=? AND e.download_backend='qb'",
+            (request_id,),
+        ).fetchall()
+    return str(paths[0][0]) if len(paths) == 1 else None
+
+
 def count_download_requests_requiring_attention(request_id: int | None = None) -> int:
     """看板与重提回执共用待处理口径，可精确核对单条请求。"""
     scope = " AND id=?" if request_id is not None else ""
