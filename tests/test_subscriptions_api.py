@@ -10,11 +10,13 @@ import asyncio
 import json
 import re
 import sqlite3
+import socket
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 
@@ -23,6 +25,147 @@ from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.repositories import discovery as discovery_repo
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
+
+
+class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
+    """真实页面、请求助手与 API 合同；外部媒体/下载后端由固定回执隔离。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.test_agent_kernel_browser import _chromium_executable, sync_playwright
+
+        if sync_playwright is None:
+            raise unittest.SkipTest("未安装 Playwright")
+        playwright = cls.enterClassContext(sync_playwright())
+        executable = _chromium_executable(playwright)
+        if executable is None:
+            raise unittest.SkipTest("未找到 Chromium")
+        cls.browser = playwright.chromium.launch(
+            executable_path=executable, headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-background-networking"],
+        )
+        cls.addClassCleanup(cls.browser.close)
+
+    def setUp(self):
+        from tests.test_config_empty_values_api import login
+
+        with db.get_conn() as conn:
+            for table in ("media_download_admissions", "media_subscription_candidates",
+                          "media_subscription_runs", "media_subscriptions"):
+                conn.execute(f"DELETE FROM {table}")
+        self.subscription_id = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="86034", tmdb_id="86034", media_type="movie",
+            title="回执测试", download_target="both",
+        )
+        real_connect = socket.socket.connect
+
+        def offline_connect(sock, address):
+            if address[0] not in {"127.0.0.1", "::1", "localhost"}:
+                raise OSError("offline subscription test: outbound connection blocked")
+            return real_connect(sock, address)
+
+        self.enterContext(patch.object(socket.socket, "connect", offline_connect))
+        self.client = self.enterContext(TestClient(create_app(start_background=False)))
+        login(self.client)
+        self.errors = []
+        self.requests = []
+        context = self.browser.new_context(
+            viewport={"width": 1280, "height": 900}, reduced_motion="reduce", service_workers="block",
+        )
+        self.addCleanup(context.close)
+        context.route("**/*", self._proxy)
+        self.page = context.new_page()
+        self.page.set_default_timeout(5000)
+        self.page.on("pageerror", lambda error: self.errors.append(str(error)))
+
+    def tearDown(self):
+        self.assertEqual(self.errors, [])
+
+    def _proxy(self, route):
+        request = route.request
+        url = urlsplit(request.url)
+        if url.netloc != "app.test":
+            self.errors.append(f"unexpected external request: {request.url}")
+            route.abort()
+            return
+        self.requests.append((request.method, url.path))
+        headers = {key: value for key, value in request.headers.items()
+                   if key.lower() in {"content-type", "x-csrf-token", "accept"}}
+        response = self.client.request(
+            request.method, url.path + (f"?{url.query}" if url.query else ""),
+            content=request.post_data_buffer, headers=headers, follow_redirects=False,
+        )
+        route.fulfill(status=response.status_code, body=response.content, headers={
+            "content-type": response.headers.get("content-type", "application/octet-stream"),
+        })
+
+    def _open(self, tab="media"):
+        self.page.goto(f"http://app.test/rss#{tab}")
+        self.page.wait_for_selector("#mediaSubscriptionList .media-subscription-card" if tab == "media"
+                                    else "#subscriptionRunList .subscription-run-row")
+        self.page.evaluate("""() => {
+            window.receipts = [];
+            const alert = window.appAlert;
+            window.appAlert = value => { window.receipts.push(value); return alert(value); };
+        }""")
+
+    def test_check_receipt_uses_nested_result_and_error_semantics(self):
+        from app.modules.media_subscriptions import MediaSubscriptionError, MediaSubscriptionService
+        from playwright.sync_api import expect
+
+        self._open()
+        for result, tone in (
+            ({"status": "missing", "summary": "发现资源", "missing_count": 1, "candidate_count": 1}, "success"),
+            ({"status": "inconclusive", "summary": "媒体服务器不可用", "missing_count": 0, "candidate_count": 0}, "warning"),
+            ({"status": "satisfied", "summary": "媒体库完整", "missing_count": 0, "candidate_count": 0}, "success"),
+            ({"status": "error", "summary": "索引器不可用", "missing_count": 1, "candidate_count": 0}, "error"),
+        ):
+            with self.subTest(status=result["status"]), patch.object(
+                MediaSubscriptionService, "check_subscription",
+                AsyncMock(return_value={"subscription": {"id": self.subscription_id}, "result": result}),
+            ):
+                self.page.evaluate("window.receipts = []")
+                self.page.locator('[data-media-action="check"]').click()
+                self.page.wait_for_function("window.receipts.length === 1")
+                receipt = self.page.evaluate("window.receipts[0]")
+                self.assertEqual(receipt["type"], tone)
+                self.assertIn(result["summary"], receipt["message"])
+                self.assertIn(f'缺失 {result["missing_count"]} 项 · 候选 {result["candidate_count"]} 项', receipt["message"])
+                expect(self.page.locator("#appMessageModal")).to_have_class(re.compile(f"is-{tone}"))
+                expect(self.page.locator("#appMessageText")).to_contain_text(result["summary"])
+                self.page.locator("#appMessageClose").click()
+                expect(self.page.locator('[data-media-action="check"]')).to_be_enabled()
+        with patch.object(MediaSubscriptionService, "check_subscription", AsyncMock(
+            side_effect=MediaSubscriptionError("检查被拒绝", code="busy", status_code=409),
+        )):
+            self.page.evaluate("window.receipts = []")
+            self.page.locator('[data-media-action="check"]').click()
+            self.page.wait_for_function("window.receipts.length === 1")
+            self.assertEqual(self.page.evaluate("window.receipts[0]"), {
+                "type": "warning", "title": "媒体巡检未完成", "message": "检查被拒绝",
+            })
+            self.page.locator("#appMessageClose").click()
+
+    def test_run_history_uses_shared_chinese_statuses_and_preserves_legacy(self):
+        from app.modules.media_subscriptions import MediaSubscriptionService
+        from playwright.sync_api import expect
+
+        states = {"satisfied": "已满足", "missing": "发现缺失", "inconclusive": "待核验",
+                  "error": "检查异常", "completed": "已完成", "failed": "失败",
+                  "running": "运行中", "cancelled": "已取消"}
+        # completed/error 是历史或展示合同输入，当前数据库只接受有限巡检终态。
+        with patch.object(MediaSubscriptionService, "list_runs", return_value=[
+            {"subscription_id": self.subscription_id, "status": status, "summary": status}
+            for status in states
+        ]):
+            self._open("runs")
+        for status, label in states.items():
+            row = self.page.locator(".subscription-run-row").filter(
+                has=self.page.locator(".subscription-run-body > p", has_text=re.compile(f"^{status}$")),
+            )
+            expect(row.locator(".subscription-status")).to_have_text(label)
+            expect(row.locator('[data-lucide="circle-help"]')).to_have_count(0)
 
 
 class SubscriptionAPITests(IsolatedDatabaseTestCase):
@@ -393,6 +536,7 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(created.status_code, 201, created.text)
         self.assertEqual(updated.status_code, 200, updated.text)
         self.assertEqual(checked.status_code, 200, checked.text)
+        self.assertEqual(checked.json(), {"result": {"status": "satisfied"}})
         self.assertEqual(removed.status_code, 200, removed.text)
         service.create_subscription.assert_awaited_once_with({"tmdb_id": "86034", "media_type": "tv"})
         service.update_subscription.assert_called_once_with(7, {"enabled": False})

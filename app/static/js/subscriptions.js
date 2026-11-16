@@ -191,6 +191,10 @@
             missing: {label: '发现缺失', className: 'is-missing', icon: 'circle-alert'},
             inconclusive: {label: '待核验', className: 'is-inconclusive', icon: 'shield-alert'},
             error: {label: '检查异常', className: 'is-error', icon: 'circle-x'},
+            completed: {label: '已完成', className: 'is-satisfied', icon: 'circle-check-big'},
+            failed: {label: '失败', className: 'is-error', icon: 'circle-x'},
+            running: {label: '运行中', className: 'is-checking', icon: 'loader-circle'},
+            cancelled: {label: '已取消', className: 'is-paused', icon: 'circle-slash'},
         })[status] || {label: status || '未知', className: 'is-new', icon: 'circle-help'};
     }
 
@@ -622,8 +626,8 @@
     }
 
     function runStatus(status) {
-        return ({completed: ['已完成', 'is-satisfied', 'circle-check-big'], failed: ['失败', 'is-error', 'circle-x'], running: ['运行中', 'is-checking', 'loader-circle']})[status]
-            || [status || '未知', 'is-new', 'circle-help'];
+        const meta = statusMeta(status);
+        return [meta.label, meta.className, meta.icon];
     }
 
     function renderRuns(rows) {
@@ -1068,7 +1072,7 @@
     async function checkMedia(item, trigger) {
         buttonBusy(trigger, true, '检查中');
         try {
-            const result = await apiJSON(`/api/subscriptions/media/${item.id}/check`, {method: 'POST'});
+            const {result} = await apiJSON(`/api/subscriptions/media/${item.id}/check`, {method: 'POST'});
             const missing = Number(result.missing_count || 0);
             const candidates = Number(result.candidate_count || 0);
             await Promise.all([loadMedia({preserve: true}), loadRuns({preserve: true}), loadStats()]);
