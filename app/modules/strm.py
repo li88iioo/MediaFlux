@@ -187,6 +187,10 @@ def _track_change(
     *, on_refresh_paths: Callable[[list[str]], object] | None = None,
 ) -> None:
     """记录有界展示变化；执行路径溢出时交给策略感知的持久化回调。"""
+    if target and not Path(str(target)).is_absolute():
+        managed = _safe_indexed_path(str(target), strm_root)
+        if managed is not None:
+            target = managed
     append_change(stats, relative_change(action, target, strm_root))
     if action != "removed_dir":
         _record_changed_path(stats, target, on_refresh_paths=on_refresh_paths)
@@ -1102,6 +1106,17 @@ def _install_video_candidate(
     if previous_path and previous_path != expected and not _retained_indexed_paths(
         [str(previous_path)], strm_root, removing={(source_key, file.file_id)},
     ):
+        if current and not current["content_fingerprint"] and previous_path.suffix.lower() == ".strm" and previous_path.is_file():
+            # 旧索引身份和签名指针必须逐字节吻合，不能凭存在或空指纹认领。
+            previous_url = build_play_url(
+                base_url, current["file_id"], current["etag"], current["size"], current["filename"],
+            )
+            if previous_path.stat().st_size == len(previous_url.encode("utf-8")):
+                _, fingerprint = _read_strm_state(previous_path, previous_url)
+                if fingerprint:
+                    current["content_fingerprint"] = fingerprint
+                    # 先持久化已核实的旧指纹；索引迁移随后才能留下可重启恢复的清理凭据。
+                    strm_repo.upsert_strm_index_batch(source_key, [current])
         _require_owned_file(previous_path, [current], "删除旧 STRM")
     target_backup = _copy_backup(expected)
     previous_backup = (
@@ -3681,7 +3696,9 @@ def _process_claimed_strm_failures(
                             existing_by_id, existing_by_path,
                         )
                         if cleaned and current_before_install:
-                            refresh_paths.append(str(_row_field(current_before_install, "strm_path", "")))
+                            previous = _safe_indexed_path(_row_field(current_before_install, "strm_path", ""), strm_root)
+                            if previous is not None:
+                                refresh_paths.append(str(previous))
                     else:
                         cleanup = _remove_indexed_rows(
                             source_key, [current_before_install] if current_before_install else [],

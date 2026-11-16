@@ -629,6 +629,172 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             "光鸭云盘/成人内容/ATID-675/ATID-675.nfo",
         )
 
+    def test_legacy_empty_prefix_and_missing_fingerprint_migrate_verified_pointer(self):
+        for changed in (False, True):
+            with self.subTest(remote_changed=changed), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                old = GuangYaFile("video", "Movie.mkv", False, 100, "old", "film")
+                current = GuangYaFile("video", "Renamed.mkv", False, 200, "new", "film") if changed else old
+                old_path = generate_strm(old, "Film", "http://play.invalid", root)
+                strm_repo.upsert_strm_index("guangya:source", old.file_id, old.etag, old.size, old.name,
+                                           str(old_path.relative_to(root)), "")
+                protected = [old_path.with_suffix(".srt"), old_path.parent / "poster.jpg"]
+                for path in protected:
+                    path.write_bytes(b"user owned sidecar")
+                before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in protected]
+                sources = [{"id": "source", "name": "Source"}]
+                db.kv_set(db._STRM_SOURCE_SNAPSHOT_KEY, json.dumps({
+                    "version": 1, "strm_root": root, "sources": sources,
+                    "local_prefixes": {"source": ""},
+                }))
+                db.reconcile_configured_strm_sources(sources, root)
+                prefix = db.get_strm_source_prefixes(sources)["source"]
+                self.assertEqual(prefix, "Source")
+                client = _TreeClient({"source": [GuangYaFile("film", "Film", True, parent_id="source")], "film": [current]})
+                stats = sync_strm("source", "http://play.invalid", root, client=cast(GuangYaClient, client), rel_prefix=prefix)
+                target = strm_module._strm_target(current, "Source/Film", root)
+                self.assertEqual((stats["generated"], stats["failed"], stats["cleaned"]), (1, 0, 1), stats)
+                self.assertFalse(old_path.exists())
+                self.assertEqual(target.read_text(), strm_module.build_play_url("http://play.invalid", current.file_id, current.etag, current.size, current.name))
+                row = strm_repo.list_strm_index("guangya:source")[0]
+                self.assertEqual(row["strm_path"], str(target))
+                self.assertEqual(row["content_fingerprint"], strm_module._content_fingerprint(target))
+                self.assertTrue(all(Path(path).is_absolute() for path in stats["changed_strm_paths"]), stats)
+                self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
+                self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in protected], before)
+                strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
+                target_before = (target.read_bytes(), target.stat().st_mtime_ns)
+                db.reconcile_configured_strm_sources(sources, root)
+                again = sync_strm("source", "http://play.invalid", root, client=cast(GuangYaClient, client), rel_prefix=prefix)
+                self.assertEqual((again["generated"], again["failed"], again["cleaned"]), (0, 0, 0), again)
+                self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), target_before)
+                self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_legacy_missing_fingerprint_does_not_claim_changed_identity_or_metadata_path(self):
+        for mismatch in ("id", "etag", "size", "name", "host", "signature", "manual", "metadata-path"):
+            with self.subTest(mismatch=mismatch), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                file = GuangYaFile("video", "Movie.mkv", False, 100, "etag", "source")
+                old_path = generate_strm(file, "", "http://play.invalid", root)
+                if mismatch == "metadata-path":
+                    renamed = old_path.with_suffix(".jpg")
+                    old_path.rename(renamed)
+                    old_path = renamed
+                payload = strm_module.build_play_url(
+                    "http://other.invalid" if mismatch == "host" else "http://play.invalid",
+                    "other" if mismatch == "id" else file.file_id,
+                    "other" if mismatch == "etag" else file.etag,
+                    200 if mismatch == "size" else file.size,
+                    "Other.mkv" if mismatch == "name" else file.name,
+                ).encode()
+                if mismatch == "signature":
+                    payload = payload[:-1] + (b"0" if payload[-1:] != b"0" else b"1")
+                elif mismatch == "manual":
+                    payload = b"https://user.invalid/hand-edited-video"
+                old_path.write_bytes(payload)
+                strm_repo.upsert_strm_index("guangya:source", file.file_id, file.etag, file.size, file.name,
+                                           str(old_path.relative_to(root)), "")
+                before = dict(strm_repo.list_strm_index("guangya:source")[0])
+                stats = sync_strm("source", "http://play.invalid", root, rel_prefix="Source",
+                                  client=cast(GuangYaClient, _TreeClient({"source": [file]})))
+                self.assertEqual(stats["failed"], 1, stats)
+                self.assertEqual(old_path.read_bytes(), payload)
+                self.assertFalse((Path(root) / STRM_SUBDIR / "Source/Movie.strm").exists())
+                self.assertEqual(dict(strm_repo.list_strm_index("guangya:source")[0]), before)
+                self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_legacy_pointer_proof_is_rechecked_before_migration_deletes_old_file(self):
+        with isolated_test_database(), tempfile.TemporaryDirectory() as root:
+            file = GuangYaFile("video", "Movie.mkv", False, 100, "etag", "source")
+            old_path = generate_strm(file, "", "http://play.invalid", root)
+            strm_repo.upsert_strm_index("guangya:source", file.file_id, file.etag, file.size, file.name,
+                                       str(old_path.relative_to(root)), "")
+            read_state = strm_module._read_strm_state
+
+            def edit_after_proof(path, url):
+                proof = read_state(path, url)
+                if path == old_path and proof[0]:
+                    old_path.write_bytes(b"user edited after identity proof")
+                return proof
+
+            client = _TreeClient({"source": [file]})
+            with patch.object(strm_module, "_read_strm_state", side_effect=edit_after_proof):
+                stats = sync_strm("source", "http://play.invalid", root, rel_prefix="Source", client=cast(GuangYaClient, client))
+            self.assertEqual(stats["failed"], 1)
+            self.assertEqual(old_path.read_bytes(), b"user edited after identity proof")
+            self.assertFalse((Path(root) / STRM_SUBDIR / "Source/Movie.strm").exists())
+            again = sync_strm("source", "http://play.invalid", root, rel_prefix="Source", client=cast(GuangYaClient, client))
+            self.assertEqual(again["failed"], 1)
+            self.assertEqual(old_path.read_bytes(), b"user edited after identity proof")
+
+    def test_legacy_missing_fingerprint_migration_works_for_incremental_and_retry(self):
+        for mode in ("incremental", "retry"):
+            with self.subTest(mode=mode), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                file = GuangYaFile("video", "Movie.mkv", False, 100, "etag", "new-dir")
+                old_path = generate_strm(file, "Old", "http://play.invalid", root)
+                strm_repo.upsert_strm_index("guangya:source", file.file_id, file.etag, file.size, file.name,
+                                           str(old_path.relative_to(root)), "")
+                client = _TreeClient({"source": [GuangYaFile("new-dir", "New", True, parent_id="source")], "new-dir": [file]})
+                if mode == "incremental":
+                    result = strm_module.sync_strm_incremental("source", [{
+                        "source_id": "source", "file_id": file.file_id, "parent_id": file.parent_id,
+                        "name": file.name, "rel_dir": "New",
+                    }], "http://play.invalid", root, client=cast(GuangYaClient, client))
+                    self.assertEqual(result["generated"], 1, result)
+                    self.assertFalse(result["fallback_required"], result)
+                else:
+                    identifier = db.record_strm_failure(source_id="source", source_name="Source", file_id=file.file_id,
+                        parent_id=file.parent_id, filename=file.name, action="generate", rel_dir="Old",
+                        target_rel_path=str(old_path.relative_to(root)), error="historical migration failed")
+                    result = strm_module.retry_strm_failures([identifier], "web", client=cast(GuangYaClient, client), runtime_config={
+                        "sources": strm_module.plan_strm_sources([{"id": "source", "name": "Source"}], prefixes={"source": ""}),
+                        "strm_root": root, "base_url": "http://play.invalid", "video_exts": ("mkv",),
+                        "metadata_enabled": False, "metadata_exts": (), "skip_threshold_mb": 0,
+                    })
+                    self.assertEqual(result["resolved"], 1, result)
+                self.assertEqual(result["failed"], 0, result)
+                target = Path(root) / STRM_SUBDIR / "New/Movie.strm"
+                self.assertTrue(target.is_file())
+                self.assertFalse(old_path.exists())
+                events = strm_repo.list_strm_refresh_entries()
+                changed_paths = result["changed_strm_paths"] if mode == "incremental" else [event["path"] for event in events]
+                self.assertTrue(all(Path(path).is_absolute() for path in changed_paths), changed_paths)
+                self.assertIn(str(old_path), changed_paths)
+                # 完整校准消费可能尚未 ACK 的旧凭据，之后不能持续重放旧路径。
+                recovered = sync_strm("source", "http://play.invalid", root, client=cast(GuangYaClient, client))
+                self.assertEqual((recovered["failed"], recovered["generated"]), (0, 0))
+                self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
+                strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
+                again = sync_strm("source", "http://play.invalid", root, client=cast(GuangYaClient, client))
+                self.assertEqual((again["failed"], again["generated"]), (0, 0))
+                self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_legacy_pointer_fingerprint_persists_for_process_exit_cleanup_recovery(self):
+        from tests.test_strm_move_recovery import BASE_URL, MoveCloud, crash_move, sync
+
+        for stage in ("before_index", "after_index", "after_delete"):
+            # 子进程 tests 使用该固定测试密钥；父进程 Web 夹具必须保持相同签名身份。
+            with self.subTest(stage=stage), isolated_test_database() as database_path, tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.playgy_signing.get_web_secret", return_value="mediaflux-unit-test-secret",
+            ):
+                file = MoveCloud().file_info("video")
+                old_path = generate_strm(file, "Old", BASE_URL, root)
+                payload = old_path.read_bytes()
+                strm_repo.upsert_strm_index("guangya:source", file.file_id, file.etag, file.size, file.name,
+                                           str(old_path.relative_to(root)), "")
+                crash_move(database_path, root, stage)
+                if stage != "before_index":
+                    receipts = strm_repo.list_strm_path_cleanup("guangya:source")
+                    self.assertEqual(len(receipts), 1)
+                    self.assertEqual(receipts[0]["content_fingerprint"], f"sha256:{hashlib.sha256(payload).hexdigest()}")
+                db.init_db()
+                recovered = sync(root, "New")
+                target = strm_module._strm_target(file, "New", root)
+                self.assertEqual(recovered["failed"], 0, recovered)
+                self.assertTrue(target.is_file())
+                self.assertEqual(target.read_bytes(), payload)
+                self.assertFalse(old_path.exists())
+                self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
+                self.assertEqual(strm_repo.list_strm_index("guangya:source")[0]["content_fingerprint"], strm_module._content_fingerprint(target))
+
     def test_full_sync_migrates_indexed_double_suffix_strm(self):
         source_id = f"source-migrate-{uuid.uuid4().hex}"
         source_key = f"guangya:{source_id}"
