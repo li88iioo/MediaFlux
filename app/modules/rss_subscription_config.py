@@ -140,7 +140,7 @@ def _media_fields(data: Mapping[str, Any], current: Mapping[str, Any] | None) ->
     )
     return {
         "media_tmdb_id": tmdb_id,
-        "media_default_season": default_season,
+        "media_default_season": default_season if tmdb_id else 1,
         "skip_existing_episodes": 1 if skip_existing else 0,
     }
 

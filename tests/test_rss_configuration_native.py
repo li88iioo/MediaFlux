@@ -18,9 +18,77 @@ from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.modules import rss_subscriptions as service
+from app.routes import rss_api
 from app.modules.rss import _release_rss_refresh, _try_acquire_rss_refresh
 from tests.support import isolated_test_database
 from tests.test_agent_sdk_effects import context_for, executor
+
+
+@pytest.mark.parametrize("operation", ["create", "update", "unbind"])
+def test_unbound_media_configuration_is_canonical_and_write_verification_completes(operation):
+    with isolated_test_database(), patch.object(service, "wake_rss_scheduler", return_value=True):
+        if operation == "create":
+            kind = "create"
+            arguments = {"name": "New", "urls": ["https://example.invalid/new"], "media_default_season": 2}
+        else:
+            kind = "update"
+            sid = rss_repo.add_rss_subscription(
+                "Existing", "https://example.invalid/rss",
+                media_tmdb_id="123" if operation == "unbind" else "",
+                media_default_season=2 if operation == "unbind" else 1,
+                skip_existing_episodes=int(operation == "unbind"),
+            )
+            arguments = {"subscription_id": sid, "name": "Changed", "media_default_season": 2}
+            if operation == "unbind":
+                arguments.update(media_tmdb_id="", skip_existing_episodes=False)
+        prepared = service.prepare_change(kind, arguments)
+        result = service.apply_change(kind, arguments, expected_snapshot=prepared["snapshot"])
+        assert result["ok"] and result["status"] == "completed"
+        row = rss_repo.get_rss_subscription(result["data"]["subscription_id"])
+        assert row["media_tmdb_id"] == "" and row["media_default_season"] == 1
+        assert not row["skip_existing_episodes"]
+
+
+@pytest.mark.parametrize(
+    "method,enabled,fields,qb_url,expected",
+    [
+        ("qb", 0, {"enabled": True}, "", 400),
+        ("", 0, {"enabled": True}, "", 400),
+        ("qb", 1, {"name": "Changed"}, "", 400),
+        ("qb", 0, {"enabled": False, "download_method": "qb", "name": "Changed"}, "", 200),
+        ("guangya", 0, {"enabled": True}, "", 200),
+        ("qb", 0, {"enabled": True, "download_method": "guangya"}, "", 200),
+        ("guangya", 1, {"download_method": " QB "}, "", 400),
+        ("qb", 0, {"enabled": True}, "http://qb.invalid", 200),
+    ],
+)
+def test_web_updates_preflight_the_effective_download_target(method, enabled, fields, qb_url, expected):
+    from app import config
+
+    with isolated_test_database(), patch.object(service, "wake_rss_scheduler", return_value=True), patch.object(
+        rss_api, "require_api_login"
+    ), patch.object(config, "_cache", {"QB_URL": qb_url}):
+        sid = rss_repo.add_rss_subscription("Existing", "https://example.invalid/rss", download_method=method, enabled=enabled)
+        before = dict(rss_repo.get_rss_subscription(sid))
+        response = rss_api.update_sub(sid, Mock(), fields)
+        assert response.status_code == expected
+        if expected == 400:
+            assert json.loads(response.body)["code"] == "qb_not_configured"
+            assert dict(rss_repo.get_rss_subscription(sid)) == before
+        else:
+            row = rss_repo.get_rss_subscription(sid)
+            assert row["enabled"] == fields.get("enabled", enabled)
+            assert row["download_method"] == fields.get("download_method", method)
+
+
+def test_web_disabled_qb_creation_keeps_existing_setup_requirement():
+    from app import config
+
+    with isolated_test_database(), patch.object(rss_api, "require_api_login"), patch.object(config, "_cache", {"QB_URL": ""}):
+        response = rss_api.create_sub(Mock(), {"name": "Draft", "urls": "https://example.invalid/rss", "download_method": "qb", "enabled": False})
+        assert response.status_code == 400
+        assert json.loads(response.body)["code"] == "qb_not_configured"
+        assert rss_repo.list_rss_subscriptions() == []
 
 
 def test_full_configuration_and_real_pages_keep_fields_and_redact_url_credentials():

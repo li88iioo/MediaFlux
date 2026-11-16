@@ -88,8 +88,8 @@ def update_sub(sid: int, request: Request, data: dict = Body(...)):
     current = rss_repo.get_rss_subscription(sid)
     if current is None:
         return api_error("订阅项不存在", 404)
-    if "download_method" in data and data.get("enabled") is not False:
-        setup_error = _download_setup_error(data["download_method"])
+    if data.get("enabled", bool(current["enabled"])):
+        setup_error = _download_setup_error(data.get("download_method", current["download_method"]))
         if setup_error is not None:
             return setup_error
     try:

@@ -268,7 +268,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
                 ):
                     normalize_rss_subscription_create({**base, field: invalid})
         normalized = normalize_rss_subscription_create(
-            {**base, "refresh_interval_minutes": "45", "media_default_season": "2"}
+            {**base, "refresh_interval_minutes": "45", "media_default_season": "2", "media_tmdb_id": "123"}
         )
         self.assertEqual(normalized["refresh_interval_minutes"], 45)
         self.assertEqual(normalized["media_default_season"], 2)
