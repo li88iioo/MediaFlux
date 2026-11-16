@@ -506,7 +506,7 @@ def build_indexer_service() -> IndexerService:
     return IndexerService(
         registry=registry,
         result_store=IndexerResultStore(
-            ttl_seconds=config.get_int_clamped("INDEXER_RESULT_TTL_SECONDS", 600, 60, 3600),
+            ttl_seconds=config.get_int_setting("INDEXER_RESULT_TTL_SECONDS"),
             max_entries=10_000,
         ),
         site_timeout_seconds=site_timeout_seconds,

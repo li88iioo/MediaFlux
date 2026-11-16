@@ -1794,7 +1794,7 @@ class MediaSubscriptionService:
 
     @staticmethod
     def _candidate_expiry() -> str:
-        ttl = max(60, min(config.get_int("INDEXER_RESULT_TTL_SECONDS", 600), 3600))
+        ttl = config.get_int_setting("INDEXER_RESULT_TTL_SECONDS")
         safe_ttl = max(45, ttl - 15)
         return (datetime.now() + timedelta(seconds=safe_ttl)).strftime("%Y-%m-%d %H:%M:%S")
 

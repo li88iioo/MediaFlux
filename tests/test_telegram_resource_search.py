@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import unittest
 from types import CoroutineType, SimpleNamespace
@@ -194,23 +195,76 @@ class TelegramIndexerWorkerTests(unittest.TestCase):
 
 
 class TelegramResourceSearchStoreTests(unittest.TestCase):
-    def test_session_and_actions_are_owner_bound_and_expire(self):
+    def _session(self, store, ttl: str, user_id: str = "9") -> str:
+        with patch.dict(os.environ, {"INDEXER_RESULT_TTL_SECONDS": ttl}):
+            return store.create_session(
+                chat_id="100", user_id=user_id, query="作品 A", items=_items(), sites=_sites()
+            )
+
+    def test_session_and_actions_are_owner_bound_consumed_once_bounded_and_expire(self):
         now = [10.0]
-        store = TelegramResourceSearchStore(
-            ttl_seconds=30, max_sessions=2, max_actions=10, clock=lambda: now[0]
-        )
-        session_id = store.create_session(
-            chat_id="100", user_id="9", query="作品 A", items=_items(), sites=_sites()
-        )
+        store = TelegramResourceSearchStore(max_sessions=2, max_actions=10, clock=lambda: now[0])
+        session_id = self._session(store, "60")
         action_id = store.create_action(
             session_id, "100", "9", "view", {"site_id": "nyaa", "page": 0}
         )
         self.assertEqual(store.resolve_action(action_id, "100", "9")["kind"], "view")
         with self.assertRaisesRegex(TelegramResourceSearchError, "不属于"):
             store.resolve_action(action_id, "100", "10")
-        now[0] = 41.0
+        download_id = store.create_action(session_id, "100", "9", "download", {"index": 0})
+        self.assertEqual(store.resolve_action(download_id, "100", "9")["kind"], "download")
+        with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
+            store.resolve_action(download_id, "100", "9")
+        # 容量满时淘汰最早会话及其按钮。
+        self._session(store, "60", user_id="10")
+        now[0] = 11.0
+        self._session(store, "60", user_id="11")
+        with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
+            store.resolve_action(action_id, "100", "9")
+        now[0] = 10.0 + 55
         with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
             store.snapshot(session_id, "100", "9")
+
+    def test_new_sessions_use_current_ttl_and_existing_deadlines_stay(self):
+        now = [0.0]
+        store = TelegramResourceSearchStore(clock=lambda: now[0])
+        old_session = self._session(store, "600")
+        old_action = store.create_action(old_session, "100", "9", "view", {"page": 0})
+        new_session = self._session(store, "120")  # 同一个 store 热改后无需重建
+        now[0] = 114.0
+        store.snapshot(new_session, "100", "9")
+        now[0] = 115.0
+        with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
+            store.snapshot(new_session, "100", "9")
+        now[0] = 594.0
+        store.snapshot(old_session, "100", "9")
+        self.assertEqual(store.resolve_action(old_action, "100", "9")["kind"], "view")
+        now[0] = 595.0
+        with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
+            store.resolve_action(old_action, "100", "9")
+
+    def test_result_ttl_bounds_are_shared_by_tg_store_indexer_and_subscriptions(self):
+        from datetime import datetime
+
+        from app.indexers.runtime import build_indexer_service
+        from app.modules.media_subscriptions import MediaSubscriptionService
+
+        # 缺失/空/非法回退 600，越界截断到 60–3600；TG 余量 5 秒，订阅余量 15 秒。
+        for raw, ttl in (("", 600), ("bad", 600), ("5", 60), (" 120 ", 120), ("99999", 3600)):
+            with self.subTest(raw=raw):
+                now = [0.0]
+                store = TelegramResourceSearchStore(clock=lambda: now[0])
+                session_id = self._session(store, raw)
+                now[0] = ttl - 5 - 0.5
+                store.snapshot(session_id, "100", "9")
+                now[0] = ttl - 5
+                with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
+                    store.snapshot(session_id, "100", "9")
+                with patch.dict(os.environ, {"INDEXER_RESULT_TTL_SECONDS": raw}):
+                    self.assertEqual(build_indexer_service().result_store.ttl_seconds, ttl)
+                    before = datetime.now().replace(microsecond=0)
+                    expiry = datetime.strptime(MediaSubscriptionService._candidate_expiry(), "%Y-%m-%d %H:%M:%S")
+                self.assertLessEqual(abs((expiry - before).total_seconds() - (ttl - 15)), 2)
 
 
 class TelegramResourceSearchViewTests(unittest.TestCase):

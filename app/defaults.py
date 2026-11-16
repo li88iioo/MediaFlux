@@ -42,13 +42,15 @@ DEFAULT_BOOL_CONFIG_VALUES: dict[str, bool] = {
 }
 # STRM 与光鸭整理定时计划缺失时的默认 Cron；显式空值保持为空（不生效）。
 DEFAULT_SCHEDULE_CRON = "0 4 * * *"
-# 页面可配置的数值设置：(默认值, 最小值, 最大值)；运行时截断与保存校验共用。
+# 可配置的数值设置：(默认值, 最小值, 最大值)；运行时截断与保存校验共用。
 INT_SETTING_BOUNDS: dict[str, tuple[int, int, int]] = {
     "AI_RECOGNITION_REQUESTS_PER_MINUTE": (6, 1, 30),
     "AI_RECOGNITION_DAILY_REQUEST_LIMIT": (100, 1, 100_000),
     "AI_RECOGNITION_MAX_CONCURRENCY": (2, 1, 8),
     "AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS": (60, 10, 600),
     "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT": (20, 1, 100_000),
+    # 索引器下载候选的有效期；TG 会话与订阅候选各自再留余量。
+    "INDEXER_RESULT_TTL_SECONDS": (600, 60, 3600),
 }
 AI_RECOGNITION_CONFIDENCE_BOUNDS = (0.8, 0.5, 0.99)
 DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS = 0

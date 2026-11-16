@@ -63,14 +63,12 @@ class TelegramResourceSearchStore:
     def __init__(
         self,
         *,
-        ttl_seconds: int = 900,
         max_sessions: int = 64,
         max_actions: int = 2048,
         clock: Callable[[], float] | None = None,
     ):
-        if ttl_seconds <= 0 or max_sessions <= 0 or max_actions <= 0:
+        if max_sessions <= 0 or max_actions <= 0:
             raise ValueError("store limits must be positive")
-        self.ttl_seconds = ttl_seconds
         self.max_sessions = max_sessions
         self.max_actions = max_actions
         self._clock = clock or time.monotonic
@@ -88,6 +86,8 @@ class TelegramResourceSearchStore:
         sites: list[dict[str, Any]],
     ) -> str:
         now = self._clock()
+        # 每个新会话读取当前有效期，比底层候选早 5 秒失效；已有会话与按钮保持原截止时间。
+        ttl = config.get_int_setting("INDEXER_RESULT_TTL_SECONDS") - 5
         with self._lock:
             self._prune(now)
             while len(self._sessions) >= self.max_sessions:
@@ -102,7 +102,7 @@ class TelegramResourceSearchStore:
                 items=tuple(dict(item) for item in items),
                 sites=tuple(dict(site) for site in sites),
                 created_at=now,
-                expires_at=now + self.ttl_seconds,
+                expires_at=now + ttl,
             )
             return session_id
 
@@ -397,8 +397,7 @@ def _search_snapshot(service, result) -> dict[str, Any]:
     }
 
 
-_result_ttl = max(60, min(config.get_int("INDEXER_RESULT_TTL_SECONDS", 600), 3600))
-_store = TelegramResourceSearchStore(ttl_seconds=max(30, _result_ttl - 5))
+_store = TelegramResourceSearchStore()
 _worker = TelegramIndexerWorker()
 
 
