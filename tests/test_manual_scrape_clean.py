@@ -1,37 +1,26 @@
-"""手动整理名称精简：共享清洗 API 与本地页面真实点击回归。"""
+"""手动刮削搜索词：打开弹窗时的自动清洗样本，以及双语整串零结果时的单语言补搜。"""
 from __future__ import annotations
 
 import json
-import re
-import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import urlsplit
 
-from fastapi import HTTPException
-from fastapi.testclient import TestClient
-from starlette.requests import Request
-
-from app.main import create_app
 from app.modules.recognition.cleaner import _comparison_key
 from app.modules.scraper import TMDBScraper
-from app.routes.tools_api import clean_scrape_query
-from tests.support import IsolatedDatabaseTestCase, authenticated_session
-from tests.test_guangya_directory_scrape_browser import APP_MODAL_SCRIPT, POSITION_SCRIPT
-from tests.test_agent_kernel_browser import _chromium_executable, sync_playwright
+from tests.support import IsolatedDatabaseTestCase
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLEAN_ENDPOINT = '/api/tools/scrape/clean-query'
-MOVIE_RELEASE = '血玫瑰.Bloody.Rose.1988.LDVDRip.HALFCD.2Audios.mkv'
+SLIME = '关于我转生变成史莱姆这档事 Tensei Shitara Slime Datta Ken'
 
 
-class ManualScrapeCleanApiTests(IsolatedDatabaseTestCase):
-    @staticmethod
-    def clean(payload):
-        return clean_scrape_query(Request({'type': 'http', 'session': authenticated_session()}), payload)
+class ManualScrapeQueryCleaningTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.scraper = TMDBScraper()
+        self.addCleanup(self.scraper.close)
 
-    def test_instance_releases_use_shared_cleaning_and_keep_year(self):
+    def test_instance_releases_clean_to_their_titles_without_tmdb(self):
         cases = [json.loads(line) for line in (
             ROOT / 'tests/fixtures/release_recognition_cases.jsonl'
         ).read_text('utf-8').splitlines()]
@@ -40,249 +29,83 @@ class ManualScrapeCleanApiTests(IsolatedDatabaseTestCase):
                 if 'source-instance-20261010' not in case.get('tags', []):
                     continue
                 with self.subTest(filename=case['filename']):
-                    response = self.clean({'query': case['filename']})
-                    self.assertEqual(response.status_code, 200)
-                    expected = case['expected']
                     self.assertEqual(
-                        _comparison_key(json.loads(bytes(response.body))['query']),
-                        _comparison_key(f"{expected['title']} {expected['year']}"),
+                        _comparison_key(self.scraper.clean_title(case['filename'])),
+                        _comparison_key(case['expected']['title']),
                     )
 
-    def test_official_title_numbers_unknown_subtitle_and_clean_name_are_preserved(self):
+    def test_release_noise_is_removed_and_official_title_parts_are_kept(self):
+        # 样本来自原“一键精简”回归：括号副标题、真实标题中的语言词和数字不得被误删。
         cases = (
-            ('1917.2019.1080p.BluRay.mkv', '1917 2019'),
+            ('1917.2019.1080p.BluRay.mkv', '1917'),
             ('Toy Story 3', 'Toy Story 3'),
             ('Proper Hybrid Unrated IMAX', 'Proper Hybrid Unrated IMAX'),
-            ('Movie.SecretChapter.2024.1080p.BluRay.mkv', 'Movie SecretChapter 2024'),
-            ('被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生',
+            ('Movie.SecretChapter.2024.1080p.BluRay.mkv', 'Movie SecretChapter'),
+            ('[Japanese] Story.2003.1080p.WEB-DL.H264.AAC.mkv', 'Japanese Story'),
+            ('[Arifureta Shokugyou de Sekai Saikyou S2][01-12][BIG5][1080P][MP4]',
+             'Arifureta Shokugyou de Sekai Saikyou'),
+            ('[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生（仅限港澳台)',
              '被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生'),
-            ('[Japanese] Story.2003.1080p.WEB-DL.H264.AAC.mkv', 'Japanese Story 2003'),
+            ('[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生（仅限港澳台） - 01 '
+             '[1080P][Bilibili][WEB-DL][AAC AVC][CHT CHS][MP4].mp4',
+             '被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生'),
+            ('[Sakurato] Kage no Jitsuryokusha ni Naritakute! [01-20 FIN][AVC-8bit 1080P AAC][CHS]',
+             'Kage no Jitsuryokusha ni Naritakute!'),
+            ('[LoliHouse] The Ghost in the Shell - 03 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv',
+             'The Ghost in the Shell'),
+            ('[orion origin] Undead Unluck [01-24] [BDRip] [1080p] [H265 10bit_FLAC] [CHS＆JPN]',
+             'Undead Unluck'),
+            ('[豌豆字幕组&LoliHouse] 关于我转生变成史莱姆这档事 第四季 _ Tensei Shitara Slime Datta Ken '
+             '4th Season [01-24(73-96) 合集][WebRip 1080p HEVC-10bit AAC][简繁内封字幕][Fin]', SLIME),
         )
         for raw, expected in cases:
             with self.subTest(raw=raw):
-                response = self.clean({'query': raw})
-                self.assertEqual(json.loads(bytes(response.body))['query'], expected)
-
-    def test_invalid_names_are_rejected_before_creating_scraper(self):
-        with patch('app.routes.tools_api.TMDBScraper') as scraper:
-            for query in (None, '', '   ', 12, ['Movie'], 'a' * 1025):
-                with self.subTest(query=str(query)[:20]):
-                    self.assertEqual(self.clean({'query': query}).status_code, 400)
-            scraper.assert_not_called()
+                self.assertEqual(self.scraper.clean_title(raw), expected)
 
     def test_audio_channels_are_cleaned_whole_and_never_become_episode_numbers(self):
-        scraper = TMDBScraper()
-        self.addCleanup(scraper.close)
         for audio in ('DTS-HD.MA.5.1', 'DTS.HD.MA.6.1', 'DDP5.1', 'TrueHD.7.1'):
             for position in ('', '.S02E01'):
                 with self.subTest(audio=audio, position=position):
                     raw = f'Movie{position}.2024.1080p.BluRay.{audio}.mkv'
-                    self.assertEqual(json.loads(bytes(self.clean({'query': raw}).body))['query'], 'Movie 2024')
-                    parsed = scraper.parse_media(raw)
+                    self.assertEqual(self.scraper.clean_title(raw), 'Movie')
+                    parsed = self.scraper.parse_media(raw)
                     self.assertEqual(parsed.media_type, 'tv' if position else 'movie')
                     self.assertEqual(parsed.source_episode, 1 if position else None)
 
-    def test_options_list_full_name_then_single_language_names(self):
-        cases = (
-            (MOVIE_RELEASE, ['血玫瑰 Bloody Rose 1988', '血玫瑰 1988', 'Bloody Rose 1988']),
-            ('[豌豆字幕组&LoliHouse] 关于我转生变成史莱姆这档事 第四季 _ Tensei Shitara Slime Datta Ken '
-             '4th Season [01-24(73-96) 合集][WebRip 1080p HEVC-10bit AAC][简繁内封字幕][Fin]',
-             ['关于我转生变成史莱姆这档事 Tensei Shitara Slime Datta Ken', '关于我转生变成史莱姆这档事',
-              'Tensei Shitara Slime Datta Ken']),
-            ('Toy Story 3', ['Toy Story 3']),
-            ('[1080p][AAC]', []),
-        )
-        with patch.object(TMDBScraper, 'search', side_effect=AssertionError('清洗不能查询 TMDB')):
-            for raw, options in cases:
-                with self.subTest(raw=raw):
-                    body = json.loads(bytes(self.clean({'query': raw}).body))
-                    self.assertEqual(body['options'], options)
-                    self.assertEqual(body['query'], options[0] if options else '')
 
-    def test_anonymous_requests_are_rejected(self):
-        with self.assertRaises(HTTPException) as error:
-            clean_scrape_query(Request({'type': 'http', 'session': {}}), {'query': 'Movie'})
-        self.assertEqual(error.exception.status_code, 401)
-
-
-@unittest.skipIf(sync_playwright is None, '未安装 Playwright')
-class LocalManualScrapeCleanBrowserTests(IsolatedDatabaseTestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        assert sync_playwright is not None
-        cls.playwright = cls.enterClassContext(sync_playwright())
-        executable = _chromium_executable(cls.playwright)
-        if not executable:
-            raise unittest.SkipTest('未找到 Chrome/Chromium')
-        cls.browser = cls.playwright.chromium.launch(
-            executable_path=executable, headless=True, args=['--no-sandbox'],
-        )
-        cls.addClassCleanup(cls.browser.close)
-
+class ManualSearchSingleLanguageFallbackTests(IsolatedDatabaseTestCase):
     def setUp(self):
-        self.client = TestClient(create_app(start_background=False))
-        self.addCleanup(self.client.close)
-        login = self.client.get('/login')
-        search_result = re.search(r'name="csrf_token"\s+value="([^"]+)"', login.text)
-        assert search_result is not None
-        token = search_result.group(1)
-        response = self.client.post('/login', data={
-            'username': 'admin', 'password': '123456', 'csrf_token': token,
-        }, follow_redirects=False)
-        self.assertEqual(response.status_code, 302)
-        html = self.client.get('/local-media').text
-        search_result_2 = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
-        assert search_result_2 is not None
-        self.csrf = search_result_2.group(1)
-        self.html = re.sub(r'<script\b[^>]*>.*?</script>', '', html, flags=re.S)
-        self.requests = []
-        self.errors = []
-        self.clean_status = 200
-        self.pending_clean = None
-        self.hold_clean = False
-        self.inspection_id = 0
-        self.page = self.browser.new_page(viewport={'width': 1280, 'height': 800})
-        self.addCleanup(self.page.close)
-        self.page.on('pageerror', lambda error: self.errors.append(str(error)))
-        self.page.route('**/*', self._route)
-        self.page.goto('http://testserver/local-media#manual')
-        self.page.evaluate("""() => {
-            window.renderLucideIcons = () => {};
-            window.appAlert = async () => true;
-            window.appConfirm = async () => false;
-        }""")
-        self.page.add_script_tag(content=APP_MODAL_SCRIPT)
-        self.page.add_script_tag(content=POSITION_SCRIPT)
-        self.page.add_script_tag(path=str(ROOT / 'app/static/js/local-media.js'))
-        self._open()
+        super().setUp()
+        self.scraper = TMDBScraper()
+        self.addCleanup(self.scraper.close)
+        self.calls: list[tuple[str, str]] = []
 
-    def _route(self, route):
-        path = urlsplit(route.request.url).path
-        if path == '/local-media':
-            return route.fulfill(status=200, content_type='text/html', body=self.html)
-        if path.startswith('/static/css/') and path.endswith('.css'):
-            response = self.client.get(path)
-            return route.fulfill(status=response.status_code, content_type='text/css', body=response.content)
-        if not path.startswith('/api/'):
-            return route.fulfill(status=404, body='')
-        body = route.request.post_data_json if route.request.post_data else None
-        self.requests.append((path, body))
-        if path == CLEAN_ENDPOINT:
-            if self.hold_clean:
-                self.pending_clean = route
-                return
-            return self._finish_clean(route)
-        if path == '/api/local-media/sources':
-            data = {'sources': [{'id': 1, 'name': '测试来源', 'media_type': 'auto', 'enabled': True}]}
-        elif path == '/api/local-media/tasks':
-            data = {'tasks': []}
-        elif path == '/api/local-media/items':
-            data = {'items': [{
-                'source_id': 1, 'source_name': '测试来源', 'name': MOVIE_RELEASE,
-                'path': '/test/' + MOVIE_RELEASE, 'kind': 'video', 'organize_ready': True,
-            }], 'sources': []}
-        elif path == '/api/local-media/inspect':
-            self.inspection_id += 1
-            data = {
-                'inspection_id': str(self.inspection_id), 'selected_kind': 'file',
-                'suggested_query': MOVIE_RELEASE, 'media_type': 'movie',
-                'video_count': 1, 'file_count': 1,
-            }
-        elif path == '/api/local-media/search':
-            data = {'candidates': [{'tmdb_id': '1', 'title': '血玫瑰', 'media_type': 'movie'}]}
-        else:
-            self.fail(f'精简名称时出现无关业务请求：{path}')
-        route.fulfill(status=200, json=data)
+    def _search(self, hits):
+        def search(title, year, media_type):
+            self.calls.append((title, year))
+            return [dict(item) for item in hits.get(title, [])]
+        return patch.object(self.scraper, 'search', side_effect=search)
 
-    def _finish_clean(self, route):
-        if self.clean_status != 200:
-            return route.fulfill(status=self.clean_status, json={'error': '测试清洗失败'})
-        response = self.client.post(CLEAN_ENDPOINT, json=route.request.post_data_json,
-                                    headers={'X-CSRF-Token': self.csrf})
-        route.fulfill(status=response.status_code, content_type='application/json', body=response.content)
+    def test_bilingual_query_without_results_retries_each_language_in_order(self):
+        hit = {'id': 82684, 'name': '关于我转生变成史莱姆这档事', 'first_air_date': '2018-10-02'}
+        with self._search({'关于我转生变成史莱姆这档事': [hit]}):
+            candidates = self.scraper.search_candidates(SLIME, '2018', 'tv')
+        self.assertEqual(self.calls, [(SLIME, '2018'), (SLIME, ''), ('关于我转生变成史莱姆这档事', '2018')])
+        self.assertEqual([item.tmdb_id for item in candidates], ['82684'])
 
-    def _open(self):
-        self.page.locator('[data-open-item-menu]').first.click()
-        # 菜单必须按真实样式固定在视口内，不能靠无样式页面的滚动时序点击。
-        self.assertEqual(self.page.locator('#lmItemContextMenu').evaluate(
-            'element => getComputedStyle(element).position',
-        ), 'fixed')
-        self.page.locator('[data-item-action="search"]').click()
-        self.page.wait_for_function("document.getElementById('lmScrapeStatus').textContent === '请选择候选'")
-        self.requests.clear()
+    def test_full_query_hit_or_single_language_title_never_adds_searches(self):
+        hit = {'id': 862, 'title': 'Toy Story', 'release_date': '1995-10-30'}
+        for query, hits, expected in (
+            (SLIME, {SLIME: [hit]}, [(SLIME, '')]),
+            ('Toy Story 3', {}, [('Toy Story 3', '')]),
+        ):
+            with self.subTest(query=query):
+                self.calls.clear()
+                with self._search(hits):
+                    self.scraper.search_candidates(query, '', 'movie')
+                self.assertEqual(self.calls, expected)
 
-    def _click_clean(self):
-        self.page.locator('#lmScrapeCleanBtn').click()
-        self.page.wait_for_function("!document.getElementById('lmScrapeCleanBtn').disabled")
-
-    def test_clean_updates_input_searches_once_and_reports_effect(self):
-        self._click_clean()
-        expected = '血玫瑰 Bloody Rose 1988'
-        self.assertEqual(self.page.locator('#lmSearchQuery').input_value(), expected)
-        self.assertIn('已精简名称', self.page.locator('#lmScrapeStatus').inner_text())
-        self.assertEqual([path for path, _ in self.requests], [CLEAN_ENDPOINT, '/api/local-media/search'])
-        self.assertEqual(self.requests[-1][1]['query'], expected)
-        self.assertTrue(self.page.locator('#lmExecuteBtn').is_disabled())
-        self.assertEqual(self.errors, [])
-
-    def test_repeat_clicks_switch_single_language_names_until_user_edits(self):
-        label = self.page.locator('#lmScrapeCleanBtn span')
-        query = self.page.locator('#lmSearchQuery')
-        self._click_clean()
-        self.assertEqual(query.input_value(), '血玫瑰 Bloody Rose 1988')
-        self.assertEqual(label.text_content(), '换一个名称')
-        for expected, step in (('血玫瑰 1988', '2/3'), ('Bloody Rose 1988', '3/3'), ('血玫瑰 Bloody Rose 1988', '1/3')):
-            with self.subTest(expected=expected):
-                self.requests.clear()
-                self._click_clean()
-                self.assertEqual(query.input_value(), expected)
-                self.assertIn(f'已切换搜索名称 {step}', self.page.locator('#lmScrapeStatus').inner_text())
-                # 已识别的候选名称在本地切换，只重新搜索，不重复清洗。
-                self.assertEqual([path for path, _ in self.requests], ['/api/local-media/search'])
-                self.assertEqual(self.requests[-1][1]['query'], expected)
-        query.fill('用户自定义名称')
-        self.assertEqual(label.text_content(), '一键精简')
-        self.assertEqual(self.errors, [])
-
-    def test_clean_title_gives_feedback_and_preserves_position_fields(self):
-        self.page.locator('#lmMediaType').select_option('tv')
-        self.page.locator('#lmScrapeSeason').fill('2')
-        self.page.locator('#lmScrapeEpisode').fill('3')
-        self.page.locator('#lmSearchQuery').fill('Toy Story 3')
-        self._click_clean()
-        self.assertEqual(self.page.locator('#lmSearchQuery').input_value(), 'Toy Story 3')
-        self.assertIn('名称无需精简', self.page.locator('#lmScrapeStatus').inner_text())
-        self.assertEqual(self.page.locator('#lmScrapeSeason').input_value(), '2')
-        self.assertEqual(self.page.locator('#lmScrapeEpisode').input_value(), '3')
-        self.assertEqual(self.requests[-1][1]['media_type'], 'tv')
-
-    def test_failed_and_empty_cleaning_keep_input_and_do_not_search(self):
-        for status, raw in ((503, MOVIE_RELEASE), (200, '[1080p][AAC]')):
-            with self.subTest(status=status):
-                self.clean_status = status
-                self.page.locator('#lmSearchQuery').fill(raw)
-                self.requests.clear()
-                self._click_clean()
-                self.assertEqual(self.page.locator('#lmSearchQuery').input_value(), raw)
-                self.assertEqual([path for path, _ in self.requests], [CLEAN_ENDPOINT])
-                self.assertRegex(self.page.locator('#lmScrapeStatus').inner_text(), '精简失败|未识别到')
-
-    def test_pending_response_does_not_overwrite_edits_or_reopened_modal(self):
-        for reopen in (False, True):
-            with self.subTest(reopen=reopen):
-                self.hold_clean = True
-                self.page.locator('#lmSearchQuery').fill(MOVIE_RELEASE)
-                self.page.locator('#lmScrapeCleanBtn').click()
-                self.page.wait_for_function("document.getElementById('lmScrapeCleanBtn').disabled")
-                if reopen:
-                    self.page.locator('#lmScrapeCloseBtn').click()
-                    self._open()
-                self.page.locator('#lmSearchQuery').fill('用户重新输入的标题')
-                self.requests.clear()
-                self._finish_clean(self.pending_clean)
-                self.page.wait_for_function("!document.getElementById('lmScrapeCleanBtn').disabled")
-                self.assertEqual(self.page.locator('#lmSearchQuery').input_value(), '用户重新输入的标题')
-                self.assertNotIn('正在精简', self.page.locator('#lmScrapeStatus').inner_text())
-                self.assertEqual(self.requests, [])
-                self.assertEqual(self.errors, [])
+    def test_noise_only_query_does_not_search(self):
+        with self._search({}):
+            self.assertEqual(self.scraper.search_candidates('[1080p][AAC]', '', 'movie'), [])
+        self.assertEqual(self.calls, [])

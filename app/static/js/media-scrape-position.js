@@ -1,91 +1,6 @@
 ((global) => {
     'use strict';
 
-    function bindSearchCleaner({root, button, query, status, getInspection, onChange, onSearch}) {
-        const label = button?.querySelector('span');
-        const defaultLabel = label?.textContent || '一键精简';
-        const defaultTitle = button?.title || '';
-        const same = (left, right) => left.trim().replace(/\s+/g, ' ').toLowerCase()
-            === right.trim().replace(/\s+/g, ' ').toLowerCase();
-        // 同一次检查内记住识别出的候选名称：已是其中之一时再点就切换，而不是原样返回。
-        let remembered = null;
-
-        function remember(inspection, options) {
-            remembered = options.length > 1 ? {inspection, options} : null;
-            if (label) label.textContent = remembered ? '换一个名称' : defaultLabel;
-            if (button) {
-                button.title = remembered
-                    ? `在 ${options.length} 个识别出的搜索名称间切换（完整名 / 各语言名）`
-                    : defaultTitle;
-            }
-        }
-
-        function flash() {
-            query.classList.remove('is-cleaned');
-            void query.offsetWidth;
-            query.classList.add('is-cleaned');
-        }
-
-        query.addEventListener('animationend', () => query.classList.remove('is-cleaned'));
-        // 弹窗关闭即复位，下次打开其它目录时按钮不会停在“换一个名称”。
-        if (root && typeof MutationObserver === 'function') {
-            new MutationObserver(() => {
-                if (root.hidden && remembered) remember(null, []);
-            }).observe(root, {attributes: true, attributeFilter: ['hidden']});
-        }
-        query.addEventListener('input', () => {
-            if (remembered) remember(null, []);
-            if (button?.disabled) status.textContent = '搜索名称已修改，请重新精简';
-        });
-        button?.addEventListener('click', async () => {
-            const inspection = getInspection();
-            if (!inspection) return;
-            const raw = query.value;
-            const isCurrent = () => !root.hidden && getInspection() === inspection;
-            button.disabled = true;
-            status.textContent = '正在精简名称';
-            try {
-                let options = remembered?.inspection === inspection ? remembered.options : null;
-                if (!options?.some((option) => same(option, raw))) {
-                    const response = await fetch('/api/tools/scrape/clean-query', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query: raw}),
-                    });
-                    const data = await response.json();
-                    if (!isCurrent() || query.value !== raw) return;
-                    if (!response.ok) throw new Error(data.error || '名称精简失败');
-                    options = (Array.isArray(data.options) && data.options.length ? data.options : [data.query])
-                        .filter((option) => typeof option === 'string' && option.trim());
-                }
-                if (!options.length) {
-                    status.textContent = '未识别到可保留的标题，请手动修改';
-                    query.focus();
-                    query.select();
-                    return;
-                }
-                remember(inspection, options);
-                const current = options.findIndex((option) => same(option, raw));
-                const index = current >= 0 && options.length > 1 ? (current + 1) % options.length : 0;
-                const next = options[index];
-                const message = same(next, raw)
-                    ? '名称无需精简'
-                    : (current >= 0 ? `已切换搜索名称 ${index + 1}/${options.length}` : '已精简名称');
-                query.value = next;
-                if (!same(next, raw)) flash();
-                onChange?.();
-                await onSearch();
-                if (isCurrent() && query.value === next) {
-                    status.textContent = `${message} · ${status.textContent}`;
-                }
-            } catch (error) {
-                if (isCurrent() && query.value === raw) status.textContent = `精简失败：${error.message}`;
-            } finally {
-                button.disabled = false;
-            }
-        });
-    }
-
     function create({root, isSingleFile, elements = {}}) {
         if (!root) throw new Error('刮削弹窗不存在');
         const fields = elements.fields || root.querySelector('[data-media-scrape-role="position-fields"]');
@@ -154,5 +69,5 @@
         };
     }
 
-    global.MediaScrapePosition = {create, bindSearchCleaner};
+    global.MediaScrapePosition = {create};
 })(window);

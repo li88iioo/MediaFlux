@@ -1785,12 +1785,6 @@
     $('lmRefreshItemsBtn').addEventListener('click', refreshMediaItems);
     $('lmSearchBtn').addEventListener('click', search);
     $('lmAutoPreviewBtn').addEventListener('click', () => preview());
-    window.MediaScrapePosition.bindSearchCleaner({
-        root: $('lmScrapeModal'), button: $('lmScrapeCleanBtn'),
-        query: $('lmSearchQuery'), status: $('lmScrapeStatus'),
-        getInspection: () => inspection,
-        onChange: invalidatePreview, onSearch: search,
-    });
     $('lmScrapeExternalBtn')?.addEventListener('click', loadExternalHints);
     $('lmScrapeExternalHints')?.addEventListener('click', (event) => {
         const button = event.target.closest('[data-external-hint]');

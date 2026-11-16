@@ -18,16 +18,8 @@
         <div class="{{ media_scrape.css }}-searchbar">
             <label{% if media_scrape.query_label_class %} class="{{ media_scrape.query_label_class }}"{% endif %}>
                 <span>搜索名称</span>
-                {% if media_scrape.clean_id %}<div class="{{ media_scrape.css }}-query-input-wrap">{% endif %}
                 <input type="search" class="form-input" id="{{ media_scrape.query_id }}"
                        autocomplete="off" placeholder="输入电影或剧集名称">
-                {% if media_scrape.clean_id %}
-                    <button type="button" class="{{ media_scrape.css }}-clean-btn" id="{{ media_scrape.clean_id }}"
-                            title="智能精简搜索词（保留正式副标题，仅移除发布噪声）" aria-label="一键精简搜索名称">
-                        <i data-lucide="sparkles"></i><span>一键精简</span>
-                    </button>
-                </div>
-                {% endif %}
             </label>
             <label>
                 <span>媒体类型</span>

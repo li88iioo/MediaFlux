@@ -4650,17 +4650,20 @@ class TMDBScraper:
 
     def search_candidates(self, query: str, year: str = "",
                           media_type: str = "movie") -> list[Candidate]:
-        """人工纠偏搜索入口，返回按标题和年份排序后的 Top3。"""
+        """人工纠偏搜索入口，返回按标题和年份排序后的 Top3。
+
+        双语整串常在 TMDB 零结果；与自动识别一致，整串无果时依次改用拆出的
+        单语言名称。结果只供人工选择，不会因此自动锁定。
+        """
         media_type = "tv" if media_type == "tv" else "movie"
         clean = self.clean_title(query)
-        if not clean:
-            return []
-        candidates = self.search(clean, year, media_type)
-        if not candidates and year:
-            candidates = self.search(clean, "", media_type)
-        if not candidates:
-            return []
-        return self._pick_best(clean, year, media_type, candidates).candidates
+        for title in _split_title_variants(clean):
+            candidates = self.search(title, year, media_type)
+            if not candidates and year:
+                candidates = self.search(title, "", media_type)
+            if candidates:
+                return self._pick_best(title, year, media_type, candidates).candidates
+        return []
 
     def match_from_tmdb(self, tmdb_id: str | int, media_type: str) -> MatchResult:
         """按人工指定的 TMDB ID 构建完整匹配结果，并绑定详情响应身份。"""
@@ -5003,9 +5006,7 @@ class TMDBScraper:
             result.effective_season = result.season_override
         return result
 
-    def clean_title(
-        self, title: str, *, keep_year: bool = False,
-    ) -> str:
+    def clean_title(self, title: str) -> str:
         """生成搜索词；只删除已知发布噪声，保留正式括号副标题。"""
         if not title:
             return ""
@@ -5052,11 +5053,7 @@ class TMDBScraper:
         ):
             cleaned = guessed_title
         cleaned = _strip_season_tokens(cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._-")
-        year = _position_number(guessed.get("year")) if keep_year else None
-        if cleaned and year and not re.search(rf"(?<!\d){year}(?!\d)", cleaned):
-            cleaned = f"{cleaned} {year}"
-        return cleaned
+        return re.sub(r"\s+", " ", cleaned).strip(" ._-")
 
     @staticmethod
     def parse_resource_tags(filename: str) -> dict[str, str]:

@@ -304,27 +304,6 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             html.index('id="gyCapabilityBadge"'),
         )
 
-    def test_one_click_clean_preserves_bracketed_title_and_removes_release_tags(self):
-        self.assertIn("window.MediaScrapePosition.bindSearchCleaner", DIRECTORY_SCRIPT.read_text("utf-8"))
-        cases = (
-            ('[Arifureta Shokugyou de Sekai Saikyou S2][01-12][BIG5][1080P][MP4]',
-             'Arifureta Shokugyou de Sekai Saikyou'),
-            ('[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生（仅限港澳台)',
-             '被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生'),
-            ('[Sakurato] Kage no Jitsuryokusha ni Naritakute! [01-20 FIN][AVC-8bit 1080P AAC][CHS]',
-             'Kage no Jitsuryokusha ni Naritakute!'),
-            ('[LoliHouse] The Ghost in the Shell - 03 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv',
-             'The Ghost in the Shell'),
-        )
-        headers = {"X-CSRF-Token": self._csrf(self.client.get('/guangya').text)}
-        for raw, expected in cases:
-            with self.subTest(raw=raw):
-                response = self.client.post('/api/tools/scrape/clean-query', headers=headers, json={
-                    'query': raw,
-                })
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual(response.json()['query'], expected)
-
     def test_preview_renderer_does_not_truncate_directory_files(self):
         script = DIRECTORY_SCRIPT.read_text("utf-8")
 

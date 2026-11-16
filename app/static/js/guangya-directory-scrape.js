@@ -12,7 +12,6 @@
         search: document.getElementById('gyScrapeSearchBtn'),
         externalBtn: document.getElementById('gyScrapeExternalBtn'),
         externalHints: document.getElementById('gyScrapeExternalHints'),
-        cleanBtn: document.getElementById('gyScrapeCleanBtn'),
         query: document.getElementById('gyScrapeQuery'),
         type: document.getElementById('gyScrapeType'),
         episodeFields: document.getElementById('gyScrapeEpisodeFields'),
@@ -303,7 +302,6 @@
         if (typeLabel) typeLabel.textContent = nsfwOnly ? '归档结构' : '媒体类型';
         if (candidateTitle) candidateTitle.textContent = nsfwOnly ? 'MetaTube 精确候选' : '媒体候选';
         if (candidateTab) candidateTab.textContent = nsfwOnly ? '番号候选' : '媒体候选';
-        if (elements.cleanBtn) elements.cleanBtn.hidden = nsfwOnly;
         if (elements.externalBtn) elements.externalBtn.hidden = nsfwOnly;
         setButtonContent(elements.search, 'search', nsfwOnly ? '识别番号' : '搜索');
     }
@@ -1474,11 +1472,6 @@
     elements.cancel.addEventListener('click', closeModal);
     elements.search.addEventListener('click', searchCandidates);
     elements.externalBtn.addEventListener('click', loadExternalHints);
-    window.MediaScrapePosition.bindSearchCleaner({
-        root: modal, button: elements.cleanBtn, query: elements.query, status: elements.status,
-        getInspection: () => state.inspection,
-        onSearch: searchCandidates,
-    });
     elements.query.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') searchCandidates();
     });

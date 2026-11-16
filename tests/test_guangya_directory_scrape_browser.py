@@ -1,16 +1,10 @@
 """光鸭目录/文件操作菜单的真实浏览器行为回归测试。"""
 from __future__ import annotations
 
-import json
 import shutil
 import textwrap
 import unittest
 from pathlib import Path
-
-from starlette.requests import Request
-
-from app.routes.tools_api import clean_scrape_query
-from tests.support import authenticated_session
 
 try:
     from playwright.sync_api import sync_playwright
@@ -75,7 +69,6 @@ HARNESS = textwrap.dedent(
             <button id="gyScrapeCancelBtn"></button>
             <button id="gyScrapeRunBtn"><span></span></button>
             <button id="gyScrapeSearchBtn"><span></span></button>
-            <button id="gyScrapeCleanBtn"><span>一键精简</span></button>
             <button id="gyScrapeExternalBtn"><span>豆瓣 / BGM 线索</span></button>
             <input id="gyScrapeQuery">
             <select id="gyScrapeType">
@@ -148,9 +141,6 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.page_errors: list[str] = []
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         self.page.set_content(HARNESS)
-        self.page.expose_function("__cleanQuery", lambda body: json.loads(bytes(clean_scrape_query(
-            Request({"type": "http", "session": authenticated_session()}), body,
-        ).body)))
         self.page.evaluate(
             """
             () => {
@@ -171,9 +161,6 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                 window.fetch = async (path, options = {}) => {
                     const body = options.body ? JSON.parse(options.body) : null;
                     window.__requests.push({path, body});
-                    if (path === '/api/tools/scrape/clean-query') {
-                        return {ok: true, json: () => window.__cleanQuery(body)};
-                    }
                     if (path.endsWith('/inspect')) {
                         return {
                             ok: true,
@@ -716,187 +703,6 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         )
         self.assertNotIn("season", preview_request["body"])
         self.assertNotIn("episode", preview_request["body"])
-        self.assertEqual(self.page_errors, [])
-
-    def test_one_click_clean_preserves_official_parenthesis_and_searches(self):
-        self.page.evaluate(
-            """
-            () => {
-                window.__inspection = {
-                    suggested_query: '[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生（仅限港澳台)',
-                    media_type: 'tv',
-                    season: 1,
-                    episode: null,
-                    season_inferred: true,
-                };
-            }
-            """
-        )
-        directory = self._bind(is_directory=True, left=200, top=120)
-        self._open_button(directory)
-        self.page.evaluate(
-            '() => document.querySelector(\'[data-scrape-action="manual"]\').click()'
-        )
-        self.page.wait_for_function("() => !document.getElementById('gyScrapeModal').hidden")
-        self.page.evaluate("() => { window.__requests = []; }")
-        self.page.locator('#gyScrapeCleanBtn').click()
-        self.page.wait_for_function(
-            "() => window.__requests.some(request => request.path.endsWith('/search'))"
-        )
-
-        value = self.page.locator('#gyScrapeQuery').input_value()
-        request = self.page.evaluate(
-            "() => window.__requests.find(request => request.path.endsWith('/search'))"
-        )
-        self.assertEqual(
-            value,
-            '被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生',
-        )
-        self.assertEqual(request['body']['query'], value)
-        self.assertEqual(request['body']['media_type'], 'tv')
-        self.assertEqual(self.page_errors, [])
-
-    def test_one_click_clean_preserves_bracketed_title_and_searches(self):
-        raw = '[Arifureta Shokugyou de Sekai Saikyou S2][01-12][BIG5][1080P][MP4]'
-        self.page.evaluate(
-            """
-            value => {
-                window.__inspection = {
-                    suggested_query: value,
-                    media_type: 'tv',
-                    season: 2,
-                    episode: null,
-                    season_inferred: true,
-                };
-            }
-            """,
-            raw,
-        )
-        directory = self._bind(is_directory=True, left=200, top=120)
-        self._open_button(directory)
-        self.page.evaluate(
-            '() => document.querySelector(\'[data-scrape-action="manual"]\').click()'
-        )
-        self.page.wait_for_function("() => !document.getElementById('gyScrapeModal').hidden")
-        self.page.evaluate("() => { window.__requests = []; }")
-        self.page.locator('#gyScrapeCleanBtn').click()
-        self.page.wait_for_function(
-            "() => window.__requests.some(request => request.path.endsWith('/search'))"
-        )
-
-        value = self.page.locator('#gyScrapeQuery').input_value()
-        request = self.page.evaluate(
-            "() => window.__requests.find(request => request.path.endsWith('/search'))"
-        )
-        self.assertEqual(value, 'Arifureta Shokugyou de Sekai Saikyou')
-        self.assertEqual(request['body']['query'], value)
-        self.assertEqual(request['body']['media_type'], 'tv')
-        self.assertEqual(self.page_errors, [])
-
-    def test_one_click_clean_removes_orion_origin_and_japanese_audio_tag(self):
-        raw = (
-            '[orion origin] Undead Unluck [01-24] [BDRip] [1080p] '
-            '[H265 10bit_FLAC] [CHS＆JPN]'
-        )
-        self.page.evaluate(
-            """
-            value => {
-                window.__inspection = {
-                    suggested_query: value,
-                    media_type: 'tv',
-                    season: 1,
-                    episode: null,
-                    season_inferred: true,
-                };
-            }
-            """,
-            raw,
-        )
-        directory = self._bind(is_directory=True, left=200, top=120)
-        self._open_button(directory)
-        self.page.evaluate(
-            '() => document.querySelector(\'[data-scrape-action="manual"]\').click()'
-        )
-        self.page.wait_for_function("() => !document.getElementById('gyScrapeModal').hidden")
-        self.page.evaluate("() => { window.__requests = []; }")
-        self.page.locator('#gyScrapeCleanBtn').click()
-        self.page.wait_for_function(
-            "() => window.__requests.some(request => request.path.endsWith('/search'))"
-        )
-
-        value = self.page.locator('#gyScrapeQuery').input_value()
-        self.assertEqual(value, 'Undead Unluck')
-        self.assertEqual(self.page_errors, [])
-
-    def test_one_click_clean_preserves_japanese_word_in_title(self):
-        raw = '[Japanese] Story.2003.1080p.WEB-DL.H264.AAC.mkv'
-        self.page.evaluate(
-            """
-            value => {
-                window.__inspection = {
-                    suggested_query: value,
-                    media_type: 'movie',
-                    season: null,
-                    episode: null,
-                    season_inferred: false,
-                };
-            }
-            """,
-            raw,
-        )
-        directory = self._bind(is_directory=True, left=200, top=120)
-        self._open_button(directory)
-        self.page.evaluate(
-            '() => document.querySelector(\'[data-scrape-action="manual"]\').click()'
-        )
-        self.page.wait_for_function("() => !document.getElementById('gyScrapeModal').hidden")
-        self.page.evaluate("() => { window.__requests = []; }")
-        self.page.locator('#gyScrapeCleanBtn').click()
-        self.page.wait_for_function(
-            "() => window.__requests.some(request => request.path.endsWith('/search'))"
-        )
-
-        self.assertEqual(self.page.locator('#gyScrapeQuery').input_value(), 'Japanese Story 2003')
-        self.assertEqual(self.page_errors, [])
-
-    def test_one_click_clean_removes_known_episode_and_release_tags(self):
-        raw = (
-            '[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生'
-            '（仅限港澳台） - 01 [1080P][Bilibili][WEB-DL][AAC AVC][CHT CHS][MP4].mp4'
-        )
-        self.page.evaluate(
-            """
-            value => {
-                window.__inspection = {
-                    suggested_query: value,
-                    media_type: 'tv',
-                    season: 1,
-                    episode: 1,
-                    season_inferred: false,
-                };
-            }
-            """,
-            raw,
-        )
-        video = self._bind(is_directory=False, is_video=True, left=200, top=120)
-        self._open_button(video)
-        self.page.evaluate(
-            '() => document.querySelector(\'[data-scrape-action="manual"]\').click()'
-        )
-        self.page.wait_for_function("() => !document.getElementById('gyScrapeModal').hidden")
-        self.page.evaluate("() => { window.__requests = []; }")
-        self.page.locator('#gyScrapeCleanBtn').click()
-        self.page.wait_for_function(
-            "() => window.__requests.some(request => request.path.endsWith('/search'))"
-        )
-
-        value = self.page.locator('#gyScrapeQuery').input_value()
-        self.assertEqual(
-            value,
-            '被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生',
-        )
-        self.assertNotIn('01', value)
-        self.assertNotIn('mp4', value.lower())
         self.assertEqual(self.page_errors, [])
 
     def test_pending_video_is_visible_and_never_hidden_in_archive_summary(self):
