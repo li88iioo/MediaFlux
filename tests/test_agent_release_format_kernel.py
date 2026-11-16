@@ -110,9 +110,9 @@ def test_native_confirmation_rejects_stale_or_foreign_scope_before_writing(runti
         elif change == "publication":
             await store.begin_turn(owner=OWNER, session_id=context.session_id, request_id="superseded")
         elif change == "config_aba":
-            original = config.get("TG_QB_SAVE_PATH", "")
-            config.set_and_save({"TG_QB_SAVE_PATH": "/changed"})
-            config.set_and_save({"TG_QB_SAVE_PATH": original})
+            original = config.get("QB_CATEGORY", "")
+            config.set_and_save({"QB_CATEGORY": "changed"})
+            config.set_and_save({"QB_CATEGORY": original})
         elif change == "registry":
             other = teaching()
             other["draft"]["parent_path"] = "/Anime/Other"

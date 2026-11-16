@@ -4,10 +4,12 @@ from __future__ import annotations
 from typing import Annotated
 from fastapi import APIRouter, Body, Query, Request
 
+from app import config
 from app.repositories import rss as rss_repo
 from app.logger import get_logger
-from app.modules.rss import RSSEngine, rss_entry_delivery
+from app.modules.rss import RSSEngine, rss_download_defaults, rss_entry_delivery
 from app.modules.rss_subscriptions import RSSSubscriptionError, apply_change
+from app.modules.rss_subscription_config import RSS_SUBSCRIPTION_DEFAULTS
 from app.web import api_error, api_response, require_api_login
 
 logger = get_logger(__name__)
@@ -26,6 +28,7 @@ def rss_stats(request: Request):
 def list_subs(request: Request):
     require_api_login(request)
     rows = rss_repo.list_rss_subscriptions()
+    legacy_method = rss_download_defaults()["default_method"]
     return api_response([{
         "id": r["id"],
         "name": r["name"],
@@ -37,7 +40,7 @@ def list_subs(request: Request):
         "refresh_cron": r["refresh_cron"],
         "refresh_interval_minutes": int(r["refresh_interval_minutes"] or 0),
         "last_refreshed_at": r["last_refreshed_at"],
-        "download_method": r["download_method"] or "",
+        "download_method": r["download_method"] or legacy_method,
         "qb_save_path": r["qb_save_path"] or "",
         "gy_target_dir": r["gy_target_dir"] or "",
         "gy_target_dir_name": r["gy_target_dir_name"] or "",
@@ -57,9 +60,21 @@ def _subscription_response(result: dict):
     return api_response(data)
 
 
+def _download_setup_error(method: str):
+    if isinstance(method, str):
+        method = method.strip().lower()
+    method = method or rss_download_defaults()["default_method"]
+    if method == "qb" and not config.get("QB_URL").strip():
+        return api_response({"error": "未配置 qBittorrent，请先设置下载器连接。", "code": "qb_not_configured"}, 400)
+    return None
+
+
 @router.post("/subscriptions")
 def create_sub(request: Request, data: dict = Body(...)):
     require_api_login(request)
+    setup_error = _download_setup_error(data.get("download_method", RSS_SUBSCRIPTION_DEFAULTS["download_method"]))
+    if setup_error is not None:
+        return setup_error
     try:
         result = apply_change("create", data)
     except (TypeError, ValueError) as exc:
@@ -73,6 +88,10 @@ def update_sub(sid: int, request: Request, data: dict = Body(...)):
     current = rss_repo.get_rss_subscription(sid)
     if current is None:
         return api_error("订阅项不存在", 404)
+    if "download_method" in data and data.get("enabled") is not False:
+        setup_error = _download_setup_error(data["download_method"])
+        if setup_error is not None:
+            return setup_error
     try:
         if "subscription_id" in data:
             raise ValueError("订阅配置包含未支持字段")

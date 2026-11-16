@@ -342,6 +342,33 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         self.assertEqual(int(second["subscription"]["revision"]), 2)
         self.assertEqual(media_subscriptions_repo.count_media_subscriptions(), 1)
 
+    def test_repository_and_agent_creation_share_subscription_defaults(self) -> None:
+        from app.modules.media_subscriptions import subscription_create_arguments
+
+        defaults = media_subscriptions_repo.MEDIA_SUBSCRIPTION_DEFAULTS
+        arguments = subscription_create_arguments({
+            "provider": "tmdb", "external_id": "43", "media_type": "tv",
+        })
+        for key in ("check_interval_minutes", "action", "download_target", "enabled"):
+            self.assertEqual(arguments[key], defaults[key])
+        for create, identity in (
+            (media_subscriptions_repo.add_media_subscription, "43"),
+            (media_subscriptions_repo.upsert_media_subscription, "44"),
+        ):
+            with self.subTest(create=create.__name__):
+                result = create(
+                    provider="tmdb", external_id=identity, tmdb_id=identity,
+                    media_type="tv", title="默认配置",
+                )
+                identifier = result[0] if isinstance(result, tuple) else result
+                row = media_subscriptions_repo.get_media_subscription(identifier)
+                self.assertIsNotNone(row)
+                assert row is not None
+                for key in ("monitor_mode", "action", "download_target", "check_interval_minutes"):
+                    self.assertEqual(row[key], defaults[key])
+                self.assertEqual(bool(row["enabled"]), defaults["enabled"])
+                self.assertEqual(bool(row["include_specials"]), defaults["include_specials"])
+
     def test_movie_and_update_validation_reject_unsafe_or_unknown_fields(self) -> None:
         service = MediaSubscriptionService()
         detail = {

@@ -4,7 +4,7 @@
 - MikanParser：feedparser 解析 Mikan RSS，提取标题、下载地址、发布时间与 guid
 - RSSEngine：订阅管理、刷新去重，并把 qB/光鸭任务接入统一下载状态机
 
-下载目标由配置 RSS_DOWNLOAD_METHOD 决定：qb / guangya。
+下载目标由订阅明确选择：qb / guangya；旧订阅的空目标按历史配置读取。
 """
 from __future__ import annotations
 
@@ -305,20 +305,19 @@ def _release_rss_refresh(sub_id: int) -> None:
         _RSS_REFRESHING_SUBSCRIPTIONS.discard(sub_id)
 
 
-_RSS_DEFAULT_KEYS = ("RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD")
+_RSS_DEFAULT_KEYS = ("QB_CATEGORY", "RSS_DOWNLOAD_METHOD")
 
 
 def _rss_defaults_from(values: Mapping[str, str]) -> dict[str, str]:
     method = (values["RSS_DOWNLOAD_METHOD"] or "qb").strip().lower()
     return {
-        "category": (values["RSS_QB_CATEGORY"] or ""),
-        "default_save_path": (values["RSS_QB_SAVE_PATH"] or ""),
+        "category": (values["QB_CATEGORY"] or ""),
         "default_method": method if method in {"qb", "guangya"} else "qb",
     }
 
 
 def rss_download_defaults() -> dict[str, str]:
-    """RSS 全局下载默认值（不含 qB 地址与凭据）；未冻结的下载与页面展示共用。"""
+    """统一 qB 分类及旧订阅空目标的读取兼容；新订阅始终保存明确目标。"""
     return _rss_defaults_from(get_many(_RSS_DEFAULT_KEYS, {"RSS_DOWNLOAD_METHOD": "qb"}))
 
 
@@ -1013,7 +1012,7 @@ class RSSEngine:
         try:
             submission_options: dict[str, Any] = {
                 "qb_save_path": str(
-                    self._entry_value(entry, "qb_save_path", "") or defaults.get("default_save_path") or ""
+                    self._entry_value(entry, "qb_save_path", "") or (runtime or {}).get("default_save_path") or ""
                 ),
                 "qb_category": str(defaults.get("category") or ""),
                 "qb_runtime_config": runtime,

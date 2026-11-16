@@ -302,7 +302,7 @@ def test_native_retry_cancel_or_frozen_drift_never_writes(retry_backend, monkeyp
         elif change == "source":
             download_requests_repo.update_download_request(retry_backend.request_id, title="changed")
         elif change == "config":
-            monkeypatch.setenv("TG_QB_SAVE_PATH", "/changed")
+            monkeypatch.setenv("QB_CATEGORY", "changed")
         else:
             context = await context_for(store, owner="other-owner")
         with pytest.raises((ToolPipelineError, asyncio.CancelledError)) as error:
@@ -460,7 +460,7 @@ def test_unapproved_or_changed_snapshot_never_submits(resources_backend, monkeyp
             monkeypatch.setattr(effects.effect_store.store, "_clock", lambda: plan.expires_at + 1)
         elif ending == "target_changed":
             service.result_store = IndexerResultStore()
-            monkeypatch.setenv("TG_QB_SAVE_PATH", "/different-destination")
+            monkeypatch.setenv("QB_CATEGORY", "different-category")
         elif ending == "source_revoked":
             service.result_store = IndexerResultStore()
             service.sukebei_authorized = False
@@ -625,7 +625,7 @@ def test_native_confirmation_rechecks_production_authority(resources_backend, ow
     async def check():
         with initialized_web_runtime(), patch("app.modules.download_dispatcher._submit_qb", return_value={"ok": True}) as url_backend:
             config.set_and_save({"TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "-100123",
-                                 "TG_AGENT_ALLOWED_USER_IDS": "8", "TG_QB_SAVE_PATH": "/frozen-target", "QB_URL": "http://qb.invalid"})
+                                 "TG_AGENT_ALLOWED_USER_IDS": "8", "QB_CATEGORY": "frozen-category", "QB_URL": "http://qb.invalid"})
             store = SQLiteKernelStore()
             context = await context_for(store, owner=owner)
             effects = executor(store, authorization=MediaFluxAuthorizationPolicy())
@@ -636,8 +636,8 @@ def test_native_confirmation_rechecks_production_authority(resources_backend, ow
             assert prepared.effect_plan.snapshot_fingerprint.startswith("mfkr2:")
             resources_backend.service.result_store = IndexerResultStore()
             if change == "config_aba":
-                config.set_and_save({"TG_QB_SAVE_PATH": "/another-target"})
-                config.set_and_save({"TG_QB_SAVE_PATH": "/frozen-target"})
+                config.set_and_save({"QB_CATEGORY": "another-category"})
+                config.set_and_save({"QB_CATEGORY": "frozen-category"})
             elif change == "revoked":
                 config.set_and_save({"TG_AGENT_ALLOWED_USER_IDS": "9"})
             rebuilt = executor(SQLiteKernelStore(), authorization=MediaFluxAuthorizationPolicy())

@@ -101,6 +101,7 @@ def subscription_stats(request: Request):
     rss = rss_repo.get_rss_stats()
     return api_response({
         **media,
+        "form_defaults": dict(media_subscriptions_repo.MEDIA_SUBSCRIPTION_DEFAULTS),
         "rss_total": rss.get("subscription_total", 0),
         "rss_active": rss.get("active_subscriptions", 0),
         "rss_pending": rss.get("pending_total", 0),

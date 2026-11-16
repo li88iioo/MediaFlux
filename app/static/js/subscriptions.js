@@ -23,6 +23,7 @@
         candidateSubscriptionId: null,
         loaded: {media: false, watchlist: false, runs: false},
         statsHydrated: false,
+        mediaFormDefaults: null,
     };
 
     const modalReturnFocus = new WeakMap();
@@ -393,6 +394,15 @@
         try {
             const stats = await apiJSON('/api/subscriptions/stats', {}, controller.signal);
             if (requestId !== state.statsRequestId) return;
+            state.mediaFormDefaults = null;
+            const defaults = stats.form_defaults;
+            if (!defaults || !['provider', 'media_type', 'monitor_mode', 'action', 'download_target'].every((key) => typeof defaults[key] === 'string' && defaults[key])
+                || !Array.isArray(defaults.seasons) || !Array.isArray(defaults.sites)
+                || typeof defaults.enabled !== 'boolean' || typeof defaults.include_specials !== 'boolean'
+                || !Number.isInteger(defaults.check_interval_minutes) || defaults.check_interval_minutes <= 0) {
+                throw new Error('媒体订阅默认设置不完整，请刷新后重试');
+            }
+            state.mediaFormDefaults = defaults;
             const values = {
                 subscriptionStatTotal: stats.total,
                 subscriptionStatMediaActive: stats.media_active,
@@ -779,8 +789,6 @@
     window.openSubscriptionModal = openModal;
     window.closeSubscriptionModal = closeModal;
 
-    const supportedMediaIntervals = new Set(['4320', '10080']);
-
     function formatLegacyMediaInterval(minutes) {
         const value = Number(minutes);
         if (value >= 1440 && value % 1440 === 0) return `每 ${value / 1440} 天`;
@@ -795,8 +803,9 @@
 
     function setMediaInterval(value, {preserveLegacy = false} = {}) {
         clearLegacyMediaInterval();
-        const normalized = String(Number(value) || 4320);
-        if (preserveLegacy && !supportedMediaIntervals.has(normalized)) {
+        const normalized = String(Number(value) || state.mediaFormDefaults.check_interval_minutes);
+        const supported = Array.from(fields.interval.options).some((option) => option.value === normalized);
+        if (preserveLegacy && !supported) {
             const option = new Option(`当前旧设置：${formatLegacyMediaInterval(normalized)}`, normalized, true, true);
             option.disabled = true;
             option.dataset.legacyInterval = 'true';
@@ -804,27 +813,32 @@
             fields.interval.dataset.legacyInterval = normalized;
             return;
         }
-        fields.interval.value = supportedMediaIntervals.has(normalized) ? normalized : '4320';
+        fields.interval.value = normalized;
     }
 
     function resetMediaForm() {
+        const defaults = state.mediaFormDefaults;
+        if (!defaults) {
+            void appAlert?.({type: 'error', title: '媒体订阅默认设置未就绪', message: '请刷新订阅页面后重试。'});
+            return false;
+        }
         state.editingId = null;
         state.watchlistContext = null;
         fields.id.value = '';
-        fields.provider.value = 'tmdb';
+        fields.provider.value = defaults.provider;
         fields.externalId.value = '';
         fields.tmdbId.value = '';
         fields.tmdbId.disabled = false;
-        fields.mediaType.value = 'tv';
+        fields.mediaType.value = defaults.media_type;
         fields.mediaType.disabled = false;
-        fields.monitorMode.value = 'missing';
-        fields.seasons.value = '';
-        fields.action.value = 'confirm';
-        fields.target.value = 'guangya';
-        fields.sites.value = '';
-        setMediaInterval(4320);
-        fields.specials.checked = false;
-        fields.enabled.checked = true;
+        fields.monitorMode.value = defaults.monitor_mode;
+        fields.seasons.value = defaults.seasons.join(', ');
+        fields.action.value = defaults.action;
+        fields.target.value = defaults.download_target;
+        fields.sites.value = defaults.sites.join(', ');
+        setMediaInterval(defaults.check_interval_minutes);
+        fields.specials.checked = defaults.include_specials;
+        fields.enabled.checked = defaults.enabled;
         elements.mediaFormStatus.textContent = '';
         elements.mapping.hidden = true;
         elements.mappingList.replaceChildren();
@@ -832,29 +846,30 @@
         elements.mediaModalTitle.textContent = '新建媒体订阅';
         elements.mediaModalHint.textContent = '使用 TMDB ID 建立可靠的媒体身份。';
         syncMediaForm();
+        return true;
     }
 
     function openCreateMedia(trigger = elements.createMedia) {
-        resetMediaForm();
+        if (!resetMediaForm()) return;
         openModal(elements.mediaModal, trigger);
     }
 
     function openEditMedia(item, trigger) {
-        resetMediaForm();
+        if (!resetMediaForm()) return;
         state.editingId = Number(item.id);
         fields.id.value = String(item.id);
-        fields.provider.value = item.provider || 'tmdb';
+        fields.provider.value = item.provider || fields.provider.value;
         fields.externalId.value = item.external_id || item.tmdb_id || '';
         fields.tmdbId.value = item.tmdb_id || '';
         fields.tmdbId.disabled = true;
-        fields.mediaType.value = item.media_type || 'tv';
+        fields.mediaType.value = item.media_type || fields.mediaType.value;
         fields.mediaType.disabled = true;
-        fields.monitorMode.value = item.monitor_mode || 'missing';
+        fields.monitorMode.value = item.monitor_mode || fields.monitorMode.value;
         fields.seasons.value = Array.isArray(item.seasons) ? item.seasons.join(', ') : '';
-        fields.action.value = item.action || 'confirm';
-        fields.target.value = item.download_target || 'guangya';
+        fields.action.value = item.action || fields.action.value;
+        fields.target.value = item.download_target || fields.target.value;
         fields.sites.value = Array.isArray(item.sites) ? item.sites.join(', ') : '';
-        setMediaInterval(item.check_interval_minutes || 4320, {preserveLegacy: true});
+        setMediaInterval(item.check_interval_minutes, {preserveLegacy: true});
         fields.specials.checked = Boolean(item.include_specials);
         fields.enabled.checked = Boolean(item.enabled);
         elements.mediaModalTitle.textContent = `编辑 · ${item.title || '媒体订阅'}`;
@@ -884,11 +899,11 @@
             }
             return;
         }
-        resetMediaForm();
+        if (!resetMediaForm()) return;
         state.watchlistContext = item;
-        fields.provider.value = item.provider || 'tmdb';
+        fields.provider.value = item.provider || fields.provider.value;
         fields.externalId.value = item.external_id || '';
-        fields.mediaType.value = item.media_type || 'tv';
+        fields.mediaType.value = item.media_type || fields.mediaType.value;
         fields.mediaType.disabled = true;
         if (item.provider === 'tmdb') fields.tmdbId.value = item.external_id || '';
         elements.mediaModalTitle.textContent = `创建追更 · ${item.title || '收藏媒体'}`;
@@ -972,7 +987,7 @@
             action: fields.action.value,
             download_target: fields.target.value,
             sites: parseSites(fields.sites.value),
-            check_interval_minutes: Number(fields.interval.value || 4320),
+            check_interval_minutes: Number(fields.interval.value),
             enabled: fields.enabled.checked,
         };
         let path = '/api/subscriptions/media';
@@ -990,7 +1005,7 @@
             payload.provider = state.watchlistContext.provider;
             payload.external_id = state.watchlistContext.external_id;
         } else {
-            payload.provider = 'tmdb';
+            payload.provider = fields.provider.value;
             payload.external_id = tmdbId;
         }
         buttonBusy(elements.mediaSave, true, '保存中');

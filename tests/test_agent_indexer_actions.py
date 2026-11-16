@@ -497,11 +497,12 @@ class IndexerReceivingSourceTests(unittest.TestCase):
         from app.indexers.downloads import DownloadSnapshotChanged, preflight_indexer_download
         from app.modules.offline import OfflineRules
 
-        for target, field in (("qb", "title"), ("qb", "TG_QB_SAVE_PATH"), ("qb", "TG_QB_CATEGORY"),
-                              ("guangya", "target_dir_id"), ("guangya", "secondary_dir_id")):
-            with self.subTest(target=target, field=field):
+        for target, field, changed in (("qb", "title", "changed candidate"), ("qb", "QB_CATEGORY", "changed"),
+                                       ("qb", "QB_CATEGORY", ""), ("guangya", "target_dir_id", "changed"),
+                                       ("guangya", "secondary_dir_id", "changed")):
+            with self.subTest(target=target, field=field, changed=changed):
                 service = FakeDownloadService(_resource_item())
-                values = {"TG_QB_SAVE_PATH": "/frozen", "TG_QB_CATEGORY": "original",
+                values = {"QB_CATEGORY": "original",
                           "QB_PASSWORD": "fixture-private-password"}
                 rules = replace(OfflineRules.from_config(), target_dir_id="original", secondary_enabled=True,
                                 secondary_dir_id="secondary-original", secondary_keywords=("Demo",))
@@ -519,12 +520,12 @@ class IndexerReceivingSourceTests(unittest.TestCase):
 
                     async def resolve(_result_id: str, *, scope: str = "manual") -> ResolvedDownload:
                         if field == "title":
-                            service.result_store.item = replace(service.result_store.item, title="changed candidate")
+                            service.result_store.item = replace(service.result_store.item, title=changed)
                         elif target == "qb":
-                            values[field] = "changed"
+                            values[field] = changed
                         else:
-                            routing.return_value = (replace(rules, target_dir_id="changed") if field == "target_dir_id"
-                                                    else replace(rules, secondary_dir_id="changed"))
+                            routing.return_value = (replace(rules, target_dir_id=changed) if field == "target_dir_id"
+                                                    else replace(rules, secondary_dir_id=changed))
                         return ResolvedDownload("magnet", _SECRET_MAGNET)
 
                     service.resolve = resolve

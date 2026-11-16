@@ -153,11 +153,11 @@ class DiscoveryConfigTests(unittest.TestCase):
 
     def test_unrelated_config_save_does_not_shutdown_discovery_service(self):
         response, persist, shutdown = self._save(
-            {"RSS_QB_SAVE_PATH": "/downloads/rss"}
+            {"QB_CATEGORY": "shared"}
         )
 
         self.assertEqual(response, {"success": True})
-        persist.assert_called_once_with({"RSS_QB_SAVE_PATH": "/downloads/rss"})
+        persist.assert_called_once_with({"QB_CATEGORY": "shared"})
         shutdown.assert_not_called()
 
     def test_unknown_configuration_key_remains_rejected(self):

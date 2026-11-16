@@ -18,6 +18,8 @@ from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
 
 from jinja2 import Environment, FileSystemLoader
+from app.modules.rss_subscription_config import RSS_SUBSCRIPTION_DEFAULTS
+from app.repositories.media_subscriptions import MEDIA_SUBSCRIPTION_DEFAULTS
 
 try:
     from .test_agent_kernel_browser import _chromium_executable, sync_playwright
@@ -121,7 +123,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 app_version="offline-session-test",
                 discovery_enabled=False,
                 agent_enabled=False,
-                rss_defaults={"default_method": "qb", "category": "", "default_save_path": ""},
+                rss_subscription_defaults=RSS_SUBSCRIPTION_DEFAULTS,
                 rss_inherited_dir_id="0",
                 rss_inherited_dir_name="根目录",
                 csrf_token=lambda: "fake-csrf",
@@ -276,7 +278,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 route.fulfill(json={"created": False})
                 return
             if path == "/api/subscriptions/stats":
-                route.fulfill(json={})
+                route.fulfill(json={"form_defaults": dict(MEDIA_SUBSCRIPTION_DEFAULTS)})
                 return
             if path == "/api/subscriptions/watchlist":
                 route.fulfill(json={"items": [], "total": 0, "has_more": False, "next": None})
@@ -1129,6 +1131,72 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         page.locator("#appMessageClose").click()
         self.manual("A")
         self.wait_manual("A")
+
+    def test_media_forms_use_backend_defaults_without_extra_initialization_requests(self):
+        defaults = {
+            **MEDIA_SUBSCRIPTION_DEFAULTS,
+            "action": "notify", "download_target": "qb", "monitor_mode": "future",
+            "check_interval_minutes": 10080, "include_specials": True, "enabled": False,
+            "sites": ["mikan"],
+        }
+        self.replies[("GET", "/api/subscriptions/stats")] = [(200, {"form_defaults": defaults})] * 4
+        page = self.make_page("rss")
+        self.settle()
+        requests = len(self.requests)
+        page.locator("#createMediaSubscription").click()
+        page.locator("#mediaSubModal").wait_for(state="visible")
+        for selector, value in (
+            ("#ms_action", "notify"), ("#ms_download_target", "qb"),
+            ("#ms_monitor_mode", "future"), ("#ms_interval", "10080"),
+            ("#ms_sites", "mikan"),
+        ):
+            self.assertEqual(page.locator(selector).input_value(), value)
+        self.assertFalse(page.locator("#ms_enabled").is_checked())
+        self.assertTrue(page.locator("#ms_include_specials").is_checked())
+        self.assertEqual(len(self.requests), requests)
+        self.close_editor()
+        self.edit(1)
+        self.assertEqual(page.locator("#ms_action").input_value(), "confirm")
+        self.assertEqual(page.locator("#ms_download_target").input_value(), "guangya")
+        self.assertEqual(page.locator("#ms_monitor_mode").input_value(), "selected")
+        self.assertTrue(page.locator("#ms_enabled").is_checked())
+
+    def test_media_create_rejects_missing_or_incomplete_backend_defaults(self):
+        page = self.make_page("rss")
+        for stats in ({}, {"form_defaults": {"action": "auto"}}):
+            with self.subTest(stats=stats):
+                self.replies[("GET", "/api/subscriptions/stats")] = [(200, stats)]
+                page.evaluate("document.dispatchEvent(new CustomEvent('mediaflux:rss-stats-updated'))")
+                self.settle()
+                page.locator("#createMediaSubscription").click()
+                page.locator("#appMessageModal:not([hidden])").wait_for()
+                self.assertIn("默认设置未就绪", page.locator("#appMessageModal").inner_text())
+                self.assertTrue(page.locator("#mediaSubModal").is_hidden())
+                page.locator("#appMessageClose").click()
+        self.assertFalse(any(request["method"] != "GET" for request in self.requests))
+
+    def test_media_legacy_interval_is_retained_until_user_selects_a_new_interval(self):
+        self.replies[("GET", MEDIA)] = [(200, {
+            "items": [{**SUBSCRIPTIONS[0], "check_interval_minutes": 60}],
+            "total": 1, "has_more": False, "next": None,
+        })]
+        page = self.make_page("rss")
+        self.edit(1)
+        self.assertEqual(page.locator("#ms_interval").input_value(), "60")
+        self.assertIn("当前旧设置", page.locator("#ms_interval option:checked").inner_text())
+        self.save_held(1)
+        saved = [item for item in self.requests if item["method"] == "PUT"][-1]
+        self.assertNotIn("check_interval_minutes", saved["body"])
+        self.release_reply("old-save")
+        page.locator("#mediaSubModal").wait_for(state="hidden")
+        page.locator("#appMessageModal:not([hidden])").wait_for()
+        page.locator("#appMessageClose").click()
+        self.edit(1)
+        page.locator("#ms_interval").select_option("10080")
+        self.save_held(1, "new-interval")
+        saved = [item for item in self.requests if item["method"] == "PUT"][-1]
+        self.assertEqual(saved["body"]["check_interval_minutes"], 10080)
+        self.release_reply("new-interval")
 
     def test_media_late_success_cannot_close_new_editor_or_steal_focus(self):
         page = self.make_page("rss")

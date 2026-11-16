@@ -197,14 +197,7 @@
         setDoubanDbcl2Status(doubanDbcl2Input.value.trim()?'unknown':'unconfigured');
     });
 
-    const inheritedDownloadFields=new Set();
     loadAppConfig().then(config=>{
-        form.querySelectorAll('[data-inherit-from]').forEach(field=>{
-            if(!(field.dataset.key in config)){
-                inheritedDownloadFields.add(field);
-                config[field.dataset.key]=config[field.dataset.inheritFrom]||'';
-            }
-        });
         fillConfigFields(form,config);
         loadIndexerSiteSelection(config);
         setConfigReady();
@@ -226,20 +219,8 @@
         state.className='';
         state.textContent='正在保存当前分区...';
         try{
-            const submitted=collectConfigFields(panel);
             const result=await saveAppConfig(panel);
-            if(panel.dataset.settingsPanel==='downloads'){
-                inheritedDownloadFields.forEach(field=>{
-                    if(field.dataset.key in submitted){
-                        inheritedDownloadFields.delete(field);
-                    }else if(field.value===field.dataset.configInitialValue){
-                        const source=form.querySelector(`[data-key="${field.dataset.inheritFrom}"]`);
-                        field.value=source.dataset.configInitialValue||'';
-                        field.dataset.configInitialValue=field.value;
-                    }
-                });
-                syncTelemetryWidgets();
-            }
+            if(panel.dataset.settingsPanel==='downloads')syncTelemetryWidgets();
             const hasPendingChanges=result?.__hasPendingConfigChanges===true
                 || Object.keys(collectConfigFields(panel)).length>0;
             state.className=hasPendingChanges?'':'is-success';
@@ -570,7 +551,7 @@
             }
         }
 
-        const qbCat=form.querySelector('[data-key="TG_QB_CATEGORY"]')?.value?.trim();
+        const qbCat=form.querySelector('[data-key="QB_CATEGORY"]')?.value?.trim();
         const qbCatPreview=document.getElementById('qbCategoryPreview');
         if(qbCatPreview)qbCatPreview.textContent=qbCat||'未指定';
 

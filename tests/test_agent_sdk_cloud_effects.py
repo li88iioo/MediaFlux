@@ -185,9 +185,9 @@ def test_recycle_confirm_rechecks_authority_and_cancellation_without_resubmittin
         if change == "generation":
             client.credential_generation += 1
         elif change == "config_aba":
-            original = config.get("TG_QB_SAVE_PATH", "")
-            config.set_and_save({"TG_QB_SAVE_PATH": "/changed"})
-            config.set_and_save({"TG_QB_SAVE_PATH": original})
+            original = config.get("QB_CATEGORY", "")
+            config.set_and_save({"QB_CATEGORY": "changed"})
+            config.set_and_save({"QB_CATEGORY": original})
         elif change == "cancel":
             assert await effects.cancel_effect(plan.plan_id, lease=context.lease)
         elif change == "cancel_during_read":
@@ -604,9 +604,9 @@ def test_production_confirmation_runtime_and_authority_are_frozen(cloud_backend,
         plan = (await effects.prepare("cloud.change", {"operations": _operations(), "trigger_strm": False}, context=context)).effect_plan
         assert plan is not None and plan.snapshot_fingerprint.startswith("mfkr2:")
         if change == "config_aba":
-            original = config.get("TG_QB_SAVE_PATH", "")
-            config.set_and_save({"TG_QB_SAVE_PATH": "/different"})
-            config.set_and_save({"TG_QB_SAVE_PATH": original})
+            original = config.get("QB_CATEGORY", "")
+            config.set_and_save({"QB_CATEGORY": "different"})
+            config.set_and_save({"QB_CATEGORY": original})
         elif change == "disabled":
             config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         if change == "unchanged":

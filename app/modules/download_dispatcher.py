@@ -811,8 +811,8 @@ class DownloadRetryChanged(ValueError):
 
 
 _RETRY_CONFIG_KEYS = (
-    "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY", "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
-    "RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "OFFLINE_MAGNET_ENABLED", "OFFLINE_ED2K_ENABLED",
+    "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY", "QB_CATEGORY",
+    "OFFLINE_MAGNET_ENABLED", "OFFLINE_ED2K_ENABLED",
     "OFFLINE_HTTP_ENABLED", "OFFLINE_TARGET_DIR", "OFFLINE_SECONDARY_ENABLED", "OFFLINE_SECONDARY_DIR",
     "OFFLINE_SECONDARY_KEYWORDS", "OFFLINE_EXCLUDE_KEYWORDS", "OFFLINE_MIN_FILE_MB", "OFFLINE_ALLOWED_EXTS",
 )
@@ -1716,16 +1716,11 @@ def _submit_qb(
     default_category = (
         runtime.get("category")
         if runtime is not None
-        else get("TG_QB_CATEGORY", get("RSS_QB_CATEGORY", ""))
-    )
-    default_save_path = (
-        runtime.get("default_save_path")
-        if runtime is not None
-        else get("TG_QB_SAVE_PATH", get("RSS_QB_SAVE_PATH", ""))
+        else get("QB_CATEGORY", "")
     )
     resolved_category = str(category if category is not None else default_category or "")
     resolved_save_path = str(
-        save_path if save_path is not None else default_save_path or ""
+        save_path if save_path is not None else (runtime or {}).get("default_save_path") or ""
     )
     torrents = row["torrent_data"] if row["kind"] in {"torrent", "http"} else None
     urls = "" if torrents else str(row["source_value"] or "")

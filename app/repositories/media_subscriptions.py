@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterable, TypedDict
 
 from app.logger import redact_sensitive_text
@@ -14,6 +15,20 @@ from app import database as db
 
 if TYPE_CHECKING:
     pass
+
+
+MEDIA_SUBSCRIPTION_DEFAULTS: Mapping[str, Any] = MappingProxyType({
+    "provider": "tmdb",
+    "media_type": "tv",
+    "enabled": True,
+    "monitor_mode": "missing",
+    "seasons": (),
+    "include_specials": False,
+    "action": "confirm",
+    "download_target": "guangya",
+    "sites": (),
+    "check_interval_minutes": 4320,
+})
 
 
 def get_conn():
@@ -59,7 +74,7 @@ class MediaSubscriptionError(ValueError):
 
 def normalize_subscription_interval(value: Any) -> int:
     if value in (None, ""):
-        value = 4320
+        value = MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"]
     if isinstance(value, bool):
         raise MediaSubscriptionError("检查间隔必须是整数")
     try:
@@ -113,17 +128,17 @@ def add_media_subscription(
     original_title: str = "",
     year: str = "",
     poster_key: str = "",
-    enabled: bool = True,
-    monitor_mode: str = "missing",
+    enabled: bool = MEDIA_SUBSCRIPTION_DEFAULTS["enabled"],
+    monitor_mode: str = MEDIA_SUBSCRIPTION_DEFAULTS["monitor_mode"],
     seasons: Iterable[int] | None = None,
-    include_specials: bool = False,
-    action: str = "confirm",
-    download_target: str = "guangya",
+    include_specials: bool = MEDIA_SUBSCRIPTION_DEFAULTS["include_specials"],
+    action: str = MEDIA_SUBSCRIPTION_DEFAULTS["action"],
+    download_target: str = MEDIA_SUBSCRIPTION_DEFAULTS["download_target"],
     sites: Iterable[str] | None = None,
-    check_interval_minutes: int = 4320,
+    check_interval_minutes: int = MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"],
 ) -> int:
     stamp = now()
-    interval = max(5, min((check_interval_minutes or 4320), 10080))
+    interval = max(5, min((check_interval_minutes or MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"]), 10080))
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO media_subscriptions("
@@ -173,20 +188,20 @@ def upsert_media_subscription(
     original_title: str = "",
     year: str = "",
     poster_key: str = "",
-    enabled: bool = True,
-    monitor_mode: str = "missing",
+    enabled: bool = MEDIA_SUBSCRIPTION_DEFAULTS["enabled"],
+    monitor_mode: str = MEDIA_SUBSCRIPTION_DEFAULTS["monitor_mode"],
     seasons: Iterable[int] | None = None,
-    include_specials: bool = False,
-    action: str = "confirm",
-    download_target: str = "guangya",
+    include_specials: bool = MEDIA_SUBSCRIPTION_DEFAULTS["include_specials"],
+    action: str = MEDIA_SUBSCRIPTION_DEFAULTS["action"],
+    download_target: str = MEDIA_SUBSCRIPTION_DEFAULTS["download_target"],
     sites: Iterable[str] | None = None,
-    check_interval_minutes: int = 4320,
+    check_interval_minutes: int = MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"],
     expected_snapshot: dict[str, Any] | None = None,
     check_cancelled: Callable[[], None] = lambda: None,
 ) -> tuple[int, bool]:
     """原子创建或恢复；冻结快照冲突返回 (0, False)，不改变关联工作。"""
     stamp = now()
-    interval = max(5, min((check_interval_minutes or 4320), 10080))
+    interval = max(5, min((check_interval_minutes or MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"]), 10080))
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         snapshot = media_subscription_identity_snapshot(conn, tmdb_id, media_type)

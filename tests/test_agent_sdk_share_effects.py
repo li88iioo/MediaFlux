@@ -119,9 +119,9 @@ def test_confirm_rejects_stale_or_foreign_plans_before_writing(backend, monkeypa
         if change == "generation":
             backend.client.credential_generation += 1
         elif change == "config_aba":
-            original = config.get("TG_QB_SAVE_PATH", "")
-            config.set_and_save({"TG_QB_SAVE_PATH": "/changed"})
-            config.set_and_save({"TG_QB_SAVE_PATH": original})
+            original = config.get("QB_CATEGORY", "")
+            config.set_and_save({"QB_CATEGORY": "changed"})
+            config.set_and_save({"QB_CATEGORY": original})
         elif change == "object":
             if tool == "cloud.share":
                 backend.client.files[0].name = "changed"

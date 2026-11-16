@@ -158,7 +158,7 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     *_MEDIA_SERVER_REFRESH_KEYS,
     "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
     "DOWNLOAD_TORRENT_RETENTION_DAYS",
-    "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
+    "QB_CATEGORY",
     "TMDB_API_KEY", "TMDB_API_URL",
     "TMDB_MATCH_MODE", "PROXY_URL", "TG_BOT_TOKEN", "TG_CHAT_ID",
     "TG_NOTIFICATION_ENABLED", "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS",
@@ -186,7 +186,7 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     "OFFLINE_HTTP_ENABLED", "OFFLINE_TARGET_DIR", "OFFLINE_TARGET_DIR_NAME",
     "OFFLINE_SECONDARY_ENABLED", "OFFLINE_SECONDARY_DIR", "OFFLINE_SECONDARY_DIR_NAME",
     "OFFLINE_SECONDARY_KEYWORDS", "OFFLINE_EXCLUDE_KEYWORDS", "OFFLINE_MIN_FILE_MB",
-    "OFFLINE_ALLOWED_EXTS", "RSS_DOWNLOAD_METHOD", "RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH",
+    "OFFLINE_ALLOWED_EXTS",
     "RSS_GY_TARGET_DIR",
     "GY_SHARE_TARGET_DIR", "GY_SHARE_TARGET_DIR_NAME",
     "GY_ORGANIZE_SOURCE_DIRS", "GY_ORGANIZE_TARGET_DIR",
@@ -966,7 +966,7 @@ def _ui_defaults() -> dict[str, str]:
     defaults.update({key: str(bounds[0]) for key, bounds in INT_SETTING_BOUNDS.items()})
     defaults["AI_RECOGNITION_CONFIDENCE_THRESHOLD"] = str(AI_RECOGNITION_CONFIDENCE_BOUNDS[0])
     defaults["TG_NOTIFICATION_LEVEL"] = DEFAULT_NOTIFICATION_LEVEL
-    defaults["RSS_DOWNLOAD_METHOD"] = "qb"
+    defaults["QB_CATEGORY"] = ""
     defaults["OFFLINE_MIN_FILE_MB"] = str(DEFAULT_OFFLINE_MIN_FILE_MB)
     defaults["STRM_VIDEO_EXTS"] = ",".join(DEFAULT_STRM_VIDEO_EXTS)
     defaults["STRM_METADATA_EXTS"] = ",".join(DEFAULT_STRM_METADATA_EXTS)
@@ -1043,9 +1043,9 @@ def get_config(request: Request):
         items["INDEXER_ENABLED_SITES"] = ",".join(persisted_sites)
     except ValueError:
         items["INDEXER_ENABLED_SITES"] = (raw_sites or "")
-    from app.modules.rss import rss_download_defaults
-
-    items["RSS_DOWNLOAD_METHOD"] = rss_download_defaults()["default_method"]
+    items["QB_CATEGORY"] = config.get("QB_CATEGORY", "")
+    for retired in ("TG_QB_CATEGORY", "RSS_QB_CATEGORY", "TG_QB_SAVE_PATH", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD"):
+        items.pop(retired, None)
     redacted: dict = redact_config(items)
     # 控制台用户名可回显；仅此已鉴权接口放行，日志等通用脱敏规则仍保护凭据。
     if "ENV_WEB_PASSPORT" in items:

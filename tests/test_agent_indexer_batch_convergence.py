@@ -425,11 +425,11 @@ class BatchConvergenceTests(unittest.TestCase):
     def test_later_resolution_config_change_also_invalidates_earlier_resolved_item(self):
         from app import config
 
-        values = {"TG_QB_SAVE_PATH": "/frozen"}
+        values = {"QB_CATEGORY": "frozen"}
         original_get = config.get
         async def resolve(result_id, *, scope):
             if result_id == ALIAS:
-                values["TG_QB_SAVE_PATH"] = "/changed"
+                values["QB_CATEGORY"] = "changed"
             return ResolvedDownload("magnet", MAGNET)
         with patch.object(config, "get", side_effect=lambda key, default="": values.get(key, original_get(key, default))), \
              patch.object(dispatcher, "_submit_qb") as backend:

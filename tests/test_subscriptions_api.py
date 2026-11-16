@@ -114,6 +114,7 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
 
     def test_api_requires_login_and_csrf_for_mutations(self) -> None:
         self.assertEqual(self.client.get("/api/subscriptions/media").status_code, 401)
+        self.assertEqual(self.client.get("/api/subscriptions/stats").status_code, 401)
         self.assertEqual(
             self.client.post("/api/subscriptions/media", json={"tmdb_id": "1"}).status_code,
             401,
@@ -127,6 +128,43 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
             self.client.delete("/api/subscriptions/media/1").status_code,
             403,
         )
+
+    def test_media_form_defaults_match_creation_and_leave_saved_values_unchanged(self) -> None:
+        headers = self.login()
+        saved_id = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="40", tmdb_id="40", media_type="tv",
+            title="历史订阅", action="notify", download_target="qb",
+            monitor_mode="selected", seasons=[2], check_interval_minutes=60,
+            enabled=False, include_specials=True,
+        )
+        saved_row = media_subscriptions_repo.get_media_subscription(saved_id)
+        assert saved_row is not None
+        saved = dict(saved_row)
+        response = self.client.get("/api/subscriptions/stats")
+        self.assertEqual(response.status_code, 200)
+        defaults = response.json()["form_defaults"]
+        self.assertEqual(defaults, {
+            "provider": "tmdb", "media_type": "tv", "enabled": True,
+            "monitor_mode": "missing", "seasons": [], "include_specials": False,
+            "action": "confirm", "download_target": "guangya", "sites": [],
+            "check_interval_minutes": 4320,
+        })
+        self.assertEqual(response.json()["media_total"], 1)
+        with patch("app.modules.media_subscriptions._tmdb_detail", return_value={
+            "name": "新订阅", "first_air_date": "2026-01-01",
+        }), patch("app.routes.subscriptions_api._wake_scheduler"):
+            for identity, options in (("41", {}), ("42", defaults)):
+                with self.subTest(options=options):
+                    created = self.client.post(
+                        "/api/subscriptions/media", headers=headers,
+                        json={**options, "tmdb_id": identity},
+                    )
+                    self.assertEqual(created.status_code, 201, created.text)
+                    subscription = created.json()["subscription"]
+                    self.assertEqual({key: subscription[key] for key in defaults}, defaults)
+        saved_row = media_subscriptions_repo.get_media_subscription(saved_id)
+        assert saved_row is not None
+        self.assertEqual(dict(saved_row), saved)
 
     def test_thin_routes_forward_crud_check_and_candidate_scope(self) -> None:
         headers = self.login()
@@ -371,7 +409,8 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         self.assertIn("return mediaDetailURL(item, resourceFocus, '/rss#watchlist')", scripts)
         self.assertIn("params.set('return_to', returnTo)", scripts)
         self.assertIn('delete document.documentElement.dataset.subscriptionInitialTab', scripts)
-        self.assertIn("setMediaInterval(4320);", scripts)
+        self.assertIn("setMediaInterval(defaults.check_interval_minutes);", scripts)
+        self.assertNotIn("setMediaInterval(4320)", scripts)
         self.assertIn("当前旧设置：${formatLegacyMediaInterval(normalized)}", scripts)
         self.assertIn("fields.interval.dataset.legacyInterval === fields.interval.value", scripts)
         self.assertIn("delete payload.check_interval_minutes;", scripts)

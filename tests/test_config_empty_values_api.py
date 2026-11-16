@@ -59,6 +59,41 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
+    def test_rss_save_checks_current_qb_setup_without_changing_existing_subscription(self):
+        from app.repositories import rss as rss_repo
+
+        self._write_raw(QB_URL="")
+        payload = {"name": "test", "urls": "https://example.invalid/rss", "download_method": "qb"}
+        rejected = self.client.post("/api/rss/subscriptions", json=payload, headers=self.headers)
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(rejected.json()["code"], "qb_not_configured")
+        self.assertEqual(rss_repo.list_rss_subscriptions(), [])
+        with patch("app.modules.rss_subscriptions.wake_rss_scheduler"):
+            created = self.client.post("/api/rss/subscriptions", json={**payload, "download_method": "guangya"}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.text)
+            sid = created.json()["id"]
+            original_row = rss_repo.get_rss_subscription(sid)
+            assert original_row is not None
+            original = dict(original_row)
+            rejected = self.client.put(f"/api/rss/subscriptions/{sid}", json=payload, headers=self.headers)
+            self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(rejected.json()["code"], "qb_not_configured")
+            unchanged = rss_repo.get_rss_subscription(sid)
+            assert unchanged is not None
+            self.assertEqual(dict(unchanged), original)
+            self._write_raw(QB_URL="http://qb.invalid:8080")
+            saved = self.client.put(f"/api/rss/subscriptions/{sid}", json=payload, headers=self.headers)
+            self.assertEqual(saved.status_code, 200, saved.text)
+            saved_row = rss_repo.get_rss_subscription(sid)
+            assert saved_row is not None
+            self.assertEqual(saved_row["download_method"], "qb")
+            self._write_raw(QB_URL="")
+            paused = self.client.put(f"/api/rss/subscriptions/{sid}", json={**payload, "enabled": False}, headers=self.headers)
+            self.assertEqual(paused.status_code, 200, paused.text)
+            paused_row = rss_repo.get_rss_subscription(sid)
+            assert paused_row is not None
+            self.assertFalse(paused_row["enabled"], "下载器未配置也应允许停用已有订阅")
+
     def test_new_defaults_and_saved_values_match_execution_without_get_writes(self):
         from app.modules.offline import OfflineRules
 
@@ -218,32 +253,62 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         from app.modules.offline import OfflineRules
 
         self._write_raw(RSS_QB_CATEGORY="rss", RSS_QB_SAVE_PATH="/rss", RSS_GY_TARGET_DIR="123")
-        updates = dict.fromkeys(("TG_QB_CATEGORY", "TG_QB_SAVE_PATH", "OFFLINE_TARGET_DIR"), "")
+        updates = dict.fromkeys(("QB_CATEGORY", "OFFLINE_TARGET_DIR"), "")
         self.assertTrue(set(updates).isdisjoint(config.all_items()))
         self.assertEqual(OfflineRules.from_config().target_dir_id, "123")
         saved = self.client.post("/api/config", json=updates, headers=self.headers)
         self.assertEqual(saved.status_code, 200, saved.text)
         self.assertEqual({key: config.all_items().get(key) for key in updates}, updates)
-        self.assertEqual(config.get("TG_QB_CATEGORY", config.get("RSS_QB_CATEGORY")), "")
-        self.assertEqual(config.get("TG_QB_SAVE_PATH", config.get("RSS_QB_SAVE_PATH")), "")
+        self.assertEqual(config.get("QB_CATEGORY"), "")
         self.assertEqual(OfflineRules.from_config().target_dir_id, "0")
         with patch("app.routes.api.config.set_and_save") as persist:
             repeated = self.client.post("/api/config", json=updates, headers=self.headers)
         self.assertEqual(repeated.status_code, 200, repeated.text)
         persist.assert_not_called()
 
+    def test_unified_qb_category_reads_legacy_values_without_publishing_or_exposing_old_controls(self):
+        from app.modules.rss import capture_rss_qb_runtime_config
+
+        self._write_raw(QB_URL="http://synthetic.invalid", RSS_QB_CATEGORY="rss", TG_QB_SAVE_PATH="/old-tg", RSS_QB_SAVE_PATH="/old-rss")
+        for updates, expected in (({}, "rss"), ({"TG_QB_CATEGORY": "tg"}, "tg"), ({"TG_QB_CATEGORY": ""}, ""), ({"QB_CATEGORY": "unified"}, "unified"), ({"QB_CATEGORY": ""}, "")):
+            with self.subTest(updates=updates):
+                self._write_raw(**updates)
+                before = config.ENV_FILE.read_bytes()
+                payload = self._config()
+                runtime, error = capture_rss_qb_runtime_config()
+                self.assertEqual(error, "")
+                self.assertEqual(payload["QB_CATEGORY"], expected)
+                self.assertEqual(runtime["category"], expected)
+                self.assertNotIn("default_save_path", runtime)
+                self.assertTrue(set(payload).isdisjoint({"TG_QB_CATEGORY", "RSS_QB_CATEGORY", "TG_QB_SAVE_PATH", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD"}))
+                self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_legacy_deployment_category_locks_the_unified_field_until_explicitly_overridden(self):
+        import os
+
+        with patch.dict(os.environ, {"TG_QB_CATEGORY": "deployed"}), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset({"TG_QB_CATEGORY"})):
+            payload = self._config()
+            self.assertEqual(payload["QB_CATEGORY"], "deployed")
+            self.assertIn("QB_CATEGORY", payload["__managed_fields"])
+            response = self.client.post("/api/config", json={"QB_CATEGORY": "edited"}, headers=self.headers)
+            self.assertNotEqual(response.status_code, 200)
+        self._write_raw(QB_CATEGORY="")
+        with patch.dict(os.environ, {"TG_QB_CATEGORY": "deployed"}), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset({"TG_QB_CATEGORY"})):
+            payload = self._config()
+            self.assertEqual(payload["QB_CATEGORY"], "")
+            self.assertNotIn("QB_CATEGORY", payload["__managed_fields"])
+
     def test_failed_publication_restores_missing_keys_without_changing_inheritance(self):
         from app.modules.offline import OfflineRules
 
         self._write_raw(RSS_QB_CATEGORY="rss", RSS_QB_SAVE_PATH="/rss", RSS_GY_TARGET_DIR="123")
         before = config.all_items()
-        updates = {"TG_QB_CATEGORY": "tg", "TG_QB_SAVE_PATH": "/tg", "OFFLINE_TARGET_DIR": "456"}
+        updates = {"QB_CATEGORY": "tg", "OFFLINE_TARGET_DIR": "456"}
         with patch("app.agent.feature_gate.invalidate_agent_runtime_generation", side_effect=RuntimeError("abort")):
             response = self.client.post("/api/config", json=updates, headers=self.headers)
         self.assertEqual(response.status_code, 500, response.text)
         self.assertEqual(config.all_items(), before)
-        self.assertEqual(config.get("TG_QB_CATEGORY", config.get("RSS_QB_CATEGORY")), "rss")
-        self.assertEqual(config.get("TG_QB_SAVE_PATH", config.get("RSS_QB_SAVE_PATH")), "/rss")
+        self.assertEqual(config.get("QB_CATEGORY"), "rss")
         self.assertEqual(OfflineRules.from_config().target_dir_id, "123")
         saved = self.client.post("/api/config", json=updates, headers=self.headers)
         self.assertEqual(saved.status_code, 200, saved.text)

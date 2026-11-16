@@ -1,4 +1,4 @@
-"""RSS 双弹窗真实浏览器回归：纯 Jinja/静态路由，不导入应用或连接后端。
+"""RSS 双弹窗真实浏览器回归：纯 Jinja/静态路由，不启动应用或连接后端。
 
 直接运行：.venv/bin/python tests/test_rss_directory_picker_layer_browser.py -v
 复用既有浏览器定位辅助；所有 HTTP/WebSocket 都在浏览器上下文中拦截。
@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from jinja2 import Environment, FileSystemLoader
+from app.modules.rss_subscription_config import RSS_SUBSCRIPTION_DEFAULTS
 
 try:
     from .test_agent_kernel_browser import _chromium_executable, sync_playwright
@@ -44,7 +45,7 @@ class RssDirectoryPickerLayerBrowserTests(unittest.TestCase):
         env = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         cls.html = env.get_template("rss.html").render(
             active="rss", app_version="offline-test", discovery_enabled=False,
-            rss_defaults={"default_method": "qb", "category": "", "default_save_path": ""},
+            rss_subscription_defaults=RSS_SUBSCRIPTION_DEFAULTS,
             rss_inherited_dir_id="0", rss_inherited_dir_name="根目录",
             agent_enabled=False, csrf_token=lambda: "offline-csrf",
             static_url=lambda name: "/static/" + name,

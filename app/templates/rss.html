@@ -175,8 +175,7 @@
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="f_method">下载目标</label>
-                    <select class="form-select" id="f_method" data-default-method="{{ rss_defaults.default_method }}">
-                        <option value="">继承全局（{{ '光鸭云盘' if rss_defaults.default_method == 'guangya' else 'qBittorrent' }}）</option>
+                    <select class="form-select" id="f_method">
                         <option value="qb">qBittorrent</option>
                         <option value="guangya">光鸭云盘</option>
                     </select>
@@ -184,19 +183,20 @@
             </div>
             <div class="form-group" id="rssQbPathRow">
                 <label class="form-label" for="f_qb_path">qB 本地保存路径</label>
-                <input type="text" class="form-input" id="f_qb_path" placeholder="留空继承全局路径，如 /volume/download/动漫">
-                <p class="subscription-source-field-hint">继承路径：{{ rss_defaults.default_save_path or '由 qB 决定' }} · 分类：{{ rss_defaults.category or '不指定' }}。<a href="/settings#downloads">修改下载默认值</a></p>
+                <input type="text" class="form-input" id="f_qb_path" placeholder="留空使用 qB 默认下载路径">
+                <p class="subscription-source-field-hint">填写时使用此路径；留空使用 qB 自身的下载路径。</p>
             </div>
-            <div class="form-group" id="rssGyTargetRow">
+            <div class="form-group" id="rssGyTargetRow" hidden>
                 <span class="form-label" id="rssGyTargetLabel">光鸭目标目录</span>
                 <input type="hidden" id="f_gy_target">
                 <input type="hidden" id="f_gy_target_name">
-                <div class="rss-target-control"><div class="organize-target-value" id="rssGyTargetValue" data-inherited-name="{{ rss_inherited_dir_name }}" data-inherited-id="{{ rss_inherited_dir_id }}"><strong>继承：{{ rss_inherited_dir_name }}</strong><span>离线转存默认目录 · ID: {{ rss_inherited_dir_id }}</span></div><button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button></div>
+                <div class="rss-target-control"><div class="organize-target-value" id="rssGyTargetValue" data-inherited-name="{{ rss_inherited_dir_name }}" data-inherited-id="{{ rss_inherited_dir_id }}"><strong>{{ ('离线转存默认目录：' ~ rss_inherited_dir_name) if rss_inherited_dir_id else '未配置' }}</strong><span>{{ ('ID: ' ~ rss_inherited_dir_id) if rss_inherited_dir_id else '请选择目录或配置离线转存默认目录' }}</span></div><button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button></div>
+                <p class="subscription-source-field-hint"><a href="/guangya/offline">设置离线转存默认目录</a></p>
             </div>
         </div>
         <div class="rss-modal-footer subscription-modal-footer">
             <label class="rss-modal-enable-toggle">
-                <span class="toggle"><input type="checkbox" id="f_enabled" checked><span class="toggle-slider"></span></span>
+                <span class="toggle"><input type="checkbox" id="f_enabled"><span class="toggle-slider"></span></span>
                 <span class="rss-modal-enable-label">启用订阅</span>
             </label>
             <div class="rss-modal-footer-btns">
@@ -260,6 +260,7 @@
 
 {% block scripts %}
 <script>
+const rssFormDefaults = {{ rss_subscription_defaults | tojson }};
 let editingId = null;
 let subscriptions = [];
 let entries = [];
@@ -320,17 +321,17 @@ function renderRssTarget(id,name){
     document.getElementById('f_gy_target_name').value=name||'';
     const box=document.getElementById('rssGyTargetValue');box.replaceChildren();
     const strong=document.createElement('strong');const span=document.createElement('span');
-    strong.textContent=id?(name||id):`继承：${box.dataset.inheritedName}`;
-    span.textContent=id?id:`离线转存默认目录 · ID: ${box.dataset.inheritedId}`;
+    strong.textContent=id?(name||id):(box.dataset.inheritedId?`离线转存默认目录：${box.dataset.inheritedName}`:'未配置');
+    span.textContent=id?`ID: ${id}`:(box.dataset.inheritedId?`ID: ${box.dataset.inheritedId}`:'请选择目录或配置离线转存默认目录');
     box.append(strong,span);
 }
 
 function updateTargetRows(){
     const field=document.getElementById('f_method');
-    const method=field.value||field.dataset.defaultMethod;
-    document.getElementById('rssQbPathRow').classList.toggle('is-disabled',method==='guangya');
+    const method=field.value;
+    document.getElementById('rssQbPathRow').hidden=method!=='qb';
     document.getElementById('f_qb_path').disabled=method==='guangya';
-    document.getElementById('rssGyTargetRow').classList.toggle('is-disabled',method==='qb');
+    document.getElementById('rssGyTargetRow').hidden=method!=='guangya';
     document.getElementById('pickRssTargetBtn').disabled=method==='qb';
 }
 
@@ -343,6 +344,7 @@ async function rssApiJSON(path,opts={}){
     let payload={};
     try{payload=await response.json();}catch(_){payload={};}
     if(!response.ok||payload?.error)throw Object.assign(new Error(payload?.error||`请求失败（HTTP ${response.status}）`),{
+        code:payload?.code,
         retry_reason:payload?.retry_reason,retry_after:payload?.retry_after,retry_at:payload?.retry_at,
     });
     return payload;
@@ -430,7 +432,7 @@ async function loadSubs({preserve=true}={}){
         list.innerHTML=rows.map(s=>{
             const urls=(s.urls||'').split('\n').filter(Boolean);
             const en=Boolean(s.enabled);
-            const targetText=s.download_method==='qb'?'qBittorrent':(s.download_method==='guangya'?'光鸭云盘':'继承全局');
+            const targetText=s.download_method==='guangya'?'光鸭云盘':'qBittorrent';
             const intervalText=s.refresh_interval_minutes?`每 ${s.refresh_interval_minutes} 分钟`:'手动刷新';
             const actionText=s.action==='download'?'自动离线':'仅订阅';
             return `<div class="rss-sub-card">
@@ -483,37 +485,21 @@ function openSubForm(id,trigger){
     rssTargetPicker=null;
     editingId = id||null;
     document.getElementById('modalTitle').textContent = id?'编辑订阅源':'新建订阅源';
-    document.getElementById('f_name').value='';
-    document.getElementById('f_urls').value='';
-    document.getElementById('f_exclude').value='';
-    document.getElementById('f_action').value='subscribe';
+    const initial={...rssFormDefaults,...(id?subscriptions.find(item=>item.id===id):{})};
+    for(const [field,key] of Object.entries({f_name:'name',f_urls:'urls',f_exclude:'exclude_keywords',f_action:'action',f_method:'download_method',f_qb_path:'qb_save_path'})){
+        document.getElementById(field).value=initial[key];
+    }
     const intervalSelect=document.getElementById('f_interval');
     intervalSelect.querySelectorAll('[data-current-interval]').forEach(option=>option.remove());
-    intervalSelect.value='0';
-    document.getElementById('f_method').value='';
-    document.getElementById('f_qb_path').value='';
-    renderRssTarget('','');
-    document.getElementById('f_enabled').checked=true;
-    if(id){
-        const s=subscriptions.find(x=>x.id===id);
-        if(s){
-            document.getElementById('f_name').value=s.name;
-            document.getElementById('f_urls').value=s.urls;
-            document.getElementById('f_exclude').value=s.exclude_keywords||'';
-            document.getElementById('f_action').value=s.action;
-            const interval=String(s.refresh_interval_minutes||0);
-            if(!Array.from(intervalSelect.options).some(option=>option.value===interval)){
-                const option=new Option(`每 ${interval} 分钟（当前设置）`,interval);
-                option.dataset.currentInterval='true';
-                intervalSelect.add(option);
-            }
-            intervalSelect.value=interval;
-            document.getElementById('f_method').value=s.download_method||'';
-            document.getElementById('f_qb_path').value=s.qb_save_path||'';
-            renderRssTarget(s.gy_target_dir||'',s.gy_target_dir_name||'');
-            document.getElementById('f_enabled').checked=s.enabled;
-        }
+    const interval=String(initial.refresh_interval_minutes);
+    if(!Array.from(intervalSelect.options).some(option=>option.value===interval)){
+        const option=new Option(`每 ${interval} 分钟（当前设置）`,interval);
+        option.dataset.currentInterval='true';
+        intervalSelect.add(option);
     }
+    intervalSelect.value=interval;
+    renderRssTarget(initial.gy_target_dir,initial.gy_target_dir_name);
+    document.getElementById('f_enabled').checked=Boolean(initial.enabled);
     updateTargetRows();
     const modal=document.getElementById('subModal');
     modal.setAttribute('aria-hidden','false');
@@ -556,7 +542,14 @@ async function saveSub(){
     try{
         await rssApiJSON(editingId?'/api/rss/subscriptions/'+editingId:'/api/rss/subscriptions',{method:editingId?'PUT':'POST',body:JSON.stringify(body)});
         closeSubForm();await loadSubs();
-    }catch(error){await appAlert({type:'error',title:'订阅保存失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
+    }catch(error){
+        if(error.code==='qb_not_configured'){
+            const configure=await appConfirm({title:'未配置 qBittorrent',message:'请先配置 qBittorrent 连接，再保存此订阅。也可以返回改选光鸭云盘。',confirmText:'前往配置',cancelText:'返回修改',icon:'settings',trigger:btn});
+            if(configure)window.location.assign('/settings#downloads');
+        }else{
+            await appAlert({type:'error',title:'订阅保存失败',message:error.message||'请求失败，请检查网络和服务状态。'});
+        }
+    }
     finally{setRssButtonBusy(btn,false);}
 }
 

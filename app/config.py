@@ -149,6 +149,10 @@ def get(key: str, default: str = "") -> str:
         loaded = _ensure_loaded()
     if key in loaded:
         return loaded[key]
+    # 旧渠道分类只作为读取边界的迁移来源；所有下载入口统一读取 QB_CATEGORY。
+    # 新键（包括显式空值）优先，历史值按原 Bot → RSS 的优先级收敛。
+    if key == "QB_CATEGORY":
+        return get("TG_QB_CATEGORY", get("RSS_QB_CATEGORY", default))
     if key == "STRM_ROOT" and default == "":
         return str(PATHS.strm_dir)
     return default
@@ -996,6 +1000,11 @@ def update_env_file(
 def has_external_override(key: str) -> bool:
     """判断配置项是否由进程启动环境显式覆盖；不返回覆盖值。"""
     normalized = (key or "")
+    if normalized == "QB_CATEGORY":
+        for candidate in ("QB_CATEGORY", "TG_QB_CATEGORY", "RSS_QB_CATEGORY"):
+            if os.environ.get(candidate) or candidate in _ensure_loaded():
+                return candidate in _STARTUP_ENV_OVERRIDES and bool(os.environ.get(candidate))
+        return False
     return normalized in _STARTUP_ENV_OVERRIDES and bool(os.environ.get(normalized))
 
 

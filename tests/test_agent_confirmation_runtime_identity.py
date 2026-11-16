@@ -23,8 +23,8 @@ from tests.test_agent_kernel_core import ScriptedModel
 from tests.test_agent_kernel_existing_ports import context_for
 
 OWNER = "webk:v1:" + "a" * 64
-OLD = {"QB_URL": "http://old-qb.invalid", "TG_QB_SAVE_PATH": "/old-target", "TG_QB_CATEGORY": "old"}
-NEW = {"QB_URL": "http://new-qb.invalid", "TG_QB_SAVE_PATH": "/new-target", "TG_QB_CATEGORY": "new"}
+OLD = {"QB_URL": "http://old-qb.invalid", "QB_CATEGORY": "old"}
+NEW = {"QB_URL": "http://new-qb.invalid", "QB_CATEGORY": "new"}
 
 
 class RecordingQB:
@@ -169,7 +169,7 @@ def test_confirmed_destination_survives_restart_only_when_authority_is_unchanged
                 completed = [event for event in result["events"] if event["type"] == "effect.completed"]
                 if change == "unchanged":
                     assert len(completed) == 1
-                    assert result["calls"] == [{"url": NEW["QB_URL"], "path": NEW["TG_QB_SAVE_PATH"], "category": NEW["TG_QB_CATEGORY"]}]
+                    assert result["calls"] == [{"url": NEW["QB_URL"], "path": "", "category": NEW["QB_CATEGORY"]}]
                 else:
                     assert not completed
                     assert result["calls"] == []

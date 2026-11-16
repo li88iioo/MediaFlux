@@ -2168,6 +2168,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
 
     def test_watchlist_detail_entry_keeps_cards_and_subscription_list_intact(self):
         from jinja2 import Environment, FileSystemLoader
+        from app.modules.rss_subscription_config import RSS_SUBSCRIPTION_DEFAULTS
 
         card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
                 "title": "已订阅电影", "state": "watchlisted", "tmdb_id": "550"}
@@ -2188,7 +2189,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         html = templates.get_template("rss.html").render(
             active="rss", discovery_enabled=True, resource_results_enabled=False,
-            rss_defaults={"default_method": "qb", "category": "", "default_save_path": ""},
+            rss_subscription_defaults=RSS_SUBSCRIPTION_DEFAULTS,
             rss_inherited_dir_id="0", rss_inherited_dir_name="根目录",
             csrf_token=lambda: "test", url_for=lambda name: "/" + name.split(".")[-1],
             static_url=lambda path: "/static/" + path,

@@ -239,91 +239,105 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertFalse(self._checked(settings, "STRM_NOTIFY_ENABLED"), "通知移至设置页，显式空仍为关闭")
         self.assertEqual(self.config_posts, [])
 
-    def test_rss_inherited_guangya_directory_matches_offline_default(self):
-        # 展示必须与执行规则一致；旧目录键仍生效，显式空或 0 优先于历史键和残留名称。
+    def test_rss_cloud_target_states_follow_offline_configuration(self):
         for values, name, directory_id in (
-            ({}, "根目录", "0"),
+            ({}, "未配置", ""),
             ({"RSS_GY_TARGET_DIR": "123"}, "默认目录", "123"),
-            ({"OFFLINE_TARGET_DIR": "1939382533671788571", "OFFLINE_TARGET_DIR_NAME": "离线"},
-             "离线", "1939382533671788571"),
-            ({"OFFLINE_TARGET_DIR": "", "RSS_GY_TARGET_DIR": "123"}, "根目录", "0"),
+            ({"OFFLINE_TARGET_DIR": "456", "OFFLINE_TARGET_DIR_NAME": "离线"}, "离线", "456"),
+            ({"OFFLINE_TARGET_DIR": "", "RSS_GY_TARGET_DIR": "123"}, "未配置", ""),
             ({"OFFLINE_TARGET_DIR": "0", "OFFLINE_TARGET_DIR_NAME": "旧目录"}, "根目录", "0"),
         ):
             with self.subTest(values=values):
                 config.set_and_save(dict.fromkeys(("RSS_GY_TARGET_DIR", "OFFLINE_TARGET_DIR", "OFFLINE_TARGET_DIR_NAME"), None))
-                if values:
-                    self._write(**values)
+                self._write(**values)
                 page = self._open("/rss#rss")
                 page.locator(".subscription-rss-create").first.click()
+                page.locator("#f_method").select_option("guangya")
+                self.assertFalse(page.locator("#rssQbPathRow").is_visible())
                 target = page.locator("#rssGyTargetValue")
-                target.wait_for(state="visible")
-                self.assertEqual(
-                    (target.locator("strong").inner_text(), target.locator("span").inner_text()),
-                    (f"继承：{name}", f"离线转存默认目录 · ID: {directory_id}"),
-                )
-                self.assertEqual(page.locator("#f_gy_target").input_value(), "", "展示继承值不能将订阅固定到当前目录")
+                self.assertTrue(target.is_visible())
+                self.assertEqual(target.locator("strong").inner_text(), f"离线转存默认目录：{name}" if directory_id else "未配置")
+                self.assertEqual(page.locator("#f_gy_target").input_value(), "", "展示默认目录不能将其固定到订阅")
+                page.evaluate("renderRssTarget('789','手选目录')")
+                self.assertEqual(target.locator("strong").inner_text(), "手选目录")
+                self.assertEqual(page.locator("#f_gy_target").input_value(), "789")
                 page.close()
         self.assertEqual(self.config_posts, [])
 
-    def test_download_defaults_preserve_channel_values_and_inheritance_on_sparse_save(self):
+    def test_download_settings_have_one_category_and_no_global_path_or_target(self):
         for width in (1280, 390):
             with self.subTest(width=width):
-                config.set_and_save({"TG_QB_CATEGORY": None, "TG_QB_SAVE_PATH": None})
-                self._write(RSS_DOWNLOAD_METHOD="guangya", RSS_QB_CATEGORY="rss", RSS_QB_SAVE_PATH="/rss")
+                config.set_and_save({"QB_CATEGORY": None, "TG_QB_CATEGORY": None})
+                self._write(RSS_QB_CATEGORY="rss-old", RSS_QB_SAVE_PATH="/rss-old", TG_QB_SAVE_PATH="/tg-old")
                 page = self._open("/settings#downloads")
                 page.set_viewport_size({"width": width, "height": 900})
                 page.locator('[data-settings-target="downloads"]').click()
-                field = lambda key: page.locator(f'[data-key="{key}"]')  # noqa: E731
-                self.assertEqual(field("RSS_DOWNLOAD_METHOD").input_value(), "guangya")
-                self.assertEqual(field("TG_QB_CATEGORY").input_value(), "rss")
-                self.assertEqual(field("TG_QB_SAVE_PATH").input_value(), "/rss")
-                field("RSS_QB_CATEGORY").fill("rss-new")
-                field("RSS_QB_SAVE_PATH").fill("/rss-new")
-                before = len(self.config_posts)
-                page.locator('#settings-panel-downloads [data-save-settings]').click()
-                page.wait_for_function("document.querySelector('#settings-panel-downloads [data-settings-state]')?.classList.contains('is-success')")
-                self.assertEqual(self.config_posts[before:], [(200, {"RSS_QB_CATEGORY": "rss-new", "RSS_QB_SAVE_PATH": "/rss-new"})])
-                self.assertNotIn("TG_QB_CATEGORY", config.all_items())
-                self.assertNotIn("TG_QB_SAVE_PATH", config.all_items())
-                self.assertEqual(field("TG_QB_CATEGORY").input_value(), "rss-new")
-                self.assertEqual(page.locator("#qbCategoryPreview").inner_text(), "rss-new")
-                self.assertEqual(field("TG_QB_SAVE_PATH").input_value(), "/rss-new")
-                field("TG_QB_CATEGORY").fill("tg")
-                field("TG_QB_SAVE_PATH").fill("")
-                before = len(self.config_posts)
-                page.locator('#settings-panel-downloads [data-save-settings]').click()
-                page.wait_for_function("document.querySelector('#settings-panel-downloads [data-settings-state]')?.classList.contains('is-success')")
-                self.assertEqual(self.config_posts[before:], [(200, {"TG_QB_CATEGORY": "tg", "TG_QB_SAVE_PATH": ""})])
-                page.reload()
-                page.wait_for_function(READY["/settings"])
-                self.assertEqual(field("TG_QB_CATEGORY").input_value(), "tg")
-                self.assertEqual(field("TG_QB_SAVE_PATH").input_value(), "")
-                self.assertEqual(config.get("RSS_QB_CATEGORY"), "rss-new")
+                field = page.locator('[data-key="QB_CATEGORY"]')
+                self.assertEqual(field.input_value(), "rss-old")
+                for removed in ("TG_QB_CATEGORY", "RSS_QB_CATEGORY", "TG_QB_SAVE_PATH", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD"):
+                    self.assertEqual(page.locator(f'[data-key="{removed}"]').count(), 0)
+                for category in ("shared", ""):
+                    field.fill(category)
+                    before = len(self.config_posts)
+                    page.locator('#settings-panel-downloads [data-save-settings]').click()
+                    page.wait_for_function("document.querySelector('#settings-panel-downloads [data-settings-state]')?.classList.contains('is-success')")
+                    self.assertEqual(self.config_posts[before:], [(200, {"QB_CATEGORY": category})])
+                    page.reload()
+                    page.wait_for_function(READY["/settings"])
+                    self.assertEqual(field.input_value(), category)
+                self.assertEqual(config.get("RSS_QB_CATEGORY"), "rss-old", "旧值保留但不能覆盖新键显式空值")
                 self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
                 page.close()
-        with patch.object(config, "has_external_override", side_effect=lambda key: key == "RSS_QB_CATEGORY"):
+        with patch.object(config, "has_external_override", side_effect=lambda key: key == "QB_CATEGORY"):
             page = self._open("/settings#downloads")
-        self.assertTrue(page.locator('[data-key="RSS_QB_CATEGORY"]').is_disabled())
-        self.assertFalse(page.locator('[data-key="TG_QB_CATEGORY"]').is_disabled())
+        self.assertTrue(page.locator('[data-key="QB_CATEGORY"]').is_disabled())
 
-    def test_rss_inheritance_displays_effective_method_and_preserves_overrides(self):
-        for method, label in (("guangya", "光鸭云盘"), ("qb", "qBittorrent"), ("invalid-old-value", "qBittorrent")):
-            with self.subTest(method=method):
-                self._write(RSS_DOWNLOAD_METHOD=method, RSS_QB_CATEGORY="rss", RSS_QB_SAVE_PATH="/rss")
-                page = self._open("/rss#rss")
-                page.locator(".subscription-rss-create").first.click()
-                self.assertEqual(page.locator('#f_method option:checked').inner_text(), f"继承全局（{label}）")
-                self.assertIn("/rss", page.locator("#rssQbPathRow").inner_text())
-                self.assertIn("rss", page.locator("#rssQbPathRow").inner_text())
-                self.assertEqual(page.locator("#f_method").input_value(), "")
-                self.assertEqual(page.locator("#f_qb_path").input_value(), "")
-                self.assertEqual(page.locator("#f_qb_path").is_disabled(), method == "guangya")
-                page.locator("#f_method").select_option("qb")
-                page.locator("#f_qb_path").fill("/subscription")
-                page.locator("#f_method").select_option("guangya")
-                page.locator("#f_method").select_option("qb")
-                self.assertEqual(page.locator("#f_qb_path").input_value(), "/subscription")
-                page.close()
+    def test_rss_explicit_targets_hide_unrelated_fields_and_keep_saved_paths(self):
+        from app.repositories import rss as rss_repo
+        self._write(RSS_DOWNLOAD_METHOD="guangya", RSS_QB_SAVE_PATH="/obsolete", QB_URL="")
+        legacy_id = rss_repo.add_rss_subscription("旧订阅", "https://example.com/rss", download_method="")
+        for width in (1280, 390):
+            page = self._open("/rss#rss")
+            page.set_viewport_size({"width": width, "height": 900})
+            page.locator(".subscription-rss-create").first.click()
+            self.assertEqual(page.locator("#f_method option").count(), 2)
+            self.assertEqual(page.locator("#f_method").input_value(), "qb", "新订阅不再继承历史全局目标")
+            self.assertTrue(page.locator("#rssQbPathRow").is_visible())
+            self.assertFalse(page.locator("#rssGyTargetRow").is_visible())
+            self.assertNotIn("未配置 qBittorrent", page.locator("#rssQbPathRow").inner_text())
+            self.assertEqual(page.locator("#f_qb_path").input_value(), "")
+            page.locator("#f_qb_path").fill("/subscription")
+            page.locator("#f_method").select_option("guangya")
+            self.assertFalse(page.locator("#rssQbPathRow").is_visible())
+            page.locator("#f_method").select_option("qb")
+            self.assertEqual(page.locator("#f_qb_path").input_value(), "/subscription")
+            page.evaluate("closeSubForm()")
+            page.evaluate("id=>editSub(id)", legacy_id)
+            self.assertEqual(page.locator("#f_method").input_value(), "guangya", "历史继承订阅按原有效目标回显")
+            page.close()
+
+    def test_rss_save_without_qb_opens_configuration_dialog_and_keeps_draft(self):
+        from app.repositories import rss as rss_repo
+
+        self._write(QB_URL="")
+        page = self._open("/rss#rss")
+        page.locator(".subscription-rss-create").first.click()
+        page.locator("#f_name").fill("待配置订阅")
+        page.locator("#f_urls").fill("https://example.com/rss")
+        page.locator("#f_qb_path").fill("/download/custom")
+        page.locator("#saveBtn").click()
+        page.locator("#appConfirmModal").wait_for(state="visible")
+        self.assertEqual(page.locator("#appConfirmTitle").inner_text(), "未配置 qBittorrent")
+        self.assertEqual(page.locator("#appConfirmSubmit").inner_text(), "前往配置")
+        self.assertEqual(rss_repo.list_rss_subscriptions(), [])
+        page.locator("#appConfirmCancel").click()
+        self.assertEqual(page.locator("#f_name").input_value(), "待配置订阅")
+        self.assertEqual(page.locator("#f_qb_path").input_value(), "/download/custom")
+        page.wait_for_function("!document.getElementById('saveBtn').disabled")
+        page.locator("#saveBtn").click()
+        page.locator("#appConfirmSubmit").click()
+        page.wait_for_url(ORIGIN + "/settings#downloads")
+        self.assertEqual(rss_repo.list_rss_subscriptions(), [])
 
     def test_media_agent_switch_greys_dependents_and_keeps_their_values(self):
         self._write(

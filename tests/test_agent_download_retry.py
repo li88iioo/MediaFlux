@@ -79,7 +79,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
                     download_requests_repo.update_download_request(request_id, **{
                         change: {"torrent_data": b"changed", "qb_status": "outcome_unknown"}.get(change, "changed"),
                     })
-                with patch.dict(os.environ, {"TG_QB_SAVE_PATH": "/changed"} if change == "config" else {}), \
+                with patch.dict(os.environ, {"QB_CATEGORY": "changed"} if change == "config" else {}), \
                      patch.object(dispatcher, "_submit_qb") as backend, \
                      self.assertRaises(dispatcher.DownloadRetryChanged):
                     dispatcher.resubmit_download_request(

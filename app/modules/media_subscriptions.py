@@ -32,6 +32,7 @@ from app.logger import get_logger
 from app.modules.episode_resource_ranking import rank_episode_search
 from app.modules.media_identity import build_media_key
 from app.repositories.media_subscriptions import (
+    MEDIA_SUBSCRIPTION_DEFAULTS,
     MediaSubscriptionError,
     media_subscription_config_snapshot,
     list_media_subscriptions_by_identity,
@@ -153,7 +154,7 @@ def _strict_bool(value: Any, *, default: bool) -> bool:
 
 
 def _provider_identity(provider: Any, external_id: Any, tmdb_id: str) -> tuple[str, str]:
-    normalized_provider = _choice(provider, DISCOVERY_PROVIDERS, "tmdb")
+    normalized_provider = _choice(provider, DISCOVERY_PROVIDERS, MEDIA_SUBSCRIPTION_DEFAULTS["provider"])
     normalized_external = str(external_id or tmdb_id).strip()
     if not normalized_external or len(normalized_external) > 128:
         raise MediaSubscriptionError("外部媒体 ID 无效")
@@ -302,7 +303,7 @@ def _subscription_workflow(row: Any, aggregate: Mapping[str, Any] | None = None)
     )
     missing_count = int(row["missing_count"] or 0)
     status = str(row["status"] or "new")
-    action = str(row["action"] or "confirm")
+    action = str(row["action"] or MEDIA_SUBSCRIPTION_DEFAULTS["action"])
     if workflow["manual_review_count"]:
         primary = "manual_review"
     elif workflow["processing_count"]:
@@ -416,7 +417,12 @@ def subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     allowed = {"provider", "external_id", "media_type", "season", "check_interval_minutes", "action", "download_target", "sites", "enabled"}
     if not isinstance(arguments, dict) or set(arguments) - allowed or not {"provider", "external_id", "media_type"} <= arguments.keys():
         raise MediaSubscriptionError("创建订阅需要精确来源、媒体 ID 和媒体类型")
-    values = {"season": None, "check_interval_minutes": 4320, "action": "confirm", "download_target": "guangya", "sites": [], "enabled": True, **arguments}
+    values = {
+        **{key: MEDIA_SUBSCRIPTION_DEFAULTS[key] for key in (
+            "check_interval_minutes", "action", "download_target", "sites", "enabled",
+        )},
+        "season": None, **arguments,
+    }
     for key, choices in (("provider", DISCOVERY_PROVIDERS), ("media_type", _ALLOWED_MEDIA_TYPES)):
         values[key] = _choice(values[key], choices, "")
     identity = values["external_id"]
@@ -428,7 +434,7 @@ def subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         raise MediaSubscriptionError("season 只支持剧集的 1 到 100 整数季度")
     interval = values["check_interval_minutes"]
     if interval is None:
-        interval = 4320
+        interval = MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"]
     if isinstance(interval, bool) or not isinstance(interval, int):
         raise MediaSubscriptionError("check_interval_minutes 必须是整数")
     values["check_interval_minutes"] = normalize_subscription_interval(interval)
@@ -556,7 +562,7 @@ class MediaSubscriptionService:
             if tmdb_id != expected_snapshot["tmdb_id"]:
                 raise MediaSubscriptionError("媒体身份映射已变化，请重新预检", code="conflict")
             payload = {key: value for key, value in args.items() if key != "season"}
-            payload.update(tmdb_id=tmdb_id, monitor_mode="selected" if args["season"] is not None else "missing",
+            payload.update(tmdb_id=tmdb_id, monitor_mode="selected" if args["season"] is not None else MEDIA_SUBSCRIPTION_DEFAULTS["monitor_mode"],
                            seasons=[args["season"]] if args["season"] is not None else [], include_specials=False)
             result = run_indexer_awaitable_sync(self.create_subscription(payload, identity_confirmed=args["provider"] != "tmdb",
                 expected_snapshot=expected_snapshot["identity"], check_cancelled=check_cancelled), timeout_seconds=35.0)
@@ -590,16 +596,16 @@ class MediaSubscriptionService:
     ) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise MediaSubscriptionError("订阅参数必须是 JSON 对象")
-        media_type = _choice(data.get("media_type"), _ALLOWED_MEDIA_TYPES, "tv")
+        media_type = _choice(data.get("media_type"), _ALLOWED_MEDIA_TYPES, MEDIA_SUBSCRIPTION_DEFAULTS["media_type"])
         tmdb_id = _numeric_tmdb_id(data.get("tmdb_id"))
-        monitor_mode = _choice(data.get("monitor_mode"), _ALLOWED_MONITOR_MODES, "missing")
-        action = _choice(data.get("action"), _ALLOWED_ACTIONS, "confirm")
-        target = _choice(data.get("download_target"), DOWNLOAD_TARGETS, "guangya")
-        interval = normalize_subscription_interval(data.get("check_interval_minutes", 4320))
+        monitor_mode = _choice(data.get("monitor_mode"), _ALLOWED_MONITOR_MODES, MEDIA_SUBSCRIPTION_DEFAULTS["monitor_mode"])
+        action = _choice(data.get("action"), _ALLOWED_ACTIONS, MEDIA_SUBSCRIPTION_DEFAULTS["action"])
+        target = _choice(data.get("download_target"), DOWNLOAD_TARGETS, MEDIA_SUBSCRIPTION_DEFAULTS["download_target"])
+        interval = normalize_subscription_interval(data.get("check_interval_minutes"))
         seasons = normalize_subscription_seasons(data.get("seasons"))
         sites = _normalize_sites(data.get("sites"))
-        include_specials = _strict_bool(data.get("include_specials"), default=False)
-        enabled = _strict_bool(data.get("enabled"), default=True)
+        include_specials = _strict_bool(data.get("include_specials"), default=MEDIA_SUBSCRIPTION_DEFAULTS["include_specials"])
+        enabled = _strict_bool(data.get("enabled"), default=MEDIA_SUBSCRIPTION_DEFAULTS["enabled"])
         provider, external_id = _provider_identity(
             data.get("provider"), data.get("external_id"), tmdb_id
         )
@@ -820,17 +826,17 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError(f"包含不支持的订阅参数：{', '.join(sorted(unknown))}")
         fields: dict[str, Any] = {}
         if "enabled" in data:
-            fields["enabled"] = int(_strict_bool(data["enabled"], default=True))
+            fields["enabled"] = int(_strict_bool(data["enabled"], default=MEDIA_SUBSCRIPTION_DEFAULTS["enabled"]))
         if "monitor_mode" in data:
-            fields["monitor_mode"] = _choice(data["monitor_mode"], _ALLOWED_MONITOR_MODES, "missing")
+            fields["monitor_mode"] = _choice(data["monitor_mode"], _ALLOWED_MONITOR_MODES, MEDIA_SUBSCRIPTION_DEFAULTS["monitor_mode"])
         if "seasons" in data:
             fields["seasons_json"] = _dumps(normalize_subscription_seasons(data["seasons"]))
         if "include_specials" in data:
-            fields["include_specials"] = int(_strict_bool(data["include_specials"], default=False))
+            fields["include_specials"] = int(_strict_bool(data["include_specials"], default=MEDIA_SUBSCRIPTION_DEFAULTS["include_specials"]))
         if "action" in data:
-            fields["action"] = _choice(data["action"], _ALLOWED_ACTIONS, "confirm")
+            fields["action"] = _choice(data["action"], _ALLOWED_ACTIONS, MEDIA_SUBSCRIPTION_DEFAULTS["action"])
         if "download_target" in data:
-            fields["download_target"] = _choice(data["download_target"], DOWNLOAD_TARGETS, "guangya")
+            fields["download_target"] = _choice(data["download_target"], DOWNLOAD_TARGETS, MEDIA_SUBSCRIPTION_DEFAULTS["download_target"])
         if "sites" in data:
             fields["sites_json"] = _dumps(_normalize_sites(data["sites"]))
         if "check_interval_minutes" in data:
@@ -875,7 +881,7 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError("该媒体订阅正在检查或已暂停", status_code=409, code="busy")
         row = media_subscriptions_repo.get_media_subscription(subscription_id)
         assert row is not None
-        interval = int(row["check_interval_minutes"] or 4320)
+        interval = int(row["check_interval_minutes"] or MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"])
         revision = int(row["revision"] or 1)
         run_token = _ACTIVE_CHECK_RUN_ID.set(run_id)
         try:
@@ -1144,7 +1150,7 @@ class MediaSubscriptionService:
         include_specials = bool(row["include_specials"])
         if not include_specials:
             available = [season for season in available if season > 0]
-        mode = str(row["monitor_mode"] or "missing")
+        mode = str(row["monitor_mode"] or MEDIA_SUBSCRIPTION_DEFAULTS["monitor_mode"])
         selected = [int(value) for value in _loads(row["seasons_json"], [])]
         if mode == "selected":
             available = [season for season in available if season in selected]
@@ -1526,8 +1532,8 @@ class MediaSubscriptionService:
         media_type: str = "tv",
         search_status: str = "",
     ) -> dict[str, Any]:
-        mode = str(row["action"] or "confirm")
-        target = str(row["download_target"] or "guangya")
+        mode = str(row["action"] or MEDIA_SUBSCRIPTION_DEFAULTS["action"])
+        target = str(row["download_target"] or MEDIA_SUBSCRIPTION_DEFAULTS["download_target"])
         mode_label = {
             "notify": "仅通知",
             "confirm": "确认后提交",
@@ -1876,7 +1882,7 @@ class MediaSubscriptionService:
         if not bool(subscription["enabled"]):
             raise MediaSubscriptionError("媒体订阅已暂停", status_code=409, code="paused")
         revision = int(subscription["revision"] or 1)
-        normalized_target = _choice(target or subscription["download_target"], DOWNLOAD_TARGETS, "guangya")
+        normalized_target = _choice(target or subscription["download_target"], DOWNLOAD_TARGETS, MEDIA_SUBSCRIPTION_DEFAULTS["download_target"])
         if require_active_check:
             self._ensure_active_check(int(subscription["id"]), revision, cancel_event)
         elif cancel_event is not None and cancel_event.is_set():

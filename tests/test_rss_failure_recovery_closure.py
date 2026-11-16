@@ -658,13 +658,13 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         return (patch("app.modules.rss.get_many", side_effect=get_many),
                 patch.object(dispatcher, "get", side_effect=get))
 
-    def test_qb_retry_keeps_subscription_directory_and_rss_category(self):
+    def test_qb_retry_keeps_subscription_directory_and_shared_category(self):
         sid, eid, _ = self.pending()
         rss_repo.update_rss_subscription(sid, {"qb_save_path": "/synthetic/subscription"})
         values = {
             "QB_URL": "http://synthetic.invalid",
             "RSS_QB_SAVE_PATH": "/synthetic/rss-default",
-            "RSS_QB_CATEGORY": "rss-category",
+            "QB_CATEGORY": "shared-category",
             "TG_QB_CATEGORY": "tg-category",
             "TG_QB_SAVE_PATH": "/synthetic/tg-default",
         }
@@ -683,16 +683,16 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
             self.assertTrue(engine.download(eid)["existing"])
         routes = [(call.kwargs["save_path"], call.kwargs["category"])
                   for call in qb.add_torrent_detailed.call_args_list]
-        assert routes == [("/synthetic/subscription", "rss-category")] * 2, routes
+        assert routes == [("/synthetic/subscription", "shared-category")] * 2, routes
 
-    def test_qb_inherits_rss_default_path_on_live_and_frozen_entries(self):
-        """订阅未指定路径时，普通 / 批量 / 定时与冻结确认入口一致：路径与分类用 RSS 默认，不借 TG 默认。"""
+    def test_qb_leaves_empty_path_to_downloader_on_live_and_frozen_entries(self):
+        """订阅未指定路径时不读取旧渠道全局路径，普通/批量/冻结入口都用统一分类。"""
         from app.modules.rss import capture_rss_qb_runtime_config
 
         values = {
             "QB_URL": "http://synthetic.invalid",
             "RSS_QB_SAVE_PATH": "/synthetic/rss-default",
-            "RSS_QB_CATEGORY": "rss-category",
+            "QB_CATEGORY": "shared-category",
             "TG_QB_CATEGORY": "tg-category",
             "TG_QB_SAVE_PATH": "/synthetic/tg-default",
         }
@@ -712,7 +712,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         self.assertTrue(single["ok"] and batch["success_count"] == 1 and frozen["ok"], (single, batch, frozen))
         routes = [(call.kwargs["save_path"], call.kwargs["category"])
                   for call in qb.add_torrent_detailed.call_args_list]
-        assert routes == [("/synthetic/rss-default", "rss-category")] * 3, routes
+        assert routes == [("", "shared-category")] * 3, routes
 
     def test_qb_retry_keeps_frozen_config_when_live_config_changes(self):
         _sid, eid, _ = self.pending()

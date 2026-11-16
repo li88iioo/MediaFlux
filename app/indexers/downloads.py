@@ -259,8 +259,8 @@ def preflight_indexer_download(service, result_id: str, target: str, *, scope: s
     destination = indexer_download_destination(item, target)
     if target in {"qb", "both"}:
         destination.update(
-            qb_save_path=config.get("TG_QB_SAVE_PATH", config.get("RSS_QB_SAVE_PATH", "")) or "",
-            qb_category=config.get("TG_QB_CATEGORY", config.get("RSS_QB_CATEGORY", "")) or "",
+            qb_save_path="",
+            qb_category=config.get("QB_CATEGORY", ""),
         )
     routing = {}
     if target in {"guangya", "both"} and not destination.get("gy_target_dir"):

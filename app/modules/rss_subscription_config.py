@@ -7,9 +7,16 @@ from typing import Any
 
 from app.logger import get_logger
 from app.modules.media_identity import normalize_tmdb_id
-from app.modules.rss import validate_rss_source_urls
+from app.modules.rss import rss_download_defaults, validate_rss_source_urls
 
 logger = get_logger(__name__)
+
+RSS_SUBSCRIPTION_DEFAULTS = {
+    "name": "", "urls": "", "exclude_keywords": "", "refresh_cron": "",
+    "parser": "mikan", "action": "subscribe", "enabled": True,
+    "refresh_interval_minutes": 0, "download_method": "qb", "qb_save_path": "",
+    "gy_target_dir": "", "gy_target_dir_name": "",
+}
 
 
 class RSSSubscriptionConfigError(ValueError):
@@ -146,6 +153,7 @@ def normalize_rss_subscription_create(
     unknown = set(data) - _CREATE_FIELDS
     if unknown:
         raise RSSSubscriptionConfigError("订阅配置包含未支持字段")
+    data = {**RSS_SUBSCRIPTION_DEFAULTS, **data}
     name = _text(data.get("name"), field="name", maximum=_MAX_NAME, required=True)
     urls = validate_rss_source_urls(
         _text(data.get("urls"), field="urls", maximum=8000, required=True)
@@ -161,6 +169,7 @@ def normalize_rss_subscription_create(
     ).casefold()
     if method not in _ALLOWED_DOWNLOAD_METHODS:
         raise RSSSubscriptionConfigError("下载目标无效")
+    method = method or rss_download_defaults()["default_method"]
     interval = _integer(
         data.get("refresh_interval_minutes", 0),
         field="refresh_interval_minutes",
@@ -253,7 +262,7 @@ def normalize_rss_subscription_update(
         ).casefold()
         if method not in _ALLOWED_DOWNLOAD_METHODS:
             raise RSSSubscriptionConfigError("下载目标无效")
-        fields["download_method"] = method
+        fields["download_method"] = method or rss_download_defaults()["default_method"]
     if "enabled" in data:
         fields["enabled"] = 1 if _bool(data["enabled"], field="enabled") else 0
     if "refresh_interval_minutes" in data:

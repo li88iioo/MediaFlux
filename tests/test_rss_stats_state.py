@@ -342,7 +342,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         unknown = {"ok": False, "status": "outcome_unknown", "summary": "写入结果无法核验", "error": "先查询状态，不要重复提交", "data": {"subscription_id": sid}}
         with patch.object(rss_api, "require_api_login"), patch.object(rss_api, "apply_change", return_value=unknown):
             for operation in (
-                lambda: rss_api.create_sub(Request({"type": "http"}), {"name": "new", "urls": "https://example.invalid/new"}),
+                lambda: rss_api.create_sub(Request({"type": "http"}), {"name": "new", "urls": "https://example.invalid/new", "download_method": "guangya"}),
                 lambda: rss_api.update_sub(sid, Request({"type": "http"}), {"name": "new"}),
                 lambda: rss_api.delete_sub(sid, Request({"type": "http"})),
             ):
@@ -365,6 +365,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                     with self.subTest(initial=initial, updated=updated):
                         created = client.post("/api/rss/subscriptions", headers=headers, json={
                             "name": f"interval-{initial}", "urls": "https://example.invalid/feed",
+                            "download_method": "guangya",
                             "refresh_interval_minutes": initial,
                         })
                         self.assertEqual(created.status_code, 200, created.text)
@@ -476,6 +477,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                     json={
                         "name": "new-cron",
                         "urls": "https://example.invalid/new",
+                        "download_method": "guangya",
                         "refresh_cron": "0 4 * * *",
                     },
                 )
@@ -510,6 +512,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                     json={
                         "name": "interval-feed",
                         "urls": "https://example.invalid/interval",
+                        "download_method": "guangya",
                         "refresh_cron": "",
                         "refresh_interval_minutes": 10,
                     },
