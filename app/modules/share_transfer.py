@@ -5,6 +5,7 @@ callback 均不保存或输出这些敏感值。
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -492,13 +493,11 @@ def submit_prepared_share_transfer(
         )
         if current["snapshot"] != prepared:
             raise ValueError("光鸭分享内容或目标目录已变化，请重新检查")
-        if cancel_check is not None:
-            cancel_check()
         result = create_share_request(
             current["preview_id"], [item["id"] for item in prepared["files"]],
             prepared["target_id"], chat_id, user_id=user_id,
             target_name=prepared["target_name"], origin=origin, tracker_chat_id=tracker_chat_id,
-            client=runtime_client, store=store,
+            client=runtime_client, store=store, cancel_check=cancel_check,
         )
     row = download_requests_repo.get_download_request(result["request_id"])
     if row is not None:
@@ -561,8 +560,11 @@ def create_share_request(
     tracker_chat_id: str | None = None,
     client: GuangYaClient | None = None,
     store: ShareTransferPreviewStore | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """二次校验选集并执行一次幂等分享转存。"""
+    if cancel_check is not None:
+        cancel_check()
     store = store or get_share_transfer_store()
     snapshot = store.consume(
         preview_id,
@@ -628,139 +630,178 @@ def create_share_request(
             "status": "failed", "error": error,
         }
 
-    with ExitStack() as stack:
-        try:
-            client = stack.enter_context(_guangya_client_scope(client))
-        except Exception as exc:
-            # 尚未尝试任何云写，明确失败允许既有的一次显式重试。
-            logger.warning("光鸭分享客户端初始化失败 (%s)", type(exc).__name__)
-            return preparation_failed("光鸭客户端初始化失败，请重新确认后重试")
-        organize_target = (get("GY_ORGANIZE_TARGET_DIR", "") or "").strip()
-        auto_follow_up = (
-            organize_target not in {"", "0"}
-            and snapshot.target_id not in {"", "0"}
-        )
-        if not client.logged_in:
-            error = "光鸭未登录，请先重新登录"
-            return preparation_failed(error)
+    effective_target_id = snapshot.target_id
+    effective_target_name = persisted_target_name
+    staging_parent_id = ""
+    staging_name = ""
+    isolated = False
+    creating_staging = False
+    restore_started = False
 
-        effective_target_id = snapshot.target_id
-        effective_target_name = persisted_target_name
-        staging_parent_id = ""
-        staging_name = ""
-        isolated = False
-        if auto_follow_up:
-            existing = download_requests_repo.get_download_request(request_id)
-            existing_staging = str(existing["gy_target_dir"] or "") if existing else ""
-            if existing and int(existing["gy_isolated"] or 0) and existing_staging:
-                effective_target_id = existing_staging
-                staging_parent_id = str(existing["gy_staging_parent_dir"] or snapshot.target_id)
-                staging_name = str(existing["gy_staging_name"] or _share_staging_name(request_id))
-                effective_target_name = str(
-                    existing["gy_target_name"]
-                    or f"{persisted_target_name} / {staging_name}"
-                )
-                isolated = True
-            else:
-                staging_parent_id = str(
-                    (existing["gy_staging_parent_dir"] if existing else "")
-                    or snapshot.target_id
-                )
-                staging_name = str(
-                    (existing["gy_staging_name"] if existing else "")
-                    or _share_staging_name(request_id)
-                )
-                if not existing or not str(existing["gy_staging_name"] or ""):
-                    # 先持久化不可预测的隔离目录身份，再触发云端创建。这样即使
-                    # Provider 已建目录而进程在 ID 落库前退出，重试也只会认领
-                    # 这个请求预先分配的目录名。
-                    download_requests_repo.update_download_request(
-                        request_id, gy_staging_parent_dir=staging_parent_id,
-                        gy_staging_name=staging_name,
-                        gy_staging_cleanup_status="pending",
-                        gy_staging_cleanup_error="",
-                    )
-                try:
-                    effective_target_id = _find_share_staging_dir(
-                        client, staging_parent_id, staging_name
-                    )
-                    if not effective_target_id:
-                        try:
-                            effective_target_id = (
-                                client.create_dir(staging_name, staging_parent_id) or ""
-                            )
-                        except Exception:
-                            # Provider 已成功建目录但进程在落库前中断时，重试应复用
-                            # 确定性目录，而不是创建重复目录或永久失败。
-                            effective_target_id = _find_share_staging_dir(
-                                client, staging_parent_id, staging_name
-                            )
-                            if not effective_target_id:
-                                raise
-                except Exception as exc:
-                    error = redact_sensitive_text(f"创建分享隔离目录失败：{exc}")
-                    return preparation_failed(error)
-                if not effective_target_id:
-                    error = "创建分享隔离目录失败"
-                    return preparation_failed(error)
-                effective_target_name = f"{persisted_target_name} / {staging_name}"
-                isolated = True
-            if not download_requests_repo.bind_download_request_guangya_staging(
-                request_id, staging_id=effective_target_id,
-                parent_id=staging_parent_id, staging_name=staging_name,
-                target_name=effective_target_name,
-            ):
-                return current_result()
+    def before_restore() -> None:
+        nonlocal restore_started
+        if cancel_check is not None:
+            cancel_check()
+        restore_started = True
 
-        try:
-            result = client.restore_share(
-                snapshot.access_token,
-                list(canonical_ids),
-                effective_target_id,
+    try:
+        with ExitStack() as stack:
+            try:
+                client = stack.enter_context(_guangya_client_scope(client))
+            except Exception as exc:
+                # 尚未尝试任何云写，明确失败允许既有的一次显式重试。
+                logger.warning("光鸭分享客户端初始化失败 (%s)", type(exc).__name__)
+                return preparation_failed("光鸭客户端初始化失败，请重新确认后重试")
+            organize_target = (get("GY_ORGANIZE_TARGET_DIR", "") or "").strip()
+            auto_follow_up = (
+                organize_target not in {"", "0"}
+                and snapshot.target_id not in {"", "0"}
             )
-            success = bool(result.get("success"))
-            retry_safe = bool(result.get("retry_safe", False))
-            failure_status = "failed" if retry_safe else "manual_review"
-            error = "" if success else (
-                "光鸭分享转存失败，可重新确认后重试"
-                if retry_safe
-                else "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
-            )
-        except Exception as exc:
-            logger.warning("光鸭分享转存请求 #%s 失败 (%s)", request_id, type(exc).__name__)
-            success = False
-            failure_status = "manual_review"
-            error = "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
+            if not client.logged_in:
+                error = "光鸭未登录，请先重新登录"
+                return preparation_failed(error)
 
-        stale = finish(
-            success=success,
-            target_dir_id=effective_target_id,
-            target_dir_name=effective_target_name,
-            title=title,
-            count=len(canonical_ids),
-            error=redact_sensitive_text(error),
-            failure_status=failure_status if not success else "failed",
-            isolated=isolated,
-            staging_parent_dir=staging_parent_id,
-            staging_name=staging_name,
-            staging_cleanup_status="pending" if isolated else "",
-        )
-        if stale is not None:
-            return stale
-        if success:
+            if cancel_check is not None:
+                cancel_check()
             if auto_follow_up:
-                # 不直接启动整理/STRM/刷新，只唤醒既有 tracker 按现有配置决策。
-                from app.modules.download_tracker import get_download_tracker
+                existing = download_requests_repo.get_download_request(request_id)
+                existing_staging = str(existing["gy_target_dir"] or "") if existing else ""
+                if existing and int(existing["gy_isolated"] or 0) and existing_staging:
+                    effective_target_id = existing_staging
+                    staging_parent_id = str(existing["gy_staging_parent_dir"] or snapshot.target_id)
+                    staging_name = str(existing["gy_staging_name"] or _share_staging_name(request_id))
+                    effective_target_name = str(
+                        existing["gy_target_name"]
+                        or f"{persisted_target_name} / {staging_name}"
+                    )
+                    isolated = True
+                else:
+                    staging_parent_id = str(
+                        (existing["gy_staging_parent_dir"] if existing else "")
+                        or snapshot.target_id
+                    )
+                    staging_name = str(
+                        (existing["gy_staging_name"] if existing else "")
+                        or _share_staging_name(request_id)
+                    )
+                    if not existing or not str(existing["gy_staging_name"] or ""):
+                        # 先持久化不可预测的隔离目录身份，再触发云端创建。这样即使
+                        # Provider 已建目录而进程在 ID 落库前退出，重试也只会认领
+                        # 这个请求预先分配的目录名。
+                        download_requests_repo.update_download_request(
+                            request_id, gy_staging_parent_dir=staging_parent_id,
+                            gy_staging_name=staging_name,
+                            gy_staging_cleanup_status="pending",
+                            gy_staging_cleanup_error="",
+                        )
+                    try:
+                        effective_target_id = _find_share_staging_dir(
+                            client, staging_parent_id, staging_name
+                        )
+                        if not effective_target_id:
+                            try:
+                                if cancel_check is not None:
+                                    cancel_check()
+                                creating_staging = True
+                                effective_target_id = (
+                                    client.create_dir(staging_name, staging_parent_id) or ""
+                                )
+                                creating_staging = False
+                            except Exception:
+                                # Provider 已成功建目录但进程在落库前中断时，重试应复用
+                                # 确定性目录，而不是创建重复目录或永久失败。
+                                effective_target_id = _find_share_staging_dir(
+                                    client, staging_parent_id, staging_name
+                                )
+                                if not effective_target_id:
+                                    raise
+                                creating_staging = False
+                    except Exception as exc:
+                        error = redact_sensitive_text(f"创建分享隔离目录失败：{exc}")
+                        return preparation_failed(error)
+                    if not effective_target_id:
+                        error = "创建分享隔离目录失败"
+                        return preparation_failed(error)
+                    effective_target_name = f"{persisted_target_name} / {staging_name}"
+                    isolated = True
+                if not download_requests_repo.bind_download_request_guangya_staging(
+                    request_id, staging_id=effective_target_id,
+                    parent_id=staging_parent_id, staging_name=staging_name,
+                    target_name=effective_target_name,
+                ):
+                    return current_result()
 
-                get_download_tracker().reload()
-        return {
-            "success": success,
-            "created": True,
-            "duplicate": False,
-            "retried": retried,
-            "request_id": request_id,
-            "count": len(canonical_ids) if success else 0,
-            "target_dir_name": snapshot.target_name,
-            "status": "completed" if success else failure_status,
-            "error": redact_sensitive_text(error),
-        }
+            if cancel_check is not None:
+                cancel_check()
+            try:
+                restore_args = (snapshot.access_token, list(canonical_ids), effective_target_id)
+                if cancel_check is not None:
+                    # 客户端取得 raw（含凭据刷新）后再检查，只有真正进入发送边界才算在途。
+                    result = client.restore_share(*restore_args, cancel_check=before_restore)
+                else:
+                    restore_started = True
+                    result = client.restore_share(*restore_args)
+                success = bool(result.get("success"))
+                retry_safe = bool(result.get("retry_safe", False))
+                failure_status = "failed" if retry_safe else "manual_review"
+                error = "" if success else (
+                    "光鸭分享转存失败，可重新确认后重试"
+                    if retry_safe
+                    else "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
+                )
+            except Exception as exc:
+                logger.warning("光鸭分享转存请求 #%s 失败 (%s)", request_id, type(exc).__name__)
+                success = False
+                failure_status = "manual_review"
+                error = "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
+
+            stale = finish(
+                success=success,
+                target_dir_id=effective_target_id,
+                target_dir_name=effective_target_name,
+                title=title,
+                count=len(canonical_ids),
+                error=redact_sensitive_text(error),
+                failure_status=failure_status if not success else "failed",
+                isolated=isolated,
+                staging_parent_dir=staging_parent_id,
+                staging_name=staging_name,
+                staging_cleanup_status="pending" if isolated else "",
+            )
+            if stale is not None:
+                return stale
+            if success:
+                if auto_follow_up:
+                    # 不直接启动整理/STRM/刷新，只唤醒既有 tracker 按现有配置决策。
+                    from app.modules.download_tracker import get_download_tracker
+
+                    get_download_tracker().reload()
+            return {
+                "success": success,
+                "created": True,
+                "duplicate": False,
+                "retried": retried,
+                "request_id": request_id,
+                "count": len(canonical_ids) if success else 0,
+                "target_dir_name": snapshot.target_name,
+                "status": "completed" if success else failure_status,
+                "error": redact_sensitive_text(error),
+            }
+    except asyncio.CancelledError:
+        # 取消也必须结算认领；已知目录保留身份，发送后的未知结果禁止重放。
+        unknown = creating_staging or restore_started
+        error = (
+            "操作已取消，云端写入结果不确定，请先核对，勿重复转存"
+            if unknown else "操作已取消，未提交分享转存"
+        )
+        retained = isolated or creating_staging
+        finish(
+            success=False, target_dir_id=effective_target_id if isolated else snapshot.target_id,
+            target_dir_name=effective_target_name, title=title, error=error,
+            failure_status="manual_review" if unknown else "failed",
+            isolated=isolated, staging_parent_dir=staging_parent_id,
+            staging_name=staging_name,
+            staging_cleanup_status="retained" if retained else "",
+            staging_cleanup_error="操作已取消，隔离目录已保留待核对" if retained else "",
+        )
+        raise

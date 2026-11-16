@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import Mock, patch
+
+import pytest
 
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
@@ -11,6 +14,125 @@ from app.clients.guangya import GuangYaClient
 from app.modules.share_transfer import ShareTransferPreviewStore, create_share_request
 from tests.support import isolated_test_database
 from tests.test_telegram_guangya_share import FakeShareClient
+
+
+@pytest.mark.parametrize("stage,expected_status", [
+    ("before_create", "failed"),
+    ("after_create", "failed"),
+    ("during_create", "manual_review"),
+    ("before_restore_without_staging", "failed"),
+    ("raw_initialization", "failed"),
+    ("during_restore", "manual_review"),
+])
+def test_cancelled_share_finalizes_request_and_preserves_staging(stage, expected_status):
+    from app.agent.kernel.state_types import CancellationToken
+
+    token = CancellationToken()
+    client = FakeShareClient()
+    store = ShareTransferPreviewStore()
+    preview = store.create(client.inspected, "chat", "user")
+    original_create, original_restore = client.create_dir, client.restore_share
+
+    def create(*args, **kwargs):
+        directory_id = original_create(*args, **kwargs)
+        if stage in {"after_create", "during_create"}:
+            token.cancel()
+        if stage == "during_create":
+            token.raise_if_cancelled()
+        return directory_id
+
+    def restore(*args, **kwargs):
+        result = original_restore(*args, **kwargs)
+        if stage == "during_restore":
+            token.cancel()
+            token.raise_if_cancelled()
+        return result
+
+    def list_dir(_parent_id="0"):
+        if stage == "before_create":
+            token.cancel()
+        return []
+
+    def get(_key, _default=""):
+        if stage == "before_restore_without_staging":
+            token.cancel()
+            return ""
+        return "archive"
+
+    client.create_dir, client.restore_share, client.list_dir = create, restore, list_dir
+    if stage == "raw_initialization":
+        raw = Mock()
+
+        class RefreshCancelled:
+            @property
+            def raw(self):
+                token.cancel()
+                return raw
+
+        adapter = RefreshCancelled()
+        client.restore_share = lambda *args, **kwargs: GuangYaClient.restore_share(adapter, *args, **kwargs)
+    with isolated_test_database(), patch("app.modules.share_transfer.get", side_effect=get), patch(
+        "app.modules.download_tracker.get_download_tracker", return_value=Mock()
+    ) as tracker:
+        with pytest.raises(asyncio.CancelledError):
+            create_share_request(preview, ["file-1"], "target", "chat", user_id="user",
+                store=store, client=client, cancel_check=token.raise_if_cancelled)
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT * FROM download_requests WHERE kind='guangya_share'").fetchone()
+        assert row["status"] == row["gy_status"] == expected_status
+        assert len(client.restore_calls) == (1 if stage == "during_restore" else 0)
+        assert len(client.create_dir_calls) == (0 if stage in {"before_create", "before_restore_without_staging"} else 1)
+        if stage in {"after_create", "raw_initialization", "during_restore"}:
+            assert row["gy_target_dir"] == "staging-target"
+            assert row["gy_isolated"] == 1
+        else:
+            assert row["gy_target_dir"] == "target"
+        if stage != "before_restore_without_staging":
+            assert row["gy_staging_parent_dir"] == "target"
+            assert row["gy_staging_name"]
+            assert row["gy_staging_cleanup_status"] == ("" if stage == "before_create" else "retained")
+        tracker.return_value.reload.assert_not_called()
+        if stage == "raw_initialization":
+            raw.share_restore.assert_not_called()
+        db.init_db()
+        restored = download_requests_repo.get_download_request(row["id"])
+        assert restored["status"] == expected_status
+        assert restored["gy_staging_name"] == row["gy_staging_name"]
+        if stage == "after_create":
+            retried = create_share_request(preview, ["file-1"], "target", "chat", user_id="user",
+                store=store, client=client)
+            assert retried["success"] and retried["retried"]
+            assert retried["request_id"] == row["id"]
+            assert len(client.create_dir_calls) == len(client.restore_calls) == 1
+        if expected_status == "manual_review":
+            duplicate = create_share_request(preview, ["file-1"], "target", "chat", user_id="user",
+                store=store, client=client)
+            assert duplicate["duplicate"] and duplicate["status"] == "manual_review"
+            assert len(client.restore_calls) == (1 if stage == "during_restore" else 0)
+
+
+def test_share_cancel_after_known_acceptance_preserves_completed_result():
+    from app.agent.kernel.state_types import CancellationToken
+
+    token = CancellationToken()
+    client = FakeShareClient()
+    store = ShareTransferPreviewStore()
+    preview = store.create(client.inspected, "chat", "user")
+    actual = client.restore_share
+
+    def restore(*args, **kwargs):
+        result = actual(*args, **kwargs)
+        token.cancel()
+        return result
+
+    client.restore_share = restore
+    with isolated_test_database(), patch("app.modules.share_transfer.get", return_value="archive"), patch(
+        "app.modules.download_tracker.get_download_tracker", return_value=Mock()
+    ) as tracker:
+        result = create_share_request(preview, ["file-1"], "target", "chat", user_id="user",
+            store=store, client=client, cancel_check=token.raise_if_cancelled)
+        assert result["success"] and result["status"] == "completed" and token.cancelled
+        tracker.return_value.reload.assert_called_once()
 
 
 class LifecycleShareClient(FakeShareClient, Mock):

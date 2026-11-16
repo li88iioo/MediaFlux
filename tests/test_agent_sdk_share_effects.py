@@ -58,6 +58,54 @@ async def context_for(store, *, owner="webk:v1:" + "f" * 64, session="native-sha
         report_progress=AsyncMock(), channel="web")
 
 
+def test_transfer_cancel_during_staging_finishes_request_without_restore(backend, monkeypatch):
+    from dataclasses import replace
+    from app.modules import share_transfer
+    from app.repositories import download_requests as requests
+    from tests.test_telegram_guangya_share import FakeShareClient, SHARE_URL
+
+    client = FakeShareClient()
+    monkeypatch.setattr(share_transfer, "GuangYaClient", lambda: client)
+    monkeypatch.setattr(share_transfer, "get", lambda key, default="": {
+        "GY_SHARE_TARGET_DIR": "target", "GY_SHARE_TARGET_DIR_NAME": "Target",
+        "GY_ORGANIZE_TARGET_DIR": "archive",
+    }.get(key, default))
+
+    async def check():
+        store = SQLiteKernelStore()
+        context = await context_for(store)
+        effects = EffectExecutor(catalog=ToolCatalog([sdk_effects.share_transfer_tool()]),
+            state_store=store, reference_store=store,
+            effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
+        plan = (await effects.prepare("cloud.transfer_share", {
+            "url": SHARE_URL, "file_ids": ["file-1"],
+        }, context=context)).effect_plan
+        assert plan is not None and not client.restore_calls
+        create = client.create_dir
+
+        def create_then_cancel(*args, **kwargs):
+            directory_id = create(*args, **kwargs)
+            context.cancellation.cancel()
+            return directory_id
+
+        monkeypatch.setattr(client, "create_dir", create_then_cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await effects.execute_confirmed(plan.plan_id, context=context)
+        assert client.restore_calls == []
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT * FROM download_requests WHERE kind='guangya_share'").fetchone()
+        assert row["status"] == row["gy_status"] == "failed"
+        assert row["gy_target_dir"] == "staging-target"
+        assert row["gy_staging_cleanup_status"] == "retained"
+        db.init_db()
+        assert requests.get_download_request(row["id"])["status"] == "failed"
+        with pytest.raises(ToolPipelineError):
+            await effects.execute_confirmed(plan.plan_id, context=replace(context, cancellation=CancellationToken()))
+        assert len(client.create_dir_calls) == 1 and client.restore_calls == []
+
+    asyncio.run(check())
+
+
 def executor(store, *, confirmation_store=None):
     return EffectExecutor(catalog=ToolCatalog(sdk_effects.cloud_share_tools()),
         state_store=store, reference_store=store,
