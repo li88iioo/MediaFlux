@@ -1,5 +1,6 @@
 <script>
 (function(){
+    const manifestSchema=JSON.parse(document.querySelector('[data-gcid-manifest-schema]').dataset.gcidManifestSchema);
     const state={manifest:null,preview:null,runToken:'',historyLoaded:false,retryTokens:new Map(),importAvailable:false,importReason:'能力检查中'};
     const byId=(id)=>document.getElementById(id);
     function setMessage(id,text,ok=false){const el=byId(id);el.textContent=text;el.className='gcid-message '+(ok?'is-ok':text?'is-error':'');}
@@ -29,7 +30,7 @@
         const tree=byId('gcidImportTree');clearNode(tree);appendText(tree,'div',message,'gcid-empty-state');
     }
     function syncPreviewButton(){byId('gcidImportPreviewBtn').disabled=!(state.importAvailable&&state.manifest&&byId('gcidImportTarget').value);}
-    function clientValidateManifest(data){if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('清单根节点必须是 JSON 对象');if(data.format!=='mediaflux.gcid'||data.version!==2)throw new Error('仅接受 MediaFlux v2 GCID 清单');if(!Array.isArray(data.files))throw new Error('files 必须是数组');if(data.files.length>10000)throw new Error('文件数量超过 10,000 上限');if(data.file_count!==data.files.length)throw new Error('file_count 与 files 数量不一致');return data;}
+    function clientValidateManifest(data){if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('清单根节点必须是 JSON 对象');if(data.format!==manifestSchema.format||data.version!==manifestSchema.version)throw new Error(`仅接受 MediaFlux v${manifestSchema.version} GCID 清单`);if(!Array.isArray(data.files))throw new Error('files 必须是数组');if(data.files.length>manifestSchema.max_files)throw new Error(`文件数量超过 ${manifestSchema.max_files.toLocaleString('en-US')} 上限`);if(data.file_count!==data.files.length)throw new Error('file_count 与 files 数量不一致');return data;}
     byId('gcidImportFile').addEventListener('change',async(event)=>{
         const file=event.target.files[0];state.manifest=null;invalidatePreview(file?'文件已变化，请重新生成预览':'预览树将在这里稳定显示');
         byId('gcidImportFileLabel').textContent=file?file.name:'选择 v2 JSON 清单';

@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +21,8 @@ from app import database as db
 from app import notifier
 from app.main import create_app
 from app.modules import gcid_import
-from app.modules.gcid_manifest import FORMAT_NAME
+from app.clients.guangya import GuangYaFile
+from app.modules.gcid_manifest import FORMAT_NAME, export_manifest
 from app.modules.telegram_notification_center import NotificationPublishResult
 
 
@@ -459,6 +462,43 @@ class GCIDImportAPITests(InitializedWebTestCase):
         self.assertRegex(css, r"\.gcid-import-preview[^{}]*\{[^}]*min-height")
         self.assertRegex(css, r"\.gcid-import-history[^{}]*\{[^}]*min-height")
         self.assertIn(".gcid-stable-button", css)
+
+    def test_official_export_passes_rendered_page_validation_and_server_preview(self):
+        headers = self.authenticate()
+        client = type("ExportClient", (), {
+            "list_dir": lambda _self, _directory: [
+                GuangYaFile("file-1", "Film.mkv", False, 42, "gcid-film", "source")
+            ],
+        })()
+        manifest = export_manifest(client, "source", "导出来源")
+        html = self.client.get("/guangya/more?view=gcid").text
+        validator = re.search(r"    function clientValidateManifest\(data\).*", html)
+        self.assertIsNotNone(validator)
+        schema = re.search(r"    const manifestSchema=.*", html)
+        schema_data = re.search(r'data-gcid-manifest-schema="([^"]+)"', html)
+        self.assertIsNotNone(schema_data)
+        script = "\n".join((
+            "const document={querySelector:()=>({dataset:{gcidManifestSchema:"
+            + json.dumps(unescape(schema_data.group(1)) if schema_data else "{}") + "}})};",
+            schema.group(0) if schema else "",
+            validator.group(0) if validator else "",
+            "const cases=JSON.parse(require('node:fs').readFileSync(0,'utf8'));",
+            "console.log(JSON.stringify(cases.map(data=>{try{clientValidateManifest(data);return true;}catch(_){return false;}})));",
+        ))
+        cases = [manifest, {**manifest, "format": "mediaflux.gcid"}, {**manifest, "version": 1}]
+        result = subprocess.run(
+            ["node", "-e", script], input=json.dumps(cases), text=True,
+            capture_output=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), [True, False, False])
+        preview = self.client.post(
+            "/api/tools/gcid/import/preview",
+            json={"manifest": manifest, "target_dir_id": "target-1"}, headers=headers,
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["file_count"], 1)
+        self.assertEqual(preview.json()["total_size"], 42)
+        self.assertEqual(db.list_gcid_import_tasks(), [])
 
 
 class GCIDImportNotificationTests(unittest.TestCase):
