@@ -154,7 +154,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         self.assertEqual(target.stat().st_mtime_ns, stamp)
         self.assertFalse(temp.exists())
         row = strm_repo.list_strm_index("guangya-meta:source")[0]
-        self.assertTrue(strm._metadata_state_matches(row, remote, target))
+        self.assertTrue(strm._metadata_state_matches(row, remote, target, str(self.root)))
         again = strm.sync_strm("source", "http://media.invalid", str(self.root), client=cast(GuangYaClient, client),
                                metadata_exts={"ass"}, clean_invalid=False)
         self.assertEqual(again["metadata_queued"], 0)

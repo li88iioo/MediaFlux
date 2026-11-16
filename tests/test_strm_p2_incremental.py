@@ -16,7 +16,7 @@ from app.clients.guangya import GuangYaFile
 from app.modules.scheduler import STRMScheduler, _merge_organize_changes
 from app.modules.strm import (
     STRM_SUBDIR,
-    _build_video_index_maps,
+    _build_index_maps,
     _update_video_index_snapshot,
     clean_retired_strm_sources,
     generate_strm,
@@ -147,25 +147,25 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             target = Path(root) / "target.strm"
             target.write_text("payload", encoding="utf-8")
             rows = [
-                {"file_id": "file", "strm_path": "/old", "etag": "1", "size": 1,
+                {"file_id": "file", "strm_path": str(Path(root) / "old"), "etag": "1", "size": 1,
                  "filename": "old.mkv", "content_fingerprint": ""},
                 {"file_id": "conflict-a", "strm_path": str(target), "etag": "1", "size": 1,
                  "filename": "a.mkv", "content_fingerprint": ""},
                 {"file_id": "conflict-b", "strm_path": str(target), "etag": "1", "size": 1,
                  "filename": "b.mkv", "content_fingerprint": ""},
-                {"file_id": "other", "strm_path": "/other", "etag": "1", "size": 1,
+                {"file_id": "other", "strm_path": str(Path(root) / "other"), "etag": "1", "size": 1,
                  "filename": "other.mkv", "content_fingerprint": ""},
             ]
-            by_id, by_path = _build_video_index_maps(rows)
+            by_id, by_path = _build_index_maps(rows, root)
             _update_video_index_snapshot(
                 by_id, by_path,
-                GuangYaFile("file", "target.mkv", False, 2, "2"), target,
+                GuangYaFile("file", "target.mkv", False, 2, "2"), target, strm_root=root,
             )
 
             self.assertEqual(set(by_id), {"file", "other"})
-            self.assertNotIn("/old", by_path)
+            self.assertNotIn(str(Path(root) / "old"), by_path)
             self.assertEqual(set(by_path[str(target)]), {"file"})
-            self.assertEqual(set(by_path["/other"]), {"other"})
+            self.assertEqual(set(by_path[str(Path(root) / "other")]), {"other"})
 
     def test_incremental_upsert_never_scans_and_second_run_is_current(self):
         source_id = "incremental-source"

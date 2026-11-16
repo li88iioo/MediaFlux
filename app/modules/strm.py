@@ -481,6 +481,11 @@ def _safe_indexed_path(path_text: object, strm_root: str) -> Path | None:
         return None
 
 
+def _index_path_aliases(path: Path, strm_root: str) -> tuple[str, str]:
+    """安装与归属查询共用当前根下的绝对/历史相对路径。"""
+    return str(path), str(path.relative_to(Path(strm_root).expanduser().resolve(strict=False)))
+
+
 def _strm_target(file: GuangYaFile, rel_dir: str, strm_root: str) -> Path:
     # 本地 STRM 使用媒体主文件名，而不是 ``.mkv.strm`` 双扩展名。
     # 原始容器类型仍保留在 STRM 内容的 /playgy/.../{filename} URL 中。
@@ -629,13 +634,12 @@ def _retained_indexed_paths(
 ) -> set[str]:
     """按当前根同时查询绝对/历史相对路径；source/file_id 联合标识 owner。"""
     removing = removing or set()
-    root = Path(strm_root).expanduser().resolve(strict=False)
     aliases: dict[str, str] = {}
     for value in paths:
         path = _managed_path(value, strm_root)
         if path is not None:
             canonical = str(path)
-            for alias in (value, canonical, str(path.relative_to(root))):
+            for alias in (value, *_index_path_aliases(path, strm_root)):
                 aliases[alias] = canonical
     return {
         aliases[str(row["strm_path"])]
@@ -920,17 +924,18 @@ def _record_candidate(
     winners[target_text] = (winner[0], winner[1], current[2] + 1)
 
 
-def _build_video_index_maps(existing_rows: list) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """把视频索引构造成 file_id 与 path 双索引，保留同路径多行语义。"""
+def _build_index_maps(existing_rows: list, strm_root: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """视频/元数据共用物理路径桶；原始行保持不变，供历史索引回滚。"""
     by_id: dict[str, Any] = {}
     by_path: dict[str, dict[str, Any]] = {}
     for row in existing_rows:
         file_id = str(_row_field(row, "file_id", "") or "")
-        path = str(_row_field(row, "strm_path", "") or "")
+        path = _safe_indexed_path(_row_field(row, "strm_path"), strm_root)
         if not file_id:
             continue
         by_id[file_id] = row
-        by_path.setdefault(path, {})[file_id] = row
+        if path is not None:
+            by_path.setdefault(str(path), {})[file_id] = row
     return by_id, by_path
 
 
@@ -965,13 +970,14 @@ def _update_video_index_snapshot(
     file: GuangYaFile,
     expected: Path,
     content_fingerprint: str | None = None,
+    *, strm_root: str,
 ) -> dict[str, Any]:
     """安装成功后 O(1) 维护双索引；同目标路径冲突按 bucket 清理。"""
     file_id = file.file_id
     expected_text = str(expected)
     current = existing_by_id.get(file_id)
     if current is not None:
-        previous_path = str(_row_field(current, "strm_path", "") or "")
+        previous_path = str(_safe_indexed_path(_row_field(current, "strm_path"), strm_root))
         previous_bucket = existing_by_path.get(previous_path)
         if previous_bucket is not None:
             previous_bucket.pop(file_id, None)
@@ -1020,13 +1026,9 @@ def _install_video_candidate(
         current["strm_path"] if current else "", strm_root
     )
     target_owners = list(existing_by_path.get(str(expected), {}).values())
-    indexed_target = bool(
-        current
-        and str(current.get("strm_path") or "") == str(expected)
-    )
     target_fingerprint = ""
     if expected.is_file():
-        if indexed_target:
+        if previous_path == expected:
             # 已索引文件可自动修复；替换前仍复核快照，保护并发外部写入。
             target_fingerprint = _content_fingerprint(expected)
         elif not target_owners and not _retained_indexed_paths([str(expected)], strm_root):
@@ -1127,14 +1129,14 @@ def _install_metadata_candidate(
     conflicts = [
         _row_snapshot(row) for row in existing_rows
         if str(row["file_id"]) != file.file_id
-        and str(row["strm_path"] or "") == str(expected)
+        and _safe_indexed_path(row["strm_path"], strm_root) == expected
     ]
     previous_path = _safe_indexed_path(
         current["strm_path"] if current else "", strm_root
     )
     target_owners = [
         row for row in existing_rows
-        if str(_row_field(row, "strm_path", "") or "") == str(expected)
+        if _safe_indexed_path(_row_field(row, "strm_path"), strm_root) == expected
     ]
     prepared = prepared or prepare_metadata_download(
         file, rel_dir, strm_root, client,
@@ -1229,9 +1231,9 @@ def _prepare_strm_metadata_job_with_client(
     rel_dir = str(job.get("rel_dir") or "")
     expected = _metadata_target(remote, rel_dir, strm_root)
     current = next((row for row in strm_repo.list_strm_installation_rows(
-        f"guangya-meta:{job.get('source_id') or ''}", file_id, str(expected)
+        f"guangya-meta:{job.get('source_id') or ''}", file_id, _index_path_aliases(expected, strm_root)
     ) if str(row["file_id"]) == file_id), None)
-    if current and _metadata_state_matches(current, remote, expected):
+    if current and _metadata_state_matches(current, remote, expected, strm_root):
         # 安装成功而 ACK 前中断时，复用同一索引/指纹判定补交接，不重新
         # 获取直链和下载。这里不持写锁；commit 仍必须再次确认本地文件。
         return {"file": remote, "rel_dir": rel_dir, "prepared": None}
@@ -1282,14 +1284,14 @@ def commit_strm_metadata_job(
     expected = _metadata_target(remote, rel_dir, strm_root)
     metadata_source_key = f"guangya-meta:{source_id}"
     existing_rows = strm_repo.list_strm_installation_rows(
-        metadata_source_key, file_id, str(expected)
+        metadata_source_key, file_id, _index_path_aliases(expected, strm_root)
     )
     current = next(
         (row for row in existing_rows if str(row["file_id"]) == file_id), None
     )
     cleaned = 0
     status = "skipped"
-    if current and _metadata_state_matches(current, remote, expected):
+    if current and _metadata_state_matches(current, remote, expected, strm_root):
         if prepared is not None:
             prepared.temp.unlink(missing_ok=True)
     else:
@@ -1568,12 +1570,20 @@ def _incremental_parent_snapshots(
     return snapshots, False
 
 
-def _metadata_state_matches(row, file: GuangYaFile, expected: Path) -> bool:
-    return (
-        str(row["file_id"]) == file.file_id
+def _index_matches(row, file: GuangYaFile, expected: Path, strm_root: str) -> bool:
+    """全量、精准增量与元数据共享同一索引快照判定。"""
+    return bool(
+        row
+        and str(row["file_id"]) == file.file_id
         and str(row["etag"] or "") == (file.etag or "")
         and int(row["size"] or 0) == (file.size or 0)
-        and str(row["strm_path"] or "") == str(expected)
+        and _safe_indexed_path(row["strm_path"], strm_root) == expected
+    )
+
+
+def _metadata_state_matches(row, file: GuangYaFile, expected: Path, strm_root: str) -> bool:
+    return (
+        _index_matches(row, file, expected, strm_root)
         and expected.is_file()
         and (not file.size or expected.stat().st_size == file.size)
         and _fingerprint_matches(expected, _row_field(row, "content_fingerprint", ""))
@@ -1858,11 +1868,13 @@ def _sync_strm_incremental_impl(
                 expected = _strm_target(file, rel_dir, strm_root)
                 # 仅装载本项及目标冲突；保留本批已核验但尚未补写的指纹，
                 # 后续互相迁移/覆盖不能用数据库中的旧快照替换它。
-                for row in strm_repo.list_strm_installation_rows(video_key, file.file_id, str(expected)):
+                for row in strm_repo.list_strm_installation_rows(video_key, file.file_id, _index_path_aliases(expected, strm_root)):
                     owner_id = str(row["file_id"])
                     if owner_id and owner_id not in video_by_id:
                         video_by_id[owner_id] = row
-                        video_by_path.setdefault(str(row["strm_path"] or ""), {})[owner_id] = row
+                        owner_path = _safe_indexed_path(row["strm_path"], strm_root)
+                        if owner_path is not None:
+                            video_by_path.setdefault(str(owner_path), {})[owner_id] = row
                 current = video_by_id.get(file_id)
                 expected_url = build_play_url(
                     base_url, file.file_id, file.etag, file.size, file.name
@@ -1870,13 +1882,7 @@ def _sync_strm_incremental_impl(
                 content_matches, content_fingerprint = _read_strm_state(
                     expected, expected_url
                 )
-                is_current = bool(
-                    current
-                    and str(_row_field(current, "strm_path", "") or "") == str(expected)
-                    and str(_row_field(current, "etag", "") or "") == (file.etag or "")
-                    and int(_row_field(current, "size", 0) or 0) == (file.size or 0)
-                    and content_matches
-                )
+                is_current = _index_matches(current, file, expected, strm_root) and content_matches
                 if is_current:
                     if str(_row_field(current, "content_fingerprint", "") or "") != content_fingerprint:
                         fingerprint_backfills.append({
@@ -1889,7 +1895,7 @@ def _sync_strm_incremental_impl(
                         })
                         _update_video_index_snapshot(
                             video_by_id, video_by_path, file, expected,
-                            content_fingerprint,
+                            content_fingerprint, strm_root=strm_root,
                         )
                     stats["skipped"] += 1
                 else:
@@ -1905,7 +1911,7 @@ def _sync_strm_incremental_impl(
                         _track_change(stats, "removed", current["strm_path"], strm_root, on_refresh_paths=on_refresh_paths)
                     _update_video_index_snapshot(
                         video_by_id, video_by_path, file, expected,
-                        installed_fingerprint,
+                        installed_fingerprint, strm_root=strm_root,
                     )
                     stats["generated"] += 1
                     stats["updated" if is_update else "created"] += 1
@@ -1917,7 +1923,7 @@ def _sync_strm_incremental_impl(
                     raise RuntimeError("精准增量对象不属于已配置伴随文件类型")
                 expected = _metadata_target(file, rel_dir, strm_root)
                 current = next(iter(strm_repo.list_strm_index(metadata_key, only_file_ids={file_id})), None)
-                if current and _metadata_state_matches(current, file, expected):
+                if current and _metadata_state_matches(current, file, expected, strm_root):
                     stats["metadata_skipped"] += 1
                     pending_resolutions["metadata"][file_id] = (file, rel_dir)
                 else:
@@ -2480,7 +2486,7 @@ def _sync_strm_impl(
 
     failure_snapshots = db.get_strm_failure_resolution_snapshot(source_dir_id)
     existing_rows = strm_repo.list_strm_index(source_key)
-    existing_by_id, existing_by_path = _build_video_index_maps(existing_rows)
+    existing_by_id, existing_by_path = _build_index_maps(existing_rows, strm_root)
     fingerprint_backfills: list[dict[str, Any]] = []
     video_progress_total = len(video_candidates)
     for _file, _rel_dir, duplicate_count in video_candidates.values():
@@ -2504,12 +2510,7 @@ def _sync_strm_impl(
                 expected_url = build_play_url(
                     base_url, file.file_id, file.etag, file.size, file.name
                 )
-                index_matches = bool(
-                    current
-                    and str(current["strm_path"] or "") == str(expected)
-                    and str(current["etag"] or "") == (file.etag or "")
-                    and int(current["size"] or 0) == (file.size or 0)
-                )
+                index_matches = _index_matches(current, file, expected, strm_root)
                 verify_future = (
                     verify_executor.submit(
                         _read_strm_state, expected, expected_url
@@ -2563,12 +2564,7 @@ def _sync_strm_impl(
                 # 同一批内更早候选可能更新或清理冲突索引，因此提交判定必须
                 # 重新读取内存快照；并发线程只负责文件读取，不拥有业务状态。
                 current = existing_by_id.get(file.file_id)
-                index_matches = bool(
-                    current
-                    and str(current["strm_path"] or "") == str(expected)
-                    and str(current["etag"] or "") == (file.etag or "")
-                    and int(current["size"] or 0) == (file.size or 0)
-                )
+                index_matches = _index_matches(current, file, expected, strm_root)
                 is_current = (index_matches and content_matches)
                 if is_current:
                     if str(
@@ -2584,7 +2580,7 @@ def _sync_strm_impl(
                         })
                         _update_video_index_snapshot(
                             existing_by_id, existing_by_path, file, expected,
-                            content_fingerprint,
+                            content_fingerprint, strm_root=strm_root,
                         )
                     seen_ids.add(file.file_id)
                     stats["skipped"] += 1
@@ -2612,7 +2608,7 @@ def _sync_strm_impl(
                     _track_change(stats, "generated", expected, strm_root, on_refresh_paths=on_refresh_paths)
                     _update_video_index_snapshot(
                         existing_by_id, existing_by_path, file, expected,
-                        installed_fingerprint,
+                        installed_fingerprint, strm_root=strm_root,
                     )
                 except Exception as exc:
                     logger.debug("生成 STRM 失败 file=%s type=%s", redact_sensitive_text(file.name)[:160], type(exc).__name__)
@@ -2652,11 +2648,7 @@ def _sync_strm_impl(
     if metadata:
         progress.emit("metadata", 0, metadata_progress_total, "同步元数据")
         existing_metadata_rows = strm_repo.list_strm_index(metadata_source_key)
-        metadata_rows_by_id: dict[str, Any] = {}
-        metadata_rows_by_path: dict[str, list[sqlite3.Row | dict[str, Any]]] = {}
-        for row in existing_metadata_rows:
-            metadata_rows_by_id[str(row["file_id"])] = row
-            metadata_rows_by_path.setdefault(str(row["strm_path"] or ""), []).append(row)
+        metadata_rows_by_id, metadata_rows_by_path = _build_index_maps(existing_metadata_rows, strm_root)
         planned_metadata_targets = {
             target_text: candidate[0].file_id
             for target_text, candidate in metadata_candidates.items()
@@ -2732,9 +2724,9 @@ def _sync_strm_impl(
                     )
                 else:
                     try:
-                        target_owners = metadata_rows_by_path.get(str(expected), [])
+                        target_owners = metadata_rows_by_path.get(str(expected), {})
                         if target_owners:
-                            _require_owned_file(expected, target_owners, "排队元数据覆盖")
+                            _require_owned_file(expected, target_owners.values(), "排队元数据覆盖")
                         if previous_path and previous_path != expected:
                             _require_owned_file(
                                 previous_path,
@@ -2773,7 +2765,7 @@ def _sync_strm_impl(
                         metadata_progress_total, "排队伴随元数据",
                     )
                     continue
-                if current and _metadata_state_matches(current, file, expected):
+                if current and _metadata_state_matches(current, file, expected, strm_root):
                     stats["metadata_skipped"] += 1
                     pending_resolutions["metadata"][file.file_id] = (file, rel_dir)
                     metadata_progress_completed += 1
@@ -3547,8 +3539,9 @@ def _process_claimed_strm_failures(
                 refresh_paths = [str(target)]
                 if action == "generate":
                     source_key = source["source_key"]
-                    existing_by_id, existing_by_path = _build_video_index_maps(
-                        strm_repo.list_strm_installation_rows(source_key, file.file_id, str(target))
+                    existing_by_id, existing_by_path = _build_index_maps(
+                        strm_repo.list_strm_installation_rows(source_key, file.file_id, _index_path_aliases(target, strm_root)),
+                        strm_root,
                     )
                     current_before_install = existing_by_id.get(file.file_id)
                     cleaned, _installed_fingerprint = _install_video_candidate(

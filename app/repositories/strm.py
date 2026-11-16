@@ -220,18 +220,20 @@ def list_strm_index(
 
 
 def list_strm_installation_rows(
-    source: str, file_id: str, strm_path: str,
+    source: str, file_id: str, strm_paths: tuple[str, str],
 ) -> list[sqlite3.Row]:
     """读取当前项及同来源目标 owner；复用现有 ID/路径索引，不扫描整源。
 
+    两种路径逐一等值查询，避免 IN 子查询使 SQLite 选择整源扫描。
     UNION 去重同 ID 同路径的行，但不截断冲突集合，保留所有权与回滚依据。
     调用方仍须在 STRM 写锁内查询后提交，不能跨任务缓存文件所有权快照。
     """
     with db.get_conn() as conn:
         return conn.execute(
             "SELECT * FROM strm_index WHERE source=? AND file_id=? "
+            "UNION SELECT * FROM strm_index WHERE strm_path=? AND source=? "
             "UNION SELECT * FROM strm_index WHERE strm_path=? AND source=?",
-            (source, file_id, strm_path, source),
+            (source, file_id, strm_paths[0], source, strm_paths[1], source),
         ).fetchall()
 
 

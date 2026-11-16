@@ -241,6 +241,67 @@ class StrmFirstInstallRecoveryTests(unittest.TestCase):
 
 
 class StrmMoveRecoveryTests(unittest.TestCase):
+    def test_same_path_history_survives_restart_and_repeated_sync(self):
+        for incremental in (False, True):
+            for relative in (False, True):
+                with self.subTest(incremental=incremental, relative=relative), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                    sync(root, "New")
+                    row = dict(strm_repo.list_strm_index("guangya:source")[0])
+                    target = Path(row["strm_path"])
+                    stored = str(target.relative_to(root)) if relative else str(target)
+                    with db.get_conn() as conn:
+                        conn.execute("UPDATE strm_index SET strm_path=? WHERE id=?", (stored, row["id"]))
+                    db.init_db()
+                    file = MoveCloud().file_info("video")
+                    change = {"source_id": "source", "kind": "video", "action": "upsert",
+                              "file_id": file.file_id, "rel_dir": "New", "name": file.name,
+                              "etag": file.etag, "size": file.size, "parent_id": file.parent_id}
+                    stamp = target.stat().st_mtime_ns
+                    for repair in (False, True, False):
+                        if repair:
+                            target.write_text("stale URL", encoding="utf-8")
+                        stats = (strm.sync_strm_incremental("source", [change], BASE_URL, root,
+                                 client=cast(GuangYaClient, MoveCloud("New"))) if incremental else sync(root, "New"))
+                        self.assertEqual(stats["failed"], 0, stats)
+                        self.assertEqual(stats["generated"], int(repair), stats)
+                        self.assertEqual(stats["cleaned"], 0, stats)
+                        if not repair:
+                            self.assertEqual(target.stat().st_mtime_ns, stamp)
+                        stamp = target.stat().st_mtime_ns
+                        self.assertEqual(len(strm_repo.list_strm_index("guangya:source")), 1)
+
+    def test_metadata_update_finds_relative_target_owner_and_rolls_back_original_index(self):
+        for relative in (False, True):
+            for conflict in (False, True):
+                with self.subTest(relative=relative, conflict=conflict), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                    file = GuangYaFile("new", "Movie.nfo", False, 12, "new-etag", "series")
+                    target = strm._metadata_target(file, "New", root)
+                    target.parent.mkdir(parents=True)
+                    target.write_bytes(b"old metadata")
+                    stored = str(target.relative_to(root)) if relative else str(target)
+                    strm_repo.upsert_strm_index("guangya-meta:source", "old" if conflict else file.file_id,
+                        "old-etag", 12, file.name, stored, strm._content_fingerprint(target))
+                    original = dict(strm_repo.list_strm_index("guangya-meta:source")[0])
+                    db.init_db()
+                    job = {"file_id": file.file_id, "source_id": "source", "rel_dir": "New", "refresh_policy": {"enabled": False}}
+                    for fail in (True, False):
+                        temp = target.with_suffix(".prepared")
+                        temp.write_bytes(b"new metadata")
+                        prepared = {"file": file, "rel_dir": "New", "prepared":
+                                    strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp))}
+                        if fail:
+                            with patch.object(strm_repo, "upsert_strm_index", side_effect=RuntimeError("index unavailable")):
+                                with self.assertRaisesRegex(RuntimeError, "index unavailable"):
+                                    strm.commit_strm_metadata_job(job, prepared, root)
+                            self.assertEqual(target.read_bytes(), b"old metadata")
+                            self.assertEqual(dict(strm_repo.list_strm_index("guangya-meta:source")[0]), original)
+                        else:
+                            result = strm.commit_strm_metadata_job(job, prepared, root)
+                            self.assertEqual(result["status"], "completed")
+                            self.assertEqual(target.read_bytes(), b"new metadata")
+                            self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index("guangya-meta:source")], [file.file_id])
+                            self.assertEqual(strm.commit_strm_metadata_job(job, {**prepared, "prepared": None}, root)["status"], "skipped")
+
     def test_moved_video_and_metadata_preserve_same_id_owned_by_another_source(self):
         for metadata, relative_source in ((False, ""), (True, ""), (False, "source"), (False, "active"), (True, "source"), (True, "active")):
             with self.subTest(metadata=metadata, relative=relative_source), isolated_test_database(), tempfile.TemporaryDirectory() as root:
@@ -264,7 +325,7 @@ class StrmMoveRecoveryTests(unittest.TestCase):
                     cleaned = strm._install_metadata_candidate(file, "New", target, root, source, rows, "",
                         prepared=strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp)))
                 else:
-                    by_id, by_path = strm._build_video_index_maps(rows)
+                    by_id, by_path = strm._build_index_maps(rows, root)
                     cleaned, _ = strm._install_video_candidate(file, "New", target, BASE_URL, root, source,
                                                               by_id, by_path)
                 self.assertEqual(cleaned, 0)
