@@ -314,6 +314,61 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
                         single.assert_called_once()
                         batch.assert_not_called()
 
+    def test_older_strm_run_cannot_replace_receipt_or_publish_confirmation(self):
+        for batch_id in ("", "batch"):
+            with self.subTest(batch=bool(batch_id)):
+                token = "fenced-batch" if batch_id else "fenced-single"
+                self.create(token, batch=batch_id)
+                historical = {"moved": 1, "execution": {"moved": 1}, "strm": {"ok": True}, "warnings": ["保留"]}
+                organize_confirmations_repo.update_organize_confirmation(
+                    token, status="completed", result_json=json.dumps(historical),
+                )
+                payload = self.row(token)["payload_json"]
+                with (patch("app.modules.telegram_notification_center.get_notification_thread_event") as lookup,
+                      patch.object(confirmations, "publish_confirmation_event") as single,
+                      patch("app.modules.telegram_confirmation_batch.publish_batch_summary") as batch):
+                    for refresh in ("Emby 已排队", "Emby 已刷新"):
+                        # 真实单owner规格probe可能新开run而不换request代次；围栏归属确认原记录。
+                        self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
+                            token, strm_status="完成", media_refresh=refresh, strm_run_id=2, notify_enabled=False,
+                        ))
+                        row = self.row(token)
+                        saved = json.loads(row["result_json"])
+                        self.assertEqual(saved["_downstream_run_id"], 2)
+                        self.assertEqual(saved["_downstream"], {
+                            "strm": "完成", "media_refresh": refresh, "partial": False, "error": "",
+                        })
+                        self.assertEqual({key: saved[key] for key in historical}, historical)
+                        # 上次连接已经关闭，旧回执只能依赖新连接读到的持久run值做判断。
+                        self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
+                            token, strm_status="完成", media_refresh="Jellyfin 部分失败", partial=True,
+                            error="旧run迟到", strm_run_id=1,
+                        ))
+                        self.assertEqual(self.row(token)["result_json"], row["result_json"])
+                        self.assertEqual((self.row(token)["payload_json"], self.row(token)["status"]), (payload, "completed"))
+                    lookup.assert_not_called()
+                    single.assert_not_called()
+                    batch.assert_not_called()
+
+    def test_downstream_run_fence_preserves_same_run_and_unversioned_contract(self):
+        self.create("run-contract")
+        queued = {"strm": "完成", "media_refresh": "已排队", "partial": False, "error": ""}
+        finished = {**queued, "media_refresh": "已刷新"}
+        self.assertTrue(organize_confirmations_repo.set_confirmation_downstream("run-contract", queued))
+        self.assertNotIn("_downstream_run_id", json.loads(self.row("run-contract")["result_json"]))
+        self.assertTrue(organize_confirmations_repo.set_confirmation_downstream("run-contract", queued, strm_run_id=2))
+        self.assertTrue(organize_confirmations_repo.set_confirmation_downstream("run-contract", finished, strm_run_id=2))
+        before = self.row("run-contract")["result_json"]
+        self.assertTrue(organize_confirmations_repo.set_confirmation_downstream("run-contract", finished, strm_run_id=2))
+        self.assertEqual(self.row("run-contract")["result_json"], before)
+        self.assertFalse(organize_confirmations_repo.set_confirmation_downstream("run-contract", queued, strm_run_id=1))
+        self.assertEqual(self.row("run-contract")["result_json"], before)
+        # 无run的旧接口仍可更新原四字段，不删除已持久的围栏。
+        self.assertTrue(organize_confirmations_repo.set_confirmation_downstream("run-contract", queued))
+        saved = json.loads(self.row("run-contract")["result_json"])
+        self.assertEqual((saved["_downstream"], saved["_downstream_run_id"]), (queued, 2))
+        self.assertFalse(organize_confirmations_repo.set_confirmation_downstream("missing", queued, strm_run_id=3))
+
     def test_silent_confirmation_keeps_handoff_and_faster_downstream_receipts(self):
         from app.clients.guangya import GuangYaFile
         from app.modules.scraper import MatchResult

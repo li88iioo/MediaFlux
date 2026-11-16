@@ -979,15 +979,27 @@ def fail_interrupted_running_confirmations_conn(conn: sqlite3.Connection, *, tim
     )
 
 
-def set_confirmation_downstream(token: str, downstream: dict) -> None:
-    """记录确认整理后的 STRM 与媒体库后续状态，供批次摘要展示。"""
+def set_confirmation_downstream(
+    token: str, downstream: dict, *, strm_run_id: int | None = None,
+) -> bool:
+    """原子保存回执并拒绝较旧STRM run；无run的旧调用保持原行为。"""
+    stored = "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END"
+    result = f"json_set({stored},'$._downstream',json(?))"
+    values: list = [json.dumps(downstream, ensure_ascii=False)]
+    guard = ""
+    if strm_run_id is not None:
+        result = f"json_set({result},'$._downstream_run_id',?)"
+        values.append(strm_run_id)
+        guard = f" AND COALESCE(CAST(json_extract({stored},'$._downstream_run_id') AS INTEGER),0)<=?"
+    values.extend((db.now(), token))
+    if strm_run_id is not None:
+        values.append(strm_run_id)
     with db.get_conn() as conn:
-        conn.execute(
-            "UPDATE organize_confirmations SET result_json=json_set("
-            "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
-            "'$._downstream',json(?)),updated_at=? WHERE token=?",
-            (json.dumps(downstream, ensure_ascii=False), db.now(), token),
+        cursor = conn.execute(
+            f"UPDATE organize_confirmations SET result_json={result},updated_at=? WHERE token=?{guard}",
+            values,
         )
+        return cursor.rowcount > 0
 
 
 def set_confirmation_strm_handoff(
