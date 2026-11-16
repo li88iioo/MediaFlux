@@ -242,11 +242,12 @@ class QBittorrentClient:
         if status not in (200, 202):
             logger.warning("qB 添加任务失败: 请求被拒绝 status=%s", status)
             return TorrentAddResult(False, "qb_rejected", False)
-        if not self._parse_add_result(resp):
-            logger.warning("qB 添加任务未确认成功: status=%s", status)
-            return TorrentAddResult(False, "qb_rejected", False)
-        logger.info("qB 添加任务成功")
-        return TorrentAddResult(True, task_ids=self._added_torrent_ids(resp))
+        result = self._add_response(resp)
+        if result.ok:
+            logger.info("qB 添加任务成功")
+        else:
+            logger.warning("qB 添加任务未确认成功: status=%s code=%s", status, result.failure_code)
+        return result
 
     def _login_for_add(self) -> TorrentAddResult:
         """为添加任务登录，并保留可安全重试所需的最小分类。"""
@@ -278,46 +279,34 @@ class QBittorrentClient:
         return TorrentAddResult(True)
 
     @staticmethod
-    def _parse_add_result(resp) -> bool:
-        """解析 /torrents/add 响应，兼容 qB 4.x/5.x。"""
-        if resp.status_code not in (200, 202):
-            return False
-        text = (resp.text or "").strip()
-        low = text.lower()
-        # qB 4.x：纯文本 "Ok." / "Ok" / "true"
-        if low in ("ok.", "ok", "true", ""):
-            return True
-        # qB 5.x：JSON
+    def _add_response(resp) -> TorrentAddResult:
+        """一次解析添加回执；明确拒绝与无法确认的结果分别交给既有恢复链。"""
+        text = (resp.text or "").strip().lower()
+        if text in ("ok.", "ok", "true", ""):
+            return TorrentAddResult(True)
+        if text == "fails.":
+            return TorrentAddResult(False, "qb_rejected")
+        unknown = TorrentAddResult(False, "qb_outcome_unknown")
         try:
             data = resp.json()
         except (ValueError, AttributeError):
-            # 非 JSON 但 2xx，保守视为成功
-            return True
+            return unknown
         if not isinstance(data, dict):
-            return True
-        if data.get("failure_count", 0) > 0:
-            return False
-        return bool(
-            data.get("success_count", 0)
-            or data.get("pending_count", 0)
-            or data.get("added_torrent_ids")
-        )
-
-    @staticmethod
-    def _added_torrent_ids(resp) -> tuple[str, ...]:
-        """读取 qB 5.x 返回的实际 TorrentID；旧版文本响应返回空集合。"""
-        try:
-            data = resp.json()
-        except (ValueError, AttributeError):
-            return ()
-        if not isinstance(data, dict) or not isinstance(data.get("added_torrent_ids"), list):
-            return ()
-        task_ids: list[str] = []
-        for value in data["added_torrent_ids"]:
-            normalized = str(value or "").strip().lower()
-            if re.fullmatch(r"[0-9a-f]{40}", normalized) and normalized not in task_ids:
-                task_ids.append(normalized)
-        return tuple(task_ids)
+            return unknown
+        counts = tuple(data.get(key, 0) for key in ("success_count", "pending_count", "failure_count"))
+        if any(type(value) is not int or value < 0 for value in counts):
+            return unknown
+        ids = data.get("added_torrent_ids", [])
+        task_ids = tuple(dict.fromkeys(
+            normalized for value in (ids if isinstance(ids, list) else [])
+            if re.fullmatch(r"[0-9a-f]{40}", normalized := str(value or "").strip().lower())
+        ))
+        accepted = bool(counts[0] or counts[1] or task_ids)
+        if counts[2]:
+            return TorrentAddResult(False, "qb_outcome_unknown" if accepted else "qb_rejected", task_ids=task_ids)
+        if accepted:
+            return TorrentAddResult(True, task_ids=task_ids)
+        return unknown
 
     def _get_list(self, path: str, params: Optional[dict] = None) -> list[dict]:
         """列表型读取共用响应合同；无效载荷不能伪装成真实的空结果。"""

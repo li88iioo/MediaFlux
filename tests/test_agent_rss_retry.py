@@ -105,6 +105,8 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
 
     def test_qb_add_detailed_classifies_http_and_transport_failures(self):
         cases = (
+            (_Response(200, "Fails."), "qb_rejected", False),
+            (_Response(200, "unexpected proxy response"), "qb_outcome_unknown", False),
             (_Response(401, "secret"), "qb_auth_failed", False),
             (_Response(403, "secret"), "qb_auth_failed", False),
             (_Response(400, "private passkey=SECRET"), "qb_rejected", False),

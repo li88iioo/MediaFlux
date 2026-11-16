@@ -146,6 +146,30 @@ class QBittorrent523IdentityTests(unittest.TestCase):
 
         self.assertEqual(result, TorrentAddResult(True, task_ids=(task_id,)))
 
+    def test_add_ack_contracts_use_one_response_parse(self):
+        for payload, expected in (
+            ("Ok.", TorrentAddResult(True)), ("Ok", TorrentAddResult(True)),
+            ("true", TorrentAddResult(True)), ("", TorrentAddResult(True)),
+            ({"pending_count": 1}, TorrentAddResult(True)),
+            ({"success_count": 1}, TorrentAddResult(True)),
+            ({"failure_count": 1}, TorrentAddResult(False, "qb_rejected")),
+            ({"success_count": 1, "failure_count": 1}, TorrentAddResult(False, "qb_outcome_unknown")),
+            ({"pending_count": 1, "failure_count": 1}, TorrentAddResult(False, "qb_outcome_unknown")),
+            ({"failure_count": 1, "added_torrent_ids": ["a" * 40]},
+             TorrentAddResult(False, "qb_outcome_unknown", task_ids=("a" * 40,))),
+            ({}, TorrentAddResult(False, "qb_outcome_unknown")),
+            ([], TorrentAddResult(False, "qb_outcome_unknown")),
+            ({"success_count": "broken"}, TorrentAddResult(False, "qb_outcome_unknown")),
+        ):
+            with self.subTest(payload=payload):
+                client = QBittorrentClient("http://qb.invalid", api_key="token")
+                self.addCleanup(client.close)
+                response = _Response(200, payload)
+                with patch.object(response, "json", wraps=response.json) as parse:
+                    client._session.post = Mock(return_value=response)
+                    self.assertEqual(client.add_torrent_detailed(torrents=b"torrent"), expected)
+                    self.assertLessEqual(parse.call_count, 1)
+
     def test_qb_5_export_returns_original_torrent_bytes(self):
         task_id = "a" * 40
         torrent = _bencode({

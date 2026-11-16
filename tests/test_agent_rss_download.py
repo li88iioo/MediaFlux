@@ -625,13 +625,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             status_code=400, text="private passkey=SECRET and magnet:?xt=SECRET"
         )
         client._session.post = MagicMock(return_value=response)
-        with (
-            patch(
-                "app.clients.qbittorrent.QBittorrentClient._parse_add_result",
-                return_value=False,
-            ),
-            patch("app.clients.qbittorrent.logger.warning") as warning,
-        ):
+        with patch("app.clients.qbittorrent.logger.warning") as warning:
             self.assertFalse(
                 client.add_torrent_detailed(urls="magnet:?xt=urn:btih:PRIVATESECRET").ok
             )
@@ -639,3 +633,37 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         rendered = repr(warning.call_args)
         self.assertNotIn("PRIVATESECRET", rendered)
         self.assertNotIn("passkey", rendered)
+
+    def test_qb_rejected_and_mixed_acks_are_not_recorded_as_downloaded(self):
+        from tests.test_qbittorrent_523_compat import _Response
+
+        for index, payload in enumerate(("Fails.", {"success_count": 1, "failure_count": 1},
+                                         {"pending_count": 1, "failure_count": 1},
+                                         {"added_torrent_ids": ["a" * 40], "failure_count": 1}), 1):
+            with self.subTest(payload=payload):
+                unknown = isinstance(payload, dict)
+                client = QBittorrentClient(self.runtime["url"], api_key=self.runtime["api_key"])
+                self.addCleanup(client.close)
+                client._session.post = MagicMock(return_value=_Response(200, payload))
+                entry_id = self._entry(self._subscription(), index)
+                with (
+                    patch("app.modules.download_dispatcher.QBittorrentClient", return_value=client),
+                    patch("app.modules.download_dispatcher.get", side_effect=lambda key, default="": {
+                        "QB_URL": self.runtime["url"], "QB_API_KEY": self.runtime["api_key"],
+                    }.get(key, default)),
+                ):
+                    engine = RSSEngine()
+                    self.addCleanup(engine.close)
+                    result = engine.download(entry_id)
+                    self.assertFalse(result["ok"], result)
+                    entry = rss_repo.get_rss_entry(entry_id)
+                    assert entry is not None
+                    self.assertEqual(entry["status"], "failed")
+                    self.assertEqual(entry["processed"], 0)
+                    request = download_requests_repo.get_download_request(entry["download_request_id"])
+                    assert request is not None
+                    self.assertEqual(request["qb_status"], "outcome_unknown" if unknown else "failed")
+                    self.assertEqual(bool(result.get("review_required")), unknown)
+                    self.assertEqual(entry["failure_code"], "qb_outcome_unknown" if unknown else "qb_rejected")
+                    self.assertFalse(engine.download(entry_id).get("already_processed"))
+                self.assertEqual(client._session.post.call_count, 1)
