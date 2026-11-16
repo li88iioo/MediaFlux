@@ -649,21 +649,27 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
             with patch.object(dispatcher, "_submit_qb", side_effect=self.success), patch.object(dispatcher, "_submit_guangya", side_effect=self.success):
                 self.assertTrue(RSSEngine().download(eid)["ok"])
 
+    @staticmethod
+    def _live_rss_config(values):
+        get = lambda key, default="": values.get(key, default)  # noqa: E731
+        get_many = lambda keys, defaults=None: {  # noqa: E731
+            key: values.get(key, (defaults or {}).get(key, "")) for key in keys
+        }
+        return (patch("app.modules.rss.get_many", side_effect=get_many),
+                patch.object(dispatcher, "get", side_effect=get))
+
     def test_qb_retry_keeps_subscription_directory_and_rss_category(self):
         sid, eid, _ = self.pending()
         rss_repo.update_rss_subscription(sid, {"qb_save_path": "/synthetic/subscription"})
         values = {
             "QB_URL": "http://synthetic.invalid",
             "RSS_QB_CATEGORY": "rss-category",
+            "RSS_QB_SAVE_PATH": "/synthetic/rss-default",
             "TG_QB_CATEGORY": "tg-category",
             "TG_QB_SAVE_PATH": "/synthetic/tg-default",
         }
-        get = lambda key, default="": values.get(key, default)
-        with (
-            patch("app.modules.rss.get", side_effect=get),
-            patch.object(dispatcher, "get", side_effect=get),
-            patch.object(dispatcher, "QBittorrentClient") as factory,
-        ):
+        live_rss, live_dispatcher = self._live_rss_config(values)
+        with live_rss, live_dispatcher, patch.object(dispatcher, "QBittorrentClient") as factory:
             qb = factory.return_value
             qb.add_torrent_detailed.return_value = TorrentAddResult(True)
             engine = RSSEngine()
@@ -679,6 +685,35 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                   for call in qb.add_torrent_detailed.call_args_list]
         assert routes == [("/synthetic/subscription", "rss-category")] * 2, routes
 
+    def test_qb_inherits_rss_default_path_on_live_and_frozen_entries(self):
+        """订阅未指定路径时，普通 / 批量 / 定时入口与冻结确认入口一样使用 RSS 全局路径和分类，不借 TG 默认。"""
+        from app.modules.rss import capture_rss_qb_runtime_config
+
+        values = {
+            "QB_URL": "http://synthetic.invalid",
+            "RSS_QB_CATEGORY": "rss-category",
+            "RSS_QB_SAVE_PATH": "/synthetic/rss-default",
+            "TG_QB_CATEGORY": "tg-category",
+            "TG_QB_SAVE_PATH": "/synthetic/tg-default",
+        }
+        live_rss, live_dispatcher = self._live_rss_config(values)
+        with live_rss, live_dispatcher, patch.object(dispatcher, "QBittorrentClient") as factory:
+            qb = factory.return_value
+            qb.add_torrent_detailed.return_value = TorrentAddResult(True)
+            engine = RSSEngine()
+            self.addCleanup(engine.close)
+            single = engine.download(self.pending("")[1])
+            batch = engine.download_many([self.pending("")[1]])
+            runtime, error = capture_rss_qb_runtime_config()
+            self.assertEqual(error, "")
+            frozen = engine._download_entry(
+                rss_repo.get_rss_entry(self.pending("")[1]), qb_runtime_config=runtime,
+            )
+        self.assertTrue(single["ok"] and batch["success_count"] == 1 and frozen["ok"], (single, batch, frozen))
+        routes = [(call.kwargs["save_path"], call.kwargs["category"])
+                  for call in qb.add_torrent_detailed.call_args_list]
+        assert routes == [("/synthetic/rss-default", "rss-category")] * 3, routes
+
     def test_qb_retry_keeps_frozen_config_when_live_config_changes(self):
         _sid, eid, _ = self.pending()
         runtime = {
@@ -689,7 +724,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         }
         original = dict(runtime)
         with (
-            patch("app.modules.rss.get", side_effect=AssertionError("use frozen RSS config")),
+            patch("app.modules.rss.rss_download_defaults", side_effect=AssertionError("use frozen RSS config")),
             patch.object(dispatcher, "get", return_value=""),
             patch.object(dispatcher, "QBittorrentClient") as factory,
         ):
@@ -735,7 +770,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                     conn.execute("UPDATE rss_entries SET payload=? WHERE id=?",
                                  (json.dumps({"torrent_url": item.source_value}), eid))
                 with (
-                    patch("app.modules.rss.get", side_effect=AssertionError("use frozen RSS config")),
+                    patch("app.modules.rss.rss_download_defaults", side_effect=AssertionError("use frozen RSS config")),
                     patch.object(dispatcher, "get", return_value=live_url),
                     patch.object(dispatcher, "QBittorrentClient") as factory,
                 ):

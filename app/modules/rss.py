@@ -30,7 +30,7 @@ import httpx
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import rss as rss_repo
-from app.config import get, get_many
+from app.config import get_many
 from app.indexers.providers.base import magnet_infohash
 from app.logger import get_logger
 from app.modules import media_identity
@@ -305,21 +305,32 @@ def _release_rss_refresh(sub_id: int) -> None:
         _RSS_REFRESHING_SUBSCRIPTIONS.discard(sub_id)
 
 
+_RSS_DEFAULT_KEYS = ("RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD")
+
+
+def _rss_defaults_from(values: Mapping[str, str]) -> dict[str, str]:
+    return {
+        "category": (values["RSS_QB_CATEGORY"] or ""),
+        "default_save_path": (values["RSS_QB_SAVE_PATH"] or ""),
+        "default_method": (values["RSS_DOWNLOAD_METHOD"] or "qb").strip().lower(),
+    }
+
+
+def rss_download_defaults() -> dict[str, str]:
+    """RSS 全局下载默认值（不含 qB 地址与凭据）；未冻结的下载与页面展示共用。"""
+    return _rss_defaults_from(get_many(_RSS_DEFAULT_KEYS, {"RSS_DOWNLOAD_METHOD": "qb"}))
+
+
 def capture_rss_qb_runtime_config() -> tuple[dict, str]:
     """冻结一次 RSS → qB 提交所需的运行时配置。"""
-    keys = (
-        "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
-        "RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD",
-    )
+    keys = ("QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY", *_RSS_DEFAULT_KEYS)
     values = get_many(keys, {"RSS_DOWNLOAD_METHOD": "qb"})
     runtime = {
         "url": (values["QB_URL"] or "").strip(),
         "username": (values["QB_USERNAME"] or ""),
         "password": (values["QB_PASSWORD"] or ""),
         "api_key": (values["QB_API_KEY"] or ""),
-        "category": (values["RSS_QB_CATEGORY"] or ""),
-        "default_save_path": (values["RSS_QB_SAVE_PATH"] or ""),
-        "default_method": (values["RSS_DOWNLOAD_METHOD"] or "qb").strip().lower(),
+        **_rss_defaults_from(values),
         "timeout": 10,
     }
     if not runtime["url"]:
@@ -830,10 +841,6 @@ class RSSEngine:
         return http_torrent_infohash_hint(value)
 
     @staticmethod
-    def _entry_method(entry) -> str:
-        return (entry["download_method"] or get("RSS_DOWNLOAD_METHOD", "qb")).strip().lower()
-
-    @staticmethod
     def _entry_value(entry, key: str, default=""):
         """读取 dict/sqlite.Row 的可选字段。"""
         try:
@@ -929,9 +936,12 @@ class RSSEngine:
             entry = rss_repo.get_rss_entry(entry_id)
             if entry is None:
                 return {"error": "条目不存在", "ok": False}
+        runtime = qb_runtime_config if isinstance(qb_runtime_config, dict) else None
+        # 确认入口沿用冻结快照；其余入口在本次提交读取同一份 RSS 全局默认值。
+        defaults = runtime if runtime is not None else rss_download_defaults()
         # 已绑定的失败恢复沿原目标与内容身份，不因订阅配置 / feed URL 变化改投。
         method = str(self._entry_value(entry, "download_backend", "") or entry["download_method"]
-                     or (qb_runtime_config or {}).get("default_method") or self._entry_method(entry)).strip().lower()
+                     or defaults.get("default_method") or "qb").strip().lower()
         delivery = rss_entry_delivery(entry)
         if method not in {"qb", "guangya"}:
             method = "qb"
@@ -951,7 +961,6 @@ class RSSEngine:
 
         linked_key = str(self._entry_value(entry, "download_request_key", "") or "")
         retry_source = download_requests_repo.get_download_request(delivery["request_id"]) if delivery["request_id"] else None
-        runtime = qb_runtime_config if isinstance(qb_runtime_config, dict) else None
         # 先复用下载中心的准入判断，再重开历史回执。配置/规则拒绝不等于
         # 后端提交失败，不得覆盖原受理记录或让用户丢失再次重试的入口。
         if delivery["retryable"] and auto_guard is None and not entry_already_claimed:
@@ -1003,12 +1012,9 @@ class RSSEngine:
         try:
             submission_options: dict[str, Any] = {
                 "qb_save_path": str(
-                    self._entry_value(entry, "qb_save_path", "")
-                    or (runtime or {}).get("default_save_path") or ""
+                    self._entry_value(entry, "qb_save_path", "") or defaults.get("default_save_path") or ""
                 ),
-                "qb_category": str(
-                    (runtime.get("category") if runtime is not None else get("RSS_QB_CATEGORY", "")) or ""
-                ),
+                "qb_category": str(defaults.get("category") or ""),
                 "qb_runtime_config": runtime,
             }
             if guangya_credential_generation is not None:

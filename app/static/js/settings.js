@@ -575,7 +575,7 @@
 
         const qbCat=form.querySelector('[data-key="TG_QB_CATEGORY"]')?.value?.trim();
         const qbCatPreview=document.getElementById('qbCategoryPreview');
-        if(qbCatPreview)qbCatPreview.textContent=qbCat||'telegram';
+        if(qbCatPreview)qbCatPreview.textContent=qbCat||'未指定';
 
         const qbApiKey=form.querySelector('[data-key="QB_API_KEY"]')?.value?.trim();
         const qbAuthPreview=document.getElementById('qbAuthModePreview');
