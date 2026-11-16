@@ -958,6 +958,7 @@ def _ui_defaults() -> dict[str, str]:
     defaults.update({key: str(bounds[0]) for key, bounds in INT_SETTING_BOUNDS.items()})
     defaults["AI_RECOGNITION_CONFIDENCE_THRESHOLD"] = str(AI_RECOGNITION_CONFIDENCE_BOUNDS[0])
     defaults["TG_NOTIFICATION_LEVEL"] = DEFAULT_NOTIFICATION_LEVEL
+    defaults["RSS_DOWNLOAD_METHOD"] = "qb"
     defaults.update(dict.fromkeys(_CRON_KEYS, DEFAULT_SCHEDULE_CRON))
     return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
 
@@ -1026,6 +1027,9 @@ def get_config(request: Request):
         items["INDEXER_ENABLED_SITES"] = ",".join(persisted_sites)
     except ValueError:
         items["INDEXER_ENABLED_SITES"] = (raw_sites or "")
+    from app.modules.rss import rss_download_defaults
+
+    items["RSS_DOWNLOAD_METHOD"] = rss_download_defaults()["default_method"]
     redacted: dict = redact_config(items)
     if items.get("DOUBAN_DBCL2"):
         redacted["DOUBAN_DBCL2"] = _CONFIG_MASK

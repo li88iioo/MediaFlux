@@ -44,6 +44,8 @@ class RssDirectoryPickerLayerBrowserTests(unittest.TestCase):
         env = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         cls.html = env.get_template("rss.html").render(
             active="rss", app_version="offline-test", discovery_enabled=False,
+            rss_defaults={"default_method": "qb", "category": "", "default_save_path": ""},
+            rss_inherited_dir_id="0", rss_inherited_dir_name="根目录",
             agent_enabled=False, csrf_token=lambda: "offline-csrf",
             static_url=lambda name: "/static/" + name,
             url_for=lambda name: "/" + name.split(".")[-1],

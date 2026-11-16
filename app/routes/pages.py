@@ -306,15 +306,18 @@ def guangya_more(request: Request, view: str = "share"):
 
 @router.get("/rss", name="pages.rss")
 def rss(request: Request):
-    # 订阅不指定光鸭目录时沿用离线转存页的默认保存目录；与该页一致，"0"/空视为未配置。
-    offline = _offline_transfer_defaults()["offline_initial"]
-    inherited_dir = offline["target_dir"] if offline["target_dir"] not in ("", "0") else ""
+    from app.modules.offline import OfflineRules
+    from app.modules.rss import rss_download_defaults
+
+    offline = OfflineRules.from_config()
     return _page(
         request,
         "rss.html",
         "rss",
         resource_results_enabled=config.get_bool("INDEXER_SEARCH_ENABLED"),
-        rss_inherited_dir_name=(offline["target_dir_name"] or inherited_dir) if inherited_dir else "",
+        rss_defaults=rss_download_defaults(),
+        rss_inherited_dir_id=offline.target_dir_id,
+        rss_inherited_dir_name="根目录" if offline.target_dir_id == "0" else offline.target_dir_name,
     )
 
 

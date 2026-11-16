@@ -309,10 +309,11 @@ _RSS_DEFAULT_KEYS = ("RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD
 
 
 def _rss_defaults_from(values: Mapping[str, str]) -> dict[str, str]:
+    method = (values["RSS_DOWNLOAD_METHOD"] or "qb").strip().lower()
     return {
         "category": (values["RSS_QB_CATEGORY"] or ""),
         "default_save_path": (values["RSS_QB_SAVE_PATH"] or ""),
-        "default_method": (values["RSS_DOWNLOAD_METHOD"] or "qb").strip().lower(),
+        "default_method": method if method in {"qb", "guangya"} else "qb",
     }
 
 
