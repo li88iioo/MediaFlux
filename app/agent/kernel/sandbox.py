@@ -255,7 +255,6 @@ class _SDKRequests:
         read_result = None
         budget_error = None
         activity = None
-        activity_id = f"{self.context.call_id}:{name.removesuffix('.json')}"
         current_task = self.context.current_task
         observation: dict[str, Any] = {}
         checkpoint: dict[str, Any] | None = None
@@ -304,7 +303,7 @@ class _SDKRequests:
                         raise
             if self.context.read_only and effect in {"write", "local_write"}:
                 raise ToolPipelineError("工作区行动接力仅允许只读 SDK。", code="read_scope_required")
-            activity = _sdk_activity(activity_id, method, arguments)
+            activity = _sdk_activity(name, method, arguments)
             if activity:
                 await self.context.report_progress({"activity": activity})
             if effect == "write":
@@ -323,7 +322,7 @@ class _SDKRequests:
                         self.proposal = prepared
                         self.calls.append({"method": method, "ok": True, "status": "approval_required"})
                         await self.context.report_progress({"activity": _sdk_activity(
-                            activity_id, method, arguments, status="approval_required")})
+                            name, method, arguments, status="approval_required")})
                         self.approval_ready.set()
                         return
                     result = dict(prepared.outcome.public_content)
@@ -352,7 +351,7 @@ class _SDKRequests:
             self.context.cancellation.raise_if_cancelled()
             status = str(result.get("status") or ("partial" if result.get("partial") else "success"))
             ok = result.get("ok") is not False
-            activity = _sdk_activity(activity_id, method, arguments,
+            activity = _sdk_activity(name, method, arguments,
                 status="failed" if not ok else "partial" if result.get("partial") or status == "partial" else "success",
                 result=result)
             encoded = json.dumps({**observation, "result": result}, ensure_ascii=False, allow_nan=False).encode()
@@ -389,14 +388,14 @@ class _SDKRequests:
                 call["execution_started"] = execution_started
             encoded = json.dumps({**observation, "error": error}, ensure_ascii=False).encode()
             if method in METHODS:
-                activity = _sdk_activity(activity_id, method, arguments if isinstance(arguments, dict) else {},
+                activity = _sdk_activity(name, method, arguments if isinstance(arguments, dict) else {},
                                          status="failed", error=message)
         if activity:
             await self.context.report_progress({"activity": activity})
         if observation:
             call["called_at"] = observation["called_at"]
             patch = observation_patch(current_task, owner=self.context.owner, session_id=self.context.session_id,
-                tool=method, call_id=f"{self.context.call_id}:{len(self.calls)}",
+                tool=method, call_id=name,
                 observations={} if identity(current_task) != identity(self.context.current_task) else read_observations(
                     current_task, method, observation["arguments"], read_result))
             if patch is not None:

@@ -4,6 +4,7 @@ from typing import cast
 
 import asyncio
 import json
+import re
 from tests.agent_task_native_helpers import returned_task
 import socket
 from contextlib import contextmanager
@@ -582,8 +583,15 @@ def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_p
         assert not failures
         expected = set() if qb_state == "error" else {"tmdb"} if qb_state == "invalid" else {"tmdb", "qbittorrent"}
         assert {fact["component"] for fact in observed["verified_facts"]} == expected
+        activity_ids = {e.payload["activity"]["id"] for e in events
+                        if e.payload.get("activity", {}).get("method") == "diagnostics.configuration"}
+        assert len(activity_ids) == 1
+        [activity_id] = activity_ids
+        assert re.fullmatch(r"[0-9a-f]{32}\.json", activity_id)
+        assert len({fact["evidence_id"] for fact in observed["verified_facts"]}) == len(expected)
         for fact in observed["verified_facts"]:
-            assert fact["tool"] == "diagnostics.configuration" and fact["call_id"] == "call-observe:1"
+            assert fact["tool"] == "diagnostics.configuration" and fact["call_id"] == activity_id
+            assert fact["evidence_id"] != activity_id
             assert fact["scope"]["owner"] == OWNER and fact["scope"]["session_id"] == session_id
             assert fact["network_accessed"] is False and fact["probe_mode"] == "configuration_only"
             assert fact["status"] == (qb_state if fact["component"] == "qbittorrent" else "ready")

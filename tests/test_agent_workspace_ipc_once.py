@@ -259,8 +259,7 @@ def test_distinct_requests_use_four_slots_and_release_completed_slots(tmp_path):
         effects = SimpleNamespace(prepare=AsyncMock())
         with patch.dict(sandbox.METHODS, {"library.episodes": read}):
             async with _bridge(tmp_path, effects) as (rpc, progress):
-                for index in range(5):
-                    _publish(rpc, index, "library.episodes", {"query": str(index)})
+                names = {_publish(rpc, index, "library.episodes", {"query": str(index)}) for index in range(5)}
                 try:
                     async with _controlled_poll(rpc) as next_scan:
                         for _ in range(4):
@@ -281,6 +280,7 @@ def test_distinct_requests_use_four_slots_and_release_completed_slots(tmp_path):
                         for item in activities:
                             by_id.setdefault(item["id"], []).append(item)
                         assert len(by_id) == 5
+                        assert set(by_id) == names
                         assert all([item["status"] for item in pair] == ["running", "success"] for pair in by_id.values())
                         assert all(pair[0]["label"] == "查询媒体库季集" for pair in by_id.values())
                 finally:

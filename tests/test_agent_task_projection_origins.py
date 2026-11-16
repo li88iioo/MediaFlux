@@ -4,6 +4,7 @@ from typing import cast
 
 import asyncio
 import json
+import re
 from copy import deepcopy
 from unittest.mock import patch
 
@@ -124,7 +125,12 @@ def test_private_call_id_stays_internal_and_native(storage):
         runtime, cold, events = await drive(script)
         task = cold.metadata["task"]
         fact = task["verified_facts"][0]
-        assert fact["call_id"] == canary + ":1"
+        assert re.fullmatch(r"[0-9a-f]{32}\.json", fact["call_id"])
+        activities = [e.payload["activity"] for e in events
+                      if e.payload.get("activity", {}).get("method") == fact["tool"]]
+        assert [a["status"] for a in activities] == ["running", "success"]
+        assert {a["id"] for a in activities} == {fact["call_id"]}
+        assert fact["evidence_id"] != fact["call_id"]
         assert fact["scope"]["owner"] == OWNER
         assert task["obligations"][0]["evidence_ids"] == [fact["evidence_id"]]
         assert task["status"] == "complete"

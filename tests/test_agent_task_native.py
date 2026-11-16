@@ -1,7 +1,9 @@
 """原生会话任务：真实root工作区、SQLite发布和原验收证据。"""
 import asyncio
 import json
+import re
 import socket
+import threading
 from hashlib import sha256
 
 import pytest
@@ -16,6 +18,7 @@ from app.agent.kernel.bootstrap import (
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
+from app.clients.openai_compatible import parse_native_call
 from tests import test_agent_session_result as native_tests
 from tests import test_agent_task_cas as cas_tests
 from tests.test_agent_kernel_core import ScriptedModel
@@ -24,9 +27,9 @@ from tests.test_agent_task_first_slice import GOAL, OWNER, declaration
 native_workspace = native_tests.native_workspace
 task_store = cas_tests.task_store
 
-def code_round(code, *, language="python"):
+def code_round(code, *, language="python", call_id="native-task"):
     return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-        "native-task", "agent.run_code", {"code": code, "language": language})),
+        call_id, "agent.run_code", {"code": code, "language": language})),
         ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
 
 
@@ -97,7 +100,8 @@ print(json.dumps(done))'''
     asyncio.run(run())
 
 
-def test_only_business_reads_earn_native_task_evidence(task_store, native_workspace, monkeypatch):
+@pytest.mark.parametrize("call_id_length", [62, 63, 64])
+def test_only_business_reads_earn_native_task_evidence(task_store, native_workspace, monkeypatch, call_id_length):
     queried = []
 
     def search(query: str):
@@ -131,7 +135,12 @@ print(json.dumps({{'before': before, 'observed': observed, 'done': done,
 
     async def run():
         initialize_runtime_fence()
-        runtime = build_agent_kernel_runtime(model=ScriptedModel([code_round(code), final()]), store=task_store)
+        native = parse_native_call("c" * call_id_length, "agent__run_code", json.dumps({"code": code}),
+                                   allow_argument_errors=True)
+        assert native.call_id == "c" * call_id_length
+        runtime = build_agent_kernel_runtime(model=ScriptedModel([
+            code_round(code, call_id=native.call_id), final(),
+        ]), store=task_store)
         events = [event async for event in runtime.session.run(AgentInput(
             message=goal, owner=OWNER, session_id="native-read-evidence"))]
         [result] = [event.payload["result"]["data"] for event in events if event.type.value == "tool.completed"]
@@ -145,11 +154,90 @@ print(json.dumps({{'before': before, 'observed': observed, 'done': done,
         cold = await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(
             owner=OWNER, session_id="native-read-evidence")
         assert [fact["tool"] for fact in cold.metadata["task"]["verified_facts"]] == ["media.search"]
+        [fact] = cold.metadata["task"]["verified_facts"]
+        assert len(fact["call_id"]) <= 64 and fact["evidence_id"] != fact["call_id"]
+        assert [row["tool_call_id"] for row in cold.conversation if row["role"] == "tool"] == [native.call_id]
+        assert [call["call_id"] for row in cold.conversation for call in row.get("tool_calls", [])] == [native.call_id]
         assert queried == ["sample"]
         assert [call["method"] for call in result["sdk_calls"]] == [
             "session.start_task", "skills.save", "skills.save", "skills.restore", "resources.present",
             "session.pending_plan", "session.task", "media.search", "session.task", "session.checkpoint_task",
         ]
+
+    asyncio.run(run())
+
+
+def test_parallel_sdk_request_identity_survives_cold_runtime(task_store, native_workspace, monkeypatch):
+    queries = ["parallel-0", "parallel-1", "parallel-2"]
+    entered = threading.Barrier(3)
+    finished = [threading.Event() for _ in queries]
+    calls = []
+
+    def search(query: str):
+        if query in queries:
+            index = queries.index(query)
+            entered.wait(timeout=5)
+            if index < 2:
+                assert finished[index + 1].wait(5)
+            calls.append(query)
+            finished[index].set()
+        else:
+            calls.append(query)
+        return {"ok": True, "status": "success", "summary": query, "items": []}
+
+    monkeypatch.setitem(sdk.METHODS, "media.search", search)
+    goal = "并发只读核对媒体，冷恢复后继续查询。"
+    args = declaration()
+    args.pop("operation")
+    args.update(source=goal, root_goal=goal, obligations=[{
+        "id": "media", "description": "取得媒体查询证据", "required": True,
+        "acceptance": {"kind": "observed_read", "criterion": "返回真实查询结果"},
+    }])
+    first_code = f'''import json
+from concurrent.futures import ThreadPoolExecutor
+from mf import session, media
+session.start_task(**{args!r})
+with ThreadPoolExecutor(3) as pool:
+    list(pool.map(media.search, {queries!r}))
+print(json.dumps(session.task()['data']['task']))'''
+    cold_code = '''from mf import session, media
+media.search('after-cold')
+t = session.task()['data']['task']
+session.checkpoint_task([], [], read_evidence={'media': t['verified_facts'][-1]['evidence_id']})'''
+
+    async def run():
+        initialize_runtime_fence()
+        runtime = build_agent_kernel_runtime(model=ScriptedModel([
+            code_round(first_code, call_id="parallel-sdk"), final(),
+        ]), store=task_store)
+        events = [e async for e in runtime.session.run(AgentInput(message=goal, owner=OWNER, session_id="rpc-identities"))]
+        [result] = [e.payload["result"]["data"] for e in events if e.type.value == "tool.completed"]
+        assert result["exit_code"] == 0, result["stderr"]
+        cold_store = SQLiteKernelStore(secret_provider=lambda: "task-test-only")
+        before = (await cold_store.load(owner=OWNER, session_id="rpc-identities")).metadata["task"]["verified_facts"]
+        ids = {fact["call_id"] for fact in before}
+        assert len(before) == len(ids) == 3
+        assert all(re.fullmatch(r"[0-9a-f]{32}\.json", value) for value in ids)
+        activities = [e.payload["activity"] for e in events if e.payload.get("activity", {}).get("method") == "media.search"]
+        assert {activity["id"] for activity in activities} == ids
+        assert all([a["status"] for a in activities if a["id"] == value] == ["running", "success"] for value in ids)
+        cold = build_agent_kernel_runtime(model=ScriptedModel([
+            code_round(cold_code, call_id="cold-sdk"), final(),
+        ]), store=cold_store)
+        later = [e async for e in cold.session.run(AgentInput(message="继续只读核对", owner=OWNER, session_id="rpc-identities"))]
+        [result] = [e.payload["result"]["data"] for e in later if e.type.value == "tool.completed"]
+        assert result["exit_code"] == 0, result["stderr"]
+        after = (await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(
+            owner=OWNER, session_id="rpc-identities")).metadata["task"]
+        assert after["status"] == "complete" and after["verified_facts"][:3] == before
+        assert len({fact["call_id"] for fact in after["verified_facts"]}) == 4
+        assert len({fact["evidence_id"] for fact in after["verified_facts"]}) == 4
+        assert all(fact["evidence_id"] != fact["call_id"] for fact in after["verified_facts"])
+        fresh = after["verified_facts"][-1]["call_id"]
+        assert re.fullmatch(r"[0-9a-f]{32}\.json", fresh) and fresh not in ids
+        assert {e.payload["activity"]["id"] for e in later
+                if e.payload.get("activity", {}).get("method") == "media.search"} == {fresh}
+        assert calls == [*reversed(queries), "after-cold"]
 
     asyncio.run(run())
 
