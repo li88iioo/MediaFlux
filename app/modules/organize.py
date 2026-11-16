@@ -3595,6 +3595,28 @@ class Organizer:
                 "skipped": True,
                 "error": "整理存在失败项且没有已确认的变更清单，已停止 STRM 同步",
             }
+        else:
+            stats["strm"] = {
+                "ok": True, "skipped": True,
+                "reason": "未启用" if not rules.link_strm else "已跳过" if stats.get("stopped") else "无变更",
+            }
+        handoff = stats.get("strm") or {}
+        if handoff.get("skipped") or handoff.get("ok") is False:
+            # 调度器未接管的分支也必须收尾，复用自动/人工整理的同一通知路径。
+            # 已接管的任务由调度器回写，避免这里的排队状态覆盖异步完成回执。
+            from app.modules.scheduler import _publish_linked_notification_threads
+
+            context = normalize_notification_context(stats.get("notification_context"))
+            error = redact_sensitive_text(handoff.get("error") or organize_strm_error(stats))
+            _publish_linked_notification_threads(
+                {
+                    "notify_override": rules.notify_enabled and context.get("notify_enabled", True),
+                    "notification_threads": notification_threads or context.get("notification_threads", []),
+                    "download_request_ids": download_request_ids or context.get("download_request_ids", []),
+                },
+                strm_status="启动失败" if error else handoff.get("reason") or "已跳过",
+                media_refresh="未触发", partial=bool(error), error=error,
+            )
         if not rules.notify_enabled or not rules.library_notify:
             Organizer._schedule_agent_recognition_reviews(
                 stats, rules, source_name=source_name, chat_id=chat_id
@@ -3617,58 +3639,60 @@ class Organizer:
         """整理后联动：触发 STRM；媒体库刷新由 STRM 完成后统一处理。"""
         base_url = get("GY_STRM_BASE_URL", "")
         strm_root = get("STRM_ROOT", "")
-        if base_url and strm_root:
-            try:
-                from app.modules.scheduler import get_scheduler
+        if not base_url or not strm_root:
+            stats["strm"] = {"ok": False, "error": "STRM 播放地址或本地根目录未配置，无法启动同步"}
+            return
+        try:
+            from app.modules.scheduler import get_scheduler
 
-                context = normalize_notification_context(stats.get("notification_context"))
-                probe_completion = bool(stats.get("probe_completion"))
-                if context and not probe_completion:
-                    download_request_ids = download_request_ids or context["download_request_ids"]
-                    notification_threads = notification_threads or context["notification_threads"]
-                    chat_id = context["chat_id"]
-                linked_threads = [] if probe_completion else (
-                    list(notification_threads or [])
-                    or ([{
-                        "topic": "organize",
-                        "thread_key": f"organize:{str(stats.get('task_id') or '')}",
-                        "task_id": str(stats.get("task_id") or ""),
-                        "chat_id": (chat_id or ""),
-                        "topic_enabled": (rules.notify_enabled and rules.library_notify),
-                    }] if str(stats.get("task_id") or "").strip() and not download_request_ids else [])
-                )
-                trigger_options = {
-                    "notify_override": rules.notify_enabled and context.get("notify_enabled", True),
-                    "detail_notify_override": (
-                        not probe_completion and rules.notify_enabled and rules.strm_detail_notify
-                    ),
-                    "media_server_refresh_override": rules.emby_refresh,
-                    "download_request_ids": download_request_ids,
-                    "organize_changes": list(stats.get("strm_changes") or []),
-                    "force_full": False if force_incremental else (
-                        bool(stats.get("strm_force_full")) or not bool(stats.get("strm_changes"))
-                    ),
-                }
-                if sync_mode == "fast":
-                    trigger_options["sync_mode"] = "fast"
-                    trigger_options["selected_source_ids"] = sorted({
-                        change["source_id"] for change in trigger_options["organize_changes"]
-                    })
-                if linked_threads:
-                    trigger_options["notification_threads"] = linked_threads
-                if chat_id:
-                    trigger_options["chat_id"] = chat_id
-                if debounce_seconds > 0:
-                    trigger_options["debounce_seconds"] = debounce_seconds
-                result = get_scheduler().trigger("organize", **trigger_options)
-                logger.info(f"整理联动 STRM: {result}")
-                stats["strm"] = result
-            except Exception as e:
-                logger.error("联动 STRM 失败 type=%s", type(e).__name__)
-                stats["strm"] = {
-                    "ok": False, "error_code": "strm_trigger_failed",
-                    "error": f"STRM 联动启动失败: {redact_sensitive_text(e)[:300]}",
-                }
+            context = normalize_notification_context(stats.get("notification_context"))
+            probe_completion = bool(stats.get("probe_completion"))
+            if context and not probe_completion:
+                download_request_ids = download_request_ids or context["download_request_ids"]
+                notification_threads = notification_threads or context["notification_threads"]
+                chat_id = context["chat_id"]
+            linked_threads = [] if probe_completion else (
+                list(notification_threads or [])
+                or ([{
+                    "topic": "organize",
+                    "thread_key": f"organize:{str(stats.get('task_id') or '')}",
+                    "task_id": str(stats.get("task_id") or ""),
+                    "chat_id": (chat_id or ""),
+                    "topic_enabled": (rules.notify_enabled and rules.library_notify),
+                }] if str(stats.get("task_id") or "").strip() and not download_request_ids else [])
+            )
+            trigger_options = {
+                "notify_override": rules.notify_enabled and context.get("notify_enabled", True),
+                "detail_notify_override": (
+                    not probe_completion and rules.notify_enabled and rules.strm_detail_notify
+                ),
+                "media_server_refresh_override": rules.emby_refresh,
+                "download_request_ids": download_request_ids,
+                "organize_changes": list(stats.get("strm_changes") or []),
+                "force_full": False if force_incremental else (
+                    bool(stats.get("strm_force_full")) or not bool(stats.get("strm_changes"))
+                ),
+            }
+            if sync_mode == "fast":
+                trigger_options["sync_mode"] = "fast"
+                trigger_options["selected_source_ids"] = sorted({
+                    change["source_id"] for change in trigger_options["organize_changes"]
+                })
+            if linked_threads:
+                trigger_options["notification_threads"] = linked_threads
+            if chat_id:
+                trigger_options["chat_id"] = chat_id
+            if debounce_seconds > 0:
+                trigger_options["debounce_seconds"] = debounce_seconds
+            result = get_scheduler().trigger("organize", **trigger_options)
+            logger.info(f"整理联动 STRM: {result}")
+            stats["strm"] = result
+        except Exception as e:
+            logger.error("联动 STRM 失败 type=%s", type(e).__name__)
+            stats["strm"] = {
+                "ok": False, "error_code": "strm_trigger_failed",
+                "error": f"STRM 联动启动失败: {redact_sensitive_text(e)[:300]}",
+            }
 
 
     def _apply_nsfw_multipart_policy(

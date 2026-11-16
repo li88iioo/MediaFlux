@@ -25,7 +25,7 @@ _BATCH_ID = re.compile(r"[0-9a-f]{16,32}\Z")
 _CALLBACK = re.compile(r"orgb:([A-Za-z0-9_-]{1,32}):([pdra]):([0-9a-f]{16}|[0-9]{1,8})\Z")
 _STATUSES = {
     "pending": "待确认", "queued": "已排队", "running": "整理中",
-    "completed": "队列完成", "failed": "失败", "cancelled": "已结束", "expired": "已过期",
+    "completed": "整理完成", "failed": "失败", "cancelled": "已结束", "expired": "已过期",
 }
 
 
@@ -42,7 +42,7 @@ def _batch_items(batch_id: str, chat_id: str) -> dict:
 
 
 def _downstream_counts(items: list[dict]) -> dict[str, int]:
-    counts = {"partial": 0, "waiting": 0, "completed": 0}
+    counts = {"partial": 0, "waiting": 0, "submitted": 0, "completed": 0}
     for item in items:
         downstream = item.get("downstream") or {}
         if downstream.get("partial") or downstream.get("error") or item.get("status") == "failed":
@@ -51,6 +51,12 @@ def _downstream_counts(items: list[dict]) -> dict[str, int]:
             states = [str(downstream.get(key) or "").lower() for key in ("strm", "media_refresh")]
             if any(any(word in state for word in ("失败", "异常", "failed", "error")) for state in states):
                 counts["partial"] += 1
+            elif states[0] in {"完成", "已完成", "success", "completed"} and all(
+                re.search(r"(?:^|\s)(?:已排队|queued|(?:已)?完成|成功|已跳过|未启用(?:或无目标)?|无目标|skipped|disabled|success|completed)$", part.strip())
+                for part in states[1].split("/")
+            ) and ("已排队" in states[1] or "queued" in states[1]):
+                # 队列接管是持久回执，不是缺回执；也不能据此声称媒体库扫描完成。
+                counts["submitted"] += 1
             elif any(not state or any(word in state for word in (
                 "等待", "排队", "进行中", "执行中", "未完成", "pending", "queued", "running",
             )) for state in states):
@@ -152,12 +158,14 @@ def _batch_event(
     anchor = str(items[0]["confirmation_id"])
     counts = Counter(str(item.get("status") or "pending") for item in items)
     downstream_counts = _downstream_counts(items)
+    active = bool(counts["pending"] or counts["queued"] or counts["running"] or downstream_counts["waiting"] or truncated)
+    settled = not active and not downstream_counts["partial"]
     status_text = " · ".join(f"{label} {counts[status]}" for status, label in _STATUSES.items() if counts[status])
     metadata: dict = {
         "batch_id": batch_id, "page": page, "detail_token": detail_token,
         "progress": dict(counts), "downstream": downstream_counts, "truncated": truncated,
     }
-    detail = next((item for item in items if item["confirmation_id"] == detail_token), None)
+    detail = next((item for item in items if item["confirmation_id"] == detail_token), None) if not settled else None
     lines: list[str] = []
     actions: list[NotificationAction] = []
     if detail is not None:
@@ -216,7 +224,12 @@ def _batch_event(
             footer = "此组涉及季集映射，请到 Web 查看完整映射后确认；TG 仅保留跳过操作。"
     else:
         metadata["detail_token"] = ""
-        title = "⚠️ 整理待确认批次"
+        title = (
+            "⚠️ 整理待确认批次" if counts["pending"] else
+            "⚠️ 整理批次部分完成" if downstream_counts["partial"] else
+            "⏳ 整理批次处理中" if active else
+            "✅ 整理批次已完成" if counts["completed"] else "整理批次已结束"
+        )
         # 分母是整批进入过复核的组；已确认或已处理的组算完成，不能移出分母让进度倒退。
         reviewing = [item for item in items if item.get("review_status")]
         review_count = sum(item.get("status") == "pending" and item["review_status"] in {"waiting", "pending", "running"}
@@ -224,7 +237,8 @@ def _batch_event(
         fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text), ("分页", f"{page}/{pages}"))
         if any(downstream_counts.values()):
             fields += (("后续处理", " · ".join(f"{label} {downstream_counts[key]}" for key, label in (
-                ("partial", "部分完成"), ("waiting", "等待回执"), ("completed", "已完成"),
+                ("partial", "部分完成"), ("waiting", "等待回执"),
+                ("submitted", "已交接后台刷新"), ("completed", "已完成"),
             ) if downstream_counts[key])),)
         if review_count:
             # 复核逐组完成时不重发消息，避免刷屏；进度在刷新或最后一组完成时更新。
@@ -240,12 +254,18 @@ def _batch_event(
                 lines.append(f"建议：{_candidate_label(candidate)}\n{truncate_telegram_text(suggestion.get('summary') or '请查看候选详情', 140)}")
             elif item.get("review_summary") and status == "pending":
                 lines.append(f"复核：{truncate_telegram_text(item['review_summary'], 140)}")
-            actions.append(_button(f"查看 {offset} · {identity}", item["confirmation_id"], "d", page))
-        if page > 1:
+            item_downstream = _downstream_counts([item])
+            if status in {"pending", "queued", "running", "failed"} or item_downstream["partial"] or item_downstream["waiting"]:
+                actions.append(_button(f"查看 {offset} · {identity}", item["confirmation_id"], "d", page))
+        if page > 1 and not settled:
             actions.append(_button("上一页", anchor, "p", page - 1))
-        if page < pages:
+        if page < pages and not settled:
             actions.append(_button("下一页", anchor, "p", page + 1))
-        footer = "可分页查看并手动选择候选；没有建议的媒体不会自动选择。"
+        footer = ("可分页查看并手动选择候选；没有建议的媒体不会自动选择。" if counts["pending"] else
+                  "后续处理仍在进行，可刷新摘要查看状态。" if active else
+                  "请在 Web 整理日志查看处理明细。")
+        if downstream_counts["submitted"]:
+            footer += "\nSTRM 已完成，刷新已交给后台；不代表媒体库已扫描完成。"
         preview = None
         if truncated:
             footer = "此批次超过 1000 组，仅展示前 1000 组；请在 Web 分批审阅、复核和确认。"
@@ -273,7 +293,8 @@ def _batch_event(
                 footer += f"\n{preview['note']}"
         if not truncated and counts["pending"] and feature_gate.recognition_review_enabled():
             actions.append(_button("请求 Agent 只读复核", anchor, "r", page))
-        actions.append(_button("刷新摘要", anchor, "p", page))
+        if active:
+            actions.append(_button("刷新摘要", anchor, "p", page))
     return NotificationEvent(
         title=title, fields=fields, lines=tuple(lines), footer=footer,
         actions=tuple(actions), layout="relaxed", state="confirmation_batch",
