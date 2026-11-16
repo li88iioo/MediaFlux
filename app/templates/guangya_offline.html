@@ -2,20 +2,6 @@
 {% block title %}离线转存 - MediaFlux{% endblock %}
 {% block page_title %}光鸭离线转存{% endblock %}
 {% block body_class %}persistent-savebar-page{% endblock %}
-{% set offline_initial = offline_initial | default({
-    'magnet_enabled': true,
-    'ed2k_enabled': true,
-    'http_enabled': false,
-    'target_dir': '',
-    'target_dir_name': '',
-    'secondary_enabled': false,
-    'secondary_dir': '',
-    'secondary_dir_name': '',
-    'secondary_keywords': [],
-    'exclude_keywords': [],
-    'min_file_mb': 0,
-    'allowed_exts': []
-}, true) %}
 {% block content %}
 <section class="standalone-settings offline-settings-shell" id="offlineForm">
     <div class="offline-settings-grid">

@@ -819,7 +819,7 @@
         fillConfigFields(form,cfg);
 
         // Init Tag Inputs
-        videoTagInput.setTagsFromString(cfg.STRM_VIDEO_EXTS || 'mkv,mp4,ts,m2ts');
+        videoTagInput.setTagsFromString(cfg.STRM_VIDEO_EXTS || '');
         metadataTagInput.setTagsFromString(cfg.STRM_METADATA_EXTS || 'nfo,srt,ass,jpg,png');
 
         const canonical=String(cfg.GY_STRM_SOURCE_DIRS??'').trim();

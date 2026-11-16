@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse
 
 from app import config
 from app.agent.feature_gate import is_agent_enabled
+from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB, DEFAULT_STRM_VIDEO_EXTS
 from app.discovery.models import normalize_search_query
 from app.modules.global_search import build_global_search
 from app.services import (
@@ -180,7 +181,7 @@ def _offline_transfer_defaults() -> dict[str, Any]:
         "offline_initial": {
             "magnet_enabled": config.get_bool("OFFLINE_MAGNET_ENABLED", True),
             "ed2k_enabled": config.get_bool("OFFLINE_ED2K_ENABLED", True),
-            "http_enabled": config.get_bool("OFFLINE_HTTP_ENABLED", False),
+            "http_enabled": config.get_bool("OFFLINE_HTTP_ENABLED"),
             "target_dir": (config.get("OFFLINE_TARGET_DIR", "") or "").strip(),
             "target_dir_name": (config.get("OFFLINE_TARGET_DIR_NAME", "") or "").strip(),
             "secondary_enabled": config.get_bool("OFFLINE_SECONDARY_ENABLED", False),
@@ -188,7 +189,7 @@ def _offline_transfer_defaults() -> dict[str, Any]:
             "secondary_dir_name": (config.get("OFFLINE_SECONDARY_DIR_NAME", "") or "").strip(),
             "secondary_keywords": split_tags("OFFLINE_SECONDARY_KEYWORDS"),
             "exclude_keywords": split_tags("OFFLINE_EXCLUDE_KEYWORDS"),
-            "min_file_mb": max(0, config.get_int("OFFLINE_MIN_FILE_MB", 0)),
+            "min_file_mb": max(0, config.get_int("OFFLINE_MIN_FILE_MB", DEFAULT_OFFLINE_MIN_FILE_MB)),
             "allowed_exts": split_tags("OFFLINE_ALLOWED_EXTS"),
         }
     }
@@ -206,7 +207,10 @@ def guangya_offline(request: Request):
 
 @router.get("/guangya/strm", name="pages.guangya_strm")
 def guangya_strm(request: Request):
-    return _page(request, "guangya_strm.html", "guangya_strm")
+    return _page(
+        request, "guangya_strm.html", "guangya_strm",
+        strm_full_video_exts=",".join(DEFAULT_STRM_VIDEO_EXTS),
+    )
 
 
 @router.get("/guangya/media-proxy", name="pages.media_proxy")

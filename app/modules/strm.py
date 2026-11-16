@@ -45,6 +45,7 @@ from app.clients.guangya import (
     close_guangya_client,
 )
 from app.config import get, get_int
+from app.defaults import DEFAULT_STRM_VIDEO_EXTS
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
@@ -280,10 +281,7 @@ def finalize_changed_paths(stats: dict) -> dict:
     ))
     return stats
 
-DEFAULT_VIDEO_EXTS = {
-    "mp4", "mkv", "ts", "rmvb", "avi", "mov", "mpeg", "mpg",
-    "wmv", "3gp", "asf", "m4v", "flv", "m2ts", "tp", "f4v", "rm",
-}
+DEFAULT_VIDEO_EXTS = set(DEFAULT_STRM_VIDEO_EXTS)
 
 DEFAULT_METADATA_EXTS = {
     "nfo", "srt", "ass", "ssa", "sub", "idx",

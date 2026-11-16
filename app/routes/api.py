@@ -21,7 +21,9 @@ from app.defaults import (
     DEFAULT_BOOL_CONFIG_VALUES,
     DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT,
     DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
+    DEFAULT_OFFLINE_MIN_FILE_MB,
     DEFAULT_SCHEDULE_CRON,
+    DEFAULT_STRM_VIDEO_EXTS,
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
 from app.discovery.models import ProviderError
@@ -959,6 +961,8 @@ def _ui_defaults() -> dict[str, str]:
     defaults["AI_RECOGNITION_CONFIDENCE_THRESHOLD"] = str(AI_RECOGNITION_CONFIDENCE_BOUNDS[0])
     defaults["TG_NOTIFICATION_LEVEL"] = DEFAULT_NOTIFICATION_LEVEL
     defaults["RSS_DOWNLOAD_METHOD"] = "qb"
+    defaults["OFFLINE_MIN_FILE_MB"] = str(DEFAULT_OFFLINE_MIN_FILE_MB)
+    defaults["STRM_VIDEO_EXTS"] = ",".join(DEFAULT_STRM_VIDEO_EXTS)
     defaults.update(dict.fromkeys(_CRON_KEYS, DEFAULT_SCHEDULE_CRON))
     return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
 
@@ -1031,6 +1035,9 @@ def get_config(request: Request):
 
     items["RSS_DOWNLOAD_METHOD"] = rss_download_defaults()["default_method"]
     redacted: dict = redact_config(items)
+    # 控制台用户名可回显；仅此已鉴权接口放行，日志等通用脱敏规则仍保护凭据。
+    if "ENV_WEB_PASSPORT" in items:
+        redacted["ENV_WEB_PASSPORT"] = items["ENV_WEB_PASSPORT"]
     if items.get("DOUBAN_DBCL2"):
         redacted["DOUBAN_DBCL2"] = _CONFIG_MASK
     redacted["__managed_fields"] = managed_fields

@@ -11,6 +11,7 @@ import httpx
 
 from app.clients.guangya import GuangYaClient, close_guangya_client, single_bt_root_file
 from app.config import get, get_bool, get_int
+from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB
 from app.indexers.providers.base import augment_public_magnet
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.naming import sanitize_name
@@ -53,7 +54,7 @@ class OfflineRules:
         return cls(
             magnet_enabled=get_bool("OFFLINE_MAGNET_ENABLED", True),
             ed2k_enabled=get_bool("OFFLINE_ED2K_ENABLED", True),
-            http_enabled=get_bool("OFFLINE_HTTP_ENABLED", False),
+            http_enabled=get_bool("OFFLINE_HTTP_ENABLED"),
             target_dir_id=get("OFFLINE_TARGET_DIR", get("RSS_GY_TARGET_DIR", "0")) or "0",
             target_dir_name=get("OFFLINE_TARGET_DIR_NAME", DEFAULT_TARGET_DIR_NAME),
             secondary_enabled=get_bool("OFFLINE_SECONDARY_ENABLED", False),
@@ -61,7 +62,7 @@ class OfflineRules:
             secondary_dir_name=get("OFFLINE_SECONDARY_DIR_NAME", "二次分流目录"),
             secondary_keywords=tuple(_split(get("OFFLINE_SECONDARY_KEYWORDS", ""))),
             exclude_keywords=tuple(_split(get("OFFLINE_EXCLUDE_KEYWORDS", ""))),
-            min_file_mb=max(0, get_int("OFFLINE_MIN_FILE_MB", 0)),
+            min_file_mb=max(0, get_int("OFFLINE_MIN_FILE_MB", DEFAULT_OFFLINE_MIN_FILE_MB)),
             allowed_exts=normalize_video_extensions(get("OFFLINE_ALLOWED_EXTS", "")),
         )
 

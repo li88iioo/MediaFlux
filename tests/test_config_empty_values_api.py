@@ -59,6 +59,64 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
+    def test_new_defaults_and_saved_values_match_execution_without_get_writes(self):
+        from app.modules.offline import OfflineRules
+
+        defaults = {
+            "OFFLINE_MIN_FILE_MB": "50", "OFFLINE_HTTP_ENABLED": "1",
+            "STRM_VIDEO_EXTS": "mkv,mp4,ts,m2ts,iso,mov,avi,flv",
+            "AGENT_LLM_TIMEOUT_SECONDS": "120", "INDEXER_SEARCH_ENABLED": "0",
+        }
+        saved = {
+            "OFFLINE_MIN_FILE_MB": "0", "OFFLINE_HTTP_ENABLED": "0",
+            "STRM_VIDEO_EXTS": "mp4", "AGENT_LLM_TIMEOUT_SECONDS": "60",
+            "INDEXER_SEARCH_ENABLED": "1",
+        }
+        for updates, expected in (({}, defaults), (saved, saved)):
+            with self.subTest(updates=updates):
+                if updates:
+                    self._write_raw(**updates)
+                before = config.ENV_FILE.read_bytes()
+                payload = self._config()
+                self.assertEqual({key: payload[key] for key in expected}, expected)
+                rules = OfflineRules.from_config()
+                self.assertEqual(rules.min_file_mb, int(expected["OFFLINE_MIN_FILE_MB"]))
+                self.assertEqual(rules.http_enabled, expected["OFFLINE_HTTP_ENABLED"] == "1")
+                self.assertEqual(config.get_int_setting("AGENT_LLM_TIMEOUT_SECONDS"), int(expected["AGENT_LLM_TIMEOUT_SECONDS"]))
+
+                offline_page = self.client.get("/guangya/offline")
+                self.assertEqual(offline_page.status_code, 200)
+                self.assertIn(f'id="offlineMinFileMb" value="{expected["OFFLINE_MIN_FILE_MB"]}"', offline_page.text)
+                http_input = re.search(r'<input[^>]+id="offlineHttpEnabled"[^>]*>', offline_page.text)
+                self.assertIsNotNone(http_input)
+                self.assertEqual(" checked" in http_input.group(), rules.http_enabled)
+                strm_page = self.client.get("/guangya/strm")
+                self.assertEqual(strm_page.status_code, 200)
+                self.assertIn(f'data-video-ext-preset="{defaults["STRM_VIDEO_EXTS"]}">全量', strm_page.text)
+                self.assertEqual(config.ENV_FILE.read_bytes(), before, "读取页面与缺省值不能回写配置")
+
+        self._write_raw(OFFLINE_HTTP_ENABLED="", INDEXER_SEARCH_ENABLED="")
+        before = config.ENV_FILE.read_bytes()
+        payload = self._config()
+        self.assertEqual((payload["OFFLINE_HTTP_ENABLED"], payload["INDEXER_SEARCH_ENABLED"]), ("", ""))
+        self.assertFalse(OfflineRules.from_config().http_enabled)
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_console_username_is_public_while_passwords_and_secrets_stay_protected(self):
+        from app.security import redact_config
+
+        self._write_raw(AGENT_LLM_API_KEY="synthetic-llm-key", TG_BOT_TOKEN="synthetic-bot-token")
+        before = config.ENV_FILE.read_bytes()
+        username, _password = config.web_credentials()
+        payload = self._config()
+        self.assertEqual(payload["ENV_WEB_PASSPORT"], username)
+        for key in ("ENV_WEB_PASSWORD", "WEB_SECRET_KEY", "AGENT_LLM_API_KEY", "TG_BOT_TOKEN"):
+            self.assertEqual(payload[key], "********", key)
+        self.assertEqual(redact_config({"ENV_WEB_PASSPORT": username})["ENV_WEB_PASSPORT"], "********")
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/api/config").status_code, 401)
+
     def test_missing_defaults_fill_while_explicit_empty_switches_and_cron_stay_empty(self):
         from app.modules.organize_rules import OrganizeRules
         from app.modules.schedule_policy import current_policy

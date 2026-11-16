@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from app import config
-from app.defaults import DEFAULT_DISCOVERY_ENABLED, DEFAULT_INDEXER_SEARCH_ENABLED
+from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_DISCOVERY_ENABLED, DEFAULT_INDEXER_SEARCH_ENABLED
 from app.indexers.config import current_indexer_site_ids
 from app.logger import get_logger
 
@@ -23,7 +23,7 @@ FEATURES = {
     "web_read": ("WEB_READ_ENABLED", "本地网页读取", True),
     "offline_magnet": ("OFFLINE_MAGNET_ENABLED", "光鸭磁力链接离线转存", True),
     "offline_ed2k": ("OFFLINE_ED2K_ENABLED", "光鸭 ED2K 离线转存", True),
-    "offline_http": ("OFFLINE_HTTP_ENABLED", "光鸭 HTTP 链接离线转存", False),
+    "offline_http": ("OFFLINE_HTTP_ENABLED", "光鸭 HTTP 链接离线转存", DEFAULT_BOOL_CONFIG_VALUES["OFFLINE_HTTP_ENABLED"]),
     "strm_metadata": ("STRM_METADATA_ENABLED", "STRM 伴随元数据同步", False),
     "download_verification_notify": ("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", "下载后入库复核通知", True),
 }

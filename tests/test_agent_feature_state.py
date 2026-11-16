@@ -76,7 +76,7 @@ def test_typed_sdk_only_accepts_original_feature_permissions(backend):
     asyncio.run(check())
 
 
-@pytest.mark.parametrize(("feature", "enabled"), [("discovery", True), ("indexer_search", False), ("web_read", False)])
+@pytest.mark.parametrize(("feature", "enabled"), [("discovery", True), ("indexer_search", True), ("web_read", False)])
 def test_sqlite_cold_confirmation_preserves_other_configuration_and_never_replays(backend, feature, enabled):
     async def check():
         effects = executor()

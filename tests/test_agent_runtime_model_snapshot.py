@@ -355,10 +355,10 @@ def test_existing_global_limits_unchanged(harness, raw, context, cap):
     assert output(harness.requests[0]['body']) == cap
 
 
-@pytest.mark.parametrize('raw,expected', [(None, 12), ('', 12), ('bad', 12), ('0', 2), ('1', 2), ('2', 2),
+@pytest.mark.parametrize('raw,expected', [(None, 120), ('', 120), ('bad', 120), ('0', 2), ('1', 2), ('2', 2),
     ('12', 12), ('30', 30), (' 60 ', 60), ('120', 120), ('121', 120)])
 def test_timeout_shares_one_default_and_range_at_every_model_client(local_config, raw, expected):
-    """缺失/空/非法回退 12，越界截断到 2–120；断言各链路 HTTP 客户端实际收到的超时。"""
+    """缺失/空/非法回退 120，越界截断到 2–120；断言各链路 HTTP 客户端实际收到的超时。"""
     from app.clients import ai_recognition
     from app.clients.http import FixedHostHttpClient
     import socket
@@ -478,7 +478,7 @@ def test_provider_settings_is_one_real_config_snapshot(harness, monkeypatch):
     assert not writer.is_alive() and not errors
     assert published.is_set()
     assert (result.api_url, result.model, result.protocol, result.timeout_seconds, result.generation_profiles_json) == (
-        BASE + '/chat/completions', MODEL, 'chat_completions', 12, '')
+        BASE + '/chat/completions', MODEL, 'chat_completions', 120, '')
 
 
 def test_direct_provider_settings_never_read_live_channel(harness):
