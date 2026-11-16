@@ -5,10 +5,13 @@ from typing import cast
 from app.clients.guangya import GuangYaClient
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
+from guangyaclient import GuangyaClient as RawClient
 
 from app.modules import offline
 from app.modules.download_dispatcher import public_dispatch_summary
@@ -176,6 +179,78 @@ class OfflineResolutionFailureTests(unittest.TestCase):
                 self.assertEqual(result["failure_code"], "guangya_manifest_unavailable")
                 self.assertTrue(result["retryable"])
                 self.assert_no_writes(client)
+
+    def test_non_magnet_resources_without_verified_files_never_submit_whole_tasks(self):
+        cases = (
+            ("https://example.invalid/download/Feature.mkv", {}),
+            ("https://example.invalid/download/readme.txt", {}),
+            ("ed2k://|file|Feature.mkv|536870912|" + "a" * 32 + "|/", RESOLVE_EXCLUDED_ONLY_FIXTURE),
+        )
+        for url, payload in cases:
+            for isolated in (False, True):
+                with self.subTest(protocol=url.split(":")[0], isolated=isolated):
+                    client = self.client(payload=payload)
+                    result = offline.submit_offline(url, client=cast(GuangYaClient, client), isolate_task=isolated)
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["failure_code"], "guangya_manifest_unavailable")
+                    self.assertTrue(result["retryable"])
+                    self.assertEqual(result["resolve_attempts"], 1)
+                    self.assert_no_writes(client)
+
+    def test_invalid_ed2k_link_facts_cannot_be_used_as_a_single_file(self):
+        for name, size, file_hash in (
+            ("", "536870912", "a" * 32),
+            ("folder%2FFeature.mkv", "536870912", "a" * 32),
+            ("Feature.mkv", "0", "a" * 32),
+            ("Feature.mkv", "1.5", "a" * 32),
+            ("Feature.mkv", "536870912", "not-a-hash"),
+        ):
+            with self.subTest(name=name, size=size, file_hash=file_hash):
+                client = self.client()
+                result = offline.submit_offline(
+                    f"ed2k://|file|{name}|{size}|{file_hash}|/",
+                    client=cast(GuangYaClient, client), isolate_task=True,
+                )
+                self.assertFalse(result["ok"])
+                self.assert_no_writes(client)
+
+    def test_real_ed2k_resolver_rejects_business_failures_before_using_link_facts(self):
+        url = "ed2k://|file|Feature.mkv|536870912|" + "a" * 32 + "|/"
+        cases = (
+            ({"code": 403, "msg": "fixture-secret"}, False),
+            ({"code": 200, "success": False, "msg": "fixture-secret"}, False),
+            ({"code": 0, "data": {"code": 403, "msg": "fixture-secret"}}, False),
+            ({"code": 0, "data": {"success": False, "msg": "fixture-secret"}}, False),
+            ({"code": 0, "data": {}}, True),
+        )
+        for response, accepted in cases:
+            with self.subTest(response=response):
+                folder = self.enterContext(tempfile.TemporaryDirectory())
+                client = GuangYaClient(token_file=Path(folder) / "missing-token.json")
+                raw = RawClient(access_token="fixture-token", device_id="fixture-device")
+                raw.request = Mock(return_value=httpx.Response(200, json=response))
+                client._raw = raw
+                self.addCleanup(client.close)
+                client.create_dir = Mock(return_value="ed2k-staging")
+                client.add_offline_task = Mock(return_value={"ok": True, "task_ids": ["ed2k-task"]})
+                client.add_offline_selection = Mock()
+
+                result = offline.submit_offline(url, client=client, isolate_task=True)
+
+                self.assertEqual(result["ok"], accepted, result)
+                raw.request.assert_called_once()
+                self.assertTrue(raw.request.call_args.args[0].endswith("/resolve_res"))
+                client.add_offline_selection.assert_not_called()
+                if accepted:
+                    self.assertEqual(result["selection_mode"], "single_file")
+                    self.assertEqual(result["selected_count"], 1)
+                    client.add_offline_task.assert_called_once()
+                else:
+                    self.assertEqual(result["resolve_error_type"], "GuangYaReadRejected")
+                    self.assertEqual(result["resolve_attempts"], 1)
+                    self.assertNotIn("fixture-secret", json.dumps(result))
+                    client.create_dir.assert_not_called()
+                    client.add_offline_task.assert_not_called()
 
     def test_not_logged_in_is_nonretryable_auth_failure_without_resolution(self):
         for isolated in (False, True):

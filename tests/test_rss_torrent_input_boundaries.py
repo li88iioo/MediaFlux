@@ -132,10 +132,12 @@ class RSSTorrentEnclosureBoundaryTests(_TorrentBoundaryCase):
         )
         self.assertEqual(payload["torrent_url"], video)
         self.assertEqual(item.content_type, "video/x-matroska")
-        client = self.cloud({})
+        client = self.cloud()
         result = self.invoke("automatic", item.source_value, client, rules=replace(self.rules, http_enabled=True))
         self.assertTrue(result["ok"], result)
-        self.assertEqual(client.legacy_calls[0]["url"], video)
+        self.assertEqual(client.selection_calls[0]["url"], video)
+        self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
+        self.assertEqual(client.legacy_calls, [])
         self.assertEqual(client.torrent_resolve_calls, [])
         self.assertEqual(len(self.requests), 1, "媒体 HTTP 不应触发本地种子读取")
 
@@ -279,12 +281,15 @@ class TorrentTransportBoundaryTests(_TorrentBoundaryCase):
             for enabled in (False, True):
                 for mode in ("automatic", "isolated"):
                     with self.subTest(scheme=scheme, enabled=enabled, mode=mode):
-                        client = self.cloud({})
+                        client = self.cloud()
                         result = self.invoke(
                             mode, f"{scheme}://feed.invalid/Movie.mkv", client,
                             rules=replace(self.rules, http_enabled=enabled, magnet_enabled=False),
                         )
                         self.assertEqual(result["ok"], enabled, result)
+                        if enabled:
+                            self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
+                        self.assertEqual(client.legacy_calls, [])
                         self.assertEqual(client.torrent_resolve_calls, [])
         self.factory.assert_not_called()
         self.lookup.assert_not_called()

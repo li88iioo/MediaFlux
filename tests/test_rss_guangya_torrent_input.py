@@ -217,7 +217,7 @@ class RssGuangyaTorrentInputTests(RssTorrentFixture):
         self.assertEqual(client.legacy_calls, [])
 
     def test_regular_media_http_remains_an_http_file_download(self):
-        client = FakeSelectionClient({})
+        client = FakeSelectionClient(TREE)
         rules = replace(self.rules, http_enabled=True)
         with patch.object(offline.OfflineRules, "from_config", return_value=rules):
             result = offline.submit_offline(
@@ -228,8 +228,10 @@ class RssGuangyaTorrentInputTests(RssTorrentFixture):
         self.fetch.assert_not_called()
         self.assertEqual(client.torrent_resolve_calls, [])
         self.assertEqual(
-            client.legacy_calls[0]["url"], "https://feed.invalid/Movie.mkv"
+            client.selection_calls[0]["url"], "https://feed.invalid/Movie.mkv"
         )
+        self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
+        self.assertEqual(client.legacy_calls, [])
 
     def test_existing_bytes_are_reused_and_encoded_torrent_filenames_are_supported(
         self,

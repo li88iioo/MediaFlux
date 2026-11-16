@@ -582,13 +582,14 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
             allowed_exts=("mkv", "mp4"),
         )
 
-    def test_prepared_submission_stop_blocks_files_single_root_and_http_without_creating_staging(self):
+    def test_prepared_submission_stop_blocks_files_and_verified_single_files_without_creating_staging(self):
         from tests.test_guangya_single_file_manifest import SINGLE
 
         for url, payload in (
             ("magnet:?xt=urn:btih:" + "a" * 40, RESOLVE_SUBFILES_FIXTURE),
             ("magnet:?xt=urn:btih:" + "a" * 40, SINGLE),
-            ("https://fixture.invalid/Feature.mkv", {}),
+            ("https://fixture.invalid/Feature.mkv", RESOLVE_SUBFILES_FIXTURE),
+            ("ed2k://|file|Feature.mkv|536870912|" + "a" * 32 + "|/", {}),
         ):
             with self.subTest(url=url, single=payload is SINGLE):
                 client = FakeSelectionClient(payload)
@@ -604,6 +605,43 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
                 client.create_dir.assert_not_called()
                 self.assertEqual(client.selection_calls, [])
                 self.assertEqual(client.legacy_calls, [])
+
+    def test_ed2k_single_file_facts_obey_the_same_video_size_and_exclusion_rules(self):
+        cases = (
+            ("Feature%20%E7%89%87%E5%90%8D.mkv", 200 * 1024 * 1024, ""),
+            ("readme.txt", 500 * 1024 * 1024, "扩展名不允许"),
+            ("Small.mp4", 200 * 1024 * 1024 - 1, "小于 200 MB"),
+            ("Feature.s%61mple.mkv", 500 * 1024 * 1024, "命中排除词"),
+            ("Sample.mkv", 500 * 1024 * 1024, "样片不自动下载"),
+        )
+        for name, size, excluded_reason in cases:
+            for isolated in (False, True):
+                with self.subTest(name=name, isolated=isolated):
+                    client = FakeSelectionClient({"code": 0, "data": {}})
+                    client.create_dir = Mock(return_value="ed2k-staging")
+                    rules = replace(self.rules, exclude_keywords=() if name == "Sample.mkv" else ("sample",))
+                    with patch.object(offline.OfflineRules, "from_config", return_value=rules):
+                        result = offline.submit_offline(
+                            f"ed2k://|file|{name}|{size}|{'a' * 32}|/",
+                            client=cast(GuangYaClient, client), isolate_task=isolated,
+                        )
+                    self.assertEqual(client.selection_calls, [])
+                    if excluded_reason:
+                        self.assertFalse(result["ok"])
+                        self.assertIn(excluded_reason, result["error"])
+                        self.assertEqual(result["selected_count"], 0)
+                        self.assertEqual(result["excluded_count"], 1)
+                        client.create_dir.assert_not_called()
+                        self.assertEqual(client.legacy_calls, [])
+                    else:
+                        self.assertTrue(result["ok"], result)
+                        self.assertEqual(result["selection_mode"], "single_file")
+                        self.assertEqual(result["selected_count"], 1)
+                        self.assertEqual(result["excluded_count"], 0)
+                        self.assertFalse(result["unverified_manifest"])
+                        self.assertEqual(len(client.legacy_calls), 1)
+                        self.assertEqual(client.legacy_calls[0]["task_type"], "ed2k")
+                        self.assertEqual(client.create_dir.call_count, int(isolated))
 
     def test_stop_after_staging_persistence_uses_the_same_rollback_once(self):
         client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)

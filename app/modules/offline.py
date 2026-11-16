@@ -88,10 +88,10 @@ class OfflineRules:
 
 @dataclass(frozen=True)
 class OfflineManifestResolution:
-    response: dict
     files: list[dict]
     attempts: int
     diagnostic: str
+    single_file: bool = False
 
 
 class TorrentPreparationError(ValueError):
@@ -205,6 +205,21 @@ def _resolver_excluded_only(files: list[dict]) -> bool:
     return bool(files) and all(bool(item.get("excluded")) for item in files)
 
 
+def _ed2k_root_file(url: str) -> dict:
+    """ED2K 链接自带单文件名、字节数和哈希；索引0只用于本地规则筛选。"""
+    parts = url.strip().split("|")
+    if (
+        len(parts) < 6 or parts[0].lower() != "ed2k://" or parts[1].lower() != "file"
+        or parts[-1] != "/" or not re.fullmatch(r"[0-9]+", parts[3])
+        or int(parts[3]) <= 0 or not re.fullmatch(r"[0-9a-fA-F]{32}", parts[4])
+    ):
+        raise ValueError("ED2K 链接缺少可验证文件信息")
+    name = unquote(parts[2], errors="strict").strip()
+    if not name or name in {".", ".."} or any(char in name for char in ("/", "\\", "\x00")):
+        raise ValueError("ED2K 文件名无效")
+    return {"index": 0, "name": name, "size": int(parts[3]), "excluded": False}
+
+
 def _resolve_offline_manifest(
     client: GuangYaClient, url: str, protocol: str, *,
     torrent_data: bytes | None = None,
@@ -226,6 +241,10 @@ def _resolve_offline_manifest(
             )
             last_response = response if isinstance(response, dict) else {"raw_type": type(response).__name__}
             last_files = GuangYaClient.normalize_offline_files(last_response)
+            single_file = single_bt_root_file(last_response) is not None
+            if protocol == "ed2k" and not last_files:
+                last_files = [_ed2k_root_file(url)]
+                single_file = True
         except Exception as exc:
             # HTTP/网络的有界重试由 GuangYaClient._call_read 统一负责。
             # 保留 SDK 业务 RuntimeError 的磁力轮询，但最终异常不得报为空清单。
@@ -241,7 +260,7 @@ def _resolve_offline_manifest(
             raise failure from exc
         resolver_excluded_only = _resolver_excluded_only(last_files)
         if protocol != "magnet" or (last_files and not resolver_excluded_only):
-            return OfflineManifestResolution(last_response, last_files, attempt, _manifest_diagnostic(last_response))
+            return OfflineManifestResolution(last_files, attempt, _manifest_diagnostic(last_response), single_file)
         if attempt < attempts and delay > 0:
             time.sleep(delay * attempt)
     diagnostic = (
@@ -253,7 +272,7 @@ def _resolve_offline_manifest(
         "光鸭%s解析未返回可用文件清单 attempts=%s diagnostic=%s",
         source_label, attempts, diagnostic,
     )
-    return OfflineManifestResolution(last_response, last_files, attempts, diagnostic)
+    return OfflineManifestResolution(last_files, attempts, diagnostic)
 
 
 @dataclass(frozen=True)
@@ -478,7 +497,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
 
     自动入口先解析文件树并强制应用仅视频扩展名、排除词和最小体积。
     原始种子优先上传到光鸭解析，避免只转换为磁力后依赖 DHT 获取元数据；
-    磁力无法取得可验证清单时一律失败关闭。单文件根资源通过同一筛选后普通提交；隔离目录只会
+    所有协议无法取得可验证文件信息时一律失败关闭。单文件通过同一筛选后普通提交；隔离目录只会
     在已经确认应下载的文件后创建，用于后续下载落稳与安全整理。
     """
     rules = OfflineRules.from_config()
@@ -522,11 +541,13 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             }
 
         manifest_unverifiable = not choices or _resolver_excluded_only(files)
-        if decision.protocol == "magnet" and manifest_unverifiable:
+        if manifest_unverifiable:
             unresolved_error = (
                 f"种子文件未解析到可验证文件列表（尝试 {resolution.attempts} 次），"
                 if torrent_data else
                 f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
+                if decision.protocol == "magnet" else
+                f"{decision.protocol.upper()} 资源未解析到可验证文件列表，"
             )
             return {
                 "ok": False, "decision": decision.as_dict(),
@@ -539,7 +560,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             }
 
         selected = [int(item["index"]) for item in choices if item.get("selected")]
-        if choices and not selected:
+        if not selected:
             detail = "；".join(
                 f"{item.get('name') or item.get('index')}: {item.get('exclude_reason') or '不符合规则'}"
                 for item in choices[:5]
@@ -575,10 +596,8 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 staging["parent_name"] = decision.target_dir_name or ""
                 error = "持久化任务隔离目录失败，未提交离线任务"
 
-        # 单文件根资源的0是本地规则筛选索引，不是服务端选集索引。
-        # 只依据同一严格解析器确认根资源，不能把“多文件里只选一个”当成单文件。
-        single_file = single_bt_root_file(resolution.response) is not None
-        selection_mode = "single_file" if single_file else "files" if choices else "legacy"
+        # 单文件的0只用于本地筛选；真实多文件索引保持原值，不按选中数量猜单文件。
+        selection_mode = "single_file" if resolution.single_file else "files"
         result: dict[str, Any] = {"ok": False, "error": error}
         if not error:
             try:
