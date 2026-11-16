@@ -923,6 +923,7 @@ class RSSEngine:
         qb_runtime_config: dict | None = None,
         auto_guard: Callable[[], bool] | None = None,
         guangya_credential_generation: int | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> dict:
         """将单条 RSS 下载统一接入 download_request / DownloadTracker。"""
         if not entry:
@@ -1019,6 +1020,8 @@ class RSSEngine:
             }
             if guangya_credential_generation is not None:
                 submission_options["guangya_credential_generation"] = guangya_credential_generation
+            if check_cancelled is not None:
+                submission_options["check_cancelled"] = check_cancelled
             from app.indexers.downloads import submit_download_input
             if linked_key:
                 from app.repositories.rss import bind_rss_entry_download
@@ -1334,15 +1337,16 @@ class RSSEngine:
             try:
                 if check_cancelled:
                     check_cancelled()
+                result = self._download_entry(
+                    row, entry_already_claimed=True, qb_runtime_config=runtime_config,
+                    guangya_credential_generation=guangya_credential_generation,
+                    check_cancelled=check_cancelled,
+                )
             except asyncio.CancelledError:
                 unstarted = claimed_rows[index:]
                 release_unsubmitted_rss_entries(unstarted, submitted_at=submitted_at)
                 cancelled = len(unstarted)
                 break
-            result = self._download_entry(
-                row, entry_already_claimed=True, qb_runtime_config=runtime_config,
-                guangya_credential_generation=guangya_credential_generation,
-            )
             if result.get("pending"):
                 pending += 1
             elif result.get("ok"):

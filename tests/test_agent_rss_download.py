@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from app import database as db
@@ -10,6 +12,7 @@ from app.repositories import download_requests as download_requests_repo
 from app.repositories import rss as rss_repo
 from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
 from app.modules import rss_delivery
+from app.indexers import downloads as indexer_downloads
 from app.modules.rss import RSSEngine
 from app.modules.rss_subscriptions import RSSSubscriptionError
 from tests.support import IsolatedDatabaseTestCase, seed_rss_entry_state
@@ -152,6 +155,116 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         serialized = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("QB_SECRET", serialized)
         self.assertNotIn("/private", serialized)
+
+
+    def test_cancellation_during_preparation_restores_claims_without_creating_requests(self):
+        for operation in ("download", "retry"):
+            with self.subTest(operation=operation):
+                _clear_rss()
+                sid = self._subscription()
+                ids = [self._entry(sid, index) for index in (1, 2)]
+                if operation == "retry":
+                    for entry_id in ids:
+                        rss_repo.record_rss_entry_failure(entry_id, "qb_unavailable", True)
+                before = {entry_id: dict(rss_repo.get_rss_entry(entry_id)) for entry_id in ids}
+                cancelled = False
+                prepare = indexer_downloads.prepare_download_input
+
+                def prepare_then_cancel(*args):
+                    nonlocal cancelled
+                    item = prepare(*args)
+                    cancelled = True
+                    return item
+
+                def check_cancelled():
+                    if cancelled:
+                        raise asyncio.CancelledError()
+
+                with patch.object(indexer_downloads, "prepare_download_input", side_effect=prepare_then_cancel), patch.object(
+                    QBittorrentClient, "add_torrent_detailed", return_value=TorrentAddResult(True)
+                ) as add:
+                    result = rss_delivery.execute(operation, {"entry_ids": ids}, check_cancelled=check_cancelled)
+                add.assert_not_called()
+                self.assertEqual(result["status"], "cancelled")
+                self.assertEqual(result["data"]["cancelled"], 2)
+                self.assertEqual(result["data"]["submitted"], 0)
+                self.assertEqual(result["data"]["failed"], 0)
+                with db.get_conn() as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 0)
+                for entry_id in ids:
+                    self.assertEqual(dict(rss_repo.get_rss_entry(entry_id)), before[entry_id])
+
+    def test_cancellation_after_login_stops_add_and_releases_current_claim(self):
+        for operation in ("download", "retry"):
+            with self.subTest(operation=operation):
+                _clear_rss()
+                sid = self._subscription()
+                entry_id = self._entry(sid, 1)
+                source_id = None
+                if operation == "retry":
+                    with patch.object(QBittorrentClient, "add_torrent_detailed", return_value=TorrentAddResult(False, "qb_unavailable", True)):
+                        self.assertFalse(rss_delivery.execute("download", {"entry_ids": [entry_id]})["ok"])
+                    source_id = rss_repo.get_rss_entry(entry_id)["download_request_id"]
+                    self.assertTrue(source_id)
+                cancelled = False
+                client = QBittorrentClient("http://qb.invalid", username="test", password="test")
+
+                def login(*args, **kwargs):
+                    nonlocal cancelled
+                    cancelled = True
+                    return SimpleNamespace(status_code=200, text="Ok.")
+
+                def check_cancelled():
+                    if cancelled:
+                        raise asyncio.CancelledError()
+
+                client._session.post = MagicMock(side_effect=login)
+                with patch("app.modules.download_dispatcher.QBittorrentClient", return_value=client):
+                    result = rss_delivery.execute(operation, {"entry_ids": [entry_id]}, check_cancelled=check_cancelled)
+                client._session.post.assert_called_once()
+                self.assertTrue(client._session.post.call_args.args[0].endswith("/auth/login"))
+                self.assertEqual(result["status"], "cancelled")
+                self.assertEqual(result["data"]["cancelled"], 1)
+                current = rss_repo.get_rss_entry(entry_id)
+                self.assertEqual(current["status"], "failed" if source_id else "pending")
+                self.assertEqual(current["failure_code"], "qb_unavailable" if source_id else "")
+                self.assertTrue(current["download_request_id"])
+                request = download_requests_repo.get_download_request(current["download_request_id"])
+                self.assertEqual(request["qb_status"], "failed")
+                self.assertEqual(request["status"], "failed")
+                if source_id:
+                    self.assertNotEqual(current["download_request_id"], source_id)
+                    self.assertEqual(download_requests_repo.get_download_request(source_id)["status"], "failed")
+
+    def test_preparation_cancellation_preserves_previous_accepted_item(self):
+        sid = self._subscription()
+        ids = [self._entry(sid, index) for index in (1, 2, 3)]
+        cancelled = False
+        prepare = indexer_downloads.prepare_download_input
+        preparations = 0
+
+        def prepare_then_cancel(*args):
+            nonlocal cancelled, preparations
+            item = prepare(*args)
+            preparations += 1
+            if preparations == 2:
+                cancelled = True
+            return item
+
+        def check_cancelled():
+            if cancelled:
+                raise asyncio.CancelledError()
+
+        with patch.object(indexer_downloads, "prepare_download_input", side_effect=prepare_then_cancel), patch.object(
+            QBittorrentClient, "add_torrent_detailed", return_value=TorrentAddResult(True)
+        ) as add:
+            result = rss_delivery.execute("download", {"entry_ids": ids}, check_cancelled=check_cancelled)
+        add.assert_called_once()
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["submitted"], 1)
+        self.assertEqual(result["data"]["cancelled"], 2)
+        self.assertEqual(rss_repo.get_rss_entry(ids[-1])["status"], "downloaded")
+        self.assertTrue(all(rss_repo.get_rss_entry(identifier)["status"] == "pending" for identifier in ids[:-1]))
 
 
     def test_unknown_submission_requires_qb_review_before_retry(self):
