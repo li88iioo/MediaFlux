@@ -1202,6 +1202,12 @@ if (initialTab === 'runtime') {
     const sameEntries=(left,right)=>Array.isArray(left)&&left.length===right.length&&new Set(left.map(entry=>entry.confirmation_id)).size===right.length&&
         right.every(entry=>left.some(other=>other.confirmation_id===entry.confirmation_id&&other.candidate_index===entry.candidate_index));
     const title=item=>textValue(item.identity)||textValue(item.directory)||'未命名媒体组';
+    const statusClass=item=>item.status==='completed'?'done':['failed','expired'].includes(item.status)?'failed':item.status==='pending'?'paused':'running';
+    const localTime=value=>{const date=new Date(value);return Number.isNaN(date.getTime())?String(value):date.toLocaleString('zh-CN',{hour12:false});};
+    function empty(node,icon,heading,hint){
+        node.innerHTML=`<div class="confirmation-review-empty"><i data-lucide="${icon}"></i><strong>${_esc(heading)}</strong><span>${_esc(hint)}</span></div>`;
+        window.renderLucideIcons?.(node);
+    }
     const visible=()=>!el('Modal').hidden;
     const cleanTokens=tokens=>[...new Set((Array.isArray(tokens)?tokens:[]).filter(token=>typeof token==='string'&&token).slice(0,limit))];
     const say=(message,error=false)=>{el('State').textContent=message;el('State').classList.toggle('is-error',error);};
@@ -1293,12 +1299,13 @@ if (initialTab === 'runtime') {
             if(input.dataset.reviewAction==='save')input.disabled||=!state.drafts.has(state.active);
         });
         const ready=entriesForSelection().length;
-        el('Ready').textContent=`已选 ${count} 组 · 已读取且可确认 ${ready} 组；未保存选择、无建议及非待确认项不提交。`;
+        el('Ready').innerHTML=`<strong>已选 ${count} 组 · 可确认 ${ready} 组</strong><span>未保存的选择、无建议及非待确认项不会提交。</span>`;
     }
     function renderList(){
         const list=el('List');
         if(!state.items.length){
-            list.innerHTML='<p class="confirmation-review-empty">'+(el('Scope').value==='pending'?'没有匹配的待确认媒体组，可调整筛选后刷新。':'此范围暂无媒体组，可返回待确认队列选择。')+'</p>';
+            if(el('Scope').value==='pending')empty(list,'inbox','没有匹配的待确认媒体组','调整筛选条件后刷新。');
+            else empty(list,'list-checks','此范围暂无媒体组','切换到待确认队列勾选媒体组。');
             return;
         }
         list.querySelector('.confirmation-review-empty')?.remove();
@@ -1319,8 +1326,7 @@ if (initialTab === 'runtime') {
             const context=[item.source,item.reason].filter(Boolean).join(' · ');
             button.querySelector('small').textContent=context;button.querySelector('small').title=context;
             const index=serverIndex(item);
-            const statusClass=item.status==='completed'?'done':['failed','expired'].includes(item.status)?'failed':item.status==='pending'?'paused':'running';
-            const statusMarkup=`<span class="status-pill ${statusClass}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(reviewStatuses[item.review_status]||(index!==null?(item.suggestion?.source==='human'?'已保存人工选择':'已有候选建议'):'等待选择'))}</span>`;
+            const statusMarkup=`<span class="status-pill ${statusClass(item)}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(reviewStatuses[item.review_status]||(index!==null?(item.suggestion?.source==='human'?'已保存人工选择':'已有候选建议'):'等待选择'))}</span>`;
             const statusNode=button.querySelector('.confirmation-review-row-status');
             if(statusNode.innerHTML!==statusMarkup)statusNode.innerHTML=statusMarkup;
             if(row!==cursor)list.insertBefore(row,cursor);
@@ -1330,7 +1336,11 @@ if (initialTab === 'runtime') {
     }
     function renderDetail(){
         const item=state.cache.get(state.active), detail=el('Detail');
-        if(!item){detail.innerHTML='<p class="confirmation-review-empty">选择一个媒体组，查看文件与候选作品。</p>';delete detail.dataset.signature;return;}
+        if(!item){
+            if(state.items.length)empty(detail,'mouse-pointer-click','选择一个媒体组','从左侧队列打开媒体组，查看文件与候选作品。');
+            else empty(detail,'folder-search','暂无可审阅的媒体组','光鸭整理无法自动确定作品时，媒体组会进入待确认队列。');
+            delete detail.dataset.signature;return;
+        }
         const draft=state.drafts.has(item.confirmation_id)?state.drafts.get(item.confirmation_id):serverIndex(item);
         const signature=JSON.stringify([item,draft]);
         if(detail.dataset.signature===signature)return;
@@ -1341,17 +1351,21 @@ if (initialTab === 'runtime') {
         const confidence=Number(suggestion?.confidence);
         const suggestionTitle=suggestion?.source==='human'?'已保存人工选择':suggestion?'Agent 候选建议（只读）':'尚无候选建议';
         detail.innerHTML=`<h3>${_esc(title(item))}</h3>
-            <div class="confirmation-review-context"><span>${_esc(statuses[item.status]||item.status)} · ${_esc(item.source||'未知来源')} · 任务 ${_esc(item.task_id||'—')}</span><code>${_esc(textValue(item.directory))}</code><span>待确认原因：${_esc(item.reason||'未提供')}</span>${item.expires_at?`<span>有效期至 ${_esc(item.expires_at)}</span>`:''}${item.error?`<span class="is-error">${_esc(item.error)}</span>`:''}</div>
+            <div class="confirmation-review-context"><span class="status-pill ${statusClass(item)}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(item.source||'未知来源')}</span><span>任务 ${_esc(item.task_id||'—')}</span></div>
+            <code class="confirmation-review-path">${_esc(textValue(item.directory))}</code>
+            <dl class="confirmation-review-facts"><div><dt>待确认原因</dt><dd>${_esc(item.reason||'未提供')}</dd></div>${item.expires_at?`<div><dt>有效期至</dt><dd>${_esc(localTime(item.expires_at))}</dd></div>`:''}</dl>
+            ${item.error?`<p class="confirmation-review-error">${_esc(item.error)}</p>`:''}
             <details class="confirmation-review-files"><summary>查看 ${files.length} 个文件及季集信息</summary><ul>${files.map(file=>`<li>${_esc(file.name||textValue(file))}${file.season!=null?` · 第 ${_esc(file.season)} 季`:''}${file.episode!=null?`第 ${_esc(file.episode)} 集`:''}</li>`).join('')}</ul></details>
             <div class="confirmation-review-suggestion"><strong>${_esc(suggestionTitle)}</strong>${_esc(suggestion?.summary||item.review_summary||reviewStatuses[item.review_status]||'手动选择候选，或对已选媒体组发起 Agent 只读复核。')}${suggestion?.reason_code?`<br>依据：${_esc(suggestion.reason_code)}`:''}${suggestion?.confidence!=null&&Number.isFinite(confidence)?` · 置信度 ${Math.round(confidence*100)}%`:''}</div>
             ${item.downstream&&Object.keys(item.downstream).length?`<div class="confirmation-review-downstream"><strong>STRM / 媒体库后续</strong>${Object.entries(item.downstream).filter(([,value])=>value!==''&&value!==null).map(([key,value])=>`<p>${_esc(({strm:'STRM',media_refresh:'媒体库刷新',media_library:'媒体库',library:'媒体库',partial:'部分完成',status:'状态',error:'错误',message:'说明'})[key]||key)}：${_esc(typeof value==='boolean'?(value?'是':'否'):evidenceValue(value))}</p>`).join('')}</div>`:''}
-            <fieldset class="confirmation-review-candidates"><legend>候选作品 · 不会默认选择第一项</legend>${candidates.map(candidate=>`<label class="confirmation-review-candidate${draft===candidate.index?' is-selected':''}"><input type="radio" name="confirmation-review-candidate" value="${_attr(candidate.index)}" aria-label="选择候选 ${_attr(candidate.title)} (${_attr(candidate.year||'年份未知')})"${draft===candidate.index?' checked':''}><span><strong>${_esc(candidate.title||'未命名候选')} ${_esc(candidate.year||'')}</strong><small>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')} · ${_esc(candidate.media_type||'')}</small>${Object.entries(candidate.evidence||{}).filter(([,value])=>value!=null&&evidenceValue(value)).map(([key,value])=>`<small>${_esc(evidenceLabels[key]||key)}：${_esc(evidenceValue(value))}</small>`).join('')}</span></label>`).join('')||'<p class="confirmation-review-empty">没有可选候选，请保留待确认。</p>'}</fieldset>
+            <fieldset class="confirmation-review-candidates"><legend>候选作品 · 不会默认选择第一项</legend>${candidates.map(candidate=>`<label class="confirmation-review-candidate${draft===candidate.index?' is-selected':''}"><input type="radio" name="confirmation-review-candidate" value="${_attr(candidate.index)}" aria-label="选择候选 ${_attr(candidate.title)} (${_attr(candidate.year||'年份未知')})"${draft===candidate.index?' checked':''}><span class="confirmation-review-candidate-body"><strong>${_esc(candidate.title||'未命名候选')} ${_esc(candidate.year||'')}</strong><small>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')} · ${_esc(candidate.media_type||'')}</small><span class="confirmation-review-evidence">${Object.entries(candidate.evidence||{}).filter(([,value])=>value!=null&&evidenceValue(value)).map(([key,value])=>`<small>${_esc(evidenceLabels[key]||key)}：${_esc(evidenceValue(value))}</small>`).join('')}</span></span></label>`).join('')||'<p class="confirmation-review-note">没有可选候选，请保留待确认。</p>'}</fieldset>
             <div class="confirmation-review-savebar"><button type="button" class="jump-btn" data-review-action="save">保存并下一条</button><button type="button" class="jump-btn" data-review-action="next">下一条 / 暂留待确认</button></div>`;
     }
     function render(){
         renderList();renderDetail();controls();
         el('PageInfo').textContent=`共 ${state.total} 组 · ${state.page} / ${Math.max(1,state.pages)} 页`;
-        el('Counts').textContent=Object.entries(state.counts).map(([key,count])=>`${statuses[key]||key} ${count}`).join(' · ')+(state.truncated?' · 匹配超过 1000 组，本次最多选择前 1000 组':'');
+        const counts=Object.entries(state.counts).map(([key,count])=>`${statuses[key]||key} ${count}`).join(' · ')+(state.truncated?' · 超过 1000 组，最多选择前 1000 组':'');
+        el('Counts').textContent=counts;el('Counts').title=counts;
     }
     async function load(page=state.page,quiet=false){
         if(!visible()||state.busy||(quiet&&state.loading)){schedule();return;}
