@@ -2848,7 +2848,7 @@ def _edit_share_message(bot, call, text: str, markup=None) -> None:
 
 
 def _handle_share_callback(bot, call, telebot) -> None:
-    from app.modules.share_transfer import get_share_transfer_store
+    from app.modules.share_transfer import accept_share_request, get_share_transfer_store
 
     store = get_share_transfer_store()
     chat_id, user_id = _telegram_identity(call)
@@ -2935,114 +2935,99 @@ def _handle_share_callback(bot, call, telebot) -> None:
                 store=store,
             )
         elif action == "confirm":
-            snapshot = store.snapshot(preview_id, chat_id, user_id)
-            selected_ids = list(snapshot["selected_ids"])
-            locked = store.consume(
-                preview_id,
-                chat_id,
-                user_id,
-                selected_ids=selected_ids,
-                target_id=snapshot["target_id"],
-                target_name=snapshot["target_name"],
+            accepted = accept_share_request(
+                preview_id, chat_id, user_id=user_id,
+                tracker_chat_id=chat_id, store=store,
             )
-            bot.answer_callback_query(call.id, "正在转存")
-            _edit_share_message(
-                bot,
-                call,
-                f"正在转存 {len(locked.selected_ids)} 项到 {html.escape(locked.target_name)}",
-            )
-            threading.Thread(
-                target=_dispatch_share_transfer_callback,
-                args=(
-                    bot,
-                    call.message.chat.id,
-                    call.message.message_id,
-                    preview_id,
-                    selected_ids,
-                    locked.target_id,
-                    locked.target_name,
-                    chat_id,
-                    user_id,
-                ),
-                name=f"tg-share-{preview_id[:8]}",
-                daemon=True,
-            ).start()
+            if isinstance(accepted, dict):
+                _deliver_share_receipt(bot, call, accepted)
+            else:
+                worker = threading.Thread(
+                    target=_dispatch_share_transfer_callback,
+                    args=(bot, call, accepted),
+                    name=f"tg-share-{preview_id[:8]}",
+                    daemon=True,
+                )
+                try:
+                    worker.start()
+                except RuntimeError:
+                    _dispatch_share_transfer_callback(bot, call, accepted)
+            try:
+                bot.answer_callback_query(call.id, "已受理，结果以转存回执为准")
+            except Exception as exc:
+                logger.info("Telegram 光鸭分享确认应答未送达 (%s)", type(exc).__name__)
             return
         else:
             raise ValueError("操作已过期或无效")
         bot.answer_callback_query(call.id)
         _edit_share_message(bot, call, text, markup)
     except (TypeError, ValueError) as exc:
+        message = str(exc) or "操作已过期或无效"
+        if "过期" in message:
+            message += "。若已确认，请在下载记录核对转存结果"
         bot.answer_callback_query(
-            call.id, str(exc) or "操作已过期或无效", show_alert=True
+            call.id, message, show_alert=True
         )
     except Exception as exc:
         logger.warning("Telegram 光鸭分享操作失败 (%s)", type(exc).__name__)
         bot.answer_callback_query(
-            call.id, "操作失败，请重新解析分享链接", show_alert=True
+            call.id, "无法核实操作结果，请先在下载记录核对", show_alert=True
         )
 
 
-def _dispatch_share_transfer_callback(
-    bot,
-    message_chat_id,
-    message_id,
-    preview_id: str,
-    selected_ids: list[str],
-    target_id: str,
-    target_name: str,
-    owner_chat_id: str,
-    owner_user_id: str,
-) -> None:
-    from app.modules.share_transfer import (
-        create_share_request,
-        get_share_transfer_store,
-    )
+def _dispatch_share_transfer_callback(bot, call, submission) -> None:
+    from app.modules.share_transfer import execute_share_request, get_share_request_result
 
+    snapshot = submission.snapshot
     try:
-        result = create_share_request(
-            preview_id,
-            selected_ids,
-            target_id,
-            owner_chat_id,
-            user_id=owner_user_id,
-            target_name=target_name,
-            origin="telegram",
-            tracker_chat_id=str(message_chat_id),
-            store=get_share_transfer_store(),
+        _edit_share_message(
+            bot, call,
+            f"正在转存 {len(snapshot.selected_ids)} 项到 {html.escape(snapshot.target_name)}"
+            f"（请求 #{submission.request_id}）",
         )
-        if result.get("duplicate") and result.get("accepted"):
-            text = (
-                "<b>相同光鸭分享转存请求正在处理</b>\n"
-                f"请求: #{result.get('request_id')}\n"
-                f"状态: {html.escape(str(result.get('status') or 'pending'))}"
-            )
-        elif result.get("success"):
-            duplicate = "（幂等复用已有请求）" if result.get("duplicate") else ""
-            text = (
-                "<b>光鸭分享转存完成</b>\n"
-                f"请求: #{result.get('request_id')} {duplicate}\n"
-                f"项目: {result.get('count', len(selected_ids))}\n"
-                f"目标: {html.escape(target_name or '根目录')}"
-            )
+    except Exception as exc:
+        logger.info("Telegram 光鸭分享进度未送达 (%s)", type(exc).__name__)
+    try:
+        result = execute_share_request(submission)
+    except Exception as exc:
+        logger.warning("Telegram 光鸭分享执行异常 (%s)", type(exc).__name__)
+        try:
+            result = get_share_request_result(submission.request_id)
+        except Exception:
+            result = {"request_id": submission.request_id}
+    _deliver_share_receipt(bot, call, result, target_id=snapshot.target_id)
+
+
+def _deliver_share_receipt(bot, call, result: dict, *, target_id: str = "") -> None:
+    reference = f"请求: #{result['request_id']}"
+    status = result.get("status")
+    if result.get("success"):
+        text = f"<b>光鸭分享转存完成</b>\n{reference}"
+        if result.get("duplicate"):
+            text += "（幂等复用已有请求）"
+        else:
+            text += f"\n项目: {result['count']}"
+        text += f"\n目标: {html.escape(result['target_dir_name'])}"
+        if target_id:
             organize_target = (get("GY_ORGANIZE_TARGET_DIR", "") or "").strip()
-            if organize_target and organize_target != "0" and target_id != "0":
+            if organize_target not in {"", "0"} and target_id != "0":
                 text += "\n已交由现有 tracker 按配置处理整理、STRM 与媒体库刷新。"
             else:
                 text += "\n当前配置不触发后续整理链。"
-        else:
-            text = "光鸭分享转存失败\n" + html.escape(
-                str(result.get("error") or "请稍后查看任务状态")
-            )
-        bot.edit_message_text(text, message_chat_id, message_id)
+    elif status in {"failed", "manual_review", "stopped"}:
+        label = {"failed": "转存失败", "manual_review": "转存待核对", "stopped": "转存已停止"}[status]
+        text = f"光鸭分享{label}\n{reference}\n"
+        text += html.escape(result.get("error") or "请在下载记录查看任务状态")
+    else:
+        text = f"光鸭分享转存已受理\n{reference}\n请在下载记录核对结果"
+    try:
+        _edit_share_message(bot, call, text)
     except Exception as exc:
-        logger.warning("Telegram 光鸭分享转存提交失败 (%s)", type(exc).__name__)
+        logger.info("Telegram 光鸭分享回执编辑未送达 (%s)", type(exc).__name__)
         try:
-            bot.edit_message_text(
-                "光鸭分享转存失败，请稍后查看任务状态", message_chat_id, message_id
-            )
+            _reply_to_source(bot, call, text)
         except Exception as reply_exc:
-            logger.info("Telegram 失败提示未送达 type=%s", type(reply_exc).__name__)
+            logger.info("Telegram 光鸭分享回执补发未送达 (%s)", type(reply_exc).__name__)
 
 
 def _download_follow_up_text(succeeded: list[str]) -> str:

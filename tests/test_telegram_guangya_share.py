@@ -789,6 +789,80 @@ class TelegramShareViewTests(unittest.TestCase):
         self.assertIn("解析失败", bot.reply_to.call_args.args[1])
 
 
+class TelegramShareConfirmationTests(IsolatedDatabaseTestCase):
+    def test_telegram_timeouts_preserve_the_persisted_transfer_and_its_receipt(self):
+        from app.bot.handlers import _handle_share_callback, _share_selection_view
+        from app.modules.share_transfer import ShareTransferPreviewStore
+
+        store = ShareTransferPreviewStore()
+        client = FakeShareClient()
+
+        def run_worker(*, target, args, **_kwargs):
+            return SimpleNamespace(start=lambda: target(*args))
+
+        with (
+            patch("app.modules.share_transfer.get_share_transfer_store", return_value=store),
+            patch("app.modules.share_transfer.GuangYaClient", return_value=client),
+            patch("app.bot.handlers.threading.Thread", side_effect=run_worker),
+        ):
+            for attempt, failing_text in enumerate(("正在转存", "光鸭分享转存完成"), 1):
+                with self.subTest(failing_text=failing_text):
+                    chat_id, user_id = 100, 200
+                    target_id = str(attempt - 1)
+                    preview_id = store.create(client.inspected, chat_id, user_id, target_id=target_id)
+                    _, markup = _share_selection_view(
+                        FAKE_TELEBOT, preview_id, chat_id=str(chat_id), user_id=str(user_id), store=store,
+                    )
+                    confirm = next(button for button in markup.buttons if button.text == "确认转存")
+                    call = SimpleNamespace(
+                        id="callback", data=confirm.callback_data,
+                        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=5, message_thread_id=42),
+                        from_user=SimpleNamespace(id=user_id),
+                    )
+                    bot = Mock()
+                    receipts = []
+
+                    def edit(text, *_args, **_kwargs):
+                        if text.startswith("正在转存"):
+                            with db.get_conn() as conn:
+                                status = conn.execute(
+                                    "SELECT status FROM download_requests ORDER BY id DESC LIMIT 1"
+                                ).fetchone()
+                            self.assertIsNotNone(status)
+                            self.assertEqual(status["status"], "submitting")
+                        if failing_text in text:
+                            raise TimeoutError("Telegram timeout")
+                        receipts.append(text)
+
+                    bot.edit_message_text.side_effect = edit
+                    if attempt == 1:
+                        bot.answer_callback_query.side_effect = TimeoutError("Telegram timeout")
+                    _handle_share_callback(bot, call, FAKE_TELEBOT)
+
+                    with db.get_conn() as conn:
+                        rows = conn.execute("SELECT * FROM download_requests ORDER BY id").fetchall()
+                    self.assertEqual(len(rows), attempt)
+                    row = rows[-1]
+                    self.assertEqual((row["status"], row["gy_status"]), ("completed", "completed"))
+                    self.assertEqual(client.restore_calls[-1][-1], target_id)
+                    if attempt == 1:
+                        self.assertEqual(len(receipts), 1)
+                        receipt = receipts[0]
+                    else:
+                        self.assertEqual(len(receipts), 1)
+                        bot.reply_to.assert_called_once()
+                        self.assertEqual(bot.reply_to.call_args.kwargs["message_thread_id"], 42)
+                        receipt = bot.reply_to.call_args.args[1]
+                    self.assertIn("光鸭分享转存完成", receipt)
+                    self.assertIn(f"#{row['id']}", receipt)
+                    self.assertNotIn("转存失败", receipt)
+
+                    bot.answer_callback_query.side_effect = None
+                    _handle_share_callback(bot, call, FAKE_TELEBOT)
+                    self.assertIn("下载记录核对", bot.answer_callback_query.call_args.args[1])
+                    self.assertEqual(len(client.restore_calls), attempt)
+
+
 class ShareApiSecurityTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         from app.main import create_app

@@ -55,6 +55,14 @@ class ShareTransferSnapshot:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class ShareTransferSubmission:
+    request_id: int
+    snapshot: ShareTransferSnapshot
+    title: str
+    retried: bool
+
+
 @dataclass
 class _PreviewEntry:
     preview_id: str
@@ -548,6 +556,57 @@ def _result_from_existing(row) -> dict[str, Any]:
     }
 
 
+def get_share_request_result(request_id: int) -> dict[str, Any]:
+    row = download_requests_repo.get_download_request(request_id)
+    if row is None or row["kind"] != "guangya_share":
+        raise RuntimeError("分享转存请求状态丢失")
+    return _result_from_existing(row)
+
+
+def accept_share_request(
+    preview_id: str,
+    chat_id: str | int,
+    *,
+    user_id: str | int = "",
+    selected_ids: list[str] | None = None,
+    target_id: str | None = None,
+    target_name: str | None = None,
+    origin: str = "telegram",
+    tracker_chat_id: str | None = None,
+    store: ShareTransferPreviewStore | None = None,
+) -> ShareTransferSubmission | dict[str, Any]:
+    """冻结选集及目录，持久认领一次转存，或返回同一请求的现有状态。"""
+    store = store or get_share_transfer_store()
+    snapshot = store.consume(
+        preview_id,
+        chat_id,
+        user_id,
+        selected_ids=selected_ids,
+        target_id=target_id,
+        target_name=target_name,
+    )
+    key = share_request_key(
+        snapshot.share_id,
+        snapshot.selected_ids,
+        snapshot.target_id,
+        chat_id,
+        user_id,
+    )
+    names = [redact_sensitive_text(file["name"] or "未命名项目") for file in snapshot.files]
+    title = redact_sensitive_text(f"分享转存 {len(names)} 项: {', '.join(names[:3])}")
+    request_id, created = download_requests_repo.create_share_transfer_request(
+        key,
+        title=title,
+        chat_id=(tracker_chat_id or ""),
+        origin=(origin or "telegram"),
+    )
+    if created:
+        return ShareTransferSubmission(request_id, snapshot, title, retried=False)
+    if download_requests_repo.claim_failed_share_transfer_request(request_id):
+        return ShareTransferSubmission(request_id, snapshot, title, retried=True)
+    return get_share_request_result(request_id)
+
+
 def create_share_request(
     preview_id: str,
     selected_ids: list[str],
@@ -562,60 +621,33 @@ def create_share_request(
     store: ShareTransferPreviewStore | None = None,
     cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """二次校验选集并执行一次幂等分享转存。"""
+    """同步调用者使用与 Telegram 相同的认领和转存链。"""
     if cancel_check is not None:
         cancel_check()
-    store = store or get_share_transfer_store()
-    snapshot = store.consume(
-        preview_id,
-        chat_id,
-        user_id,
-        selected_ids=selected_ids,
-        target_id=target_id,
-        target_name=target_name,
+    accepted = accept_share_request(
+        preview_id, chat_id, user_id=user_id, selected_ids=selected_ids,
+        target_id=target_id, target_name=target_name, origin=origin,
+        tracker_chat_id=tracker_chat_id, store=store,
     )
-    # 进入数据库前再次只从已锁定快照构造 canonical IDs，不信任调用方列表。
-    canonical_ids = tuple(sorted(file["id"] for file in snapshot.files))
-    key = share_request_key(
-        snapshot.share_id,
-        canonical_ids,
-        snapshot.target_id,
-        chat_id,
-        user_id,
-    )
-    names = [redact_sensitive_text(file["name"] or "未命名项目") for file in snapshot.files]
-    title = redact_sensitive_text(f"分享转存 {len(names)} 项: {', '.join(names[:3])}")
-    persisted_target_name = redact_sensitive_text(snapshot.target_name)
-    request_id, created = download_requests_repo.create_share_transfer_request(
-        key,
-        title=title,
-        chat_id=(tracker_chat_id or ""),
-        origin=(origin or "telegram"),
-    )
-    retried = False
-    if not created:
-        row = download_requests_repo.get_download_request(request_id)
-        if row is None:
-            raise RuntimeError("分享转存请求状态丢失")
-        if str(row["status"] or "") == "failed" and download_requests_repo.claim_failed_share_transfer_request(
-            request_id
-        ):
-            created = True
-            retried = True
-        else:
-            return _result_from_existing(row)
+    if isinstance(accepted, dict):
+        return accepted
+    return execute_share_request(accepted, client=client, cancel_check=cancel_check)
 
-    def current_result() -> dict[str, Any]:
-        # 超时恢复或人工操作已经接管，旧提交者不能再报告成功或触发后处理。
-        row = download_requests_repo.get_download_request(request_id)
-        if row is None:
-            raise RuntimeError("分享转存请求状态丢失")
-        return _result_from_existing(row)
+
+def execute_share_request(
+    submission: ShareTransferSubmission,
+    *,
+    client: GuangYaClient | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    request_id, snapshot = submission.request_id, submission.snapshot
+    title, retried = submission.title, submission.retried
+    persisted_target_name = redact_sensitive_text(snapshot.target_name)
 
     def finish(**fields) -> dict[str, Any] | None:
         if download_requests_repo.finish_share_transfer_request(request_id, **fields):
             return None
-        return current_result()
+        return get_share_request_result(request_id)
 
     def preparation_failed(error: str) -> dict[str, Any]:
         stale = finish(
@@ -729,12 +761,12 @@ def create_share_request(
                     parent_id=staging_parent_id, staging_name=staging_name,
                     target_name=effective_target_name,
                 ):
-                    return current_result()
+                    return get_share_request_result(request_id)
 
             if cancel_check is not None:
                 cancel_check()
             try:
-                restore_args = (snapshot.access_token, list(canonical_ids), effective_target_id)
+                restore_args = (snapshot.access_token, list(snapshot.selected_ids), effective_target_id)
                 if cancel_check is not None:
                     # 客户端取得 raw（含凭据刷新）后再检查，只有真正进入发送边界才算在途。
                     result = client.restore_share(*restore_args, cancel_check=before_restore)
@@ -760,7 +792,7 @@ def create_share_request(
                 target_dir_id=effective_target_id,
                 target_dir_name=effective_target_name,
                 title=title,
-                count=len(canonical_ids),
+                count=len(snapshot.selected_ids),
                 error=redact_sensitive_text(error),
                 failure_status=failure_status if not success else "failed",
                 isolated=isolated,
@@ -782,7 +814,7 @@ def create_share_request(
                 "duplicate": False,
                 "retried": retried,
                 "request_id": request_id,
-                "count": len(canonical_ids) if success else 0,
+                "count": len(snapshot.selected_ids) if success else 0,
                 "target_dir_name": snapshot.target_name,
                 "status": "completed" if success else failure_status,
                 "error": redact_sensitive_text(error),
