@@ -588,7 +588,7 @@ class MediaProxyTests(InitializedWebTestCase):
                 )
                 binding_id = int(created["id"])
                 binding = media_proxy_repo.get_media_proxy_binding(
-                    instance_id, "item-1", "source-1", upstream_identity=created["upstream_identity"],
+                    instance_id, ("item-1",), ("source-1",), upstream_identity=created["upstream_identity"],
                 )
                 assert binding is not None
                 self.assertEqual(int(binding["id"]), binding_id)

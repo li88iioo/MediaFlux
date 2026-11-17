@@ -1,6 +1,7 @@
 """Emby / Jellyfin 多实例媒体反代的数据访问。"""
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -171,26 +172,23 @@ def list_media_proxy_bindings(instance_id: int) -> list[sqlite3.Row]:
 
 def get_media_proxy_binding(
     instance_id: int,
-    media_item_id: str,
-    media_source_id: str = "",
+    item_ids: tuple[str, ...],
+    source_ids: tuple[str, ...] = (),
     *,
     upstream_identity: str,
 ) -> sqlite3.Row | None:
+    """精确版本优先于仅适用于单源项目的显式空源记录。"""
     if not upstream_identity:
         return None
     with db.get_conn() as conn:
-        if media_source_id:
-            row = conn.execute(
-                "SELECT * FROM media_proxy_bindings WHERE instance_id=? "
-                "AND upstream_identity=? AND media_item_id=? AND media_source_id=? AND enabled=1",
-                (instance_id, upstream_identity, media_item_id, media_source_id),
-            ).fetchone()
-            if row:
-                return row
         return conn.execute(
-            "SELECT * FROM media_proxy_bindings WHERE instance_id=? "
-            "AND upstream_identity=? AND media_item_id=? AND enabled=1 ORDER BY id LIMIT 1",
-            (instance_id, upstream_identity, media_item_id),
+            "SELECT b.* FROM media_proxy_bindings b "
+            "JOIN json_each(?) item ON item.value=b.media_item_id "
+            "LEFT JOIN json_each(?) source ON source.value=b.media_source_id "
+            "WHERE b.instance_id=? AND b.upstream_identity=? AND b.enabled=1 "
+            "AND (source.key IS NOT NULL OR b.media_source_id='') "
+            "ORDER BY b.media_source_id='', item.key, source.key, b.id LIMIT 1",
+            (json.dumps(item_ids), json.dumps(source_ids), instance_id, upstream_identity),
         ).fetchone()
 
 

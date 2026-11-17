@@ -3990,29 +3990,10 @@ def _media_proxy_binding(
 ) -> Any:
     """精确绑定直接返回；Item 级绑定必须先在单源 PlaybackInfo 中登记。"""
     requested_source = (source_id or "").strip()
-    normalized_requested_source = _normalized_media_identifier(requested_source)
-    binding = None
-    for item_variant in _media_identifier_variants(item_id):
-        for source_variant in _media_identifier_variants(requested_source):
-            candidate = media_proxy_repo.get_media_proxy_binding(
-                instance_id, item_variant, source_variant, upstream_identity=upstream_identity,
-            )
-            if not candidate:
-                continue
-            bound_source = str(
-                candidate["media_source_id"] or ""
-            ).strip()
-            if (
-                bound_source
-                and normalized_requested_source
-                and _normalized_media_identifier(bound_source)
-                != normalized_requested_source
-            ):
-                continue
-            binding = candidate
-            break
-        if binding:
-            break
+    binding = media_proxy_repo.get_media_proxy_binding(
+        instance_id, _media_identifier_variants(item_id), _media_identifier_variants(requested_source),
+        upstream_identity=upstream_identity,
+    )
     if not binding:
         return None
     if str(binding["source_type"] or "").strip().lower() != "guangya":

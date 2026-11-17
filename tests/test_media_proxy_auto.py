@@ -38,6 +38,8 @@ from yarl import URL
 from app.modules import media_proxy
 from app.clients import guangya as guangya_module
 from app.clients.guangya import GuangYaClient as RealGuangYaClient
+from app.repositories import media_proxy as proxy_repo
+from tests.support import isolated_test_database
 
 
 class _FakeUpstreamResponse:
@@ -2104,8 +2106,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             "media_source_id": "cloud version/4k",
         }
 
-        def binding_lookup(_instance_id, _item_id, source_id="", *, upstream_identity):
-            return binding if source_id in {"cloud version/4k", ""} else None
+        def binding_lookup(_instance_id, _item_ids, source_ids, *, upstream_identity):
+            return binding if "cloud version/4k" in source_ids else None
 
         with patch(
             "app.repositories.media_proxy.get_media_proxy_binding",
@@ -3646,32 +3648,26 @@ class HybridMediaProxyTests(unittest.TestCase):
         canonical = "b3851937-35e9-8d81-287b-2b7ccc84fe42"
         compact = "b385193735e98d81287b2b7ccc84fe42"
         stored_canonical = canonical.upper()
-        binding = {
-            "id": 9,
-            "source_type": "guangya",
-            "guangya_file_id": "manual-uuid-file",
-            "media_item_id": stored_canonical,
-            "media_source_id": stored_canonical,
-        }
-        calls = []
-
-        def lookup(instance_id, item_id, source_id="", *, upstream_identity):
-            calls.append((instance_id, item_id, source_id))
-            if item_id == stored_canonical and source_id == stored_canonical:
-                return binding
-            return None
-
-        with patch(
-            "app.repositories.media_proxy.get_media_proxy_binding",
-            side_effect=lookup,
-        ):
+        with isolated_test_database():
+            instance_id = proxy_repo.add_media_proxy_instance(
+                name="UUID bindings", server_type="jellyfin", upstream_url="http://fixture.invalid",
+                api_key="", listen_host="127.0.0.1", listen_port=18096,
+            )
+            proxy_repo.create_media_proxy_binding(
+                instance_id=instance_id, media_item_id=compact, media_source_id="",
+                source_type="guangya", guangya_file_id="default-file",
+            )
+            exact = proxy_repo.create_media_proxy_binding(
+                instance_id=instance_id, media_item_id=stored_canonical, media_source_id=stored_canonical,
+                source_type="guangya", guangya_file_id="manual-uuid-file",
+            )
             resolved = media_proxy._media_proxy_binding(
-                7, compact, compact, upstream_identity="fixture-upstream",
+                instance_id, compact, compact, upstream_identity=exact["upstream_identity"],
                 item_level_scopes=self.app.state.item_level_scopes,
+                allow_item_level=True,
             )
 
-        self.assertIs(resolved, binding)
-        self.assertIn((7, stored_canonical, stored_canonical), calls)
+        self.assertEqual(resolved["id"], exact["id"])
 
     def test_signed_url_cache_uses_bounded_lru_eviction(self):
         try:
@@ -9629,15 +9625,20 @@ class HybridMediaProxyTests(unittest.TestCase):
             "id": 91,
         }
 
-        with patch(
-            "app.repositories.media_proxy.get_media_proxy_binding",
-            return_value=fallback_binding,
-        ):
+        with isolated_test_database():
+            instance_id = proxy_repo.add_media_proxy_instance(
+                name="Mixed versions", server_type="jellyfin", upstream_url="http://fixture.invalid",
+                api_key="", listen_host="127.0.0.1", listen_port=18096,
+            )
+            binding = proxy_repo.create_media_proxy_binding(
+                instance_id=instance_id, media_item_id="mixed-item", media_source_id=fallback_binding["media_source_id"],
+                source_type="guangya", guangya_file_id=fallback_binding["guangya_file_id"],
+            )
             rewritten, changed = media_proxy.rewrite_playback_info(
                 payload,
-                7,
+                instance_id,
                 "mixed-item",
-                upstream_identity="fixture-upstream",
+                upstream_identity=binding["upstream_identity"],
                 dynamic_mappings=self.app.state.dynamic_mappings,
                 item_level_scopes=self.app.state.item_level_scopes,
                 playback_grants=self.app.state.playback_grants,
@@ -9661,7 +9662,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch(
                 "app.repositories.media_proxy.get_media_proxy_binding",
-                return_value=fallback_binding,
+                side_effect=lambda _instance, _items, sources, **_: fallback_binding if "cloud-source" in sources else None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),

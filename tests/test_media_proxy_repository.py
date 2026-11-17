@@ -13,7 +13,7 @@ from tests.support import isolated_test_database
 
 class MediaProxyRepositoryTests(unittest.TestCase):
 
-    def test_repository_uses_active_test_database_and_preserves_binding_fallback(self):
+    def test_repository_prefers_exact_binding_and_only_falls_back_to_explicit_default(self):
         with isolated_test_database("media-proxy-repository.db"):
             instance_id = repository.add_media_proxy_instance(
                 name="Repository",
@@ -53,11 +53,20 @@ class MediaProxyRepositoryTests(unittest.TestCase):
                 source_type="local",
                 local_relative_path="Movie.mkv",
             )
-            row = repository.get_media_proxy_binding(
-                instance_id, "item-1", "missing-source", upstream_identity=binding["upstream_identity"],
+            identity = binding["upstream_identity"]
+            self.assertIsNone(repository.get_media_proxy_binding(
+                instance_id, ("item-1",), ("missing-source",), upstream_identity=identity,
+            ))
+            default = repository.create_media_proxy_binding(
+                instance_id=instance_id, media_item_id="item-1", media_source_id="",
+                source_type="guangya", guangya_file_id="default-file",
             )
-            assert (row) is not None
-            self.assertEqual(row["media_source_id"], "source-1")
+            for source, expected in (("source-1", binding), ("missing-source", default), ("", default)):
+                with self.subTest(source=source):
+                    selected = repository.get_media_proxy_binding(
+                        instance_id, ("item-1",), (source,), upstream_identity=identity,
+                    )
+                    self.assertEqual(selected["id"], expected["id"])
             repository.record_media_proxy_playback_attempt(
                 instance_id=instance_id,
                 playback_session_key="delete-session",
@@ -131,9 +140,9 @@ class MediaProxyRepositoryTests(unittest.TestCase):
             instance = repository.get_media_proxy_instance(instance_id)
             assert instance is not None
             identity = media_proxy_binding_identity(instance)
-            self.assertIsNone(repository.get_media_proxy_binding(instance_id, "item", upstream_identity=identity))
+            self.assertIsNone(repository.get_media_proxy_binding(instance_id, ("item",), upstream_identity=identity))
             second = repository.create_media_proxy_binding(**{**binding, "guangya_file_id": "new-file"})
-            selected = repository.get_media_proxy_binding(instance_id, "item", upstream_identity=identity)
+            selected = repository.get_media_proxy_binding(instance_id, ("item",), upstream_identity=identity)
             self.assertEqual(selected["guangya_file_id"], "new-file")
             self.assertEqual([row["id"] for row in repository.list_media_proxy_bindings(instance_id)], [7, first["id"], second["id"]])
 
