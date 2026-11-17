@@ -149,10 +149,10 @@ def test_native_library_counts_reads_real_scope_without_provider_artifacts(monke
     result = sdk.METHODS["library.counts"](server="jellyfin", library_id="tv")
     assert "library.counts" not in sdk.WRITE_METHODS
     assert result["status"] == "success" and result["data"]["counts"]["series_count"] == 9
-    assert len(calls) == 4 and "private-count-key" not in str(result)
+    assert calls == ["Movie", "Episode", "Audio", "MusicVideo", "Book", "Video", "Series"] and "private-count-key" not in str(result)
     with pytest.raises(ValueError):
         sdk.library.counts(library_id="tv")
-    assert len(calls) == 4
+    assert len(calls) == 7
 
 
 def test_inventory_and_audit_keep_missing_distinct_from_unknown():

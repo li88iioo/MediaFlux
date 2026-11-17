@@ -491,27 +491,17 @@ class MediaServerClient:
             raise ValueError("媒体库标识无效")
 
         user_id = self._user_id()
-
-        def count(include_item_types: str) -> int:
-            data = self._request(
-                f"/Users/{user_id}/Items",
-                params={
-                    "ParentId": normalized_library_id,
-                    "Recursive": "true",
-                    "Limit": 0,
-                    "EnableImages": "false",
-                    "IncludeItemTypes": include_item_types,
-                },
-            )
-            if not isinstance(data, dict):
-                raise TypeError("媒体服务器媒体库统计响应无效")
-            return max(0, int(data.get("TotalRecordCount", 0) or 0))
-
+        playable = self._PLAYABLE_ITEM_TYPES.split(",")
+        # 电影与单集计数同时计入可播放总数，不重复请求。
+        counts = {
+            item_type: self._count_items(user_id, item_type, parent_id=normalized_library_id)
+            for item_type in dict.fromkeys((*playable, "Series"))
+        }
         return {
-            "total_items": count(self._PLAYABLE_ITEM_TYPES),
-            "movie_count": count("Movie"),
-            "series_count": count("Series"),
-            "episode_count": count("Episode"),
+            "total_items": sum(counts[item_type] for item_type in playable),
+            "movie_count": counts["Movie"],
+            "series_count": counts["Series"],
+            "episode_count": counts["Episode"],
         }
 
     def get_dashboard(self, *, recent_added: list[MediaItem] | None = None) -> DashboardData:
@@ -1235,15 +1225,19 @@ class MediaServerClient:
     def _recent_played(self, limit: int = 12) -> list[MediaItem]:
         return []
 
+    def _count_items(self, user_id: str, item_type: str, *, parent_id: str = "") -> int:
+        """单类型计数。Jellyfin 12 对多类型合并计数要数秒，单类型只需百毫秒级；类型互斥，逐类型相加即总数。"""
+        params = {"Recursive": "true", "Limit": 0, "EnableImages": "false", "IncludeItemTypes": item_type}
+        if parent_id:
+            params["ParentId"] = parent_id
+        data = self._request(f"/Users/{user_id}/Items", params=params)
+        if not isinstance(data, dict):
+            raise TypeError("媒体服务器统计响应无效")
+        return max(0, int(data.get("TotalRecordCount", 0) or 0))
+
     def _total_items(self) -> int:
-        # 类型互斥，逐类型计数之和等于合并计数；Jellyfin 12 合并计数要数秒，单类型只需百毫秒级。
-        uid = self._user_id()
-        return sum(
-            int(self._request(f"/Users/{uid}/Items", params={
-                "Recursive": "true", "Limit": 0, "EnableImages": "false", "IncludeItemTypes": item_type,
-            }).get("TotalRecordCount", 0) or 0)
-            for item_type in self._PLAYABLE_ITEM_TYPES.split(",")
-        )
+        user_id = self._user_id()
+        return sum(self._count_items(user_id, item_type) for item_type in self._PLAYABLE_ITEM_TYPES.split(","))
 
     def _total_plays(self) -> int:
         raise NotImplementedError

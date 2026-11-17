@@ -176,9 +176,9 @@ class DashboardMediaCountTests(unittest.TestCase):
                             return {"ProductName": "Emby"}
                         if path.startswith("/Library/VirtualFolders"):
                             return [{"ItemId": "anime-library", "Name": "动漫", "Locations": ["/private/library"]}]
-                        calls.append((path, params))
                         self.assertEqual(path, "/Users/configured-viewer/Items")
                         assert params is not None
+                        calls.append((path, params))
                         self.assertEqual(params["ParentId"], "anime-library")
                         self.assertEqual(params["Recursive"], "true")
                         self.assertEqual(params["Limit"], 0)
@@ -187,7 +187,9 @@ class DashboardMediaCountTests(unittest.TestCase):
                     close = stack.enter_context(patch.object(cls, "close"))
                     result = services.get_library_counts(kind, library_id)
                     self.assertEqual(result["status"], "success" if library_id == "anime-library" else "not_found")
-                    self.assertEqual(len(calls), 4 if library_id == "anime-library" else 0)
+                    # 单库统计逐类型各请求一次；未找到的库不发统计请求。
+                    self.assertEqual([params["IncludeItemTypes"] for _path, params in calls],
+                                     ["Movie", "Episode", "Audio", "MusicVideo", "Book", "Video", "Series"] if library_id == "anime-library" else [])
                     self.assertEqual(result["data"]["library_id"], library_id)
                     self.assertEqual(result["data"]["sources"][0]["user_selection"], "configured")
                     self.assertEqual(result["data"]["counts"]["series_count"], 9 if calls else None)
@@ -314,10 +316,10 @@ class DashboardMediaCountTests(unittest.TestCase):
 
     def test_library_media_counts_are_scoped_to_selected_library_and_user(self):
         expected = {
-            "Movie,Episode,Audio,MusicVideo,Book,Video": 126,
             "Movie": 0,
             "Series": 9,
-            "Episode": 126,
+            "Episode": 120,
+            "Video": 6,
         }
         for client in (
             JellyfinClient("http://jellyfin.local", "key"),
@@ -331,7 +333,7 @@ class DashboardMediaCountTests(unittest.TestCase):
                     normalized = dict(params or {})
                     _calls.append((path, normalized))
                     return {
-                        "TotalRecordCount": expected[normalized["IncludeItemTypes"]]
+                        "TotalRecordCount": expected.get(normalized["IncludeItemTypes"], 0)
                     }
 
                 client._request = request
@@ -342,10 +344,14 @@ class DashboardMediaCountTests(unittest.TestCase):
                         "total_items": 126,
                         "movie_count": 0,
                         "series_count": 9,
-                        "episode_count": 126,
+                        "episode_count": 120,
                     },
                 )
-                self.assertEqual(len(calls), 4)
+                # 逐类型计数；电影与单集计数复用于总数，各类型只请求一次。
+                self.assertEqual(
+                    [params["IncludeItemTypes"] for _path, params in calls],
+                    ["Movie", "Episode", "Audio", "MusicVideo", "Book", "Video", "Series"],
+                )
                 for path, params in calls:
                     self.assertEqual(path, "/Users/user-id/Items")
                     self.assertEqual(params["ParentId"], "anime-library")
