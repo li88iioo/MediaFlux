@@ -231,7 +231,9 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
                 return [button.width, button.height,
                     document.querySelector('[data-mapping-row]').getBoundingClientRect().height];
             }"""
-            initial = page.evaluate(geometry)
+            # 空闲映射行不为结果预留空白；首次核对时展开一次，之后核对中与各结果间行高不变。
+            self.assertTrue(result.is_hidden())
+            initial = None
             for status, ids, expected_class, text in cases:
                 with self.subTest(width=width, status=status, ids=ids):
                     fixture["response"] = {"status": status, "mapped_path": "/media/movies", "matches": [
@@ -241,6 +243,7 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
                     button.click()
                     page.wait_for_function("() => document.querySelector('[data-test-mapping]').disabled")
                     self.assertIn("正在核对", result.inner_text())
+                    initial = initial or page.evaluate(geometry)
                     self.assertEqual(page.evaluate(geometry), initial)
                     fixture["pending"].pop().fulfill(json=fixture["response"])
                     page.wait_for_function("text => document.querySelector('[data-mapping-result]').textContent.includes(text)", arg=text)

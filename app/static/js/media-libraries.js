@@ -330,8 +330,7 @@
                     <button class="jump-btn danger" type="button" data-remove-mapping aria-label="删除映射" title="删除映射"
                         ${locked ? 'disabled' : ''}><i data-lucide="trash-2"></i></button>
                 </div>
-                <div class="ml-mapping-result" data-mapping-result role="status" aria-live="polite"
-                    style="display: block; min-height: 64px;"></div>
+                <div class="ml-mapping-result" data-mapping-result role="status" aria-live="polite"></div>
                 ${locked ? '<div class="ml-managed-note">该 STRM 映射由部署环境管理，本页仅展示。</div>' : ''}
             </article>`;
     }

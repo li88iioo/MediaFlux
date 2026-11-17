@@ -390,6 +390,11 @@
     display: block;
 }
 
+/* 空闲时不占位；开始核对后保留两行高度，核对中与各类结果切换时行高不跳动。 */
+.ml-mapping-result:not(:empty) {
+    min-height: 64px;
+}
+
 .ml-mapping-result.is-success {
     color: var(--accent);
     background: var(--accent-soft);
