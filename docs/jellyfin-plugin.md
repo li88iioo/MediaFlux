@@ -82,8 +82,8 @@ bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 可用 `DOTNET_BIN=/path/to/dotnet` 指定 SDK 可执行文件。产物：
 
 ```text
-plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.4.0.zip
-plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.4.0.zip.sha256
+plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.6.0.zip
+plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.6.0.zip.sha256
 ```
 
 产物、`bin/`、`obj/` 均不纳入 Git。打包脚本从 csproj 读取插件版本及 TFM，核对清单版本、插件 GUID、`net10.0` 与两个 Jellyfin NuGet 包的 `12.2.0` 基线；`targetAbi` 按 NuGet 版本加 `.0` 核对，并生成 SHA256 校验文件，不创建 Git 标签或上传包。

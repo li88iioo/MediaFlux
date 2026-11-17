@@ -48,10 +48,13 @@ class ReleaseUpgradeNotesTests(unittest.TestCase):
 
     def test_rollback_warning_names_the_actual_new_schema(self):
         previous, target = self.upgrade_span()
-        self.assertRegex(
-            self.section,
-            rf"schema{previous}\s*程序[^\n]*schema{target}\s*数据库",
-        )
+        if previous < target:
+            self.assertRegex(
+                self.section,
+                rf"schema{previous}\s*程序[^\n]*schema{target}\s*数据库",
+            )
+        else:
+            self.assertRegex(self.section, r"不新增[^。\n]*迁移|无[^。\n]*迁移")
         self.assertIn("离线恢复", self.section)
         self.assertIn("停止服务", self.section)
 

@@ -4,6 +4,51 @@
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-11-18
+
+### Added
+- 光鸭整理新增跨页批量候选复核、人工选择与冻结预览，Web、Telegram 和 Agent 共用原确认队列；Telegram 可一键确认批次内全部已通过校验的建议，无建议项仍留待人工处理（[`80639db2`](https://github.com/li88iioo/MediaFlux/commit/80639db2)、[`4ee6f020`](https://github.com/li88iioo/MediaFlux/commit/4ee6f020)）。
+- Web 整理日志支持单组及批量跳过待确认项，保留源文件，逐项反馈过期或处理失败，并保留失败选择以便继续处理（[`5e7b623f`](https://github.com/li88iioo/MediaFlux/commit/5e7b623f)、[`2dd7d9f6`](https://github.com/li88iioo/MediaFlux/commit/2dd7d9f6)）。
+- Agent 新增固定主要聊天、旁聊与只读 Telegram 会话栏，支持历史消息全文搜索、引用回复及跳转原消息；向上阅读时保留位置并显示下方消息数量，窄屏可收起会话栏（[`5e2ac950`](https://github.com/li88iioo/MediaFlux/commit/5e2ac950)、[`01eccfaf`](https://github.com/li88iioo/MediaFlux/commit/01eccfaf)、[`f3f3c820`](https://github.com/li88iioo/MediaFlux/commit/f3f3c820)、[`ec5ea4a7`](https://github.com/li88iioo/MediaFlux/commit/ec5ea4a7)）。
+- Agent 输入框支持直接添加种子或磁力链接，不调用模型即可选择下载目标；与 Telegram 共用 qBittorrent、光鸭默认目录、成人整理来源及双目标选项，提交时重新校验目标（[`161d2797`](https://github.com/li88iioo/MediaFlux/commit/161d2797)、[`187af856`](https://github.com/li88iioo/MediaFlux/commit/187af856)、[`bf2ccc44`](https://github.com/li88iioo/MediaFlux/commit/bf2ccc44)）。
+- Agent 可将光鸭分享链接直接展示为转存卡片，不调用模型即可分页勾选文件、修改目录并确认转存；预览与取消不写入云盘，已提交请求通过下载记录查询（[`9e6cb01d`](https://github.com/li88iioo/MediaFlux/commit/9e6cb01d)）。
+- 订阅中心支持安全清空已结束的巡检历史，保留运行中记录及下载所需的候选关联（[`ab238060`](https://github.com/li88iioo/MediaFlux/commit/ab238060)）。
+- Jellyfin 独立插件新增可选 STRM 起播加速：已成功探测且内容未变时复用媒体信息，新入库或内容变化的 STRM 由后台限量预探测；联动删除与加速分别控制，插件版本为 **0.1.6**（[`f53d1710`](https://github.com/li88iioo/MediaFlux/commit/f53d1710)、[`4a1a5577`](https://github.com/li88iioo/MediaFlux/commit/4a1a5577)）。
+
+### Changed
+- 光鸭整理默认开启“自动回收同版本落选文件”，可通过 `GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED` 关闭。归档完成后复核实际保留版本，再将落选视频及其专属伴随文件移入回收站；仅回收已完成核验的落选文件，归属不明时保留来源，复用已有整理回收链路（[`30c9ae8e`](https://github.com/li88iioo/MediaFlux/commit/30c9ae8e)、[`e131d784`](https://github.com/li88iioo/MediaFlux/commit/e131d784)、[`d1b8bbcd`](https://github.com/li88iioo/MediaFlux/commit/d1b8bbcd)）。
+- STRM 单来源与多来源统一分配独立本地目录，来源增删、重名及重启沿用持久化分配；保留已有非空路径，选择云盘子目录时不额外拼接其父路径，不批量搬迁已有文件（[`6cb33151`](https://github.com/li88iioo/MediaFlux/commit/6cb33151)、[`0208a58d`](https://github.com/li88iioo/MediaFlux/commit/0208a58d)）。
+- Jellyfin／Emby 自动刷新统一按真实变化路径合并，定位电影、单集、季或整剧，补充新条目图片及整剧汇总；移除内部全库刷新兜底。刷新失败或路径未匹配时记录原因并结束，不自动重试、不等待配置变更重放，由用户在媒体服务器手动刷新；已完成的整理与 STRM 不受影响（[`18a205cd`](https://github.com/li88iioo/MediaFlux/commit/18a205cd)、[`b2db8548`](https://github.com/li88iioo/MediaFlux/commit/b2db8548)、[`1991b1ea`](https://github.com/li88iioo/MediaFlux/commit/1991b1ea)）。
+- AI 能力统一受 `AGENT_LLM_ENABLED` 总开关控制，各子功能保留独立开关；每次模型请求检查最新状态。模型请求超时统一默认 120 秒、范围 2–120 秒，Agent、AI 辅助识别及连接测试共用该设置（[`8a0f0bd9`](https://github.com/li88iioo/MediaFlux/commit/8a0f0bd9)、[`e737d778`](https://github.com/li88iioo/MediaFlux/commit/e737d778)、[`4e76fd49`](https://github.com/li88iioo/MediaFlux/commit/4e76fd49)、[`c5f308ab`](https://github.com/li88iioo/MediaFlux/commit/c5f308ab)）。
+- 媒体探索、探索页豆瓣来源及媒体档案站点资源开关仅控制 Web 展示；Agent、Telegram、订阅和整理辅助识别按各自能力与站点配置运行。新安装的探索与站点资源展示默认关闭，订阅收藏在隐藏探索页后仍可使用（[`9122ac21`](https://github.com/li88iioo/MediaFlux/commit/9122ac21)、[`e8cd6995`](https://github.com/li88iioo/MediaFlux/commit/e8cd6995)、[`c5f308ab`](https://github.com/li88iioo/MediaFlux/commit/c5f308ab)、[`9054387c`](https://github.com/li88iioo/MediaFlux/commit/9054387c)）。
+- Telegram、资源站和 RSS 的 qB 下载类别统一为 `QB_CATEGORY`；新 RSS 订阅明确保存下载目标，下载目录按订阅配置，未指定时交由 qB 决定。光鸭目录留空时继续动态继承离线转存默认目录，页面显示当前有效值（[`b73a8305`](https://github.com/li88iioo/MediaFlux/commit/b73a8305)、[`aacb946a`](https://github.com/li88iioo/MediaFlux/commit/aacb946a)）。
+- 重整光鸭分享转存工作区，集中展示步骤、文件选择与容量统计，保存时再选择目标目录；优化整理复核、日志详情固定操作栏、识别规则编辑及移动端布局，媒体播放映射从所属反代实例管理（[`3dcf35bc`](https://github.com/li88iioo/MediaFlux/commit/3dcf35bc)、[`d913b659`](https://github.com/li88iioo/MediaFlux/commit/d913b659)、[`d3b6b1e9`](https://github.com/li88iioo/MediaFlux/commit/d3b6b1e9)、[`4e478f31`](https://github.com/li88iioo/MediaFlux/commit/4e478f31)）。
+- 首次安装与未配置字段统一使用后端默认值：离线最小文件体积为 50 MB、允许 HTTP(S)，STRM 视频扩展名覆盖页面“全量”集合；已有显式配置继续保留（[`3caaf430`](https://github.com/li88iioo/MediaFlux/commit/3caaf430)、[`9086de99`](https://github.com/li88iioo/MediaFlux/commit/9086de99)）。
+- 更新运行依赖锁与构建基础镜像，优化媒体库概览和统计查询；补充快速开始，更新使用指南、配置截图及业务拓扑（[`61b3f6f7`](https://github.com/li88iioo/MediaFlux/commit/61b3f6f7)、[`35cf4b13`](https://github.com/li88iioo/MediaFlux/commit/35cf4b13)、[`ca24a663`](https://github.com/li88iioo/MediaFlux/commit/ca24a663)、[`31203876`](https://github.com/li88iioo/MediaFlux/commit/31203876)）。
+
+### Fixed
+- 整理确认冻结所选候选及文件快照，人工整理后结清旧确认，跳过、取消及过期只更新对应快照内的日志；STRM 与媒体刷新结果持久回写原运行，不受通知开关影响，迟到回执不覆盖新运行（[`84bbc92a`](https://github.com/li88iioo/MediaFlux/commit/84bbc92a)、[`25f906f8`](https://github.com/li88iioo/MediaFlux/commit/25f906f8)、[`2dd7d9f6`](https://github.com/li88iioo/MediaFlux/commit/2dd7d9f6)、[`7fb0fef1`](https://github.com/li88iioo/MediaFlux/commit/7fb0fef1)）。
+- Agent 历史在会话事务中完整保存，归档后保留引用关系；切换会话、停止和失败恢复绑定原会话，未配置模型时仍可读取已有对话，切换 Telegram Agent 不再中断 Web 查询（[`731fd5a5`](https://github.com/li88iioo/MediaFlux/commit/731fd5a5)、[`59a061f7`](https://github.com/li88iioo/MediaFlux/commit/59a061f7)、[`a4dfd5d3`](https://github.com/li88iioo/MediaFlux/commit/a4dfd5d3)、[`285c1992`](https://github.com/li88iioo/MediaFlux/commit/285c1992)、[`fa8e5a53`](https://github.com/li88iioo/MediaFlux/commit/fa8e5a53)）。
+- Agent 原生 SDK 只读等待可持久恢复，不重放整段脚本或已执行写入；统一读取配额、调用身份和证据归属，保留确认与实际执行回执（[`432e6a13`](https://github.com/li88iioo/MediaFlux/commit/432e6a13)、[`ef4e3a15`](https://github.com/li88iioo/MediaFlux/commit/ef4e3a15)、[`2e8d5d49`](https://github.com/li88iioo/MediaFlux/commit/2e8d5d49)、[`ad5fac41`](https://github.com/li88iioo/MediaFlux/commit/ad5fac41)）。
+- 下载、RSS 和分享转存的取消检查贯穿准备与实际提交，保留已经受理的任务并释放未提交占用；统一 qB／光鸭的部分成功和结果不确定回执，避免把未知状态当成失败而重复下载（[`b97d0289`](https://github.com/li88iioo/MediaFlux/commit/b97d0289)、[`dbc5f128`](https://github.com/li88iioo/MediaFlux/commit/dbc5f128)、[`480deb74`](https://github.com/li88iioo/MediaFlux/commit/480deb74)、[`ba09ee7d`](https://github.com/li88iioo/MediaFlux/commit/ba09ee7d)、[`118c17ca`](https://github.com/li88iioo/MediaFlux/commit/118c17ca)）。
+- 下载待处理聚焦下载失败与待核对结果，整理或 STRM 失败不再引导重复下载；重试保留 RSS 原保存目录，活动列表自动更新，批量失败项继续保留选中（[`3a4eb0a7`](https://github.com/li88iioo/MediaFlux/commit/3a4eb0a7)、[`d5ff0674`](https://github.com/li88iioo/MediaFlux/commit/d5ff0674)、[`cf21e113`](https://github.com/li88iioo/MediaFlux/commit/cf21e113)）。
+- RSS 与媒体追更保留完整集数集合，巡检候选按所属运行原子发布，正确反馈部分下载和取消结果；取消刷新停止后续批次并回滚不完整订阅源，定时通知带出失败原因（[`24602e67`](https://github.com/li88iioo/MediaFlux/commit/24602e67)、[`5be847f3`](https://github.com/li88iioo/MediaFlux/commit/5be847f3)、[`ec6cd553`](https://github.com/li88iioo/MediaFlux/commit/ec6cd553)、[`f59a5c48`](https://github.com/li88iioo/MediaFlux/commit/f59a5c48)、[`d5b77211`](https://github.com/li88iioo/MediaFlux/commit/d5b77211)）。
+- STRM 清理按全局实际路径归属保护其他来源，恢复已核验的历史相对索引；完整、增量与重试统一重复文件选择和过滤策略，提前拒绝视频与伴随扩展名冲突，来源退役时撤销旧任务，增量读取限定到受影响文件（[`8c69a921`](https://github.com/li88iioo/MediaFlux/commit/8c69a921)、[`516418c3`](https://github.com/li88iioo/MediaFlux/commit/516418c3)、[`d837934f`](https://github.com/li88iioo/MediaFlux/commit/d837934f)、[`73cb618a`](https://github.com/li88iioo/MediaFlux/commit/73cb618a)、[`afdabfd1`](https://github.com/li88iioo/MediaFlux/commit/afdabfd1)、[`e89a1c05`](https://github.com/li88iioo/MediaFlux/commit/e89a1c05)、[`71b842a3`](https://github.com/li88iioo/MediaFlux/commit/71b842a3)）。
+- 本地整理提供中断写入的已校验重试入口，回执归属原预览；保护未完成 qB 下载仍占用的路径，临时事务文件名不再因媒体名称过长而写入失败，跨任务沿用已归档身份（[`661a1e20`](https://github.com/li88iioo/MediaFlux/commit/661a1e20)、[`0733b599`](https://github.com/li88iioo/MediaFlux/commit/0733b599)、[`42322116`](https://github.com/li88iioo/MediaFlux/commit/42322116)、[`48191305`](https://github.com/li88iioo/MediaFlux/commit/48191305)、[`278e2e7e`](https://github.com/li88iioo/MediaFlux/commit/278e2e7e)）。
+- 电影分片身份贯穿命名与冲突判定，预处理保留原始目录名，修正发布编码识别与电影别名核验；手动刮削先搜索完整标题，无结果再尝试单语言名称，结果仍由用户选择（[`bd79937a`](https://github.com/li88iioo/MediaFlux/commit/bd79937a)、[`dcd4b195`](https://github.com/li88iioo/MediaFlux/commit/dcd4b195)、[`6e93cb5c`](https://github.com/li88iioo/MediaFlux/commit/6e93cb5c)、[`f0e6450f`](https://github.com/li88iioo/MediaFlux/commit/f0e6450f)）。
+- 媒体反代按运行实例维护播放授权及有界缓存，上游请求 Cookie 相互隔离；保留活动播放范围，正确结算流式失败，允许停用故障上游，并支持已核验 Web 直放经局域网 HTTP 接入（[`df14f6fc`](https://github.com/li88iioo/MediaFlux/commit/df14f6fc)、[`16df8a6c`](https://github.com/li88iioo/MediaFlux/commit/16df8a6c)、[`3cbee495`](https://github.com/li88iioo/MediaFlux/commit/3cbee495)、[`2bc58f0b`](https://github.com/li88iioo/MediaFlux/commit/2bc58f0b)、[`e007dc12`](https://github.com/li88iioo/MediaFlux/commit/e007dc12)）。
+- 设置显示与运行时共用默认值，显式空开关保持关闭，空 Cron 保存被拒绝；配置无效或预览过期时不撤销正在使用的运行授权，回滚恢复键缺失与显式空值的区别。修改管理员凭据后撤销旧 Web 会话，备份恢复仅在提交成功后清理回滚日志（[`fde18c3f`](https://github.com/li88iioo/MediaFlux/commit/fde18c3f)、[`9086de99`](https://github.com/li88iioo/MediaFlux/commit/9086de99)、[`e5b668df`](https://github.com/li88iioo/MediaFlux/commit/e5b668df)、[`5f9566de`](https://github.com/li88iioo/MediaFlux/commit/5f9566de)、[`04fef53c`](https://github.com/li88iioo/MediaFlux/commit/04fef53c)、[`c46c852b`](https://github.com/li88iioo/MediaFlux/commit/c46c852b)）。
+- Jellyfin 插件只在探测真正成功后登记 STRM 指纹，避免源地址变化且探测失败时沿用旧媒体信息；后台预探测失败不循环重排，单项超时不终止整个队列，加速接入失败时保留联动删除；修正大小写不同的伴随文件归属（[`4a1a5577`](https://github.com/li88iioo/MediaFlux/commit/4a1a5577)、[`60c72870`](https://github.com/li88iioo/MediaFlux/commit/60c72870)、[`3b0b510c`](https://github.com/li88iioo/MediaFlux/commit/3b0b510c)）。
+
+### 升级说明
+- 从 v0.1.16 升级，数据库为 **schema41 → 41**，本版**不新增数据库 schema 迁移**。升级前停止服务并备份数据目录；如需恢复备份，停止服务后按[离线恢复流程](docs/部署指南.md#63-离线恢复与安全回退)同时恢复数据库和配套配置。
+- 核对整理规则中的“自动回收同版本落选文件”：缺失配置时默认开启；不希望自动回收来源文件时，显式关闭 `GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED`。该项与“回收被替换的归档旧版本”分别控制（[`e131d784`](https://github.com/li88iioo/MediaFlux/commit/e131d784)）。
+- Agent 总开关统一为 `AGENT_LLM_ENABLED`，旧 `AGENT_ENABLED` 不再作为独立开关；升级后核对总开关及 AI 回退、主动复核、Telegram 等子项。配置与对话历史保留，关闭总开关不自动撤销已交给下载器或整理队列的业务任务（[`c5f308ab`](https://github.com/li88iioo/MediaFlux/commit/c5f308ab)、[`8a0f0bd9`](https://github.com/li88iioo/MediaFlux/commit/8a0f0bd9)）。
+- qB 类别按 **显式 `QB_CATEGORY`（含空值）→ 旧 `TG_QB_CATEGORY` → 旧 `RSS_QB_CATEGORY`** 读取，最终所有渠道共用一项；历史两渠道类别不同时，请在下载器设置中核对统一分类。旧 `TG_QB_SAVE_PATH`／`RSS_QB_SAVE_PATH` 不再作为全局保存路径，RSS 特定目录请在各订阅中设置，留空由 qB 决定（[`b73a8305`](https://github.com/li88iioo/MediaFlux/commit/b73a8305)）。
+- 自动媒体刷新失败后不再重试，也不保留等待配置的失败积压；核对路径映射后在 Jellyfin／Emby 手动刷新即可，无需重新下载或整理。刷新已排队或请求已受理不表示媒体服务器已完成扫描（[`b2db8548`](https://github.com/li88iioo/MediaFlux/commit/b2db8548)、[`7fb0fef1`](https://github.com/li88iioo/MediaFlux/commit/7fb0fef1)）。
+- Jellyfin 插件独立升级到 **0.1.6**（程序集／manifest 为 `0.1.6.0`），更新 MediaFlux 主程序不会替换插件；安装后重启 Jellyfin，按需启用 STRM 起播加速。旧版未验证的探测指纹不再用于加速，各条目下次播放成功探测后重新登记，不批量刷新存量媒体库（[`4a1a5577`](https://github.com/li88iioo/MediaFlux/commit/4a1a5577)）；安装方式见[插件指南](docs/jellyfin-plugin.md)。
+- [Pathfin（Android）](https://github.com/li88iioo/Pathfin/releases)仍是独立客户端，不随主程序或 Jellyfin 插件升级。开启“STRM 原始地址”后，可连接 MF 反代或原 Jellyfin，通过解析云盘地址直连 CDN；已验证范围为 MF STRM＋光鸭，不将官方 Android 播放器的兼容中继行为等同于 Pathfin，详见[客户端接入说明](docs/strm-cloud-quality.md)（[`dc43e73a`](https://github.com/li88iioo/MediaFlux/commit/dc43e73a)）。
+
 ## [0.1.16] - 2026-11-11
 
 ### Added
@@ -438,7 +483,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/li88iioo/MediaFlux/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/li88iioo/MediaFlux/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/li88iioo/MediaFlux/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/li88iioo/MediaFlux/compare/v0.1.13...v0.1.14
