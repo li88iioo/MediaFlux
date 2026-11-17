@@ -321,7 +321,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("mediaflux.py backup list", deploy)
         self.assertIn("ls -lah /app/db/backups", deploy)
         self.assertIn("Pull Request、`main` 推送与 `v<SemVer>` 标签", development)
-        self.assertIn("Playwright 1.64.0", development)
+        self.assertIn("Playwright 1.65.2", development)
         self.assertIn("二者通过后执行 amd64 容器运行", development)
         self.assertIn("仅 `v<SemVer>` 标签继续构建", development)
         self.assertNotIn("支持定时扫描或下载完成自动触发", readme)
@@ -344,8 +344,8 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("needs", browser)
         self.assertIn('python -m pip install "pytest==9.2.0"', browser_runs)
         self.assertIn('version("pytest") == "9.2.0"', browser_runs)
-        self.assertIn('python -m pip install "playwright==1.64.0"', browser_runs)
-        self.assertIn('version("playwright") == "1.64.0"', browser_runs)
+        self.assertIn('python -m pip install "playwright==1.65.2"', browser_runs)
+        self.assertIn('version("playwright") == "1.65.2"', browser_runs)
         for executable in (
             "google-chrome",
             "google-chrome-stable",

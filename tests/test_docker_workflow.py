@@ -167,9 +167,9 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("npm ci --ignore-scripts --no-audit --no-fund", test_job)
         self.assertIn("--require-hashes -r requirements-release-runtime.lock", test_job)
         self.assertIn('python -m pip install "pytest==9.2.0"', test_job)
-        self.assertIn('python -m pip install "ruff==0.17.3"', test_job)
+        self.assertIn('python -m pip install "ruff==0.17.5"', test_job)
         self.assertIn('version("pytest") == "9.2.0"', test_job)
-        self.assertIn('version("ruff") == "0.17.3"', test_job)
+        self.assertIn('version("ruff") == "0.17.5"', test_job)
         self.assertIn(
             "ruff check app packaging tests --select F,E9",
             test_job,
@@ -192,9 +192,9 @@ class DockerWorkflowTests(unittest.TestCase):
 
     def test_type_check_gate_uses_ci_python_and_blocks_before_tests(self) -> None:
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
-        self.assertIn('python -m pip install "pyrefly==1.4.0"', test_job)
-        self.assertIn('"types-PyYAML==6.0.12.20261030" "types-croniter==6.2.4.20261006"', test_job)
-        self.assertIn('version("pyrefly") == "1.4.0"', test_job)
+        self.assertIn('python -m pip install "pyrefly==1.4.1"', test_job)
+        self.assertIn('"types-PyYAML==6.0.12.20261113" "types-croniter==6.2.4.20261006"', test_job)
+        self.assertIn('version("pyrefly") == "1.4.1"', test_job)
         gate = 'pyrefly check --min-severity=warn --python-interpreter-path "$(command -v python)"'
         self.assertIn(gate, test_job)
         self.assertLess(test_job.index(gate), test_job.index("python -m pytest tests"))
@@ -205,7 +205,7 @@ class DockerWorkflowTests(unittest.TestCase):
 
     def test_regression_browser_cases_are_in_required_browser_job(self) -> None:
         browser_job = self.text.split("  browser:", 1)[1].split("  smoke:", 1)[0]
-        self.assertIn('python -m pip install "playwright==1.64.0"', browser_job)
+        self.assertIn('python -m pip install "playwright==1.65.2"', browser_job)
         modules = browser_job.split("modules = (", 1)[1].split(")", 1)[0]
         for module in (
             "tests.test_node_fixes_agent_feedback",

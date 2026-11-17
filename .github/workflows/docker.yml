@@ -43,12 +43,12 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund
           python -m pip install --require-hashes -r requirements-release-runtime.lock
           python -m pip install "pytest==9.2.0"
-          python -m pip install "ruff==0.17.3"
-          python -m pip install "pyrefly==1.4.0"
-          python -m pip install "types-PyYAML==6.0.12.20261030" "types-croniter==6.2.4.20261006"
+          python -m pip install "ruff==0.17.5"
+          python -m pip install "pyrefly==1.4.1"
+          python -m pip install "types-PyYAML==6.0.12.20261113" "types-croniter==6.2.4.20261006"
           python -c 'from importlib.metadata import version; assert version("pytest") == "9.2.0"'
-          python -c 'from importlib.metadata import version; assert version("ruff") == "0.17.3"'
-          python -c 'from importlib.metadata import version; assert version("pyrefly") == "1.4.0"'
+          python -c 'from importlib.metadata import version; assert version("ruff") == "0.17.5"'
+          python -c 'from importlib.metadata import version; assert version("pyrefly") == "1.4.1"'
           python -m pip check
 
       - name: Run Python static quality gate
@@ -93,9 +93,9 @@ jobs:
         run: |
           python -m pip install --require-hashes -r requirements-release-runtime.lock
           python -m pip install "pytest==9.2.0"
-          python -m pip install "playwright==1.64.0"
+          python -m pip install "playwright==1.65.2"
           python -c 'from importlib.metadata import version; assert version("pytest") == "9.2.0"'
-          python -c 'from importlib.metadata import version; assert version("playwright") == "1.64.0"'
+          python -c 'from importlib.metadata import version; assert version("playwright") == "1.65.2"'
           python -m pip check
 
       - name: Verify system Chrome or Chromium
