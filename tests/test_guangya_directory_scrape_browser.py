@@ -5,6 +5,7 @@ import shutil
 import textwrap
 import unittest
 from pathlib import Path
+from typing import TypedDict
 
 from jinja2 import Environment, FileSystemLoader, nodes
 
@@ -71,6 +72,12 @@ HARNESS = textwrap.dedent(
     </main>
     """
 )
+
+
+class _BoundRow(TypedDict):
+    row: str
+    action: str
+    index: int
 
 
 @unittest.skipIf(sync_playwright is None, "system Python 未安装 Playwright")
@@ -241,7 +248,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         left: int,
         top: int,
         is_video: bool = False,
-    ) -> dict[str, object]:
+    ) -> _BoundRow:
         return self.page.evaluate(
             "options => window.__bindItem(options)",
             {
@@ -263,12 +270,12 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         )
         return position["left"], position["top"]
 
-    def _open_button(self, binding: dict[str, object]) -> None:
-        self.page.eval_on_selector(str(binding["action"]), "element => element.click()")
+    def _open_button(self, binding: _BoundRow) -> None:
+        self.page.eval_on_selector(binding["action"], "element => element.click()")
 
-    def _open_context(self, binding: dict[str, object], *, x: int, y: int) -> None:
+    def _open_context(self, binding: _BoundRow, *, x: int, y: int) -> None:
         self.page.eval_on_selector(
-            str(binding["row"]),
+            binding["row"],
             """
             (element, point) => element.dispatchEvent(new MouseEvent('contextmenu', {
                 bubbles: true,
@@ -285,7 +292,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
 
     def _open_manual_directory(self) -> None:
         binding = self._bind(is_directory=True, left=120, top=100)
-        self.page.locator(str(binding["action"])).click()
+        self.page.locator(binding["action"]).click()
         self.page.locator('[data-scrape-action="manual"]').click()
         self.page.locator('.gy-scrape-candidate').first.wait_for()
 
@@ -957,14 +964,14 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self._open_button(binding)
         self.page.evaluate("window.dispatchEvent(new Event('resize'))")
         self.assertEqual(
-            self.page.get_attribute(str(binding["action"]), "aria-expanded"),
+            self.page.get_attribute(binding["action"], "aria-expanded"),
             "false",
         )
 
         self._open_button(binding)
         self.page.evaluate("document.dispatchEvent(new Event('scroll'))")
         self.assertEqual(
-            self.page.get_attribute(str(binding["action"]), "aria-expanded"),
+            self.page.get_attribute(binding["action"], "aria-expanded"),
             "false",
         )
 

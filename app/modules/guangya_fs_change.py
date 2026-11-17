@@ -448,7 +448,7 @@ def submit_fs_change_plan(
         raise GuangYaFSChangeStale(
             "光鸭原任务期限已到，请先核验原任务结果，不能重复提交"
         )
-    from app.modules.organize_tasks import get_organize_manager
+    from app.modules.organize_tasks import DEFAULT_DURABLE_OPERATION_TTL_SECONDS, get_organize_manager
 
     task = get_organize_manager().start_durable_operation(
         "光鸭文件变更",
@@ -463,11 +463,11 @@ def submit_fs_change_plan(
             "credential_generation": int(plan["credential_generation"]),
         },
         dedupe_key=f"agent-guangya-fs-change:{plan_id}:{expected_fingerprint}",
-        **(
-            {"ttl_seconds": 6 * 60 * 60}
+        ttl_seconds=(
+            6 * 60 * 60
             if plan.get("batch_summary")
             and plan["stats"]["total"] > MAX_FS_CHANGE_OBJECT_OPERATIONS
-            else {}
+            else DEFAULT_DURABLE_OPERATION_TTL_SECONDS
         ),
         on_admitted=on_admitted,
     )

@@ -70,6 +70,7 @@ from app.repositories.organize_operation_jobs import (
 )
 
 logger = get_logger(__name__)
+DEFAULT_DURABLE_OPERATION_TTL_SECONDS = 3_600
 
 
 class _OrderedSourceWriteCoordinator:
@@ -839,7 +840,7 @@ class OrganizeTaskManager:
             persisted_result = {}
         status = str(row["status"] or "")
         public_status = "queued" if status == "pending" else status
-        result = {
+        receipt: dict[str, str | bool | int | dict[str, object]] = {
             "id": str(row["job_id"] or ""),
             "status": public_status,
             "message": (
@@ -861,8 +862,8 @@ class OrganizeTaskManager:
             "durable": True,
         }
         if web_owner is not None:
-            result["queue_position"] = organize_operation_queue_position(expected) if status == "pending" else 0
-        return result
+            receipt["queue_position"] = organize_operation_queue_position(expected) if status == "pending" else 0
+        return receipt
 
     def status(self) -> dict:
         result = self.task_status()
@@ -1035,7 +1036,7 @@ class OrganizeTaskManager:
         dedupe_key: str,
         job_id: str | None = None,
         queue_if_busy: bool = True,
-        ttl_seconds: int = 3_600,
+        ttl_seconds: int = DEFAULT_DURABLE_OPERATION_TTL_SECONDS,
         on_admitted: Callable[[Any, Any, bool], None] | None = None,
     ) -> dict:
         """提交可在进程重启后恢复的单次云盘操作。

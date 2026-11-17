@@ -1067,7 +1067,7 @@ class DirectoryScrapeService:
         match = record.match
         candidate = {
             "candidate_number": 1, "provider": Organizer._match_provider(match),
-            "external_id": Organizer._match_external_id(match), "tmdb_id": str(match.tmdb_id or ""),
+            "external_id": Organizer._match_external_id(match), "tmdb_id": match.tmdb_id,
             "media_type": match.media_type,
         }
         execution_owner = signed_context_fingerprint({"owner": owner}, domain="guangya-directory-scrape-job-owner")

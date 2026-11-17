@@ -5,7 +5,7 @@ from app import database as db
 from app.modules.strm_metadata_worker import STRMMetadataWorker
 from app.repositories import media_refresh_queue as queue
 from app.repositories import strm as strm_repo
-from tests.support import IsolatedDatabaseTestCase, media_refresh_providers
+from tests.support import IsolatedDatabaseTestCase, assert_present, media_refresh_providers
 
 class DurableHandoffMigrationTests(IsolatedDatabaseTestCase):
     def test_v24_upgrade_preserves_outbox_and_initializes_handoff(self):
@@ -55,7 +55,8 @@ class DurableHandoffMigrationTests(IsolatedDatabaseTestCase):
             STRMMetadataWorker()._flush_media_refresh(force=True)
         self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
         self.assertEqual(queue.claim_due_media_refreshes(owner="after-upgrade", force=True), [])
-        result = json.loads(db.get_task_run(run_id)["result"])["media_refresh_results"]
+        run = assert_present(db.get_task_run(run_id))
+        result = json.loads(run["result"])["media_refresh_results"]
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["pending"])
         self.assertIn("未记录原媒体服务器", result["events"]["legacy"]["providers"]["媒体库"]["error"])

@@ -527,7 +527,9 @@ class TmdbRegexRuleApiTests(IsolatedDatabaseTestCase):
                 self.assertEqual(saved[key], rule[key])
             response = tools_api.update_tmdb_regex_rule_api(Mock(), rule["id"], {"disabled": False})
             self.assertEqual(response.status_code, 200)
-            self.assertFalse(rules.get_rule(rule["id"])["disabled"])
+            enabled = rules.get_rule(rule["id"])
+            assert enabled is not None
+            self.assertFalse(enabled["disabled"])
             validate.assert_not_called()
 
     def test_rule_content_and_target_changes_still_require_tmdb(self):
