@@ -398,10 +398,13 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
                 self.assertTrue(stop.is_enabled())
                 self.assertTrue(send.is_hidden())
                 slot_bounds = slot.bounding_box()
+                assert slot_bounds is not None
                 page.locator('#agentPrompt').fill('继续问一个问题')
                 self.assertTrue(send.is_visible())
                 self.assertTrue(send.is_enabled())
                 stop_bounds, send_bounds = stop.bounding_box(), send.bounding_box()
+                assert stop_bounds is not None
+                assert send_bounds is not None
                 expected_size = 44 if width <= 680 else 38
                 for bounds in (stop_bounds, send_bounds):
                     self.assertEqual((bounds['width'], bounds['height']), (expected_size, expected_size))

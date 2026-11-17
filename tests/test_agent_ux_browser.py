@@ -853,11 +853,14 @@ class AgentUXBrowserTests(unittest.TestCase):
         _target(card, '光鸭·分流目录 + qBittorrent').check()
         submit = card.get_by_role('button', name='提交下载')
         bounds = submit.bounding_box()
+        assert bounds is not None
         submit.click()
         card.get_by_text('光鸭接收目录已变化', exact=False).wait_for()
         self.assertTrue(_target(card, '光鸭·主目录 + qBittorrent').is_checked())
         self.assertTrue(submit.is_enabled())
-        self.assertEqual(submit.bounding_box()['width'], bounds['width'])
+        updated_bounds = submit.bounding_box()
+        assert updated_bounds is not None
+        self.assertEqual(updated_bounds['width'], bounds['width'])
         self.assertEqual(page.evaluate('window.__rejectedForm'), [['target', 'both'], ['expected_gy_target_dir', 'secondary']])
         self.assertEqual(page.evaluate('window.__directForms.length'), 1)
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)

@@ -25,6 +25,7 @@ from app.repositories.download_requests import download_display_title
 if TYPE_CHECKING:
     from telebot import TeleBot
 
+    from app.indexers.downloads import _DownloadDestination
     from app.modules.local_media_models import LocalMediaSource
 
 from app.repositories import organize_confirmations as organize_confirmations_repo
@@ -45,8 +46,14 @@ from app.notifier import (
 
 logger = get_logger(__name__)
 
+
+class _DownloadDispatchKwargs(TypedDict, total=False):
+    nsfw_source_id: str
+    destination: _DownloadDestination
+
+
 class _DownloadDispatchOptions(TypedDict, total=False):
-    kwargs: dict[str, str]
+    kwargs: _DownloadDispatchKwargs
 
 
 _bot: TeleBot | None = None
@@ -3073,7 +3080,7 @@ def _dispatch_download_callback(
     target: str,
     *,
     nsfw_source_id: str | None = None,
-    destination: dict[str, str] | None = None,
+    destination: _DownloadDestination | None = None,
 ) -> None:
     from app.indexers.downloads import DirectDownloadPreconditionError, nsfw_download_destination
     from app.modules.download_dispatcher import (
@@ -3082,12 +3089,12 @@ def _dispatch_download_callback(
     )
     from app.modules.download_tracker import get_download_tracker
 
-    destination = destination or {}
+    resolved_destination: _DownloadDestination = destination if destination is not None else {}
     try:
         if nsfw_source_id is not None:
             if target != "guangya":
                 raise DirectDownloadPreconditionError("NSFW 下载目标无效")
-            destination = nsfw_download_destination(nsfw_source_id)
+            resolved_destination = nsfw_download_destination(nsfw_source_id)
     except DirectDownloadPreconditionError as exc:
         try:
             bot.edit_message_text(
@@ -3105,7 +3112,7 @@ def _dispatch_download_callback(
         return
 
     try:
-        result = dispatch_request(request_id, target, **destination)
+        result = dispatch_request(request_id, target, **resolved_destination)
         summary = public_dispatch_summary(result)
     except Exception as exc:
         logger.error(
@@ -3137,10 +3144,10 @@ def _dispatch_download_callback(
     labels = {"qb": "qBittorrent", "guangya": "光鸭云盘"}
     succeeded = summary["succeeded"]
     if nsfw_source_id and status != "duplicate":
-        source_name = destination["gy_target_name"] or destination["gy_target_dir"]
+        source_name = resolved_destination["gy_target_name"] or resolved_destination["gy_target_dir"]
         text += f"\nNSFW 整理来源：{html.escape(source_name)}（按 NSFW 规则整理）"
-    elif destination and "guangya" in succeeded:
-        text += f"\n光鸭接收目录：{html.escape(destination['gy_target_name'])}"
+    elif resolved_destination and "guangya" in succeeded:
+        text += f"\n光鸭接收目录：{html.escape(resolved_destination['gy_target_name'])}"
     if succeeded:
         text += "\n成功: " + "、".join(labels[item] for item in succeeded)
     if summary["failed"]:
