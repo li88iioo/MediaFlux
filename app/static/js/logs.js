@@ -1272,6 +1272,7 @@ if (initialTab === 'runtime') {
         el('SelectionCount').textContent=`已选 ${count} / ${limit} 组`;
         el('Clear').disabled=state.busy||!count;
         el('SelectMatching').disabled=locked||state.loading||!state.tokens.length||el('Scope').value!=='pending';
+        el('Skip').disabled=locked||!count;
         el('Agent').disabled=locked||!count||!state.reviewEnabled;
         el('Agent').title=state.reviewEnabled?'仅生成候选建议，不执行媒体整理':'当前未启用 Agent 复核，可手动选择候选';
         el('Prepare').disabled=locked||!count;
@@ -1360,7 +1361,7 @@ if (initialTab === 'runtime') {
             <div class="confirmation-review-suggestion"><strong>${_esc(suggestionTitle)}</strong>${_esc(suggestion?.summary||item.review_summary||reviewStatuses[item.review_status]||'手动选择候选，或对已选媒体组发起 Agent 只读复核。')}${suggestion?.reason_code?`<br>依据：${_esc(suggestion.reason_code)}`:''}${suggestion?.confidence!=null&&Number.isFinite(confidence)?` · 置信度 ${Math.round(confidence*100)}%`:''}</div>
             ${item.downstream&&Object.keys(item.downstream).length?`<div class="confirmation-review-downstream"><strong>STRM / 媒体库后续</strong>${Object.entries(item.downstream).filter(([,value])=>value!==''&&value!==null).map(([key,value])=>`<p>${_esc(({strm:'STRM',media_refresh:'媒体库刷新',media_library:'媒体库',library:'媒体库',partial:'部分完成',status:'状态',error:'错误',message:'说明'})[key]||key)}：${_esc(typeof value==='boolean'?(value?'是':'否'):evidenceValue(value))}</p>`).join('')}</div>`:''}
             <fieldset class="confirmation-review-candidates"><legend>候选作品 · 不会默认选择第一项</legend>${candidates.map(candidate=>`<label class="confirmation-review-candidate${draft===candidate.index?' is-selected':''}"><input type="radio" name="confirmation-review-candidate" value="${_attr(candidate.index)}" aria-label="选择候选 ${_attr(candidate.title)} (${_attr(candidate.year||'年份未知')})"${draft===candidate.index?' checked':''}><span class="confirmation-review-candidate-body"><strong>${_esc(candidate.title||'未命名候选')} ${_esc(candidate.year||'')}</strong><small>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')} · ${_esc(candidate.media_type||'')}</small><span class="confirmation-review-evidence">${Object.entries(candidate.evidence||{}).filter(([,value])=>value!=null&&evidenceValue(value)).map(([key,value])=>`<small>${_esc(evidenceLabels[key]||key)}：${_esc(evidenceValue(value))}</small>`).join('')}</span></span></label>`).join('')||'<p class="confirmation-review-note">没有可选候选，请保留待确认。</p>'}</fieldset>
-            <div class="confirmation-review-savebar"><button type="button" class="jump-btn" data-review-action="save">保存并下一条</button><button type="button" class="jump-btn" data-review-action="next">下一条 / 暂留待确认</button></div>`;
+            <div class="confirmation-review-savebar"><button type="button" class="jump-btn" data-review-action="save">保存并下一条</button><button type="button" class="jump-btn" data-review-action="next">下一条 / 暂留待确认</button><button type="button" class="jump-btn" data-review-action="skip" title="结束此组待确认，文件保持原位">跳过此组</button></div>`;
     }
     function render(){
         renderList();renderDetail();controls();
@@ -1406,6 +1407,18 @@ if (initialTab === 'runtime') {
         state.busy=true;state.loading=false;++state.serial;clearTimeout(state.timer);controls();
         try{await work();}catch(error){say(error.message||'操作失败，请刷新后重试',true);}
         finally{state.busy=false;el('List').setAttribute('aria-busy','false');if(visible()){render();if(!state.synced)load();else schedule();}}
+    }
+    // 与 Telegram 每组的终止按钮一致：无元数据组“跳过此组”、有候选组“暂不处理”；文件保持原位，日志标记为跳过。
+    async function skip(tokens){
+        invalidatePreview();
+        const data=await request('/skip',{confirmation_ids:tokens});
+        const results=Array.isArray(data.items)?data.items:[];
+        results.filter(item=>item.skipped).forEach(item=>{state.selected.delete(item.confirmation_id);state.drafts.delete(item.confirmation_id);});
+        persist();
+        merge(await snapshot(tokens));
+        const failed=results.filter(item=>!item.skipped);
+        say(`已跳过 ${data.skipped||0} 组，文件保持原位，日志标记为“跳过”${failed.length?`；${failed.length} 组未跳过：${failed[0].error||'状态已变化'}`:''}。以后重新执行整理时仍会再次识别。`,failed.length>0);
+        return failed.length===0;
     }
     async function next(){
         const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.confirmation_id);
@@ -1484,8 +1497,10 @@ if (initialTab === 'runtime') {
     });
     el('Detail').addEventListener('click',event=>{
         const action=event.target.closest('button')?.dataset.reviewAction;if(!action)return;
+        // 跳过的组离开待确认队列：结束后静默回读列表，保留跳过结果提示。
         act(async()=>{
             if(action==='next'){await next();return;}
+            if(action==='skip'){if(await skip([state.active]))await next();return;}
             const token=state.active,index=state.drafts.get(token);
             if(!Number.isInteger(index))return;
             invalidatePreview();
@@ -1494,8 +1509,16 @@ if (initialTab === 'runtime') {
             const saved=items.find(item=>item.confirmation_id===token);
             if(saved?.suggestion?.source!=='human'||serverIndex(saved)!==index)throw new Error('选择已提交，尚未从服务器读回人工选择，请刷新核实');
             state.drafts.delete(token);say('人工选择已保存，尚未执行整理。');await next();
-        });
+        }).then(()=>{if(action==='skip')load(state.page,true);});
     });
+    el('Skip').addEventListener('click',()=>act(async()=>{
+        const items=await snapshot([...state.selected]);merge(items);
+        const eligible=items.filter(item=>item.status==='pending').map(item=>item.confirmation_id);
+        if(!eligible.length){say('所选媒体组均已不在待确认状态，无需跳过。');return;}
+        const confirmed=await appConfirm({title:'批量跳过待确认',message:`将结束 ${eligible.length} 组待确认：文件保持原位，日志标记为“跳过”，不会移动或删除任何文件。以后重新执行整理时仍会再次识别。`,confirmText:'批量跳过',trigger:el('Skip')});
+        if(!confirmed)return;
+        await skip(eligible);
+    }).then(()=>load(state.page,true)));
     el('Agent').addEventListener('click',()=>act(async()=>{
         invalidatePreview();
         const tokens=[...state.selected],items=await snapshot(tokens);merge(items);

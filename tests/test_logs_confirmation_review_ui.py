@@ -66,6 +66,16 @@ CONFIRMATION_API = r"""
             body.confirmation_ids.forEach(token=>{const item=config.items.find(item=>item.confirmation_id===token);item.review_status='pending';});
             return reply({requested:body.confirmation_ids.length,unchanged:0});
         }
+        if(suffix==='/skip'){
+            const items=body.confirmation_ids.map(token=>{
+                const item=config.items.find(item=>item.confirmation_id===token);
+                if(!item||item.status!=='pending'||config.skipFailTokens?.includes(token))return {confirmation_id:token,skipped:false,error:'确认操作已过期，请重新执行整理'};
+                item.status='cancelled';
+                return {confirmation_id:token,skipped:true};
+            });
+            const skipped=items.filter(item=>item.skipped).length;
+            return reply({items,skipped,failed:items.length-skipped});
+        }
         if(suffix==='/selection'){
             if(config.selectionError)return reply({error:'人工选择保存失败'},422);
             const item=config.items.find(item=>item.confirmation_id===body.confirmation_id);
@@ -437,3 +447,42 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.page.keyboard.press('Escape')
         self.page.locator('#confirmationReviewModal').wait_for(state='hidden')
         self.page.wait_for_function("document.activeElement.id==='organizeConfirmationReviewBtn'")
+
+    def test_skip_one_group_ends_it_and_moves_to_the_next(self):
+        self.open()
+        detail = self.page.locator('#confirmationReviewDetail')
+        self.assertIn('媒体组 001', detail.inner_text())
+        detail.get_by_role('button', name='跳过此组').click()
+        self.page.wait_for_function("() => document.getElementById('confirmationReviewState').textContent.startsWith('已跳过 1 组')")
+        self.idle()
+        self.assertEqual([call['body'] for call in self.calls('/skip')], [{'confirmation_ids': ['group-001']}])
+        self.assertIn('文件保持原位', self.page.locator('#confirmationReviewState').inner_text())
+        self.assertNotIn('媒体组 001', self.page.locator('#confirmationReviewList').inner_text())
+        self.assertIn('媒体组 002', detail.inner_text())
+
+    def test_batch_skip_confirms_first_and_reports_groups_that_could_not_be_skipped(self):
+        self.page.evaluate("""() => { window.__confirmCalls=[]; window.__confirmAnswer=false;
+            window.appConfirm=async options=>{window.__confirmCalls.push(options);return window.__confirmAnswer;}; }""")
+        self.page.evaluate("tokens=>window.__confirmationConfig.skipFailTokens=tokens", ['group-002'])
+        self.open()
+        skip = self.page.locator('#confirmationReviewSkip')
+        self.assertTrue(skip.is_disabled())
+        self.page.locator('#confirmationReviewSelectPage').check()
+        self.assertTrue(skip.is_enabled())
+        skip.click()
+        self.idle()
+        self.assertEqual(self.calls('/skip'), [])
+        self.assertIn('文件保持原位', self.page.evaluate('window.__confirmCalls[0].message'))
+        self.page.evaluate('window.__confirmAnswer=true')
+        skip.click()
+        self.page.wait_for_function("() => document.getElementById('confirmationReviewState').textContent.startsWith('已跳过')")
+        self.idle()
+        requested = self.calls('/skip')[0]['body']['confirmation_ids']
+        self.assertEqual(len(requested), 20)
+        state = self.page.locator('#confirmationReviewState')
+        self.assertIn('已跳过 19 组', state.inner_text())
+        self.assertIn('1 组未跳过', state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+        # 失败的组仍保持勾选，成功跳过的组离开待确认队列与选择。
+        self.assertIn('已选 1 / 1000 组', self.page.locator('#confirmationReviewSelectionCount').inner_text())
+        self.assertIn('媒体组 002', self.page.locator('#confirmationReviewList').inner_text())

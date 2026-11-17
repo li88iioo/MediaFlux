@@ -222,6 +222,42 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         payload.update(_confirmation_batch="b", review_only=True, _explicit_approval=True)
         self.assertEqual(confirmations._fingerprint(payload), fingerprint)
 
+    def test_skip_ends_each_group_like_telegram_and_reports_rejected_groups(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.routes import logs_api
+
+        self.create("candidates")
+        no_metadata = self.create("no-metadata", chat="")
+        no_metadata.update(candidates=[], allow_skip_terminal=True)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='no-metadata'",
+                         (json.dumps(no_metadata, ensure_ascii=False),))
+        self.create("old")
+        self.create("done")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET expires_at='2000-01-01 00:00:00' WHERE token='old'")
+            conn.execute("UPDATE organize_confirmations SET status='completed' WHERE token='done'")
+        app = FastAPI()
+        app.include_router(logs_api.router)
+        logs: list[tuple[str, str]] = []
+        with patch.object(logs_api, "require_api_login"), TestClient(app) as client, \
+             patch.object(confirmations, "_finalize_guangya_manual_logs",
+                          side_effect=lambda payload, status, error, **_: logs.append((status, error))):
+            result = client.post("/api/logs/organize/confirmations/skip",
+                                 json={"confirmation_ids": ["candidates", "no-metadata", "old", "done", "missing"]}).json()
+            self.assertEqual(client.post("/api/logs/organize/confirmations/skip", json={"confirmation_ids": "x"}).status_code, 400)
+        self.assertEqual((result["skipped"], result["failed"]), (2, 3))
+        self.assertEqual({item["confirmation_id"]: item["skipped"] for item in result["items"]},
+                         {"candidates": True, "no-metadata": True, "old": False, "done": False, "missing": False})
+        # 有候选的组按“暂不处理”、无元数据的组按“跳过此组”，文件不动，日志统一标记为跳过；
+        # 已过期的组沿用现有过期收尾，不算作跳过。
+        self.assertEqual(logs, [("skipped", "用户选择暂不处理"), ("skipped", "用户选择跳过：暂无可用元数据"),
+                                ("skipped", "人工确认已过期")])
+        self.assertEqual({token: self.row(token)["status"] for token in ("candidates", "no-metadata", "done")},
+                         {"candidates": "cancelled", "no-metadata": "cancelled", "done": "completed"})
+        self.assertNotEqual(self.row("old")["status"], "pending")
+
     def test_api_roundtrip_uses_saved_selection_and_same_durable_queue(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient

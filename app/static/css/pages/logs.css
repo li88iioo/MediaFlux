@@ -125,8 +125,8 @@
     .confirmation-review-footer { padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0px)); }
     #confirmationReviewReady span { display: none; }
     .confirmation-review-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-    .confirmation-review-actions .btn { grid-column: 1 / -1; }
-    #confirmationReviewAgent, #confirmationReviewPrepare, .confirmation-review-actions .btn { width: 100%; }
+    /* 2×2：批量跳过与只读复核一行，预览与确认相邻一行。 */
+    #confirmationReviewSkip, #confirmationReviewAgent, #confirmationReviewPrepare, .confirmation-review-actions .btn { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
     .confirmation-review-modal, .confirmation-review-dialog, .confirmation-review-dialog button, .confirmation-review-row, .confirmation-review-candidate { animation: none; transition: none; }

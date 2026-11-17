@@ -136,6 +136,29 @@ def request_reviews(confirmation_ids: list[str], *, chat_id: str | None = None) 
     return result
 
 
+def skip_confirmations(confirmation_ids: list[str], *, chat_id: str | None = None) -> dict:
+    """逐组结束待确认，文件保持原位，与 Telegram 每组的终止按钮一致。
+
+    无可用元数据的组按“跳过此组”，有候选的组按“暂不处理”；已失效或已处理的组单独报告，不影响其余各组。
+    """
+    results = []
+    for token in _tokens(confirmation_ids):
+        try:
+            row = _row(token, chat_id)
+            if row["status"] != "pending":
+                raise ValueError("该组已不在待确认状态")
+            owner = str(row["chat_id"] or "")
+            if confirmations.decode_row(row).get("allow_skip_terminal"):
+                confirmations.skip_confirmation(token, chat_id=owner)
+            else:
+                confirmations.cancel_confirmation(token, chat_id=owner)
+            results.append({"confirmation_id": token, "skipped": True})
+        except ValueError as exc:
+            results.append({"confirmation_id": token, "skipped": False, "error": str(exc)})
+    skipped = sum(1 for item in results if item["skipped"])
+    return {"items": results, "skipped": skipped, "failed": len(results) - skipped}
+
+
 def save_selection(token: str, candidate_index: int, *, chat_id: str | None = None) -> dict:
     _tokens([token])
     organize_confirmations_repo.save_organize_confirmation_selection(token, candidate_index, chat_id=chat_id)

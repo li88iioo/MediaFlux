@@ -73,6 +73,16 @@ def select_organize_confirmation(request: Request, data: dict = Body(...)):
         return api_error(str(exc), 400)
 
 
+@router.post("/organize/confirmations/skip")
+def skip_organize_confirmations(request: Request, data: dict = Body(...)):
+    require_api_login(request)
+    from app.modules.organize_confirmation_batches import skip_confirmations
+    try:
+        return skip_confirmations(data.get("confirmation_ids", []))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
 @router.post("/organize/confirmations/preview")
 def preview_organize_confirmations(request: Request, data: dict = Body(...)):
     require_api_login(request)
