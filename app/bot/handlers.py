@@ -35,9 +35,7 @@ from app.agent.owner_routes import normalize_delivery_route
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
 from app.logger import get_logger, log_throttled
-from app.modules.organize_sources import (
-    list_nsfw_download_sources as _nsfw_download_sources,
-)
+from app.modules.organize_sources import find_nsfw_download_source
 from app.modules.strm_notifications import cleanup_notice_lines
 from app.notifier import (
     NotificationEvent,
@@ -185,30 +183,6 @@ def _configured_organize_sources() -> list[dict[str, str]]:
     return sources
 
 
-def _nsfw_download_source(source_id: str) -> dict[str, str] | None:
-    source_id = (source_id or "").strip()
-    if not source_id:
-        return None
-    return next(
-        (
-            source
-            for source in _nsfw_download_sources()
-            if source["id"] == source_id
-        ),
-        None,
-    )
-
-
-def _download_target_labels() -> dict[str, str]:
-    from app.modules.offline import DEFAULT_TARGET_DIR_NAME
-
-    name = " ".join((get("OFFLINE_TARGET_DIR_NAME", "") or "").split()) or DEFAULT_TARGET_DIR_NAME
-    if len(name) > 40:
-        name = name[:39].rstrip() + "…"
-    cloud = f"光鸭·{name}"
-    return {"qb": "qBittorrent", "guangya": cloud, "both": f"{cloud} + qBittorrent"}
-
-
 def _download_target_picker_markup(
     telebot,
     *,
@@ -222,55 +196,22 @@ def _download_target_picker_markup(
         get_telegram_write_confirmation_store,
     )
 
-    labels = _download_target_labels()
-    ordinary = [
-        (labels[target], "confirm", {"request_id": request_id, "target": target})
-        for target in ("guangya", "qb", "both")
-    ]
-    ordinary.append(("取消", "cancel", {"request_id": request_id}))
+    from app.indexers.downloads import download_target_options
+
+    def choice(option: dict[str, str]):
+        value: dict[str, object] = {"request_id": request_id, "target": option["target"]}
+        if "nsfw_source_id" in option:
+            value["nsfw_source_id"] = option["nsfw_source_id"]
+        return option["label"], "confirm", value
+
+    options = download_target_options()
+    cancel = ("取消", "cancel", {"request_id": request_id})
     if allow_guangya:
-        sources = _nsfw_download_sources()
-        rows = [ordinary[:2]]
-        if sources:
-            name_counts: dict[str, int] = {}
-            for source in sources:
-                name = " ".join((source.get("name") or "未命名来源").split())
-                name_counts[name] = name_counts.get(name, 0) + 1
-            seen_names: dict[str, int] = {}
-            for source in sources:
-                source_id = source["id"].strip()
-                name = " ".join((source.get("name") or "未命名来源").split())
-                suffix = ""
-                if name_counts[name] > 1:
-                    seen_names[name] = seen_names.get(name, 0) + 1
-                    suffix = f" #{seen_names[name]}"
-                label_name = name[: max(1, 40 - len(suffix))].rstrip() + suffix
-                rows.append([
-                    (
-                        f"光鸭·NSFW · {label_name}",
-                        "confirm",
-                        {
-                            "request_id": request_id,
-                            "target": "guangya",
-                            "nsfw_source_id": source_id,
-                        },
-                    )
-                ])
-        else:
-            rows.append([
-                (
-                    "光鸭·NSFW",
-                    "confirm",
-                    {
-                        "request_id": request_id,
-                        "target": "guangya",
-                        "nsfw_source_id": "",
-                    },
-                )
-            ])
-        rows.extend([[choice] for choice in ordinary[2:]])
+        # 与 Web 下载卡同序：普通光鸭与 qB 同行，其余各占一行，最后取消。
+        choices = [choice(option) for option in options]
+        rows = [choices[:2], *[[item] for item in choices[2:]], [cancel]]
     else:
-        rows = [[ordinary[1]], [ordinary[3]]]
+        rows = [[choice(next(option for option in options if option["target"] == "qb"))], [cancel]]
 
     action_ids = get_telegram_write_confirmation_store().create_group(
         chat_id=chat_id,
@@ -670,7 +611,9 @@ def _resource_target_view(
     )
     text = f"<b>选择下载目标</b>\n{title}\n{html.escape(_resource_item_meta(item))}"
     markup = telebot.types.InlineKeyboardMarkup(row_width=3)
-    for target, label in _download_target_labels().items():
+    from app.indexers.downloads import download_target_labels
+
+    for target, label in download_target_labels().items():
         markup.add(
             _resource_action_button(
                 telebot,
@@ -2395,7 +2338,9 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
             )
             if item is None:
                 raise TelegramResourceSearchError("资源结果已失效，请重新搜索")
-            labels = _download_target_labels()
+            from app.indexers.downloads import download_target_labels
+
+            labels = download_target_labels()
             markup = _write_confirmation_markup(
                 telebot,
                 chat_id=chat_id,
@@ -2512,7 +2457,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                 if target != "guangya":
                     raise TelegramWriteConfirmationError("NSFW 下载目标无效")
                 nsfw_source_id = str(value.get("nsfw_source_id") or "").strip()
-                source = _nsfw_download_source(nsfw_source_id)
+                source = find_nsfw_download_source(nsfw_source_id)
                 if source is None:
                     notice = (
                         "未配置 NSFW 整理来源，本次未提交；请先配置或选择其他目标。"
@@ -3137,7 +3082,7 @@ def _dispatch_download_callback(
 
     nsfw_source = None
     if nsfw_source_id:
-        nsfw_source = _nsfw_download_source(nsfw_source_id)
+        nsfw_source = find_nsfw_download_source(nsfw_source_id)
         if target != "guangya" or nsfw_source is None:
             try:
                 bot.edit_message_text(

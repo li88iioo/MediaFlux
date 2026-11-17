@@ -475,7 +475,7 @@
     }
 
     const MAGNET_RE = /^magnet:\?\S*xt=urn:bt[im]h:/i;
-    const DOWNLOAD_TARGET_LABELS = {qb: 'qBittorrent', guangya: '光鸭', both: '两者'};
+    let downloadCardCount = 0;
 
     function formatBytes(value) {
         let size = Number(value) || 0;
@@ -485,15 +485,17 @@
         return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
     }
 
-    function directDownloadForm(source, target = '') {
+    function directDownloadForm(source, option = null) {
         const form = new FormData();
         if (source.file) form.append('file', source.file, source.file.name);
         else form.append('url', source.url);
-        if (target) form.append('target', target);
+        if (option) form.append('target', option.target);
+        if (option?.nsfw_source_id) form.append('nsfw_source_id', option.nsfw_source_id);
         return form;
     }
 
     // + 上传种子或粘贴磁力链接：不经过模型，和 Telegram 发种子一样直接建下载请求，由用户选目标后提交。
+    // 目标顺序与名称由服务端统一给出，与 Telegram 选择卡一致（含 NSFW 专用来源）。
     async function createDownloadCard(source) {
         const view = appendMessage('download');
         const card = element('section', 'agent-download-card');
@@ -513,18 +515,29 @@
         meta.textContent = preview.kind === 'torrent'
             ? `种子 · ${preview.file_count || 0} 个文件 · ${formatBytes(preview.total_size)}`
             : '磁力链接';
-        const backends = preview.backends || {};
-        const select = element('select', 'agent-download-target');
-        select.setAttribute('aria-label', '下载目标');
-        for (const target of ['qb', 'guangya', 'both']) {
-            const ready = target === 'both' ? backends.qb && backends.guangya : backends[target];
-            const option = element('option', '', `${DOWNLOAD_TARGET_LABELS[target]}${ready ? '' : '（未就绪）'}`);
-            option.value = target;
-            option.disabled = !ready;
-            select.append(option);
-        }
-        const firstReady = [...select.options].find(option => !option.disabled);
-        if (firstReady) select.value = firstReady.value;
+        const targets = Array.isArray(preview.targets) ? preview.targets : [];
+        const backendLabels = {qb: 'qBittorrent'};
+        for (const option of targets) if (!('nsfw_source_id' in option) && option.target !== 'both') backendLabels[option.target] = option.label;
+        const group = element('div', 'agent-download-targets');
+        group.setAttribute('role', 'radiogroup');
+        group.setAttribute('aria-label', '下载目标');
+        const name = `agent-download-target-${++downloadCardCount}`;
+        const radios = targets.map((option, index) => {
+            const label = element('label', 'agent-download-option');
+            if (option.target === 'both' || 'nsfw_source_id' in option) label.classList.add('is-wide');
+            const input = element('input');
+            input.type = 'radio';
+            input.name = name;
+            input.value = String(index);
+            input.disabled = !option.ready;
+            label.append(input, element('span', 'agent-download-option-label', String(option.label || option.target)));
+            if (!option.ready) label.append(element('small', 'agent-download-option-note', option.nsfw_source_id === '' ? '未配置' : '未就绪'));
+            group.append(label);
+            return input;
+        });
+        const firstReady = radios.find(input => !input.disabled);
+        if (firstReady) firstReady.checked = true;
+        const chosen = () => targets[Number(radios.find(input => input.checked)?.value)];
         const submit = element('button', 'agent-download-submit', '提交下载');
         submit.type = 'button';
         submit.disabled = !firstReady;
@@ -534,11 +547,13 @@
         review.href = '/downloads?view=issues';
         review.hidden = true;
         const actions = element('div', 'agent-download-actions');
-        actions.append(select, submit, cancel, review);
-        card.append(actions);
+        actions.append(submit, cancel, review);
+        card.append(group, actions);
+        const setChoicesDisabled = disabled => radios.forEach((input, index) => { input.disabled = disabled || !targets[index].ready; });
         const showRecovery = (retryable) => {
-            select.hidden = submit.hidden = !retryable;
-            select.disabled = submit.disabled = !retryable;
+            group.hidden = submit.hidden = !retryable;
+            submit.disabled = !retryable;
+            setChoicesDisabled(!retryable);
             submit.textContent = '重试提交';
             cancel.disabled = false;
             cancel.textContent = retryable ? '取消' : '关闭';
@@ -547,16 +562,22 @@
         };
         cancel.addEventListener('click', () => view.item.remove());
         submit.addEventListener('click', async () => {
-            submit.disabled = cancel.disabled = select.disabled = true;
+            const option = chosen();
+            if (!option) return;
+            submit.disabled = cancel.disabled = true;
+            setChoicesDisabled(true);
             submit.textContent = '正在提交…';
             card.classList.remove('is-error');
             try {
-                const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, select.value)});
+                const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, option)});
                 const status = String(result.status || 'manual_review');
-                const succeeded = (result.succeeded || []).map(target => DOWNLOAD_TARGET_LABELS[target]).filter(Boolean);
+                const succeeded = (result.succeeded || [])
+                    .map(target => target === 'guangya' && option.nsfw_source_id ? option.label : backendLabels[target])
+                    .filter(Boolean);
                 meta.textContent = [result.summary || `下载请求 #${result.request_id} 受理结果待核对`,
                     succeeded.length ? `已提交：${succeeded.join('、')}` : '', result.error || ''].filter(Boolean).join(' · ');
                 if (status === 'submitted' && result.ok === true) {
+                    group.remove();
                     actions.remove();
                     card.classList.add('is-done');
                 } else {

@@ -132,6 +132,12 @@ def list_nsfw_download_sources() -> list[dict[str, str]]:
     return [source for source in sources if source["id"] in selected]
 
 
+def find_nsfw_download_source(source_id: str) -> dict[str, str] | None:
+    """按 ID 取当前仍启用的 NSFW 下载来源；来源被删除或停用时返回 None。"""
+    source_id = (source_id or "").strip()
+    return next((source for source in list_nsfw_download_sources() if source_id and source["id"] == source_id), None)
+
+
 def configured_organize_sources() -> list[dict[str, str]]:
     """读取正式多源配置；错误由各调用边界决定展示方式。"""
     from app import config

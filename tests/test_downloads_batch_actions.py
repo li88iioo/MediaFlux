@@ -398,6 +398,58 @@ class DirectDownloadApiTests(LoggedInDownloadsApiCase):
             self.assertEqual(self._request_count(), 0)
             backend.assert_not_called()
 
+    def test_preview_lists_the_same_targets_as_the_telegram_picker(self):
+        headers = self._headers()
+        magnet = "magnet:?xt=urn:btih:" + "d" * 40
+        sources = [{"id": "adult-1", "name": "成人 A"}, {"id": "adult-2", "name": "成人 A"}]
+        from app.indexers.downloads import download_target_labels
+
+        labels = download_target_labels()
+        with patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": False}), \
+             patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=sources):
+            targets = self.client.post("/api/downloads/direct/preview", headers=headers, data={"url": magnet}).json()["targets"]
+        self.assertEqual([(t["label"], t["target"], t.get("nsfw_source_id"), t["ready"]) for t in targets], [
+            (labels["guangya"], "guangya", None, False),
+            ("qBittorrent", "qb", None, True),
+            ("光鸭·NSFW · 成人 A #1", "guangya", "adult-1", False),
+            ("光鸭·NSFW · 成人 A #2", "guangya", "adult-2", False),
+            (labels["both"], "both", None, False),
+        ])
+        # 未配置 NSFW 来源时与 TG 一样显示占位，但 Web 不可选。
+        with patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}), \
+             patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[]):
+            targets = self.client.post("/api/downloads/direct/preview", headers=headers, data={"url": magnet}).json()["targets"]
+        self.assertIn({"target": "guangya", "nsfw_source_id": "", "label": "光鸭·NSFW", "ready": False}, targets)
+        self.assertEqual(self._request_count(), 0)
+
+    def test_submit_passes_the_nsfw_source_only_when_chosen(self):
+        headers = self._headers()
+        url = "magnet:?xt=urn:btih:" + "e" * 40
+        with patch("app.indexers.downloads.submit_direct_download", return_value={"request_id": 8, "status": "submitted"}) as submit:
+            self.client.post("/api/downloads/direct/submit", headers=headers, data={"url": url, "target": "guangya", "nsfw_source_id": "adult-1"})
+            self.client.post("/api/downloads/direct/submit", headers=headers, data={"url": url, "target": "guangya"})
+        self.assertEqual([call.kwargs["nsfw_source_id"] for call in submit.call_args_list], ["adult-1", None])
+
+    def test_nsfw_destination_is_checked_before_creating_a_request(self):
+        from app.indexers import downloads
+
+        url = "magnet:?xt=urn:btih:" + "f" * 40
+        sources = [{"id": "adult-1", "name": "NewNsfw"}]
+        with isolated_test_database(), \
+             patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=sources), \
+             patch.object(downloads, "download_target_readiness", return_value={"guangya": True}), \
+             patch.object(downloads, "guangya_download_credential_generation", return_value=1), \
+             patch.object(downloads, "dispatch_request", return_value={"status": "submitted", "succeeded": ["guangya"]}) as dispatch:
+            for target, source_id, message in (("guangya", "removed", "NSFW 来源已变更"), ("both", "adult-1", "NSFW 下载目标无效"),
+                                               ("guangya", "", "未配置 NSFW 整理来源")):
+                with self.subTest(target=target, source_id=source_id), self.assertRaisesRegex(downloads.DirectDownloadPreconditionError, message):
+                    downloads.submit_direct_download(downloads.direct_url_input(url), target, origin="web", nsfw_source_id=source_id)
+            self.assertEqual(self._request_count(), 0)
+            dispatch.assert_not_called()
+            downloads.submit_direct_download(downloads.direct_url_input(url), "guangya", origin="web", nsfw_source_id="adult-1")
+        kwargs = dispatch.call_args.kwargs
+        self.assertEqual((kwargs["gy_target_dir"], kwargs["gy_target_name"]), ("adult-1", "NewNsfw"))
+
     def test_confirmed_torrent_keeps_bytes_and_deduplicates_equivalent_magnets(self):
         from tests.test_torrent_manifest import _bencode, _torrent
 

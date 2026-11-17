@@ -363,7 +363,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 return_value={"created": True, "id": 77, "status": "pending"},
             ),
             patch(
-                "app.bot.handlers._nsfw_download_sources",
+                "app.modules.organize_sources.list_nsfw_download_sources",
                 return_value=[{"id": "adult-a", "name": "成人来源 A"}],
             ),
         ):
@@ -573,7 +573,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot = Bot()
         telebot = fake_telebot_types()
         with patch(
-            "app.bot.handlers._nsfw_download_sources",
+            "app.modules.organize_sources.list_nsfw_download_sources",
             return_value=sources,
         ):
             markup = handlers._download_target_picker_markup(
@@ -644,8 +644,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         ):
             with (
                 self.subTest(directory=configured),
-                patch("app.bot.handlers.get", return_value=configured),
-                patch("app.bot.handlers._nsfw_download_sources", return_value=[
+                patch("app.config.get", return_value=configured),
+                patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[
                     {"id": "adult-only", "name": "成人专区"},
                 ]),
             ):
@@ -671,7 +671,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         reset_telegram_write_confirmation_store_for_tests()
         source = {"id": "adult-only", "name": "成人专区"}
         with patch(
-            "app.bot.handlers._nsfw_download_sources",
+            "app.modules.organize_sources.list_nsfw_download_sources",
             return_value=[source],
         ):
             markup = handlers._download_target_picker_markup(
@@ -715,7 +715,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             "title": "普通下载",
         }
         with patch(
-            "app.bot.handlers._nsfw_download_sources",
+            "app.modules.organize_sources.list_nsfw_download_sources",
             return_value=[],
         ):
             markup = handlers._download_target_picker_markup(
@@ -775,7 +775,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot = Bot()
         telebot = fake_telebot_types()
         with patch(
-            "app.bot.handlers._nsfw_download_sources",
+            "app.modules.organize_sources.list_nsfw_download_sources",
             return_value=[],
         ):
             markup = handlers._download_target_picker_markup(
@@ -844,7 +844,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         telebot = fake_telebot_types()
         current_sources = [{"id": "adult-old", "name": "旧来源"}]
         with patch(
-            "app.bot.handlers._nsfw_download_sources",
+            "app.modules.organize_sources.list_nsfw_download_sources",
             side_effect=lambda: list(current_sources),
         ):
             markup = handlers._download_target_picker_markup(
@@ -910,7 +910,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         tracker = SimpleNamespace(reload=lambda: None)
         with (
             patch(
-                "app.bot.handlers._nsfw_download_sources",
+                "app.modules.organize_sources.list_nsfw_download_sources",
                 return_value=[source],
             ),
             patch(
@@ -952,7 +952,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot.edits.clear()
         with (
             patch(
-                "app.bot.handlers._nsfw_download_sources",
+                "app.modules.organize_sources.list_nsfw_download_sources",
                 return_value=[],
             ),
             patch(
