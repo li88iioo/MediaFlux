@@ -21,6 +21,9 @@
         refreshing: false,
         initialized: false,
         savedRows: '[]',
+        savedRevisions: {},
+        saveGeneration: 0,
+        conflict: false,
         saving: false,
         get dirty() { return JSON.stringify(this.rows) !== this.savedRows; },
     };
@@ -35,7 +38,7 @@
             ...options,
         });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data.error || '请求失败');
+        if (!response.ok) throw Object.assign(new Error(data.error || '请求失败'), {status: response.status});
         return data;
     }
 
@@ -230,6 +233,7 @@
         rows.push(...groupedBindings.values());
         state.rows = rows;
         state.savedRows = JSON.stringify(state.rows);
+        state.savedRevisions = state.overview.mapping_revisions || {};
     }
 
     function renderSummary() {
@@ -365,16 +369,38 @@
         icons(list);
     }
 
+    const mappingHint = $('#mlMappingHint');
+    const defaultMappingHint = mappingHint?.textContent || '';
+
+    function showMappingConflict(message = '') {
+        state.conflict = Boolean(message);
+        if (mappingHint) {
+            mappingHint.classList.toggle('is-warning', state.conflict);
+            mappingHint.textContent = message || defaultMappingHint;
+        }
+    }
+
     async function loadAll({manual = false} = {}) {
         if (state.refreshing || (manual && state.saving)) return;
+        const button = $('#mlRefreshBtn');
+        let discard = false;
         if (manual && state.dirty) {
-            window.showToast?.('存在尚未保存的媒体库映射，请先保存后再刷新', 'warning', 4200);
-            return;
+            if (!state.conflict) {
+                window.showToast?.('存在尚未保存的媒体库映射，请先保存后再刷新', 'warning', 4200);
+                return;
+            }
+            const currentDraft = JSON.stringify(state.rows);
+            discard = await appConfirm({
+                title: '加载最新映射',
+                message: '将舍弃当前未保存的草稿，并读取已保存的映射。',
+                confirmText: '舍弃并刷新', cancelText: '保留草稿', danger: true, trigger: button,
+            });
+            if (!discard || state.refreshing || state.saving || currentDraft !== JSON.stringify(state.rows)) return;
         }
         const draft = JSON.stringify(state.rows);
-        const replaceRows = !state.dirty;
+        const generation = state.saveGeneration;
+        const replaceRows = discard || !state.dirty;
         state.refreshing = true;
-        const button = $('#mlRefreshBtn');
         if (manual) setBusy(button, true, '刷新中');
         const firstLoad = !state.initialized;
         try {
@@ -383,13 +409,15 @@
                 api('/api/media-libraries/overview'),
                 state.overview ? Promise.resolve() : sleep(320),
             ]);
+            if (generation !== state.saveGeneration) return;
             state.config = config;
             state.overview = overview;
             state.initialized = true;
             if (firstLoad) setInitialLoading(false);
             renderSummary();
-            if (replaceRows && draft === state.savedRows && !state.dirty) {
+            if (replaceRows && draft === JSON.stringify(state.rows)) {
                 hydrateRows();
+                showMappingConflict();
                 renderRows();
             }
             if (manual) window.showToast?.('媒体库与路径映射已刷新', 'success');
@@ -580,14 +608,47 @@
         return false;
     }
 
+    function mappingScopes(rows) {
+        const scopes = {};
+        const managed = managedFields();
+        for (const server of state.overview?.servers || []) {
+            if (managed.has(server.mapping_key)) continue;
+            scopes[server.server_type] = rows
+                .filter((row) => row.kind === 'strm' && row.provider === server.server_type)
+                .map((row) => ({local: row.local, server: row.server}));
+        }
+        scopes.local = rows
+            .filter((row) => row.kind === 'local')
+            .flatMap((row) => availableLocalSourceIds(row.sourceIds).map((sourceId) => ({
+                source_id: sourceId,
+                category: row.category,
+                local_path: row.local,
+                provider: row.provider,
+                library_id: row.libraryId,
+                library_name: row.libraryName,
+                server_path: row.server,
+            })));
+        return scopes;
+    }
+
     async function saveMappings(button) {
         if (state.saving) return;
         const rowElements = $$('[data-mapping-row]', $('#mlMappingList'));
         rowElements.forEach(syncRow);
+        const draftScopes = mappingScopes(state.rows);
+        const savedRows = JSON.parse(state.savedRows);
+        const baseline = mappingScopes(savedRows);
+        const editedLocalRows = JSON.stringify(state.rows.filter((row) => row.kind === 'local'))
+            !== JSON.stringify(savedRows.filter((row) => row.kind === 'local'));
+        const changed = Object.keys(draftScopes).filter(
+            (scope) => JSON.stringify(draftScopes[scope]) !== JSON.stringify(baseline[scope]),
+        );
         const seenStrm = new Set();
         const seenLocal = new Set();
         for (const [index, row] of state.rows.entries()) {
-            if (rowLocked(row)) continue;
+            const scope = row.kind === 'local' ? 'local' : row.provider;
+            const unchangedScope = scope && !changed.includes(scope) && !(scope === 'local' && editedLocalRows);
+            if (rowLocked(row) || unchangedScope) continue;
             if (row.kind === 'strm') {
                 if (!row.provider || !row.local || !row.server) {
                     showRowError(rowElements, index, 'STRM 映射需要选择媒体库、STRM 目录和服务器路径');
@@ -620,38 +681,37 @@
             }
         }
 
-        const strmMappings = {};
-        for (const server of state.overview?.servers || []) {
-            if (managedFields().has(server.mapping_key)) continue;
-            strmMappings[server.server_type] = state.rows
-                .filter((row) => row.kind === 'strm' && row.provider === server.server_type)
-                .map((row) => ({local: row.local, server: row.server}));
-        }
-        const localBindings = state.rows
-            .filter((row) => row.kind === 'local')
-            .flatMap((row) => availableLocalSourceIds(row.sourceIds).map((sourceId) => ({
-                source_id: sourceId,
-                category: row.category,
-                local_path: row.local,
-                provider: row.provider,
-                library_id: row.libraryId,
-                library_name: row.libraryName,
-                server_path: row.server,
-            })));
-
         const submitted = JSON.stringify(state.rows);
+        if (!changed.length) {
+            state.savedRows = submitted;
+            updateActions();
+            return;
+        }
+        const payload = {
+            strm_mappings: Object.fromEntries(changed.filter((scope) => scope !== 'local').map((scope) => [scope, draftScopes[scope]])),
+            expected_revisions: Object.fromEntries(changed.map((scope) => [scope, state.savedRevisions[scope]])),
+        };
+        if (changed.includes('local')) payload.local_bindings = draftScopes.local;
+
         state.saving = true;
         setBusy(button, true, '保存中');
         try {
-            await api('/api/media-libraries/mappings', {
+            const saved = await api('/api/media-libraries/mappings', {
                 method: 'POST',
-                body: JSON.stringify({strm_mappings: strmMappings, local_bindings: localBindings}),
+                body: JSON.stringify(payload),
             });
             state.savedRows = submitted;
+            state.savedRevisions = {...state.savedRevisions, ...saved.mapping_revisions};
+            state.saveGeneration++;
+            showMappingConflict();
             window.showToast?.('媒体库与路径映射已保存', 'success');
             await loadAll();
         } catch (error) {
-            window.showToast?.(error.message, 'error', 4200);
+            if (error.status === 409) {
+                showMappingConflict(`${error.message}。草稿已保留，点击“刷新状态”可读取最新映射。`);
+            } else {
+                window.showToast?.(error.message, 'error', 4200);
+            }
         } finally {
             state.saving = false;
             setBusy(button, false, '保存映射');

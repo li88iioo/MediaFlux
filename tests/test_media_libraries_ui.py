@@ -121,9 +121,6 @@ class MediaLibrariesUIContractTests(unittest.TestCase):
         self.assertIn("api('/api/media-libraries/overview')", self.js)
         self.assertIn("api('/api/media-libraries/path-test'", self.js)
         self.assertIn("api('/api/media-libraries/mappings'", self.js)
-        self.assertIn("strm_mappings: strmMappings", self.js)
-        self.assertIn("local_bindings: localBindings", self.js)
-        self.assertIn(".flatMap((row) => availableLocalSourceIds(row.sourceIds)", self.js)
         self.assertIn("requestAnimationFrame", self.js)
         self.assertNotIn("@keyframes", self.css)
 

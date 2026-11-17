@@ -20,13 +20,12 @@ from app.modules.local_path_mapping import (
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
-    MediaServerPathMappingError,
     MAPPING_CONFIG,
-    list_path_mappings,
     mapping_updates,
     mapping_write_guard,
     match_media_server_libraries,
     media_server_path_is_within,
+    path_mapping_snapshot,
 )
 from app.modules.media_server_profiles import (
     MediaServerProfile,
@@ -68,13 +67,6 @@ def _library_payload(item: dict[str, Any]) -> dict[str, Any]:
             if str(location or "").strip()
         ],
     }
-
-
-def _mapping_payload(provider: str) -> tuple[list[dict[str, str]], str]:
-    try:
-        return list_path_mappings(provider)["items"], ""
-    except MediaServerPathMappingError as exc:
-        return [], str(exc)
 
 
 def _probe_profile(profile: MediaServerProfile) -> tuple[str, list[dict[str, Any]], str]:
@@ -270,7 +262,11 @@ def list_local_directories(request: Request, path: str = VIRTUAL_ROOT):
 @router.get("/overview")
 def media_library_overview(request: Request):
     require_api_login(request)
-    profiles = list_configured_profiles()
+    with config.runtime_config_read_guard():
+        profiles = list_configured_profiles()
+        _, values = config.read_env_snapshot(config.ENV_FILE)
+        mapping_snapshots = {profile.server_type: path_mapping_snapshot(profile.server_type, values)
+                             for profile in profiles}
     probes: dict[str, tuple[list[dict[str, Any]], str]] = {}
     with ThreadPoolExecutor(max_workers=max(1, min(2, len(profiles)))) as executor:
         futures = {executor.submit(_probe_profile, profile): profile for profile in profiles}
@@ -281,7 +277,7 @@ def media_library_overview(request: Request):
     servers: list[dict[str, Any]] = []
     for profile in profiles:
         mapping_key, fallback_key = MAPPING_CONFIG[profile.server_type]
-        mappings, mapping_error = _mapping_payload(profile.server_type)
+        mappings, mapping_error, _ = mapping_snapshots[profile.server_type]
         libraries, library_error = probes.get(profile.server_type, ([], "媒体库读取失败"))
         servers.append({
             **profile.public_dict(),
@@ -302,6 +298,8 @@ def media_library_overview(request: Request):
         "servers": servers,
         "local_sources": local_sources,
         "local_bindings": bindings,
+        "mapping_revisions": {**{provider: snapshot[2] for provider, snapshot in mapping_snapshots.items()},
+                              "local": local_media_repo.local_library_bindings_revision(bindings)},
         "strm": strm,
         "summary": {
             "configured_servers": sum(1 for item in servers if item["configured"]),
@@ -399,42 +397,59 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
     payload = data or {}
     if not isinstance(payload, dict):
         return api_error("映射配置必须是 JSON 对象", 400)
+    scoped = "expected_revisions" in payload
+    writes_local = "local_bindings" in payload or not scoped
+    expected = payload.get("expected_revisions")
     try:
         with mapping_write_guard():
-            local_bindings = _validated_local_bindings(payload.get("local_bindings", []))
-            strm_updates = mapping_updates(payload.get("strm_mappings", {}))
-            previous_bindings = [
-                {
-                    "source_id": item["source_id"],
-                    "category": item["category"],
-                    "path": item["local_path"],
-                    "provider": item["provider"],
-                    "library_id": item["library_id"],
-                    "library_name": item["library_name"],
-                    "server_path": item["server_path"],
-                }
-                for item in _local_bindings()
-            ]
-            local_media_repo.replace_local_library_targets(local_bindings, owner=_OWNER)
+            raw, values = config.read_env_snapshot(config.ENV_FILE)
+            strm_mappings = payload.get("strm_mappings", {})
+            strm_updates = mapping_updates(strm_mappings)
+            previous_bindings = _local_bindings() if writes_local else []
+            revisions = {provider: path_mapping_snapshot(provider, values)[2] for provider in strm_mappings}
+            if writes_local:
+                revisions["local"] = local_media_repo.local_library_bindings_revision(previous_bindings)
+            if scoped:
+                if not isinstance(expected, dict) or expected.keys() != revisions.keys():
+                    return api_error("映射修改范围和加载版本不一致", 400)
+                changed = [provider for provider, revision in revisions.items() if expected[provider] != revision]
+                if changed:
+                    labels = {"jellyfin": "Jellyfin", "emby": "Emby", "local": "本地归档"}
+                    names = "、".join(labels[provider] for provider in changed)
+                    return api_error(f"{names}映射已由其他操作更新，请核对最新映射", 409)
+            if writes_local:
+                local_bindings = _validated_local_bindings(payload.get("local_bindings", []))
+                revisions["local"] = local_media_repo.replace_local_library_targets(
+                    local_bindings, owner=_OWNER, expected_revision=revisions["local"],
+                )
             try:
                 if strm_updates:
-                    config.set_and_save(strm_updates)
+                    config.update_runtime_env_file(config.ENV_FILE, strm_updates, expected=raw)
             except Exception as exc:
-                local_media_repo.replace_local_library_targets(previous_bindings, owner=_OWNER)
+                if writes_local:
+                    try:
+                        local_media_repo.replace_local_library_targets(
+                            [{**item, "path": item["local_path"]} for item in previous_bindings],
+                            owner=_OWNER, expected_revision=revisions["local"],
+                        )
+                    except local_media_repo.LocalLibraryBindingsChanged:
+                        logger.warning("媒体库映射配置保存失败，已保留并发更新的本地归档映射")
                 return config_write_api_error(
                     exc,
                     logger=logger,
                     operation="save_media_library_mappings",
                 )
-            try:
-                from app.modules.local_media_scheduler import get_local_media_scheduler
-                get_local_media_scheduler().reload()
-            except Exception as exc:
-                logger.warning(
-                    "统一媒体库映射保存后调度器重载失败 type=%s",
-                    type(exc).__name__,
-                )
-            return {"success": True, "local_bindings": _local_bindings()}
+            if writes_local:
+                try:
+                    from app.modules.local_media_scheduler import get_local_media_scheduler
+                    get_local_media_scheduler().reload()
+                except Exception as exc:
+                    logger.warning("统一媒体库映射保存后调度器重载失败 type=%s", type(exc).__name__)
+            published = {**values, **strm_updates}
+            revisions.update({provider: path_mapping_snapshot(provider, published)[2] for provider in strm_mappings})
+            return {"success": True, "local_bindings": _local_bindings(), "mapping_revisions": revisions}
+    except local_media_repo.LocalLibraryBindingsChanged as exc:
+        return api_error(str(exc), 409)
     except (ValueError, LookupError) as exc:
         return api_error(str(exc), 400)
     except Exception as exc:

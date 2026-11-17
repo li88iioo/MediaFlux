@@ -494,6 +494,8 @@
     line-height: 1.45;
 }
 
+.ml-mapping-footer p.is-warning { color: var(--warning); }
+
 .ml-mapping-footer .btn-primary {
     width: auto !important;
     min-width: 148px;

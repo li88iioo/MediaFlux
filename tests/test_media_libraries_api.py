@@ -120,10 +120,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                 return "jellyfin", [], ""
             return "emby", [], "媒体服务器未启用"
 
-        mapping_payloads = {
-            "jellyfin": ([{"local": "/data/strm", "server": "//NAS/STRM"}], ""),
-            "emby": ([], ""),
-        }
+        config.set_and_save({"JELLYFIN_PATH_MAPPINGS": '[{"local":"/data/strm","server":"//NAS/STRM"}]'})
         bindings = [{
             "source_id": 1,
             "source_name": "qB 下载",
@@ -148,7 +145,6 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         with (
             patch("app.routes.media_libraries_api.list_configured_profiles", return_value=profiles),
             patch("app.routes.media_libraries_api._probe_profile", side_effect=probe),
-            patch("app.routes.media_libraries_api._mapping_payload", side_effect=lambda provider: mapping_payloads[provider]),
             patch("app.routes.media_libraries_api._local_bindings", return_value=bindings),
             patch("app.routes.media_libraries_api._strm_summary", return_value=strm),
             # 历史全库回退键已不参与刷新，但概览字段与原值保持对外契约。
@@ -337,7 +333,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             scheduler = Mock()
             with (
                 patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
-                patch("app.routes.media_libraries_api.config.set_and_save") as save_config,
+                patch("app.routes.media_libraries_api.config.update_runtime_env_file") as save_config,
                 patch(
                     "app.modules.local_media_scheduler.get_local_media_scheduler",
                     return_value=scheduler,
@@ -366,10 +362,57 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].path, str(target_root))
         self.assertEqual(targets[0].server_path, "//NAS/媒体/动漫")
-        save_config.assert_called_once_with({
+        save_config.assert_called_once_with(config.ENV_FILE, {
             "JELLYFIN_PATH_MAPPINGS": '[{"local":"/data/strm","server":"//NAS/STRM"}]',
-        })
+        }, expected=config.read_env_snapshot(config.ENV_FILE)[0])
         scheduler.reload.assert_called_once_with()
+
+    def test_scoped_save_preserves_concurrent_unedited_scopes_and_rejects_stale_edits(self):
+        from app.modules.media_server_path_mapping import apply_path_mapping_change, prepare_path_mapping_change
+
+        headers = {"X-CSRF-Token": self.login()}
+        mappings_url = "/api/media-libraries/mappings"
+        overview_url = "/api/media-libraries/overview"
+        config.set_and_save({"JELLYFIN_PATH_MAPPINGS": '[{"local":"/data/strm","server":"/jellyfin/original"}]'})
+        with TemporaryDirectory() as root:
+            source = Path(root) / "downloads"
+            destination = Path(root) / "media"
+            source.mkdir()
+            destination.mkdir()
+            source_id = local_media_repo.create_local_media_source(
+                name="下载来源", qb_profile="", qb_path_prefix="", local_root=str(source),
+            )
+            baseline = self.client.get(overview_url).json()["mapping_revisions"]
+            preview = prepare_path_mapping_change("update", "jellyfin", "/data/strm", server_path="/jellyfin/agent")
+            result = apply_path_mapping_change("update", "jellyfin", "/data/strm", server_path="/jellyfin/agent",
+                                               expected_fingerprint=preview["fingerprint"])
+            self.assertTrue(result["ok"])
+            local_media_repo.upsert_local_library_target(source_id, "default", str(destination))
+            emby_mappings = [{"local": "/data/strm", "server": "/emby/web"}]
+            saved = self.client.post(mappings_url, headers=headers, json={
+                "strm_mappings": {"emby": emby_mappings}, "expected_revisions": {"emby": baseline["emby"]},
+            })
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(set(saved.json()["mapping_revisions"]), {"emby"})
+
+            stale = self.client.post(mappings_url, headers=headers, json={
+                "strm_mappings": {"jellyfin": [], "emby": []}, "local_bindings": [],
+                "expected_revisions": {**baseline, "emby": saved.json()["mapping_revisions"]["emby"]},
+            })
+            self.assertEqual(stale.status_code, 409, stale.text)
+            self.assertIn("Jellyfin", stale.json()["error"])
+            self.assertIn("本地归档", stale.json()["error"])
+            state = self.client.get(overview_url).json()
+            servers = {server["server_type"]: server["mappings"] for server in state["servers"]}
+            self.assertEqual(servers, {"emby": emby_mappings, "jellyfin": [{"local": "/data/strm", "server": "/jellyfin/agent"}]})
+            self.assertEqual([binding["local_path"] for binding in state["local_bindings"]], [str(destination)])
+
+            cleared = self.client.post(mappings_url, headers=headers, json={
+                "strm_mappings": {"emby": []}, "expected_revisions": {"emby": state["mapping_revisions"]["emby"]},
+            })
+            self.assertEqual(cleared.status_code, 200, cleared.text)
+            self.assertEqual(config.get("EMBY_PATH_MAPPINGS"), "")
+            self.assertEqual(local_media_repo.list_local_library_targets(source_id)[0].path, str(destination))
 
     def test_unified_save_rejects_local_mapping_without_media_library(self):
         csrf = self.login()
@@ -425,7 +468,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             with (
                 patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
                 patch(
-                    "app.routes.media_libraries_api.config.set_and_save",
+                    "app.routes.media_libraries_api.config.update_runtime_env_file",
                     side_effect=OSError("write failed"),
                 ),
             ):
@@ -470,7 +513,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             with (
                 patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
                 patch(
-                    "app.routes.media_libraries_api.config.set_and_save",
+                    "app.routes.media_libraries_api.config.update_runtime_env_file",
                     side_effect=config.ConcurrentConfigUpdateError("private detail"),
                 ),
             ):

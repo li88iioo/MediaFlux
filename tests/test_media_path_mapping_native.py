@@ -76,7 +76,8 @@ def test_cold_confirm_crud_natural_key_full_facts_and_secret_boundary(backend):
         result = await cold.execute_confirmed(plan.plan_id, context=context)
         assert result.outcome.public_content["ok"]
         items = sdk.library.path_mappings("jellyfin")["items"]
-        assert items == web._mapping_payload("jellyfin")[0]
+        overview = web.media_library_overview(Request({"type": "http", "session": authenticated_session()}))
+        assert items == next(server["mappings"] for server in overview["servers"] if server["server_type"] == "jellyfin")
         assert items == [{"local": "/much/longer/prefix", "server": "/long"}, {"local": "D:/Short", "server": "E:/New"}]
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)

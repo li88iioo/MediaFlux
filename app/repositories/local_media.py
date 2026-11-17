@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
@@ -537,24 +539,38 @@ def list_local_library_targets(source_id: int | None = None, *, owner: str = "ad
     return [LocalLibraryTarget.from_row(row) for row in rows]
 
 
+def _list_local_library_bindings(conn: sqlite3.Connection, owner: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT t.source_id,s.name AS source_name,t.category,t.path AS local_path,"
+        "t.provider,t.library_id,t.library_name,t.server_path "
+        "FROM local_library_targets t JOIN local_media_sources s "
+        "ON s.id=t.source_id AND s.owner=t.owner WHERE t.owner=? "
+        "ORDER BY s.id,t.category,t.id", (owner,),
+    ).fetchall()
+
+
 def list_local_library_bindings(*, owner: str = "admin") -> list[sqlite3.Row]:
     """在同一读快照中投影全部来源与归档绑定，避免逐来源 N+1 查询。"""
     with db.get_conn() as conn:
-        return conn.execute(
-            "SELECT t.source_id,s.name AS source_name,t.category,t.path AS local_path,"
-            "t.provider,t.library_id,t.library_name,t.server_path "
-            "FROM local_library_targets t JOIN local_media_sources s "
-            "ON s.id=t.source_id AND s.owner=t.owner WHERE t.owner=? "
-            "ORDER BY s.id,t.category,t.id",
-            (_local_media_owner(owner),),
-        ).fetchall()
+        return _list_local_library_bindings(conn, _local_media_owner(owner))
+
+
+def local_library_bindings_revision(bindings: Iterable[sqlite3.Row | dict[str, Any]]) -> str:
+    fields = ("source_id", "source_name", "category", "local_path", "provider", "library_id", "library_name", "server_path")
+    rows = [tuple(str(row[field] or "") for field in fields) for row in bindings]
+    return hashlib.sha256(json.dumps(sorted(rows)).encode()).hexdigest()
+
+
+class LocalLibraryBindingsChanged(ValueError):
+    """本地归档绑定的加载快照已失效。"""
 
 
 def replace_local_library_targets(
     bindings: list[dict[str, Any]],
     *,
     owner: str = "admin",
-) -> None:
+    expected_revision: str,
+) -> str:
     """原子替换当前用户的全部本地归档目标，供统一媒体库页面保存。"""
     from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
 
@@ -596,6 +612,8 @@ def replace_local_library_targets(
     timestamp = db.now()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if local_library_bindings_revision(_list_local_library_bindings(conn, safe_owner)) != expected_revision:
+            raise LocalLibraryBindingsChanged("本地归档映射已由其他操作更新，请核对最新映射")
         existing_source_ids = {
             int(row["id"])
             for row in conn.execute(
@@ -611,6 +629,7 @@ def replace_local_library_targets(
         conn.execute("DELETE FROM local_library_targets WHERE owner=?", (safe_owner,))
         for item in normalized:
             _insert_target(conn, source_id=int(item["source_id"]), owner=safe_owner, item=item, timestamp=timestamp)
+        return local_library_bindings_revision(_list_local_library_bindings(conn, safe_owner))
 
 
 def create_local_media_task(

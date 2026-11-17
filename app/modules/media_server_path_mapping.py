@@ -285,14 +285,29 @@ def mapping_updates(raw: object) -> dict[str, str]:
     return updates
 
 
-def _mapping_state(server: str) -> tuple[bytes | None, list[dict[str, str]]]:
+def path_mapping_snapshot(
+    server: str, values: Mapping[str, str],
+) -> tuple[list[dict[str, str]], str, str]:
+    """由同一配置值生成展示内容和该服务器的映射修订。"""
     if server not in MAPPING_CONFIG:
         raise MediaServerPathMappingError("server 仅支持 jellyfin 或 emby")
     key = MAPPING_CONFIG[server][0]
+    managed = config.has_external_override(key)
+    value = config.get(key, "") if managed else values.get(key, "")
+    revision = hashlib.sha256(json.dumps([managed, value]).encode()).hexdigest()
+    try:
+        items = [{"local": item.local_prefix, "server": item.server_prefix}
+                 for item in parse_media_server_path_mappings(value)]
+    except MediaServerPathMappingError as exc:
+        return [], str(exc), revision
+    return items, "", revision
+
+
+def _mapping_state(server: str) -> tuple[bytes | None, list[dict[str, str]]]:
     raw, values = config.read_env_snapshot(config.ENV_FILE)
-    value = config.get(key, "") if config.has_external_override(key) else values.get(key, "")
-    items = [{"local": item.local_prefix, "server": item.server_prefix}
-             for item in parse_media_server_path_mappings(value)]
+    items, error, _ = path_mapping_snapshot(server, values)
+    if error:
+        raise MediaServerPathMappingError(error)
     return raw, items
 
 

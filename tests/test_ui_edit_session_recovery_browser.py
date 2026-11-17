@@ -189,7 +189,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             "guangya": '[data-media-id="A"]',
             "media_proxy": '[data-proxy-instance="1"]',
             "guangya_strm": '#saveStrmBtn:not(:disabled)',
-            "media_libraries": '[data-mapping-server]',
+            "media_libraries": '[data-mapping-row="0"] [data-mapping-server]',
         }[template]
         self.page.locator(ready).wait_for()
         return self.page
@@ -230,10 +230,18 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 return
             if path == "/api/media-libraries/mappings":
                 assert body is not None
+                revisions = self.mapping_overview["mapping_revisions"]
+                expected = body["expected_revisions"]
+                if any(revisions[scope] != value for scope, value in expected.items()):
+                    route.fulfill(status=409, json={"error": "媒体库映射已由其他操作更新"})
+                    return
                 for server in self.mapping_overview["servers"]:
                     server["mappings"] = body["strm_mappings"].get(server["server_type"], server["mappings"])
-                self.mapping_overview["local_bindings"] = body["local_bindings"]
-                route.fulfill(json={"ok": True})
+                if "local_bindings" in body:
+                    self.mapping_overview["local_bindings"] = body["local_bindings"]
+                for scope in expected:
+                    revisions[scope] += "-saved"
+                route.fulfill(json={"success": True, "mapping_revisions": {scope: revisions[scope] for scope in expected}})
                 return
             if path in ("/api/media-libraries/strm-directories", "/api/media-libraries/local-directories"):
                 route.fulfill(json={"directories": [{"id": "/fixture/archive", "name": "归档目录", "is_dir": True}]})
@@ -347,7 +355,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
         )
 
-    def make_mapping_page(self, width):
+    def make_mapping_page(self, width, *, emby=False):
         if self.context:
             self.context.close()
         self.requests.clear()
@@ -363,8 +371,17 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             }],
             "strm": {"output_root": "/fixture/strm"},
             "local_sources": [{"id": 1, "name": "隔离本地来源"}], "local_bindings": [],
+            "mapping_revisions": {"jellyfin": "jellyfin-original", "local": "local-original"},
             "summary": {"configured_servers": 1, "libraries": 2, "path_mappings": 1, "total_mappings": 1},
         }
+        if emby:
+            self.mapping_overview["servers"].append({
+                "server_type": "emby", "label": "Emby", "enabled": True, "configured": True,
+                "mapping_key": "EMBY_PATH_MAPPINGS",
+                "libraries": [{"id": "emby-movies", "name": "电影", "locations": ["/emby/library"]}],
+                "mappings": [{"local": "/fixture/emby", "server": "/emby/library"}],
+            })
+            self.mapping_overview["mapping_revisions"]["emby"] = "emby-original"
         page = self.make_page("media_libraries", width)
         page.wait_for_function("document.querySelector('#mediaLibrariesPage').dataset.loading==='false'")
         return page
@@ -497,6 +514,42 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
 
     def test_mapping_save_admission_and_error_recovery_mobile(self):
         self.mapping_save_admission_and_recovery(390)
+
+    def test_mapping_concurrent_provider_update_preserves_drafts_on_desktop_and_mobile(self):
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                page = self.make_mapping_page(width, emby=True)
+                inputs = page.locator('[data-mapping-server]')
+                save = page.locator('[data-save-mappings]')
+                self.mapping_overview["servers"][0]["mappings"][0]["server"] = "/library/agent"
+                self.mapping_overview["mapping_revisions"]["jellyfin"] = "jellyfin-agent"
+                inputs.nth(1).fill("/emby/web")
+                save.click()
+                page.wait_for_function("document.querySelectorAll('[data-mapping-server]')[0].value === '/library/agent'")
+                self.assertEqual(inputs.nth(1).input_value(), "/emby/web")
+                body = [entry["body"] for entry in self.requests if entry["method"] == "POST"][-1]
+                self.assertEqual(body, {
+                    "strm_mappings": {"emby": [{"local": "/fixture/emby", "server": "/emby/web"}]},
+                    "expected_revisions": {"emby": "emby-original"},
+                })
+
+                self.mapping_overview["servers"][0]["mappings"][0]["server"] = "/library/latest"
+                self.mapping_overview["mapping_revisions"]["jellyfin"] = "jellyfin-latest"
+                inputs.first.fill("/library/draft")
+                original = inputs.first.element_handle()
+                save.click()
+                page.get_by_role("status").filter(has_text="草稿已保留").wait_for()
+                self.assertEqual(inputs.first.input_value(), "/library/draft")
+                self.assertTrue(original.evaluate("node => node.isConnected"))
+                self.assertTrue(save.is_enabled())
+                self.assertTrue(page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
+                page.locator("#mlRefreshBtn").click()
+                page.get_by_role("button", name="保留草稿").click()
+                self.assertEqual(inputs.first.input_value(), "/library/draft")
+                page.locator("#mlRefreshBtn").click()
+                page.get_by_role("button", name="舍弃并刷新").click()
+                page.wait_for_function("document.querySelector('[data-mapping-server]').value === '/library/latest'")
+                self.assertTrue(save.is_disabled())
 
     def make_strm_page(self, width, count=241):
         from fastapi import FastAPI
