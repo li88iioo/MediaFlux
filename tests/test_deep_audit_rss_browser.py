@@ -39,9 +39,11 @@ class RssFilterRefreshBrowserTests(unittest.TestCase):
         cls.feedback_script = "\n".join((
             "window.alerts=[];window.feedbackResponse={};",
             "const appAlert=async value=>window.alerts.push(value);",
+            "const appConfirm=async()=>true;",
             "const batchRequest=async()=>window.feedbackResponse;",
             "const rssApiJSON=async()=>window.feedbackResponse;",
             "const setRssButtonBusy=()=>{};const loadEntries=async()=>{};",
+            extract(source, "function rssPartialRefreshNotice(", "\nfunction updateBatchbar"),
             extract(source, "async function batchDownload(trigger)", "\nasync function batchMark"),
             extract(source, "async function dlEntry(id,trigger)", "\ndocument.getElementById('f_method')"),
         ))
@@ -113,6 +115,30 @@ class RssFilterRefreshBrowserTests(unittest.TestCase):
         self.assertNotIn("成功", alert["title"])
         self.assertNotIn("失败", alert["title"])
         self.assertNotIn("qB", alert["message"])
+
+    def test_partial_sources_warn_on_refresh_and_auto_download_without_hiding_results(self):
+        page = self.feedback_page()
+        page.evaluate("""async()=>{
+            const stats={total:2,new:1,skipped:0};
+            const partial={...stats,partial:true,failed_sources:1};
+            for(const refresh of [stats,partial]){
+                window.feedbackResponse={stats:refresh};
+                await refreshSub(1,document.querySelector('#trigger'));
+                window.feedbackResponse={result:{refresh,downloaded:1}};
+                await autoDl(1,document.querySelector('#trigger'));
+            }
+        }""")
+        refreshed, downloaded, partial_refresh, partial_download = page.evaluate("window.alerts")
+        for alert in (refreshed, downloaded):
+            self.assertEqual(alert["type"], "success")
+            self.assertNotIn("刷新失败", alert["message"])
+        for alert in (partial_refresh, partial_download):
+            self.assertEqual(alert["type"], "warning")
+            self.assertIn("部分订阅源刷新失败", alert["title"])
+            self.assertIn("1 个 RSS 源刷新失败", alert["message"])
+            self.assertIn("重试刷新", alert["message"])
+        self.assertIn("新增 1 条", partial_refresh["message"])
+        self.assertIn("新增提交 1 条", partial_download["message"])
 
     def test_batch_pending_only_and_mixed_states_remain_unconfirmed(self):
         page = self.feedback_page()

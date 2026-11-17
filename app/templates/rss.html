@@ -585,6 +585,12 @@ async function toggleSub(id,enabled,trigger){
     }
 }
 
+function rssPartialRefreshNotice(stats){
+    return stats.partial
+        ? `${stats.failed_sources} 个 RSS 源刷新失败，已保留可用来源的结果。请稍后重试刷新。`
+        : '';
+}
+
 async function refreshSub(id,trigger){
     if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'刷新中');
     try{
@@ -596,9 +602,10 @@ async function refreshSub(id,trigger){
             ?`检测到 ${Number(s.detected_series_count)||2} 个剧目，已跳过 TMDB 绑定和已有剧集过滤`
             :'无法确认所有条目属于同一剧目，已保留条目并跳过 TMDB 绑定和已有剧集过滤';
         const libraryUnavailable=s.library_check&&Number(s.library_check.ready||0)===0;
-        const details=[];if(librarySkipped||duplicates)details.push(`媒体库已有 ${librarySkipped} 条 · 语义重复 ${duplicates} 条`);if(unresolved)details.push(`${unresolved} 条未解析出明确集号，已保留`);if(bindingBypassed)details.push(bypassDetail);if(libraryUnavailable)details.push('媒体服务器暂不可核对，本次未按库存过滤');
-        const warning=bindingBypassed||libraryUnavailable;
-        await appAlert({type:warning?'warning':'success',title:bindingBypassed?'订阅已刷新，已有剧集过滤已跳过':libraryUnavailable?'订阅已刷新，库存核对未完成':'订阅刷新完成',message:`拉取 ${s.total} 条\n新增 ${s.new} 条\n排除 ${s.skipped} 条${details.length?'\n'+details.join('\n'):''}`});
+        const sourceNotice=rssPartialRefreshNotice(s);
+        const details=[];if(sourceNotice)details.push(sourceNotice);if(librarySkipped||duplicates)details.push(`媒体库已有 ${librarySkipped} 条 · 语义重复 ${duplicates} 条`);if(unresolved)details.push(`${unresolved} 条未解析出明确集号，已保留`);if(bindingBypassed)details.push(bypassDetail);if(libraryUnavailable)details.push('媒体服务器暂不可核对，本次未按库存过滤');
+        const title=sourceNotice?'部分订阅源刷新失败':bindingBypassed?'订阅已刷新，已有剧集过滤已跳过':libraryUnavailable?'订阅已刷新，库存核对未完成':'订阅刷新完成';
+        await appAlert({type:sourceNotice||bindingBypassed||libraryUnavailable?'warning':'success',title,message:`拉取 ${s.total} 条\n新增 ${s.new} 条\n排除 ${s.skipped} 条${details.length?'\n'+details.join('\n'):''}`});
         await loadEntries();
     }catch(error){await appAlert({type:'error',title:'订阅刷新失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
     finally{setRssButtonBusy(trigger,false);}
@@ -621,12 +628,13 @@ async function autoDl(id,trigger){
         const bypassDetail=String(r.refresh.binding_bypass_reason||'')==='mixed_feed'
             ?`检测到 ${Number(r.refresh.detected_series_count)||2} 个剧目，已跳过 TMDB 绑定和已有剧集过滤`
             :'无法确认所有条目属于同一剧目，已保留条目并跳过 TMDB 绑定和已有剧集过滤';
-        const warning=failed>0||outcomeUnknown>0||unverified>0||deferred>0||libraryUnavailable||bindingBypassed;
+        const sourceNotice=rssPartialRefreshNotice(r.refresh);
+        const warning=failed>0||outcomeUnknown>0||unverified>0||deferred>0||libraryUnavailable||bindingBypassed||sourceNotice;
         const filtered=Number(r.refresh.library_skipped||0)+Number(r.refresh.semantic_duplicates||0);
         await appAlert({
             type:failed&&(added+existing+unverified===0)?'error':warning?'warning':'success',
-            title:outcomeUnknown?'自动下载结果待核对':failed?'自动下载部分失败':deferred?'本轮自动下载完成':bindingBypassed?'自动下载完成，已有剧集过滤已跳过':libraryUnavailable?'自动下载完成，库存核对未完成':unverified?'自动下载待核验':'自动下载完成',
-            message:`刷新：拉取 ${r.refresh.total} 条，新增 ${r.refresh.new} 条${filtered?`，精确过滤 ${filtered} 条`:''}\n下载：新增提交 ${added} 条 · qB 已存在 ${existing} 条 · 待核验 ${unverified} 条 · 失败 ${failed} 条${deferred?`\n剩余 ${deferred} 条保留待处理，将在下一轮继续`:''}${outcomeUnknown?`\n其中 ${outcomeUnknown} 条提交结果未知，请先检查下载器状态，勿直接重复提交`:''}${bindingBypassed?`\n${bypassDetail}`:libraryUnavailable?'\n媒体服务器暂不可核对，本次未按库存过滤':''}`
+            title:outcomeUnknown?'自动下载结果待核对':failed?'自动下载部分失败':sourceNotice?'自动下载已处理，部分订阅源刷新失败':deferred?'本轮自动下载完成':bindingBypassed?'自动下载完成，已有剧集过滤已跳过':libraryUnavailable?'自动下载完成，库存核对未完成':unverified?'自动下载待核验':'自动下载完成',
+            message:`刷新：拉取 ${r.refresh.total} 条，新增 ${r.refresh.new} 条${filtered?`，精确过滤 ${filtered} 条`:''}${sourceNotice?`\n${sourceNotice}`:''}\n下载：新增提交 ${added} 条 · qB 已存在 ${existing} 条 · 待核验 ${unverified} 条 · 失败 ${failed} 条${deferred?`\n剩余 ${deferred} 条保留待处理，将在下一轮继续`:''}${outcomeUnknown?`\n其中 ${outcomeUnknown} 条提交结果未知，请先检查下载器状态，勿直接重复提交`:''}${bindingBypassed?`\n${bypassDetail}`:libraryUnavailable?'\n媒体服务器暂不可核对，本次未按库存过滤':''}`
         });
         await loadEntries();
     }catch(error){await appAlert({type:'error',title:'自动下载失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
