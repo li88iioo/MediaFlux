@@ -9,6 +9,7 @@ from app import services
 from app.clients.base import (
     MediaItem,
     MediaRecommendationCandidate,
+    MediaServerClient,
     MediaRecommendationInventory,
     MediaSearchResult,
     SeriesCandidate,
@@ -586,7 +587,8 @@ def test_emby_counts_failure_reaches_public_service_instead_of_zero_inventory(mo
     assert result["ok"] is False and result["status"] == "unavailable"
     assert result["data"]["counts"]["total_items"] is None
     assert result["data"]["sources"][0]["status"] == "unavailable"
-    assert len(paths) == 2
+    assert paths.count("http://media.invalid/Items/Counts") == 1
+    assert len(paths) == 1 + len(MediaServerClient._PLAYABLE_ITEM_TYPES.split(","))
 
 
 @pytest.mark.parametrize("server_type", ["jellyfin", "emby"])
@@ -683,12 +685,13 @@ def test_recent_added_granularity_through_public_library_and_client_http(
     if media_type == "episode":
         assert [(item["series_name"], item["season_number"], item["episode_number"])
                 for item in result["items"]] == [("黑镜", 7, 6), ("黑镜", 7, 5), ("黑镜", 7, 4)]
-    assert len(calls) == 1
-    assert calls[0]["ParentId"] == "tv-library"
-    assert calls[0]["IncludeItemTypes"] == item_types
-    assert calls[0]["SortBy"] == "DateCreated"
-    assert calls[0]["SortOrder"] == "Descending"
-    assert calls[0]["Recursive"] == "true"
+    # 逐类型各查一页再按入库时间归并；多类型合并排序在 Jellyfin 12 上要数秒。
+    assert [call["IncludeItemTypes"] for call in calls] == item_types.split(",")
+    for call in calls:
+        assert call["ParentId"] == "tv-library"
+        assert call["SortBy"] == "DateCreated"
+        assert call["SortOrder"] == "Descending"
+        assert call["Recursive"] == "true"
 
 
 def test_recent_added_uses_real_library_scope_and_never_genre_guessing(monkeypatch):
@@ -726,8 +729,8 @@ def test_recent_added_uses_real_library_scope_and_never_genre_guessing(monkeypat
     assert result["scope"]["library"]["name"] == "电视剧"
     assert result["scope"]["library"]["id"] == library_id
     assert "__object_id" not in result["scope"]["library"]
-    assert calls[-1][1]["params"]["ParentId"] == "tv-library"
-    assert calls[-1][1]["params"]["IncludeItemTypes"] == "Series,Episode"
+    assert [call[1]["params"]["IncludeItemTypes"] for call in calls[-2:]] == ["Series", "Episode"]
+    assert all(call[1]["params"]["ParentId"] == "tv-library" for call in calls[-2:])
     for query in ({"library_id": "missing-library"}, {"library_name": "不存在"}, {"library_name": "电视剧"}):
         if query.get("library_name") == "电视剧":
             folders.append({"ItemId": "tv-duplicate", "Name": "电视剧"})

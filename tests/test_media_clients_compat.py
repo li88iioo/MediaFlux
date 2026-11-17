@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from contextlib import ExitStack
 from datetime import datetime
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import requests
 
@@ -144,11 +144,15 @@ class DashboardMediaCountTests(unittest.TestCase):
             self.assertEqual(path, "/Users/configured-viewer/Items")
             assert params is not None
             self.assertEqual(params["Limit"], 0)
-            return {"TotalRecordCount": 10}
+            return {"TotalRecordCount": {"Movie": 3, "Episode": 7}.get(params["IncludeItemTypes"], 0)}
         with patch("app.services.list_configured_profiles", return_value=profiles), \
              patch.object(JellyfinClient, "_request", request), patch.object(EmbyClient, "_request", request):
             result = services.get_library_counts()
-        self.assertEqual(len(calls), 4)  # 每源仅原有 total + counts，无 native 额外 HTTP。
+        # 每源仅逐类型 total + counts，无 native 额外 HTTP。
+        for client_name in ("JellyfinClient", "EmbyClient"):
+            paths = [path for name, path, _params in calls if name == client_name]
+            self.assertEqual(paths.count("/Items/Counts"), 1)
+            self.assertEqual(len(paths), 1 + len(JellyfinClient._PLAYABLE_ITEM_TYPES.split(",")))
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["data"]["counts"], {
@@ -213,25 +217,26 @@ class DashboardMediaCountTests(unittest.TestCase):
             self.assertEqual(services.get_library_counts()["data"]["sources"], [])
 
     def test_total_items_counts_only_user_visible_playable_media(self):
-        expected_params = {
-            "Recursive": "true",
-            "Limit": 0,
-            "EnableImages": "false",
-            "IncludeItemTypes": "Movie,Episode,Audio,MusicVideo,Book,Video",
-        }
+        playable = ("Movie", "Episode", "Audio", "MusicVideo", "Book", "Video")
+        per_type = {"Movie": 5, "Episode": 11}
         for client in (
             JellyfinClient("http://jellyfin.local", "key"),
             EmbyClient("http://legacy.local", "token"),
         ):
             with self.subTest(client=type(client).__name__):
                 client._cached_user_id = "user-id"
-                client._request = Mock(return_value={"TotalRecordCount": 16})
+                client._request = Mock(side_effect=lambda _path, *, params: {
+                    "TotalRecordCount": per_type.get(params["IncludeItemTypes"], 0),
+                })
 
                 self.assertEqual(client._total_items(), 16)
-                client._request.assert_called_once_with(
-                    "/Users/user-id/Items",
-                    params=expected_params,
-                )
+                # 类型互斥，逐类型计数之和即总数；多类型合并计数在 Jellyfin 12 上要数秒。
+                self.assertEqual(client._request.call_args_list, [
+                    call("/Users/user-id/Items", params={
+                        "Recursive": "true", "Limit": 0, "EnableImages": "false", "IncludeItemTypes": item_type,
+                    })
+                    for item_type in playable
+                ])
 
     def test_jellyfin_media_counts_are_scoped_to_dashboard_user(self):
         client = JellyfinClient("http://jellyfin.local", "key")

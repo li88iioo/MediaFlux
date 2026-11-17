@@ -11,6 +11,24 @@ from app.clients.jellyfin import JellyfinClient
 _ITEM_ID = "a" * 32
 
 
+def typed_pages(rows: list[dict]):
+    """模拟真实服务器：只返回所请求类型，按 StartIndex/Limit 分页；rows 已按入库时间倒序。"""
+    def page(_path, *, params):
+        typed = [row for row in rows if row["Type"] in params["IncludeItemTypes"].split(",")]
+        offset = params.get("StartIndex", 0)
+        return {"Items": typed[offset:offset + params["Limit"]]}
+    return page
+
+
+def item_queries(request) -> list:
+    return [call for call in request.call_args_list if "IncludeItemTypes" in call.kwargs.get("params", {})]
+
+
+def type_pages(request) -> list[tuple[str, int, int]]:
+    return [(call.kwargs["params"]["IncludeItemTypes"], call.kwargs["params"].get("StartIndex", 0),
+             call.kwargs["params"]["Limit"]) for call in item_queries(request)]
+
+
 class MediaServerSearchTests(unittest.TestCase):
     @staticmethod
     def _payload() -> dict:
@@ -247,12 +265,14 @@ class MediaServerSearchTests(unittest.TestCase):
                     client._cached_user_id = "user-1"
                     with patch.object(client, "_request", return_value={"Items": []}) as request:
                         self.assertEqual(client.recent_media(limit=5, parent_id="tv-library", media_type=media_type), [])
-                    params = request.call_args.kwargs["params"]
-                    self.assertEqual(params["ParentId"], "tv-library")
-                    self.assertEqual(params["IncludeItemTypes"], item_types)
-                    self.assertEqual(params["SortBy"], "DateCreated")
-                    self.assertEqual(params["Recursive"], "true")
-                    self.assertEqual("SeriesPrimaryImageTag" in params["Fields"], client_type is JellyfinClient)
+                    # 多类型合并排序在 Jellyfin 12 上要数秒，必须逐类型查询。
+                    self.assertEqual([kind for kind, _start, _limit in type_pages(request)], item_types.split(","))
+                    for call in item_queries(request):
+                        params = call.kwargs["params"]
+                        self.assertEqual(params["ParentId"], "tv-library")
+                        self.assertEqual(params["SortBy"], "DateCreated")
+                        self.assertEqual(params["Recursive"], "true")
+                        self.assertEqual("SeriesPrimaryImageTag" in params["Fields"], client_type is JellyfinClient)
 
     def test_recent_media_episode_granularity_keeps_consecutive_episodes_by_id(self):
         rows = [
@@ -295,17 +315,12 @@ class MediaServerSearchTests(unittest.TestCase):
                 client._cached_user_id = "user-1"
                 if isinstance(client, EmbyClient):
                     client._cached_server_info = {"ProductName": "Emby", "Version": "4.9"}
-                def page(_path, *, params):
-                    offset = params.get("StartIndex", 0)
-                    return {"Items": rows[offset:offset + params["Limit"]]}
-                with patch.object(client, "_request", side_effect=page) as request:
+                with patch.object(client, "_request", side_effect=typed_pages(rows)) as request:
                     items = client.recent_media(limit=2, parent_id="tv-library", media_type="tv")
                 self.assertEqual([item.name for item in items], ["第0集", "测试剧乙"])
-                self.assertEqual(request.call_count, 2)
-                self.assertEqual([call.kwargs["params"].get("StartIndex", 0) for call in request.call_args_list], [0, 30])
+                self.assertEqual(type_pages(request), [("Series", 0, 30), ("Episode", 0, 30), ("Episode", 30, 200)])
                 for call in request.call_args_list:
                     self.assertEqual(call.kwargs["params"]["ParentId"], "tv-library")
-                    self.assertEqual(call.kwargs["params"]["IncludeItemTypes"], "Series,Episode")
 
     def test_recent_media_movie_granularity_keeps_distinct_work_ids(self):
         rows = [
@@ -366,7 +381,7 @@ class MediaServerSearchTests(unittest.TestCase):
         ] + [
             {"Id": f"episode-d-{i}", "Name": f"旧单集{i}", "Type": "Episode", "SeriesId": "series-d",
              "DateCreated": f"2026-10-08T12:00:{59-i:02}Z"}
-            for i in range(25)
+            for i in range(30)
         ] + [{"Id": "series-e", "Name": "测试剧戊", "Type": "Series",
               "DateCreated": "2026-10-07T12:00:00Z"}]
         for client_type in (JellyfinClient, EmbyClient):
@@ -374,20 +389,14 @@ class MediaServerSearchTests(unittest.TestCase):
                 client._cached_user_id = "user-1"
                 if isinstance(client, EmbyClient):
                     client._cached_server_info = {"ProductName": "Emby", "Version": "4.9"}
-                def page(_path, *, params):
-                    offset = params["StartIndex"]
-                    return {"Items": rows[offset:offset + params["Limit"]]}
-                with patch.object(client, "_request", side_effect=page) as request:
+                with patch.object(client, "_request", side_effect=typed_pages(rows)) as request:
                     items = client.recent_media(limit=5, parent_id="tv-library", media_type="tv")
                 self.assertEqual([item.series_id for item in items], ["series-a", "series-b", "series-c", "series-d", "series-e"])
                 self.assertEqual([item.id for item in items], ["episode-a", "series-b", "episode-c", "episode-d", "series-e"])
-                self.assertEqual(request.call_count, 2)
-                self.assertEqual([call.kwargs["params"]["StartIndex"] for call in request.call_args_list], [0, 30])
-                self.assertEqual([call.kwargs["params"]["Limit"] for call in request.call_args_list], [30, 200])
+                self.assertEqual(type_pages(request), [("Series", 0, 30), ("Episode", 0, 30), ("Episode", 30, 200)])
                 for call in request.call_args_list:
                     self.assertEqual(call.args[0], "/Users/user-1/Items")
                     self.assertEqual(call.kwargs["params"]["ParentId"], "tv-library")
-                    self.assertEqual(call.kwargs["params"]["IncludeItemTypes"], "Series,Episode")
                     self.assertEqual(call.kwargs["params"]["SortBy"], "DateCreated")
                     self.assertEqual(call.kwargs["params"]["SortOrder"], "Descending")
 
@@ -443,16 +452,25 @@ class MediaServerSearchTests(unittest.TestCase):
                 if isinstance(client, EmbyClient):
                     client._cached_server_info = {"ProductName": "Emby", "Version": "4.9"}
                 def page(_path, *, params):
+                    if params["IncludeItemTypes"] != "Episode":
+                        return {"Items": [{"Id": "series-a", "Name": "同一部剧", "Type": "Series"}]
+                                if params["IncludeItemTypes"] == "Series" else []}
+                    start = params.get("StartIndex", 0)
+                    if start and params.get("fail_next"):
+                        raise RuntimeError("page failed")
                     return {"Items": [
-                        {"Id": "series-a", "Name": "同一部剧", "Type": "Series"} if i == 0 else
                         {"Id": str(i), "Name": "同一部剧", "Type": "Episode", "SeriesId": "series-a"}
-                        for i in range(params.get("StartIndex", 0), params.get("StartIndex", 0) + params["Limit"])
+                        for i in range(start, start + params["Limit"])
                     ]}
                 with patch.object(client, "_request", side_effect=page) as request:
                     self.assertEqual(len(client.recent_media(limit=2)), 1)
-                self.assertLessEqual(request.call_count, 11)
-                self.assertEqual(sum(call.kwargs["params"]["Limit"] for call in request.call_args_list), 2000)
-                with patch.object(client, "_request", side_effect=[page("", params={"Limit": 30}), RuntimeError("page failed")]):
+                episode_pages = [(start, limit) for kind, start, limit in type_pages(request) if kind == "Episode"]
+                self.assertLessEqual(len(episode_pages), 11)
+                self.assertEqual(sum(limit for _start, limit in episode_pages), 2000)
+                self.assertEqual(len(request.call_args_list), len(episode_pages) + 2)
+                def failing(path, *, params):
+                    return page(path, params={**params, "fail_next": True})
+                with patch.object(client, "_request", side_effect=failing):
                     with self.assertRaisesRegex(RuntimeError, "page failed"):
                         client.recent_media(limit=2)
 

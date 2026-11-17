@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import heapq
 import logging
 import math
 import os
@@ -12,7 +13,8 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Mapping
+from itertools import islice
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -1183,13 +1185,11 @@ class MediaServerClient:
     def _recent_added(self, limit: int = 8, *, parent_id: str = "", media_type: str = "all") -> list[MediaItem]:
         uid = self._user_id()
         normalized_limit = max(1, min((limit or 8), 200))
-        item_types = {"all": "Movie,Series,Episode", "movie": "Movie", "tv": "Series,Episode", "episode": "Episode"}
+        item_types = {"all": ("Movie", "Series", "Episode"), "movie": ("Movie",), "tv": ("Series", "Episode"), "episode": ("Episode",)}
         if media_type not in item_types:
             raise ValueError("媒体类型仅支持all、movie、tv或episode")
         params = {
             "Recursive": "true",
-            "Limit": max(30, normalized_limit * 3),
-            "IncludeItemTypes": item_types[media_type],
             "Fields": (
                 "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
                 "ParentIndexNumber,ImageTags," + self._RECENT_EXTRA_FIELDS + "ProductionYear,Genres,UserData"
@@ -1200,32 +1200,50 @@ class MediaServerClient:
         }
         if (parent_id or "").strip():
             params["ParentId"] = parent_id.strip()
-        # episode 保留同剧多集，其余按作品 ID 去重再补页；不为最近入库遍历整库。
+
+        def created(row: dict[str, Any]) -> str:
+            return str(row.get("DateCreated") or "")
+
+        def newest(item_type: str) -> Iterator[dict[str, Any]]:
+            offset, page_size = 0, max(30, normalized_limit * 3)
+            while offset < 2000:
+                size = min(page_size, 2000 - offset)
+                data = self._request(f"/Users/{uid}/Items", params={
+                    **params, "IncludeItemTypes": item_type, "StartIndex": offset, "Limit": size,
+                })
+                raw_items, _total = self._items_payload(data)
+                yield from sorted(raw_items, key=created, reverse=True)
+                if len(raw_items) < size:
+                    return
+                offset += len(raw_items)
+                page_size = max(page_size, 200)
+
+        # Jellyfin 12 对多类型合并排序要数秒；逐类型按需翻页再按入库时间归并，结果与合并查询一致。
+        # episode 保留同剧多集，其余按作品 ID 去重；最多扫描 2000 条，不为最近入库遍历整库。
+        merged = heapq.merge(*(newest(item_type) for item_type in item_types[media_type]), key=created, reverse=True)
         recent: dict[str, dict[str, Any]] = {}
-        offset = 0
-        while offset < 2000 and len(recent) < normalized_limit:
-            page_size = min(params["Limit"], 2000 - offset)
-            data = self._request(f"/Users/{uid}/Items", params={**params, "StartIndex": offset, "Limit": page_size})
-            raw_items, _total = self._items_payload(data)
-            for raw in sorted(raw_items, key=lambda row: str(row.get("DateCreated") or ""), reverse=True):
-                key = (str(raw['SeriesId'])
-                       if media_type != "episode" and str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId")
-                       else str(raw.get("Id") or ""))
-                if key:
-                    recent.setdefault(key, raw)
-                if len(recent) >= normalized_limit:
-                    break
-            if len(raw_items) < page_size:
+        for raw in islice(merged, 2000):
+            key = (str(raw['SeriesId'])
+                   if media_type != "episode" and str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId")
+                   else str(raw.get("Id") or ""))
+            if key:
+                recent.setdefault(key, raw)
+            if len(recent) >= normalized_limit:
                 break
-            offset += len(raw_items)
-            params["Limit"] = max(params["Limit"], 200)
         return [self._media_item(raw) for raw in recent.values()]
 
     def _recent_played(self, limit: int = 12) -> list[MediaItem]:
         return []
 
     def _total_items(self) -> int:
-        raise NotImplementedError
+        # 类型互斥，逐类型计数之和等于合并计数；Jellyfin 12 合并计数要数秒，单类型只需百毫秒级。
+        uid = self._user_id()
+        return sum(
+            int(self._request(f"/Users/{uid}/Items", params={
+                "Recursive": "true", "Limit": 0, "EnableImages": "false", "IncludeItemTypes": item_type,
+            }).get("TotalRecordCount", 0) or 0)
+            for item_type in self._PLAYABLE_ITEM_TYPES.split(",")
+        )
 
     def _total_plays(self) -> int:
         raise NotImplementedError

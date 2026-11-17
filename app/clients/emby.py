@@ -27,7 +27,6 @@ logger = get_logger(__name__)
 class EmbyClient(MediaServerClient):
     display_name = "Emby / Jellyfin 10.x"
     _REFRESH_SERVER = "emby"
-    _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
         "tvshows": "Series",
         "movies": "Movie",
@@ -234,19 +233,6 @@ class EmbyClient(MediaServerClient):
             query, limit, offset=offset, search_by=search_by,
             media_type=media_type, count_only=count_only, cancelled=cancelled,
         )
-
-    def _total_items(self) -> int:
-        uid = self._user_id()
-        data = self._request(
-            f"/Users/{uid}/Items",
-            params={
-                "Recursive": "true",
-                "Limit": 0,
-                "EnableImages": "false",
-                "IncludeItemTypes": self._PLAYABLE_ITEM_TYPES,
-            },
-        )
-        return int(data.get("TotalRecordCount", 0) or 0)
 
     def get_media_counts(self) -> dict[str, int | None]:
         """读取计数；旧服务未提供端点时保留总项数，分类未知。"""

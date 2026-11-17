@@ -31,7 +31,6 @@ class JellyfinClient(MediaServerClient):
     display_name = "Jellyfin"
     _REFRESH_SERVER = "jellyfin"
     _RECENT_EXTRA_FIELDS = "SeriesPrimaryImageTag,"
-    _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
         "tvshows": "Series",
         "movies": "Movie",
@@ -471,19 +470,6 @@ class JellyfinClient(MediaServerClient):
 
     def _recent_played(self, limit: int = 12) -> list[MediaItem]:
         return self.recently_played(self._user_id(), limit=limit)
-
-    def _total_items(self) -> int:
-        user_id = self._user_id()
-        data = self._request(
-            f"/Users/{user_id}/Items",
-            params={
-                "Recursive": "true",
-                "Limit": 0,
-                "EnableImages": "false",
-                "IncludeItemTypes": self._PLAYABLE_ITEM_TYPES,
-            },
-        )
-        return int(data.get("TotalRecordCount", 0) or 0)
 
     def get_media_counts(self) -> dict[str, int]:
         """只读取 Jellyfin 统计接口，避免为一个总数加载整张看板。"""
