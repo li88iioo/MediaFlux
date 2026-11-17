@@ -405,6 +405,8 @@ svg { display: block; flex: 0 0 auto; }
 }
 .metadata-help-trigger svg { width: 16px; height: 16px; flex: none; }
 .metadata-help-trigger:hover { color: var(--text-primary); background: var(--bg-card-hover); }
+/* 标题行内使用：收小并抵消外边距，不撑高标题行。 */
+.metadata-help-trigger.is-compact { flex-basis: 32px; width: 32px; height: 32px; margin: -6px -4px; }
 
 .metadata-help-tooltip {
     position: fixed; z-index: 240; top: 0; left: 0; box-sizing: border-box;

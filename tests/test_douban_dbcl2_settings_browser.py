@@ -22,7 +22,7 @@ CONTENT = TEMPLATE.split("{% block content %}", 1)[1].split("{% endblock %}", 1)
 HARNESS = """<!doctype html><html lang="zh-CN" data-theme="light" data-settings-config="pending">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="stylesheet" href="/static/css/main.css"><link rel="stylesheet" href="/static/css/settings-agent.css"></head>
-<body class="settings-page"><main><div class="content">{content}</div></main></body></html>""".format(
+<body class="settings-page"><main class="main"><div class="workspace-bar"></div><div class="content">{content}</div></main></body></html>""".format(
     content=Environment(autoescape=True).from_string(CONTENT).render(
         app_version="test", resource_results_enabled=False,
     ),
