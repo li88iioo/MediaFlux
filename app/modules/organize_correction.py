@@ -24,7 +24,7 @@ from app.clients.guangya import (
 )
 from app.logger import get_logger
 from app.modules.guangya_compensation import restore_guangya_file
-from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+from app.modules.directory_scrape_errors import DirectoryScrapeConflictError, DirectoryScrapeStateError
 from app.modules.media_identity import confirmed_manual_position
 from app.repositories.organize_history import begin_return_compensation
 from app.modules.nsfw import (
@@ -64,6 +64,13 @@ if TYPE_CHECKING:
     from app.modules.directory_scrape import FixedMatchScraper, PreviewSnapshotGuangYaClient
 
 logger = get_logger(__name__)
+
+
+def correction_preview_digest(preview: dict) -> str:
+    return hashlib.sha256(json.dumps(
+        preview, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+
 
 BUSY_STATUSES = {"reorganizing", "returning", "reverting", "deleting"}
 REORGANIZE_STATUSES = {"success", "failed", "skipped", "manual", "reverted", "interrupted"}
@@ -357,10 +364,9 @@ class OrganizeCorrectionService:
         for row in items:
             if row["log_id"] in errors:
                 row["error"] = errors[row["log_id"]]
-        digest = hashlib.sha256(json.dumps(
+        digest = correction_preview_digest(
             {"entries": entries, "candidate": selected, "items": items},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode()).hexdigest() if not errors else ""
+        ) if not errors else ""
         return {"items": items, "errors": [{"log_id": key, "error": value} for key, value in errors.items()],
                 "can_execute": not errors, "preview_digest": digest}
 
@@ -708,18 +714,6 @@ class OrganizeCorrectionService:
             "rules_snapshot": organize_rules_snapshot(rules),
             "cloud_write": False,
         }
-
-    def reorganize(
-        self, log_id: int, operation_token: str, expected_version: int,
-        tmdb_id: str, media_type: str, title: str = "", year: str = "",
-        season: int | None = None, episode: int | None = None,
-        *, provider: str = "", external_id: str = "",
-    ) -> dict:
-        preview = self.preview_reorganize(
-            log_id, tmdb_id, media_type, title, year, season, episode,
-            provider=provider, external_id=external_id,
-        )
-        return self._execute_reorganize(log_id, operation_token, expected_version, preview)
 
     def submit_reorganize(self, preview: dict, operation_token: str, *, confirmation_actor: str) -> dict:
         """提交已冻结的单条纠偏预览；与 Web 共用执行、回滚、确认收尾及 STRM 联动。"""
@@ -1736,7 +1730,7 @@ class OrganizeCorrectionService:
         self._verify_items(items)
         current_rules = self._rules_for_log(self.detail(log_id))
         if organize_rules_snapshot_changes(preview["rules_snapshot"], current_rules):
-            raise ValueError("整理规则已变化，请重新预览并确认")
+            raise DirectoryScrapeStateError("整理规则已变化，请重新预览并确认")
         rules = restore_organize_rules_snapshot(preview["rules_snapshot"], trusted_rules=current_rules)
         self._verify_nsfw_target_identity(MatchResult(**preview["match"]), preview["target_path"])
         before = organize_history_repo.capture_organize_business_snapshot(log_id)

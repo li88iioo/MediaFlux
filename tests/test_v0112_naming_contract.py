@@ -40,8 +40,8 @@ class NumericPositionNamingTests(unittest.TestCase):
                     target_dir_id="library", region_split=False, year_split=False,
                     link_strm=False, emby_refresh=False, keep_multi_versions=True,
                 )):
-                    result = service.reorganize(log_id, "wide-season", service.detail(log_id)["version"],
-                                                "2", "tv", season=100, episode=3)
+                    preview = service.preview_reorganize(log_id, "2", "tv", season=100, episode=3)
+                    result = service._execute_reorganize(log_id, "wide-season", preview["version"], preview)
                 row = db.get_organize_log(log_id)
                 name = cloud.files["video"].name
                 self.assertTrue(result["success"])

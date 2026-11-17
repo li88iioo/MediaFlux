@@ -187,8 +187,9 @@ window.fetch=async(input,options={})=>{
   }
   if(/\/reorganize\/preview$/.test(url.pathname)&&method==='POST'){
     if((config.singlePreviewFailures||[]).length)return jsonResponse({error:config.singlePreviewFailures.shift()},422);
-    const response=jsonResponse(config.singlePreview||{target_path:'Series/Correct',media_dir:'Series',file_name:'Correct.mkv',items:[]});
     const logId=url.pathname.match(/^\/api\/logs\/organize\/(\d+)\/reorganize\/preview$/)?.[1];
+    const response=jsonResponse({target_path:'Series/Correct',media_dir:'Series',file_name:'Correct.mkv',items:[],
+      version:detailFor(logId).version,preview_digest:'single-digest-'+body.external_id,...config.singlePreview});
     if(logId&&(config.holdSinglePreviewIds||[]).includes(logId))return new Promise(resolve=>window.__pendingSinglePreviews.push({id:logId,response,resolve}));
     return response;
   }
@@ -1094,6 +1095,7 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.page.wait_for_function("() => window.__apiCalls.some(call => call.path === '/api/logs/organize/10/reorganize' && call.method === 'POST')")
         action = next(call for call in self.calls() if call["path"] == "/api/logs/organize/10/reorganize")
         self.assertIn("expected_version", action["body"])
+        self.assertEqual(action["body"]["preview_digest"], "single-digest-111")
         self.assertFalse(self.batch_previews())
 
     def skip_calls(self):

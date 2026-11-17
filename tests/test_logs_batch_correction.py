@@ -736,15 +736,11 @@ def test_batch_receipt_reports_partial_failure_without_replaying_completed_item(
     assert harness.cloud.write_calls == writes_after_partial
 
 
-def test_batch_api_requires_auth_accepts_preview_and_rejects_legacy_implicit_request(
+@pytest.fixture
+def logs_api_client(
     isolated_db, harness: _Harness, monkeypatch: pytest.MonkeyPatch,
 ):
     del isolated_db
-    ids = [
-        _add_log(harness.cloud, "Series.S01E01.mkv"),
-        _add_log(harness.cloud, "Series.S01E02.mkv"),
-    ]
-    entries = _entries(ids)
     from app.routes import logs_api
 
     api = FastAPI()
@@ -756,37 +752,87 @@ def test_batch_api_requires_auth_accepts_preview_and_rejects_legacy_implicit_req
         request.session.update(authenticated_session())
         return {"ok": True}
 
-    created: list[OrganizeCorrectionService] = []
-
-    def service_factory():
-        service = OrganizeCorrectionService(client=cast(GuangYaClient, harness.cloud), scraper=cast(TMDBScraper, harness.scraper))
-        created.append(service)
-        return service
-
-    monkeypatch.setattr(logs_api, "OrganizeCorrectionService", service_factory)
+    monkeypatch.setattr(logs_api, "OrganizeCorrectionService", harness.service)
     with TestClient(api) as client:
-        unauthorized = client.post(
-            "/api/logs/organize/batch/preview",
-            json={"action": "reorganize", "entries": entries, "candidate": CANDIDATE},
-        )
-        assert unauthorized.status_code in {401, 403}
+        yield client
 
-        assert client.post("/__test/login").status_code == 200
-        response = client.post(
-            "/api/logs/organize/batch/preview",
-            json={"action": "reorganize", "entries": entries, "candidate": CANDIDATE},
-        )
-        assert response.status_code == 200, response.text
-        assert response.json()["can_execute"] is True
-        assert response.json()["preview_digest"]
 
-        legacy = client.post(
-            "/api/logs/organize/batch",
-            json={"action": "reorganize", "entries": entries},
-        )
-        assert legacy.status_code == 400, legacy.text
-        assert "候选" in legacy.json().get("error", "") or "预览" in legacy.json().get("error", "")
+def test_batch_api_requires_auth_accepts_preview_and_rejects_legacy_implicit_request(
+    logs_api_client, harness: _Harness,
+):
+    client = logs_api_client
+    entries = _entries([
+        _add_log(harness.cloud, "Series.S01E01.mkv"),
+        _add_log(harness.cloud, "Series.S01E02.mkv"),
+    ])
+    url = "/api/logs/organize/batch"
+    body = {"action": "reorganize", "entries": entries, "candidate": CANDIDATE}
+    unauthorized = client.post(f"{url}/preview", json=body)
+    assert unauthorized.status_code in {401, 403}
 
-    assert created
-    assert all(service._closed for service in created)
+    assert client.post("/__test/login").status_code == 200
+    response = client.post(f"{url}/preview", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["can_execute"] is True
+    assert response.json()["preview_digest"]
+
+    legacy = client.post(url, json={"action": "reorganize", "entries": entries})
+    assert legacy.status_code == 400, legacy.text
+    assert "候选" in legacy.json().get("error", "") or "预览" in legacy.json().get("error", "")
+
+    assert harness.services
+    assert all(service._closed for service in harness.services)
     assert harness.cloud.write_calls == []
+
+
+def test_single_web_confirmation_binds_the_preview_through_execution(
+    logs_api_client, harness: _Harness, archive_rules, monkeypatch: pytest.MonkeyPatch,
+):
+    from app.modules import organize_correction, organize_tasks
+
+    manager = organize_tasks.OrganizeTaskManager()
+    operations = []
+
+    def accept(operation, reference, callback, **kwargs):
+        operations.append(callback)
+        return {"ok": True, "task_id": "correction-task"}
+
+    monkeypatch.setattr(manager, "start_operation", accept)
+    monkeypatch.setattr(organize_tasks, "get_organize_manager", lambda: manager)
+    monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", harness.service)
+    monkeypatch.setattr(OrganizeCorrectionService, "_notify_reorganize_result", lambda *a, **kw: [])
+    monkeypatch.setattr(OrganizeCorrectionService, "_finalize_reorganized_source", lambda *a, **kw: [])
+    archive_rules.year_split = False
+    archive_rules.link_strm = False
+    log_id = _add_log(harness.cloud, "Series.S01E01.mkv")
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    url = f"/api/logs/organize/{log_id}/reorganize"
+    old = client.post(f"{url}/preview", json=CANDIDATE).json()
+
+    def submit(preview, token, **changes):
+        return client.post(url, json={
+            **CANDIDATE, "operation_token": token, "expected_version": preview["version"],
+            "preview_digest": preview["preview_digest"], **changes,
+        })
+
+    assert submit(old, "missing", preview_digest="").status_code == 409
+    archive_rules.year_split = True
+    response = submit(old, "stale")
+    assert response.status_code == 409 and "重新预览" in response.json()["error"]
+    assert not operations and not harness.cloud.write_calls
+
+    fresh = client.post(f"{url}/preview", json=CANDIDATE).json()
+    assert fresh["target_path"] != old["target_path"]
+    assert submit(fresh, "changed-position", season=2).status_code == 409
+    assert submit(fresh, "accepted").status_code == 200 and len(operations) == 1
+    archive_rules.year_split = False
+    with pytest.raises(ValueError, match="整理规则已变化"):
+        operations.pop()()
+    assert not harness.cloud.write_calls
+
+    archive_rules.year_split = True
+    assert submit(fresh, "reconfirmed").status_code == 200 and len(operations) == 1
+    assert operations.pop()()["success"]
+    saved = assert_present(db.get_organize_log(log_id))
+    assert saved["new_path"] == f"{fresh['target_path']}/{fresh['file_name']}"

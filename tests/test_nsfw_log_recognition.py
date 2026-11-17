@@ -88,8 +88,7 @@ def test_skipped_log_search_preview_and_reorganize_share_identity(log_case, file
             service.client.rename.assert_not_called()
             remote['media'] = GuangYaFile('media', preview['media_dir'], True, parent_id='category')
             with patch.object(service, '_notify_reorganize_result', return_value=[]):
-                result = service.reorganize(log_id, 'compact-log-reorganize', preview['version'], '', 'movie',
-                    provider=candidate['provider'], external_id=candidate['external_id'])
+                result = service._execute_reorganize(log_id, 'compact-log-reorganize', preview['version'], preview)
             assert result['success'] is True
             assert remote['video'].parent_id == 'media'
             assert remote['video'].name == preview['file_name']
@@ -173,10 +172,10 @@ def test_stale_preview_api_returns_conflict_before_task_submission(log_case):
     log_id = make_log('', 'adult-source', name='KRI079C.mp4', status='skipped')
     service.client.file_info.return_value = GuangYaFile('video', 'KRI-079.2019.mp4', False, 100, 'etag', 'archived')
     data = {'provider': 'clean_title', 'external_id': 'KRI-079', 'media_type': 'movie',
-            'operation_token': 'stale-preview', 'expected_version': 1}
+            'operation_token': 'stale-preview', 'expected_version': 1, 'preview_digest': 'old-digest'}
     request = Request({'type': 'http', 'method': 'POST', 'path': '/', 'headers': [], 'session': authenticated_session()})
     with patch('app.routes.logs_api.OrganizeCorrectionService', return_value=service), \
-            patch('app.routes.logs_api.get_organize_manager') as manager:
+            patch('app.modules.organize_tasks.get_organize_manager') as manager:
         for endpoint in (preview_reorganize, run_reorganize):
             response = endpoint(log_id, request, data)
             assert isinstance(response, JSONResponse)
@@ -221,8 +220,7 @@ def test_manual_metatube_selection_corrects_identity_and_survives_return(log_cas
             service.client.move.assert_not_called()
             service.client.rename.assert_not_called()
             remote['media'] = GuangYaFile('media', preview['media_dir'], True, parent_id='category')
-            result = service.reorganize(log_id, 'manual-correction', preview['version'], '', 'movie',
-                provider='metatube', external_id=candidate['external_id'])
+            result = service._execute_reorganize(log_id, 'manual-correction', preview['version'], preview)
             assert result['success'] is True
             assert remote['video'].parent_id == 'media'
             assert remote['video'].name == preview['file_name']

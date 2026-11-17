@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from app import database as db
 from app.logger import get_logger, log_throttled
-from app.modules.organize_correction import OrganizeCorrectionService
+from app.modules.organize_correction import OrganizeCorrectionService, correction_preview_digest
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError, public_error_message
 from app.modules.organize_tasks import get_organize_manager
 from app.modules.runtime_log import clear_logs, log_snapshot, read_stream_chunk
@@ -480,26 +480,29 @@ def _optional_position(data: dict, key: str, *, minimum: int) -> int | None:
     return value
 
 
-@router.post("/organize/{log_id}/reorganize/preview")
-def preview_reorganize(log_id: int, request: Request,
-                       data: dict | None = Body(default=None)):
-    require_api_login(request)
-    data = data or {}
+def _reorganize_candidate(data: dict) -> dict:
     tmdb_id = str(data.get("tmdb_id") or "").strip()
     provider = str(data.get("provider") or ("tmdb" if tmdb_id else "")).strip().lower()
     external_id = str(data.get("external_id") or tmdb_id).strip()
     media_type = str(data.get("media_type") or "").strip()
     if provider not in {"tmdb", "metatube", "clean_title"} or not external_id or media_type not in {"movie", "tv"}:
-        return api_error("请选择有效的媒体候选", 400)
+        raise ValueError("请选择有效的媒体候选")
+    return {
+        "tmdb_id": tmdb_id, "media_type": media_type, "provider": provider, "external_id": external_id,
+        "title": str(data.get("title") or "").strip(), "year": str(data.get("year") or "").strip(),
+        "season": _optional_position(data, "season", minimum=0),
+        "episode": _optional_position(data, "episode", minimum=1),
+    }
+
+
+@router.post("/organize/{log_id}/reorganize/preview")
+def preview_reorganize(log_id: int, request: Request,
+                       data: dict | None = Body(default=None)):
+    require_api_login(request)
     service = OrganizeCorrectionService()
     try:
-        return service.preview_reorganize(
-            log_id, tmdb_id, media_type,
-            str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
-            _optional_position(data, "season", minimum=0),
-            _optional_position(data, "episode", minimum=1),
-            provider=provider, external_id=external_id,
-        )
+        preview = service.preview_reorganize(log_id, **_reorganize_candidate(data or {}))
+        return {**preview, "preview_digest": correction_preview_digest(preview)}
     except DirectoryScrapeConflictError as exc:
         return api_error(public_error_message(exc), exc.status_code)
     except LookupError as exc:
@@ -654,40 +657,21 @@ def run_reorganize(log_id: int, request: Request,
     require_api_login(request)
     data = data or {}
     service = None
-    transferred = False
     try:
         token, version = _operation_payload(data)
+        candidate = _reorganize_candidate(data)
+        digest = data.get("preview_digest")
+        if not isinstance(digest, str) or not digest:
+            raise DirectoryScrapeConflictError("缺少整理预览确认，请重新预览后再执行")
         service = OrganizeCorrectionService()
-        tmdb_id = str(data.get("tmdb_id") or "").strip()
-        provider = str(data.get("provider") or ("tmdb" if tmdb_id else "")).strip().lower()
-        external_id = str(data.get("external_id") or tmdb_id).strip()
-        media_type = str(data.get("media_type") or "").strip()
-        if provider not in {"tmdb", "metatube", "clean_title"} or not external_id or media_type not in {"movie", "tv"}:
-            return api_error("请选择有效的媒体候选", 400)
-        season = _optional_position(data, "season", minimum=0)
-        episode = _optional_position(data, "episode", minimum=1)
-        service.preview_reorganize(
-            log_id, tmdb_id, media_type,
-            str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
-            season, episode, provider=provider, external_id=external_id,
-        )
+        preview = service.preview_reorganize(log_id, **candidate)
+        if version != preview["version"] or digest != correction_preview_digest(preview):
+            raise DirectoryScrapeConflictError("整理预览已变化，请重新预览后再执行")
         if not service.client.logged_in:
             return api_error("光鸭未登录，无法重新整理", 503)
-        result = get_organize_manager().start_operation(
-            "重新整理", f"日志 {log_id}",
-            _closing_operation(
-                service,
-                lambda: service.reorganize(
-                    log_id, token, version, tmdb_id, media_type,
-                    str(data.get("title") or "").strip(),
-                    str(data.get("year") or "").strip(),
-                    season, episode, provider=provider, external_id=external_id,
-                ),
-            ),
-        )
+        result = service.submit_reorganize(preview, token, confirmation_actor="human")
         if not result["ok"]:
             return api_error(result["error"], 409)
-        transferred = True
         return {**result, "operation_token": token}
     except DirectoryScrapeConflictError as exc:
         return api_error(public_error_message(exc), exc.status_code)
@@ -699,7 +683,7 @@ def run_reorganize(log_id: int, request: Request,
         logger.error("重新整理提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
     finally:
-        if service is not None and not transferred:
+        if service is not None:
             service.close()
 
 

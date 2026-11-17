@@ -606,15 +606,8 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         self.assertTrue(db.update_organize_log(log_id, confirmation_actor="agent"))
         before = organize_history_repo.capture_organize_business_snapshot(log_id)
         self.assertEqual(list_manual_episode_confirmations("1"), [])
-        service.reorganize(
-            log_id,
-            "manual-pos",
-            service.detail(log_id)["version"],
-            "1",
-            "tv",
-            season=2,
-            episode=3,
-        )
+        preview = service.preview_reorganize(log_id, "1", "tv", season=2, episode=3)
+        service._execute_reorganize(log_id, "manual-pos", preview["version"], preview)
         get_organize_log_result_10 = db.get_organize_log(log_id)
         assert get_organize_log_result_10 is not None
         row = dict(get_organize_log_result_10)
@@ -653,9 +646,8 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             "parse_media",
             return_value=SimpleNamespace(effective_season=2, effective_episode=3),
         ):
-            service.reorganize(
-                log_id, "inferred", service.detail(log_id)["version"], "1", "tv"
-            )
+            preview = service.preview_reorganize(log_id, "1", "tv")
+            service._execute_reorganize(log_id, "inferred", preview["version"], preview)
             preview = service.preview_reorganize(log_id, "1", "tv")
         get_organize_log_result_11 = db.get_organize_log(log_id)
         assert get_organize_log_result_11 is not None
@@ -666,23 +658,14 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
 
     def test_revert_restores_business_identity_position_and_member_targets(self):
         log_id, cloud, service = self._fixture()
-        service.reorganize(
-            log_id, "first-confirmation", service.detail(log_id)["version"],
-            "1", "tv", season=1, episode=8,
-        )
+        preview = service.preview_reorganize(log_id, "1", "tv", season=1, episode=8)
+        service._execute_reorganize(log_id, "first-confirmation", preview["version"], preview)
         before = organize_history_repo.capture_organize_business_snapshot(log_id)
         archived = replace(cloud.files["video"])
         learning_before = [dict(row) for row in list_manual_episode_confirmations("1")]
         self.assertEqual(len(learning_before), 1)
-        service.reorganize(
-            log_id,
-            "correct",
-            service.detail(log_id)["version"],
-            "2",
-            "tv",
-            season=2,
-            episode=3,
-        )
+        preview = service.preview_reorganize(log_id, "2", "tv", season=2, episode=3)
+        service._execute_reorganize(log_id, "correct", preview["version"], preview)
         self.assertEqual(list_manual_episode_confirmations("1"), [])
         changed_learning = list_manual_episode_confirmations("2")
         self.assertEqual(len(changed_learning), 1)
@@ -727,15 +710,8 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         self,
     ):
         log_id, cloud, service = self._fixture()
-        service.reorganize(
-            log_id,
-            "legacy",
-            service.detail(log_id)["version"],
-            "2",
-            "tv",
-            season=2,
-            episode=3,
-        )
+        preview = service.preview_reorganize(log_id, "2", "tv", season=2, episode=3)
+        service._execute_reorganize(log_id, "legacy", preview["version"], preview)
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE organize_operation_steps SET state_before_json='' WHERE log_id=?",
@@ -762,24 +738,15 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         original = replace(cloud.files["video"])
         cloud.fail_operation = "rename"
         with self.assertRaisesRegex(TimeoutError, "服务端已提交，但响应丢失"):
-            service.reorganize(
-                log_id, "failed-first-correction", service.detail(log_id)["version"],
-                "2", "tv", season=2, episode=3,
-            )
+            preview = service.preview_reorganize(log_id, "2", "tv", season=2, episode=3)
+            service._execute_reorganize(log_id, "failed-first-correction", preview["version"], preview)
         self.assertEqual(cloud.files["video"], original)
         self.assertEqual(service.detail(log_id)["status"], "failed")
         self.assertEqual(list_manual_episode_confirmations("1"), [])
         self.assertEqual(list_manual_episode_confirmations("2"), [])
 
-        service.reorganize(
-            log_id,
-            "correct",
-            service.detail(log_id)["version"],
-            "2",
-            "tv",
-            season=2,
-            episode=3,
-        )
+        preview = service.preview_reorganize(log_id, "2", "tv", season=2, episode=3)
+        service._execute_reorganize(log_id, "correct", preview["version"], preview)
         before_undo = replace(cloud.files["video"])
         learning_before = [dict(row) for row in list_manual_episode_confirmations("2")]
         self.assertEqual(len(learning_before), 1)
@@ -833,15 +800,8 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         db.add_organize_log_items(log_id, members)
         before = organize_history_repo.capture_organize_business_snapshot(log_id)
         originals = {file_id: replace(item) for file_id, item in cloud.files.items()}
-        service.reorganize(
-            log_id,
-            "large-correct",
-            service.detail(log_id)["version"],
-            "2",
-            "tv",
-            season=2,
-            episode=3,
-        )
+        preview = service.preview_reorganize(log_id, "2", "tv", season=2, episode=3)
+        service._execute_reorganize(log_id, "large-correct", preview["version"], preview)
         self.assertEqual(len(service.detail(log_id)["operations"]), 300)
         steps = organize_history_repo.list_latest_reversible_organize_steps(log_id)
         self.assertEqual(len(steps), 306)
@@ -857,19 +817,11 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         import json
 
         log_id, _cloud, service = self._fixture()
-        service.reorganize(
-            log_id,
-            "special",
-            service.detail(log_id)["version"],
-            "1",
-            "tv",
-            season=0,
-            episode=3,
-        )
+        preview = service.preview_reorganize(log_id, "1", "tv", season=0, episode=3)
+        service._execute_reorganize(log_id, "special", preview["version"], preview)
         self.assertEqual(service.preview_reorganize(log_id, "1", "tv")["season"], 0)
-        service.reorganize(
-            log_id, "movie", service.detail(log_id)["version"], "1", "movie"
-        )
+        preview = service.preview_reorganize(log_id, "1", "movie")
+        service._execute_reorganize(log_id, "movie", preview["version"], preview)
         get_organize_log_result_12 = db.get_organize_log(log_id)
         assert get_organize_log_result_12 is not None
         row = dict(get_organize_log_result_12)

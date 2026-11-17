@@ -2689,9 +2689,8 @@ class OrganizeCorrectionTests(unittest.TestCase):
                     client=cast(GuangYaClient, FakeClient()), scraper=cast(TMDBScraper, FakeScraper())
                 )
                 version = service.detail(log_id)["version"]
-                result = service.reorganize(
-                    log_id, "reorganize-success", version, "99", "movie"
-                )
+                preview = service.preview_reorganize(log_id, "99", "movie")
+                result = service._execute_reorganize(log_id, "reorganize-success", version, preview)
                 get_organize_log_result_9 = db.get_organize_log(log_id)
                 assert get_organize_log_result_9 is not None
                 updated_log = dict(get_organize_log_result_9)
@@ -2788,9 +2787,8 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 )
                 version = service.detail(log_id)["version"]
                 with self.assertRaisesRegex(RuntimeError, "simulated rename failure"):
-                    service.reorganize(
-                        log_id, "reorganize-fail", version, "99", "movie"
-                    )
+                    preview = service.preview_reorganize(log_id, "99", "movie")
+                    service._execute_reorganize(log_id, "reorganize-fail", version, preview)
                 self.assertEqual(
                     (remote["video"].parent_id, remote["video"].name),
                     ("target-id", "电影.mkv"),

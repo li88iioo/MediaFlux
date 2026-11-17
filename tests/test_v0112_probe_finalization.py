@@ -188,8 +188,8 @@ class ProbeSupersededFinalizationTests(unittest.TestCase):
                         clock._due(job_id)
                         worker._process_one()
                     self.assertEqual(clock._job(job_id)["status"], "retry_wait")
-                    correction = service.reorganize(log_id, "later-manual", service.detail(log_id)["version"],
-                                                    "2", "tv", season=2, episode=3)
+                    preview = service.preview_reorganize(log_id, "2", "tv", season=2, episode=3)
+                    correction = service._execute_reorganize(log_id, "later-manual", preview["version"], preview)
                     self.assertTrue(correction["success"])
                     before = dict(db.list_organize_log_items(log_id)[0])
                     second = OrganizeProbeWorker()

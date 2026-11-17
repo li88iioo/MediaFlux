@@ -93,7 +93,8 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
         get_organize_log_result = db.get_organize_log(self.log_id)
         assert get_organize_log_result is not None
         version = get_organize_log_result["version"]
-        return self.service.reorganize(self.log_id, f"archive-{version}", version, "4242", "tv")
+        preview = self.service.preview_reorganize(self.log_id, "4242", "tv")
+        return self.service._execute_reorganize(self.log_id, f"archive-{version}", version, preview)
 
     def _revert(self):
         get_organize_log_result_2 = db.get_organize_log(self.log_id)

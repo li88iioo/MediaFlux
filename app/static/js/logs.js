@@ -957,7 +957,10 @@ async function previewOrganizeCandidate(candidate){
         const data=await response.json();
         if(sequence!==organizePreviewSequence)return;
         if(!response.ok)throw new Error(data.error||'预览失败');
-        organizePreview={payload};
+        if(!data.preview_digest||data.version!==organizeDetail.version){
+            throw new Error('整理预览与当前详情不一致，请刷新详情后重新预览');
+        }
+        organizePreview={payload,digest:data.preview_digest};
         const box=document.getElementById('organizeNamingPreview');
         const fullTarget=[data.target_path,data.file_name].filter(Boolean).join('/');
         box.hidden=false;
@@ -1088,7 +1091,7 @@ async function runOrganizeReorganize(){
     }
     invalidateOrganizePreview();
     try{
-        await runOrganizeAction('/reorganize','POST',payload);
+        await runOrganizeAction('/reorganize','POST',{...payload,preview_digest:preview.digest});
     }finally{
         if(serial===organizeDetailSerial)document.getElementById('organizeReorganizeBtn').disabled=!canExecuteOrganizePreview();
     }
