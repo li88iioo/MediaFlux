@@ -7376,6 +7376,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(mode, "jellyfin_android")
 
     def test_android_infers_missing_container_and_uses_direct_stream(self):
+        local = {
+            "Id": "local-version", "Path": "/media/local.mp4", "Protocol": "File",
+            "Container": "mov,mp4,m4a,3gp,3g2,mj2", "SupportsDirectPlay": True,
+            "MediaStreams": [{"Type": "Video", "Index": 0, "Codec": "h264"}],
+        }
         cases = (
             (
                 {
@@ -7383,6 +7388,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                     "Path": "/playgy/android-a/e/1/video.mkv",
                 },
                 "/Videos/android-item/stream.mkv",
+                None,
             ),
             (
                 {
@@ -7391,15 +7397,21 @@ class HybridMediaProxyTests(unittest.TestCase):
                     "Container": "mkv;unsafe",
                 },
                 "/Videos/android-item/stream",
+                None,
+            ),
+            (
+                {"Id": "manual-version", "Path": "/mount/manual.mp4"},
+                "/Videos/android-item/stream.mp4",
+                {"id": 9, "source_type": "guangya", "media_source_id": "manual-version", "guangya_file_id": "manual-file"},
             ),
         )
 
-        for source, expected_path in cases:
+        for source, expected_path, binding in cases:
             with self.subTest(source=source):
-                payload = {"MediaSources": [copy.deepcopy(source)]}
+                payload = {"MediaSources": copy.deepcopy([source, local])}
                 with patch(
                     "app.repositories.media_proxy.get_media_proxy_binding",
-                    return_value=None,
+                    side_effect=lambda _instance, _items, sources, **_: binding if source["Id"] in sources else None,
                 ):
                     rewritten, changed = media_proxy.rewrite_playback_info(
                         payload,
@@ -7413,7 +7425,8 @@ class HybridMediaProxyTests(unittest.TestCase):
                     )
 
                 self.assertTrue(changed)
-                rewritten_source = rewritten["MediaSources"][0]
+                rewritten_source, local_source = rewritten["MediaSources"]
+                self.assertEqual(local_source, local)
                 self.assertEqual(
                     urlsplit(rewritten_source["DirectStreamUrl"]).path,
                     expected_path,
@@ -7421,8 +7434,9 @@ class HybridMediaProxyTests(unittest.TestCase):
                 self.assertFalse(rewritten_source["SupportsDirectPlay"])
                 self.assertTrue(rewritten_source["SupportsDirectStream"])
                 self.assertFalse(rewritten_source["SupportsTranscoding"])
-                if expected_path.endswith(".mkv"):
-                    self.assertEqual(rewritten_source["Container"], "mkv")
+                expected_container = Path(expected_path).suffix.removeprefix(".")
+                if expected_container:
+                    self.assertEqual(rewritten_source["Container"], expected_container)
                 self.assertEqual(
                     rewritten_source["TranscodingSubProtocol"], "http"
                 )

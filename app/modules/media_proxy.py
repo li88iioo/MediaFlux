@@ -4069,6 +4069,19 @@ def rewrite_playback_info(
         if not isinstance(source, dict):
             continue
         source_id = str(source.get("Id") or "")
+        binding = _media_proxy_binding(
+            instance_id,
+            item_id,
+            source_id,
+            upstream_identity=upstream_identity,
+            item_level_scopes=item_level_scopes,
+            allow_item_level=allow_item_level,
+            auth_scope=auth_scope,
+        )
+        file_id = str(binding["guangya_file_id"] or "") if binding else _extract_guangya_file_id(source.get("Path"))
+        if not binding and not file_id:
+            continue
+
         normalized_source_id = _normalized_media_identifier(source_id)
         browser_source_identity_unique = bool(
             allow_item_level
@@ -4093,82 +4106,21 @@ def rewrite_playback_info(
             (native_client_mode or "").strip().casefold() == "web"
             and source.get("SupportsDirectPlay") is True
         )
-        binding = _media_proxy_binding(
-            instance_id,
-            item_id,
-            source_id,
-            upstream_identity=upstream_identity,
-            item_level_scopes=item_level_scopes,
-            allow_item_level=allow_item_level,
-            auth_scope=auth_scope,
-        )
-        if binding:
-            direct_url = _direct_stream_path(
-                item_id,
-                source_id,
-                route_prefix,
-                playback_session_token,
-                source_signature,
-                native_stream_container,
-            )
-            client_direct_url = _client_stream_url(
-                direct_url, client_base_url, native_client_mode
-            )
-            _mark_direct_source(
-                source,
-                client_direct_url,
-                native_client_mode=native_client_mode,
-                client_base_url=client_base_url,
-                cloud_file_id=(
-                    str(binding["guangya_file_id"] or "")
-                    if binding["source_type"] == "guangya" else ""
-                ),
-            )
-            if (
-                browser_direct_play_eligible
-                and browser_source_identity_unique
-                and browser_direct_redirect_signatures is not None
-            ):
-                browser_direct_redirect_signatures.add(
-                    source_signature
-                )
-            for grant_scope in grant_scopes:
-                if not str(binding["media_source_id"] or "").strip():
-                    item_level_scopes.register(
-                        instance_id,
-                        item_id,
-                        source_id,
-                        _binding_signature(binding),
-                        grant_scope,
-                    )
-                playback_grants.register(
-                    grant_scope,
-                    instance_id,
-                    item_id,
-                    source_id,
-                    source_type=str(
-                        binding["source_type"] or ""
-                    ),
-                    file_id=str(
-                        binding["guangya_file_id"] or ""
-                    ),
-                    binding_signature=_binding_signature(binding),
-                )
-            changed = True
-            continue
-
-        file_id = _extract_guangya_file_id(source.get("Path"))
-        if not file_id:
-            continue
-        dynamic_mappings.register(instance_id, item_id, source_id, file_id)
+        source_type = str(binding["source_type"] or "") if binding else "dynamic"
+        binding_signature = _binding_signature(binding) if binding else ""
+        if not binding:
+            dynamic_mappings.register(instance_id, item_id, source_id, file_id)
         for grant_scope in grant_scopes:
+            if binding and not str(binding["media_source_id"] or "").strip():
+                item_level_scopes.register(instance_id, item_id, source_id, binding_signature, grant_scope)
             playback_grants.register(
                 grant_scope,
                 instance_id,
                 item_id,
                 source_id,
-                source_type="dynamic",
+                source_type=source_type,
                 file_id=file_id,
+                binding_signature=binding_signature,
             )
         direct_url = _direct_stream_path(
             item_id,
@@ -4185,7 +4137,7 @@ def rewrite_playback_info(
             source,
             client_direct_url,
             native_client_mode=native_client_mode,
-            cloud_file_id=file_id,
+            cloud_file_id=file_id if source_type in {"guangya", "dynamic"} else "",
             client_base_url=client_base_url,
         )
         if (
