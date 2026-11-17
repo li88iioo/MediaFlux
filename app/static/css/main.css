@@ -3766,7 +3766,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .share-check-all input, .share-file-row input[type="checkbox"] { width: 16px; height: 16px; flex-shrink: 0; accent-color: var(--accent); cursor: pointer; }
 .share-count-badge { padding: 2px 10px; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 999px; font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
 
-.share-file-list { min-width: 0; max-height: 520px; overflow-y: auto; overscroll-behavior: contain; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: var(--radius); }
+/* 与空态占位同高：空态、少量文件与重新输入链接之间切换时，下方按钮不跳动。 */
+.share-file-list { min-width: 0; min-height: 262px; max-height: 520px; overflow-y: auto; overscroll-behavior: contain; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: var(--radius); }
 .share-file-list:has(> .share-empty-state) { background: var(--bg-input); border-style: dashed; }
 .share-file-row { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 56px; padding: 8px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer; transition: background-color .15s ease; }
 .share-file-row:last-child { border-bottom: 0; }

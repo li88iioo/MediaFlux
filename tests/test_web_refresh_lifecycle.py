@@ -767,8 +767,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               restoreShareBtn: {disabled: false},
               shareFileToolbar: {hidden: true},
               shareFileList: {
-                innerHTML: '', children: [],
-                replaceChildren() {this.innerHTML = ''; this.children = [];},
+                innerHTML: '<div class="share-empty-state">还没有解析分享</div>', children: [],
                 querySelectorAll() {return [];},
               },
               shareMessage: {textContent: ''},
@@ -803,6 +802,8 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.equal(previewUrl, '');
               assert.deepEqual(files, []);
               assert.equal(elements.shareFileToolbar.hidden, true);
+              // 失效后恢复初始空态，列表不塌陷成零高度。
+              assert.equal(elements.shareFileList.innerHTML, '<div class="share-empty-state">还没有解析分享</div>');
               assert.equal(elements.restoreShareBtn.disabled, true);
               assert.equal(elements.inspectShareBtn.disabled, false);
               assert.match(elements.inspectShareBtn.innerHTML, /解析分享/);

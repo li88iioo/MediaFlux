@@ -8,6 +8,8 @@
     let submitting=false;
     let selectionGeneration=0;
     let pickerSession=null;
+    // 清空预览时恢复初始空态占位，保持列表高度，避免输入链接时下方按钮上跳。
+    const emptyFileList=document.getElementById('shareFileList').innerHTML;
 
     const escapeHtml=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const formatSize=size=>{
@@ -66,7 +68,9 @@
         files=[];
         cancelPicker();
         document.getElementById('shareFileToolbar').hidden=true;
-        document.getElementById('shareFileList').replaceChildren();
+        const list=document.getElementById('shareFileList');
+        list.innerHTML=emptyFileList;
+        window.renderLucideIcons?.(list);
         setStep(1);
         updateSelection();
         if(message&&hadPreview){
