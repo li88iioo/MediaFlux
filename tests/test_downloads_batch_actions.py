@@ -450,6 +450,87 @@ class DirectDownloadApiTests(LoggedInDownloadsApiCase):
         kwargs = dispatch.call_args.kwargs
         self.assertEqual((kwargs["gy_target_dir"], kwargs["gy_target_name"]), ("adult-1", "NewNsfw"))
 
+    def test_empty_nsfw_form_field_never_falls_back_to_the_default_directory(self):
+        headers = self._headers()
+        url = "magnet:?xt=urn:btih:" + "9" * 40
+        cases = (
+            ({"url": url, "target": "guangya", "nsfw_source_id": ""}, None),
+            ({"url": url, "target": "guangya", "nsfw_source_id": "  "}, None),
+            ({"target": "guangya", "nsfw_source_id": ""},
+             {"file": ("sample.torrent", _torrent_bytes(), "application/x-bittorrent")}),
+        )
+        with patch("app.indexers.downloads.download_target_readiness", return_value={"guangya": True}), \
+             patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1), \
+             patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[]), \
+             patch("app.indexers.downloads.dispatch_request", return_value={"succeeded": ["guangya"]}) as dispatch:
+            for data, files in cases:
+                with self.subTest(data=data, multipart=files is not None):
+                    response = self.client.post("/api/downloads/direct/submit", headers=headers, data=data, files=files)
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertEqual(response.json()["code"], "download_not_submitted")
+                    self.assertEqual(self._request_count(), 0)
+            dispatch.assert_not_called()
+
+    def test_nsfw_submission_keeps_canonical_directory_and_history_on_duplicates(self):
+        headers = self._headers()
+        url = "magnet:?xt=urn:btih:" + "8" * 40
+        values = {
+            "GY_ORGANIZE_NSFW_ENABLED": "true",
+            "GY_ORGANIZE_SOURCE_DIRS": '["ordinary",{"id":"adult-a","name":"正式来源 A"},{"id":"adult-b","name":"正式来源 B"}]',
+            "GY_ORGANIZE_NSFW_SOURCE_IDS": '["adult-a","adult-b"]',
+        }
+
+        def submit_offline(_url, **kwargs):
+            self.assertEqual((kwargs["target_dir_id"], kwargs["target_dir_name"]), ("adult-a", "正式来源 A"))
+            staging = {"id": "stage-a", "parent_id": "adult-a", "parent_name": "正式来源 A",
+                       "name": "MF-task", "isolated": True}
+            kwargs["on_staging_created"](staging)
+            return {"ok": True, "task_ids": ["cloud-task"], "staging": staging,
+                    "decision": {"target_dir_id": "stage-a", "target_dir_name": "正式来源 A / MF-task"}}
+
+        with patch.dict("os.environ", values), \
+             patch("app.indexers.downloads.download_target_readiness", return_value={"guangya": True}), \
+             patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1), \
+             patch("app.modules.download_dispatcher.GuangYaClient") as client, \
+             patch("app.modules.download_dispatcher._recover_guangya_magnet_torrent", return_value=None), \
+             patch("app.modules.download_dispatcher.submit_offline", side_effect=submit_offline) as offline:
+            client.return_value.logged_in = True
+            client.return_value.credential_generation = 1
+            first = self.client.post("/api/downloads/direct/submit", headers=headers, data={
+                "url": url, "target": "guangya", "nsfw_source_id": "adult-a",
+                "gy_target_dir": "forged", "gy_target_name": "伪造名称",
+            })
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["status"], "submitted")
+            request_id = first.json()["request_id"]
+            row = download_requests_repo.get_download_request(request_id)
+            assert row is not None
+            original = dict(row)
+            self.assertEqual((original["gy_requested_target_dir"], original["gy_requested_nsfw"],
+                              original["gy_staging_parent_dir"], original["gy_target_dir"]),
+                             ("adult-a", 1, "adult-a", "stage-a"))
+            for source in (None, "adult-b"):
+                with self.subTest(duplicate_source=source):
+                    data = {"url": url, "target": "guangya"}
+                    if source is not None:
+                        data["nsfw_source_id"] = source
+                    duplicate = self.client.post("/api/downloads/direct/submit", headers=headers, data=data)
+                    self.assertEqual(duplicate.status_code, 200, duplicate.text)
+                    self.assertEqual((duplicate.json()["status"], duplicate.json()["request_id"]), ("duplicate", request_id))
+                    current = download_requests_repo.get_download_request(request_id)
+                    assert current is not None
+                    self.assertEqual(dict(current), original)
+            for change in ({"GY_ORGANIZE_NSFW_ENABLED": "false"}, {"GY_ORGANIZE_SOURCE_DIRS": '[]'},
+                           {"GY_ORGANIZE_NSFW_SOURCE_IDS": '["adult-b"]'}):
+                with self.subTest(change=change), patch.dict("os.environ", change):
+                    stale = self.client.post("/api/downloads/direct/submit", headers=headers, data={
+                        "url": "magnet:?xt=urn:btih:" + "7" * 40, "target": "guangya", "nsfw_source_id": "adult-a",
+                    })
+                    self.assertEqual(stale.status_code, 400, stale.text)
+                    self.assertEqual(stale.json()["code"], "download_not_submitted")
+            offline.assert_called_once()
+            self.assertEqual(self._request_count(), 1)
+
     def test_confirmed_torrent_keeps_bytes_and_deduplicates_equivalent_magnets(self):
         from tests.test_torrent_manifest import _bencode, _torrent
 

@@ -5,7 +5,7 @@ import logging
 import re
 import time
 
-from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
 
 from app import config
 from app.repositories import download_requests as download_requests_repo
@@ -666,9 +666,16 @@ def preview_direct_download(request: Request, url: str = Form(""), file: UploadF
     return api_response({**details, "backends": backends, "targets": targets})
 
 
+async def _direct_nsfw_source_id(request: Request, nsfw_source_id: str | None = Form(None)) -> str | None:
+    # FastAPI 将空表单字段转为默认值；保留显式空选择，避免误当作普通光鸭目标。
+    if nsfw_source_id is None and "nsfw_source_id" in await request.form():
+        return ""
+    return nsfw_source_id
+
+
 @router.post("/direct/submit")
 def submit_direct_download(request: Request, target: str = Form(""), url: str = Form(""),
-                           file: UploadFile | None = File(None), nsfw_source_id: str | None = Form(None)):
+                           file: UploadFile | None = File(None), nsfw_source_id: str | None = Depends(_direct_nsfw_source_id)):
     """创建幂等下载请求并提交到所选后端；与 Agent 的 downloads.submit 共用同一服务。"""
     require_api_login(request)
     from app.indexers import downloads

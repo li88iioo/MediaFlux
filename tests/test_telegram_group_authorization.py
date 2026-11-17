@@ -975,6 +975,34 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         tracker_getter.assert_not_called()
         self.assertIn("本次未提交", bot.edits[-1][0][0])
 
+    def test_empty_nsfw_dispatch_never_falls_back_to_the_default_directory(self):
+        from unittest.mock import Mock
+        from app.bot import handlers
+
+        bot = SimpleNamespace(edit_message_text=Mock())
+        with patch("app.modules.download_dispatcher.dispatch_request") as dispatch, \
+             patch("app.modules.download_tracker.get_download_tracker") as tracker:
+            handlers._dispatch_download_callback(bot, 100, 23, 77, "guangya", nsfw_source_id="")
+        dispatch.assert_not_called()
+        tracker.assert_not_called()
+        self.assertIn("本次未提交", bot.edit_message_text.call_args.args[0])
+
+    def test_duplicate_nsfw_dispatch_does_not_attribute_existing_request_to_new_source(self):
+        from unittest.mock import Mock
+        from app.bot import handlers
+
+        bot = SimpleNamespace(edit_message_text=Mock())
+        with patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[
+            {"id": "new-source", "name": "另一个成人来源"},
+        ]), patch("app.modules.download_dispatcher.dispatch_request", return_value={
+            "duplicate": True, "error": "该请求已提交或正在处理",
+        }), patch("app.modules.download_tracker.get_download_tracker"):
+            handlers._dispatch_download_callback(bot, 100, 23, 77, "guangya", nsfw_source_id="new-source")
+        receipt = bot.edit_message_text.call_args.args[0]
+        self.assertIn("下载请求已存在", receipt)
+        self.assertNotIn("另一个成人来源", receipt)
+        self.assertNotIn("按 NSFW 规则整理", receipt)
+
 
 if __name__ == "__main__":
     unittest.main()

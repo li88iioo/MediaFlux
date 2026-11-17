@@ -35,7 +35,6 @@ from app.agent.owner_routes import normalize_delivery_route
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
 from app.logger import get_logger, log_throttled
-from app.modules.organize_sources import find_nsfw_download_source
 from app.modules.strm_notifications import cleanup_notice_lines
 from app.notifier import (
     NotificationEvent,
@@ -2369,6 +2368,7 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
 
 
 def _handle_write_confirmation_callback(bot, call, telebot) -> None:
+    from app.indexers.downloads import DirectDownloadPreconditionError, download_target_destination
     from app.modules.telegram_write_confirmations import (
         TelegramWriteConfirmationError,
         get_telegram_write_confirmation_store,
@@ -2457,8 +2457,9 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                 if target != "guangya":
                     raise TelegramWriteConfirmationError("NSFW 下载目标无效")
                 nsfw_source_id = str(value.get("nsfw_source_id") or "").strip()
-                source = find_nsfw_download_source(nsfw_source_id)
-                if source is None:
+                try:
+                    download_target_destination(target, nsfw_source_id=nsfw_source_id)
+                except DirectDownloadPreconditionError:
                     notice = (
                         "未配置 NSFW 整理来源，本次未提交；请先配置或选择其他目标。"
                         if not nsfw_source_id
@@ -3072,45 +3073,35 @@ def _dispatch_download_callback(
     request_id: int,
     target: str,
     *,
-    nsfw_source_id: str = "",
+    nsfw_source_id: str | None = None,
 ) -> None:
+    from app.indexers.downloads import DirectDownloadPreconditionError, download_target_destination
     from app.modules.download_dispatcher import (
         dispatch_request,
         public_dispatch_summary,
     )
     from app.modules.download_tracker import get_download_tracker
 
-    nsfw_source = None
-    if nsfw_source_id:
-        nsfw_source = find_nsfw_download_source(nsfw_source_id)
-        if target != "guangya" or nsfw_source is None:
-            try:
-                bot.edit_message_text(
-                    "<b>下载未提交</b>\n"
-                    "NSFW 来源配置已变化，本次未提交；请重新发送链接或种子选择目标。",
-                    chat_id,
-                    message_id,
-                    reply_markup=None,
-                )
-            except Exception as exc:  # noqa: BLE001 - Telegram may raise SDK-specific errors
-                logger.warning(
-                    "Telegram NSFW 来源失效回执投递失败 request#%s type=%s",
-                    request_id,
-                    type(exc).__name__,
-                )
-            return
+    try:
+        destination = download_target_destination(target, nsfw_source_id=nsfw_source_id)
+    except DirectDownloadPreconditionError as exc:
+        try:
+            bot.edit_message_text(
+                f"<b>下载未提交</b>\n{html.escape(str(exc))}；请重新发送链接或种子选择目标。",
+                chat_id,
+                message_id,
+                reply_markup=None,
+            )
+        except Exception as delivery_exc:  # noqa: BLE001 - Telegram may raise SDK-specific errors
+            logger.warning(
+                "Telegram 下载目标失效回执投递失败 request#%s type=%s",
+                request_id,
+                type(delivery_exc).__name__,
+            )
+        return
 
     try:
-        result = (
-            dispatch_request(
-                request_id,
-                target,
-                gy_target_dir=nsfw_source["id"],
-                gy_target_name=nsfw_source["name"],
-            )
-            if nsfw_source is not None
-            else dispatch_request(request_id, target)
-        )
+        result = dispatch_request(request_id, target, **destination)
         summary = public_dispatch_summary(result)
     except Exception as exc:
         logger.error(
@@ -3141,8 +3132,8 @@ def _dispatch_download_callback(
     text = f"<b>{title}</b>\n请求: #{request_id}"
     labels = {"qb": "qBittorrent", "guangya": "光鸭云盘"}
     succeeded = summary["succeeded"]
-    if nsfw_source is not None:
-        source_name = (nsfw_source.get("name") or nsfw_source["id"])
+    if destination and status != "duplicate":
+        source_name = destination["gy_target_name"] or destination["gy_target_dir"]
         text += f"\nNSFW 整理来源：{html.escape(source_name)}（按 NSFW 规则整理）"
     if succeeded:
         text += "\n成功: " + "、".join(labels[item] for item in succeeded)

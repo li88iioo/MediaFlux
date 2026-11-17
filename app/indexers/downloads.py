@@ -267,10 +267,17 @@ def download_target_options() -> list[dict[str, str]]:
     return options
 
 
-def nsfw_download_destination(source_id: str) -> _DownloadDestination:
-    """按当前配置解析 NSFW 来源目录；来源已删除或未配置时拒绝，不回退到普通离线目录。"""
+def download_target_destination(target: str, *, nsfw_source_id: str | None = None) -> _DownloadDestination:
+    """Web/TG 共用目标解析；显式 NSFW 选择失效时拒绝，不回退到普通离线目录。"""
     from app.modules.organize_sources import find_nsfw_download_source
 
+    if target not in DOWNLOAD_TARGETS:
+        raise DirectDownloadPreconditionError("下载目标无效")
+    if nsfw_source_id is None:
+        return {}
+    if target != "guangya":
+        raise DirectDownloadPreconditionError("NSFW 下载目标无效")
+    source_id = nsfw_source_id.strip()
     source = find_nsfw_download_source(source_id)
     if source is None:
         raise DirectDownloadPreconditionError(
@@ -871,11 +878,7 @@ def submit_direct_download(item: DownloadInput, target: str, *, origin: str,
 
     nsfw_source_id 与 TG 的 NSFW 目标一致：只用于光鸭，按当前配置解析为专用整理来源目录。
     """
-    destination: _DownloadDestination = {}
-    if nsfw_source_id is not None:
-        if target != "guangya":
-            raise DirectDownloadPreconditionError("NSFW 下载目标无效")
-        destination = nsfw_download_destination(nsfw_source_id)
+    destination = download_target_destination(target, nsfw_source_id=nsfw_source_id)
     try:
         preview, snapshot = preview_direct_download(item, target)
     except ValueError as exc:
