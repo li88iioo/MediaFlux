@@ -39,6 +39,7 @@ READY = {
 }
 
 
+@unittest.skipIf(sync_playwright is None, "未安装 Playwright")
 class ConfigBackfillBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
