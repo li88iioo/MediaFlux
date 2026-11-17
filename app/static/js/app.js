@@ -486,16 +486,19 @@
     const directoryPickerInstances = new Map();
 
     window.openGuangYaDirectoryPicker = function (options) {
-        function isVirtualRootId(id) {
-            const raw = String(id || '').trim().toLowerCase();
-            return !raw || raw === '__roots__' || raw === '0' || raw === 'undefined' || raw === 'null' || raw === '[object object]';
-        }
         const modalId = options.modalId || 'guangyaDirModal';
         const returnFocus = options.trigger || document.activeElement;
         directoryPickerInstances.get(modalId)?.destroy({restoreFocus: false});
         document.getElementById(modalId)?.remove();
         const multiple = options.multiple === true;
         const allowRoot = options.allowRoot !== false;
+        const allowLogicalRoot = allowRoot && !multiple && options.allowLogicalRoot === true
+            && String(options.rootId || '0') === '0';
+        function isVirtualRootId(id, path) {
+            const raw = String(id ?? '').trim().toLowerCase();
+            if (raw === '0') return !(allowLogicalRoot && path?.length === 0);
+            return !raw || raw === '__roots__' || raw === 'undefined' || raw === 'null' || raw === '[object object]';
+        }
         const selected = new Map(
             (Array.isArray(options.selected) ? options.selected : [])
                 .filter((item) => item && item.id && !isVirtualRootId(item.id))
@@ -587,7 +590,7 @@
         }
         function updateSelectionControls() {
             const current = currentNode();
-            const isVirtual = isVirtualRootId(current.id);
+            const isVirtual = isVirtualRootId(current.id, current.path);
             const isDisallowedRoot = !allowRoot && String(current.id) === String(options.rootId || '0');
             const disabled = isVirtual || isDisallowedRoot || (stableLoading && isLoading);
             selectCurrent.disabled = disabled;
@@ -619,14 +622,14 @@
                 if (accepted !== false) close();
                 return;
             }
-            if (!value || isVirtualRootId(value.id)) return;
+            if (!value || isVirtualRootId(value.id, value.path)) return;
             const accepted = options.onSelect?.(value);
             if (accepted !== false) close();
         }
         function selectNode(node) {
             if (closed || (stableLoading && isLoading)) return;
             const value = normalizedNode(node);
-            if (isVirtualRootId(value.id)) return;
+            if (isVirtualRootId(value.id, value.path)) return;
             if (!allowRoot && value.id === String(options.rootId || '0')) return;
             if (!multiple) {
                 commitSelection(value);
@@ -647,7 +650,7 @@
                 empty.className = 'empty-state';
                 const text = document.createElement('p');
                 const current = currentNode();
-                if (isVirtualRootId(current.id)) {
+                if (isVirtualRootId(current.id, current.path)) {
                     text.textContent = '当前没有可选择的驱动器或目录';
                 } else {
                     text.textContent = allowRoot || state.path.length ? '无子目录，可选择当前目录' : '当前没有可选择的子目录';

@@ -15,9 +15,9 @@ LOCAL_MEDIA_JS = ROOT / "app" / "static" / "js" / "local-media.js"
 class DirectoryPickerSecurityCodeContractTests(unittest.TestCase):
     def test_app_js_has_virtual_root_guard_contracts(self):
         js = APP_JS.read_text(encoding="utf-8")
-        self.assertIn("function isVirtualRootId(id)", js)
+        self.assertIn("function isVirtualRootId(id, path)", js)
         self.assertIn("raw === 'undefined' || raw === 'null'", js)
-        self.assertIn("const isVirtual = isVirtualRootId(current.id);", js)
+        self.assertIn("const isVirtual = isVirtualRootId(current.id, current.path);", js)
         self.assertIn(
             "const isDisallowedRoot = !allowRoot && String(current.id) === String(options.rootId || '0');",
             js,
@@ -25,7 +25,7 @@ class DirectoryPickerSecurityCodeContractTests(unittest.TestCase):
         self.assertIn("selectCurrent.disabled = disabled;", js)
         self.assertIn("虚拟根入口不可选，请进入具体驱动器或目录", js)
         self.assertIn("当前根目录不可选，请选择子目录", js)
-        self.assertIn("if (isVirtualRootId(value.id)) return;", js)
+        self.assertIn("if (isVirtualRootId(value.id, value.path)) return;", js)
         self.assertIn("directory.file_id ?? directory.id ?? directory.path", js)
         self.assertNotIn(
             "function updateSelectionControls() {\n            if (!multiple) return;",
@@ -331,6 +331,24 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                 picker2.close();
                 testResults.test3_request_aborted = pendingSignal?.aborted === true;
 
+                for (const [name, options] of Object.entries({
+                    default: {},
+                    logical: {allowLogicalRoot: true},
+                    virtual: {allowLogicalRoot: true, rootId: '__roots__'},
+                    disallowed: {allowLogicalRoot: true, allowRoot: false},
+                    multiple: {allowLogicalRoot: true, multiple: true},
+                })) {
+                    let value = null;
+                    const picker = window.openGuangYaDirectoryPicker({
+                        ...options, fetchDirectory: async () => [], onSelect: item => { value = item; },
+                    });
+                    const button = picker.modal.querySelector('[data-dir-select-current]');
+                    const disabled = button.disabled;
+                    for (const handler of button._listeners.click || []) handler();
+                    testResults[name] = {disabled, value};
+                    picker.close();
+                }
+
                 // Output results as JSON
                 console.log(JSON.stringify(testResults));
             });
@@ -348,6 +366,10 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
         self.assertTrue(results.get("test2_focus_restored"))
         self.assertTrue(results.get("test2_modal_open_cleared"))
         self.assertTrue(results.get("test3_request_aborted"))
+        for name in ("default", "virtual", "disallowed", "multiple"):
+            with self.subTest(name=name):
+                self.assertEqual(results[name], {"disabled": True, "value": None})
+        self.assertEqual(results["logical"], {"disabled": False, "value": {"id": "0", "name": "根目录", "path": []}})
 
     def test_local_media_on_select_rejects_virtual_roots(self):
         harness = textwrap.dedent(

@@ -607,12 +607,13 @@ class AgentUXBrowserTests(unittest.TestCase):
             window.fetch = async (url, options = {}) => {
                 const path = String(url);
                 if (!path.startsWith('/api/share/') && !path.startsWith('/api/guangya/dirs')) return original(url, options);
-                window.__shareCalls.push({path, body: options.body ? JSON.parse(options.body) : null});
+                const body = options.body ? JSON.parse(options.body) : null;
+                window.__shareCalls.push({path, body});
                 if (window.__holdShare === path) await new Promise(resolve => { window.__releaseShare = resolve; });
                 let data = path === '/api/share/inspect' ? {
                     preview_id: 'share-preview', target_id: 'offline', target_name: '离线', expires_in,
                     files: Array.from({length: count}, (_, i) => ({id: `file-${i}`, name: i ? `Episode ${i}.mkv` : 'The Silent Storm <img src=x onerror=window.__shareXss=1>', is_dir: i === 0})),
-                } : path === '/api/share/restore' ? {success: true, count: 1, target_dir_name: '电影', request_id: 19}
+                } : path === '/api/share/restore' ? {success: true, count: 1, target_dir_name: body.target_dir_name, request_id: 19}
                   : path.startsWith('/api/guangya/dirs') ? [{file_id: 'movies', name: '电影', is_dir: true}]
                   : {success: true, terminal: true, target_dir_name: '电影'};
                 const reply = window.__shareReplies[path] || {data, status: 200};
@@ -641,6 +642,12 @@ class AgentUXBrowserTests(unittest.TestCase):
         card.get_by_role('button', name='目标目录：离线').click()
         page.locator('#agentShareDirectory [data-dir-list] button').last.click()
         self.assertIn('目标目录：电影', card.inner_text())
+        card.get_by_role('button', name='目标目录：电影').click()
+        picker = page.locator('#agentShareDirectory')
+        picker.get_by_role('button', name='电影').click()
+        picker.get_by_role('button', name='上一级').click()
+        picker.get_by_role('button', name='选择当前目录').click()
+        self.assertIn('目标目录：根目录', card.inner_text())
         self.assertEqual(page.evaluate("__shareCalls.filter(c => c.path === '/api/share/restore').length"), 0)
         page.evaluate("window.__holdShare = '/api/share/restore'")
         card.get_by_role('button', name='确认转存').click()
@@ -648,7 +655,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.evaluate('window.__releaseShare()')
         card.locator('.agent-download-meta', has_text='转存成功').wait_for()
         request = page.evaluate("__shareCalls.find(c => c.path === '/api/share/restore').body")
-        self.assertEqual(request, {'preview_id': 'share-preview', 'file_ids': ['file-0', 'file-9'], 'target_dir_id': 'movies', 'target_dir_name': '电影'})
+        self.assertEqual(request, {'preview_id': 'share-preview', 'file_ids': ['file-0', 'file-9'], 'target_dir_id': '0', 'target_dir_name': '根目录'})
         self.assertEqual(page.evaluate("__kernelCalls.filter(c => c.url === '/api/agent/query').length"), 0)
         self.assertIsNone(page.evaluate('window.__shareXss'))
         self.assertTrue(card.get_by_role('button', name='重新解析').is_hidden())

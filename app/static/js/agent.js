@@ -627,6 +627,7 @@
         targetButton.addEventListener('click', () => {
             if (Date.now() >= expiresAt) { expire(); return; }
             picker = window.openGuangYaDirectoryPicker({modalId: 'agentShareDirectory', title: '选择转存目标目录', trigger: targetButton, preserveWhileLoading: true,
+                allowLogicalRoot: true,
                 onSelect: directory => { if (alive() && !finished && !pending) { target = {id: String(directory.id), name: String(directory.name)}; update(); } },
             });
         });
