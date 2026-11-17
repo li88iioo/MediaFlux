@@ -422,6 +422,41 @@ class DirectDownloadApiTests(LoggedInDownloadsApiCase):
         self.assertIn({"target": "guangya", "nsfw_source_id": "", "label": "光鸭·NSFW", "ready": False}, targets)
         self.assertEqual(self._request_count(), 0)
 
+    def test_cloud_submit_requires_fresh_confirmation_when_the_route_changes(self):
+        headers = self._headers()
+        url = "magnet:?xt=urn:btih:" + "1" * 40 + "&dn=fixture-movie"
+        rules = {
+            "OFFLINE_TARGET_DIR": "primary", "OFFLINE_TARGET_DIR_NAME": "主目录",
+            "OFFLINE_SECONDARY_ENABLED": "1", "OFFLINE_SECONDARY_KEYWORDS": "fixture-movie",
+            "OFFLINE_SECONDARY_DIR": "secondary", "OFFLINE_SECONDARY_DIR_NAME": "分流目录",
+        }
+        with (
+            patch.dict("os.environ", rules),
+            patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}),
+            patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1),
+            patch("app.modules.download_dispatcher._submit_qb", return_value={"ok": True}),
+            patch("app.modules.download_dispatcher._submit_guangya", return_value={"ok": True}) as cloud,
+        ):
+            preview = self.client.post("/api/downloads/direct/preview", headers=headers, data={"url": url})
+            options = {item["target"]: item for item in preview.json()["targets"] if "nsfw_source_id" not in item}
+            self.assertEqual(options["guangya"]["label"], "光鸭·分流目录")
+            self.assertEqual(options["both"]["label"], "光鸭·分流目录 + qBittorrent")
+            data = {"url": url, "target": "both", "expected_gy_target_dir": options["both"]["gy_target_dir"]}
+            with patch.dict("os.environ", {"OFFLINE_SECONDARY_ENABLED": "0"}):
+                stale = self.client.post("/api/downloads/direct/submit", headers=headers, data=data)
+                self.assertEqual(stale.status_code, 400, stale.text)
+                self.assertEqual(stale.json()["code"], "download_not_submitted")
+                self.assertEqual(self._request_count(), 0)
+                cloud.assert_not_called()
+                updated = next(item for item in stale.json()["targets"] if item["target"] == "both")
+                self.assertEqual(updated["label"], "光鸭·主目录 + qBittorrent")
+                fresh = self.client.post("/api/downloads/direct/submit", headers=headers, data={
+                    **data, "expected_gy_target_dir": updated["gy_target_dir"],
+                })
+                self.assertEqual(fresh.json()["status"], "submitted")
+                cloud.assert_called_once()
+                self.assertEqual(cloud.call_args.kwargs["target_dir_id"], "primary")
+
     def test_submit_passes_the_nsfw_source_only_when_chosen(self):
         headers = self._headers()
         url = "magnet:?xt=urn:btih:" + "e" * 40

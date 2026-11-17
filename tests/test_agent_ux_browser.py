@@ -28,14 +28,16 @@ SUBMITTED_276_RECEIPT = (
 )
 
 
-def _direct_preview(backends: dict, *, nsfw: tuple[tuple[str, str], ...] = (), **details) -> dict:
+def _direct_preview(backends: dict, *, nsfw: tuple[tuple[str, str], ...] = (),
+                    directory: tuple[str, str] = ('offline', '离线'), **details) -> dict:
     """与服务端一致的下载目标：普通光鸭、qB、NSFW 来源（未配置时为不可选占位）、两者。"""
     qb, guangya = bool(backends.get('qb')), bool(backends.get('guangya'))
-    targets = [{'target': 'guangya', 'label': '光鸭·离线', 'ready': guangya},
+    destination, name = directory
+    targets = [{'target': 'guangya', 'label': f'光鸭·{name}', 'ready': guangya, 'gy_target_dir': destination},
                {'target': 'qb', 'label': 'qBittorrent', 'ready': qb}]
     targets += [{'target': 'guangya', 'nsfw_source_id': source_id, 'label': f'光鸭·NSFW · {name}', 'ready': guangya}
                 for source_id, name in nsfw] or [{'target': 'guangya', 'nsfw_source_id': '', 'label': '光鸭·NSFW', 'ready': False}]
-    targets.append({'target': 'both', 'label': '光鸭·离线 + qBittorrent', 'ready': qb and guangya})
+    targets.append({'target': 'both', 'label': f'光鸭·{name} + qBittorrent', 'ready': qb and guangya, 'gy_target_dir': destination})
     return {**details, 'backends': backends, 'targets': targets}
 
 
@@ -759,6 +761,42 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertIn('is-done', completed_classes)
         self.assertNotIn('is-error', completed_classes)
         self.assertEqual(card.locator('.agent-download-submit').count(), 0)
+
+    def test_direct_download_route_change_updates_the_card_before_a_second_confirmation(self):
+        backends = {'qb': True, 'guangya': True}
+        updated = _direct_preview(backends, directory=('primary', '主目录'))['targets']
+        page = self.page({
+            'directPreview': _direct_preview(backends, directory=('secondary', '分流目录'), kind='torrent', title='Film'),
+            'directSubmit': {'ok': True, 'status': 'submitted', 'request_id': 10, 'succeeded': ['qb', 'guangya']},
+        }, viewport={'width': 390, 'height': 844})
+        page.locator('#agentAttachFile').set_input_files(files=[{
+            'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+        page.evaluate("""targets => {
+            const fetch = window.fetch;
+            window.fetch = (url, options) => {
+                if (url !== '/api/downloads/direct/submit' || options.body.get('expected_gy_target_dir') !== 'secondary') {
+                    return fetch(url, options);
+                }
+                window.__rejectedForm = Array.from(options.body.entries()).slice(1);
+                const payload = {error: '光鸭接收目录已变化，请核对最新目标后重新确认', code: 'download_not_submitted', targets};
+                return Promise.resolve(new Response(JSON.stringify(payload), {status: 400}));
+            };
+        }""", updated)
+        card = page.locator('.agent-download-card')
+        _target(card, '光鸭·分流目录 + qBittorrent').check()
+        submit = card.get_by_role('button', name='提交下载')
+        bounds = submit.bounding_box()
+        submit.click()
+        card.get_by_text('光鸭接收目录已变化', exact=False).wait_for()
+        self.assertTrue(_target(card, '光鸭·主目录 + qBittorrent').is_checked())
+        self.assertTrue(submit.is_enabled())
+        self.assertEqual(submit.bounding_box()['width'], bounds['width'])
+        self.assertEqual(page.evaluate('window.__rejectedForm'), [['target', 'both'], ['expected_gy_target_dir', 'secondary']])
+        self.assertEqual(page.evaluate('window.__directForms.length'), 1)
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+        submit.click()
+        card.get_by_text('已提交：qBittorrent、光鸭·主目录', exact=False).wait_for()
+        self.assertEqual(page.evaluate('window.__directForms[1]')[1:], [['target', 'both'], ['expected_gy_target_dir', 'primary']])
 
     def test_direct_download_nonretryable_receipts_keep_facts_and_review_without_resubmission(self):
         for status, receipt in (

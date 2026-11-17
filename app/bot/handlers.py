@@ -182,13 +182,26 @@ def _configured_organize_sources() -> list[dict[str, str]]:
     return sources
 
 
+def _pending_download_input(row):
+    from app.modules.download_dispatcher import DownloadInput
+
+    data = dict(row)
+    return DownloadInput(
+        kind=str(data.get("kind") or ""),
+        title=str(data.get("title") or ""),
+        source_value=str(data.get("source_value") or ""),
+        torrent_data=data.get("torrent_data"),
+        content_type=str(data.get("content_type") or ""),
+    )
+
+
 def _download_target_picker_markup(
     telebot,
     *,
     request_id: int,
+    item,
     chat_id: str,
     user_id: str,
-    allow_guangya: bool = True,
     message_thread_id: object = None,
 ):
     from app.modules.telegram_write_confirmations import (
@@ -201,16 +214,14 @@ def _download_target_picker_markup(
         value: dict[str, object] = {"request_id": request_id, "target": option["target"]}
         if "nsfw_source_id" in option:
             value["nsfw_source_id"] = option["nsfw_source_id"]
+        if "gy_target_dir" in option:
+            value["gy_target_dir"] = option["gy_target_dir"]
         return option["label"], "confirm", value
 
-    options = download_target_options()
     cancel = ("取消", "cancel", {"request_id": request_id})
-    if allow_guangya:
-        # 与 Web 下载卡同序：普通光鸭与 qB 同行，其余各占一行，最后取消。
-        choices = [choice(option) for option in options]
-        rows = [choices[:2], *[[item] for item in choices[2:]], [cancel]]
-    else:
-        rows = [[choice(next(option for option in options if option["target"] == "qb"))], [cancel]]
+    # 与 Web 下载卡同序：普通光鸭与 qB 同行，其余各占一行，最后取消。
+    choices = [choice(option) for option in download_target_options(item)]
+    rows = [choices[:2], *[[choice] for choice in choices[2:]], [cancel]]
 
     action_ids = get_telegram_write_confirmation_store().create_group(
         chat_id=chat_id,
@@ -1890,8 +1901,8 @@ def _register_commands(bot, telebot):
         msg,
         request_id: int,
         title: str,
+        item,
         *,
-        allow_guangya: bool = True,
         chat_id: str = "",
         user_id: str = "",
         reissued: bool = False,
@@ -1901,9 +1912,9 @@ def _register_commands(bot, telebot):
         keyboard = _download_target_picker_markup(
             telebot,
             request_id=request_id,
+            item=item,
             chat_id=chat_id,
             user_id=user_id,
-            allow_guangya=allow_guangya,
             message_thread_id=_telegram_thread_id(msg),
         )
         _reply_to_source(
@@ -1919,7 +1930,7 @@ def _register_commands(bot, telebot):
             reply_markup=keyboard,
         )
 
-    def reissue_pending_picker(msg, request: dict, title: str) -> bool:
+    def reissue_pending_picker(msg, request: dict) -> bool:
         if str(request.get("status") or "") != "pending":
             return False
         chat_id, user_id = _telegram_identity(msg)
@@ -1934,6 +1945,7 @@ def _register_commands(bot, telebot):
             msg,
             int(row["id"]),
             download_display_title(row),
+            _pending_download_input(row),
             chat_id=chat_id,
             user_id=user_id,
             reissued=True,
@@ -1976,7 +1988,7 @@ def _register_commands(bot, telebot):
                 request["id"], _telegram_thread_id(msg), only_if_unbound=True
             )
             if not request["created"]:
-                if reissue_pending_picker(msg, request, item.title):
+                if reissue_pending_picker(msg, request):
                     return
                 _reply_to_source(
                     bot,
@@ -1984,7 +1996,7 @@ def _register_commands(bot, telebot):
                     f"该种子已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）",
                 )
                 return
-            send_target_picker(msg, request["id"], item.title)
+            send_target_picker(msg, request["id"], item.title, item)
         except ValueError as exc:
             logger.info("Telegram 种子校验失败 type=%s", type(exc).__name__)
             _reply_to_source(bot, msg, f"种子文件无效：{html.escape(str(exc))}")
@@ -2044,7 +2056,7 @@ def _register_commands(bot, telebot):
                 request["id"], _telegram_thread_id(msg), only_if_unbound=True
             )
             if not request["created"]:
-                if reissue_pending_picker(msg, request, item.title):
+                if reissue_pending_picker(msg, request):
                     return
                 _reply_to_source(
                     bot,
@@ -2052,7 +2064,7 @@ def _register_commands(bot, telebot):
                     f"该任务已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）",
                 )
                 return
-            send_target_picker(msg, request["id"], item.title)
+            send_target_picker(msg, request["id"], item.title, item)
         except ValueError as exc:
             logger.info("Telegram 下载链接校验失败 type=%s", type(exc).__name__)
             _reply_to_source(bot, msg, f"下载链接无效：{html.escape(str(exc))}")
@@ -2147,6 +2159,7 @@ def _register_commands(bot, telebot):
             call.message,
             int(row["id"]),
             download_display_title(row),
+            _pending_download_input(row),
             chat_id=chat_id,
             user_id=user_id,
             reissued=True,
@@ -2452,51 +2465,41 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             target = str(value.get("target") or "")
             if target not in {"qb", "guangya", "both"}:
                 raise TelegramWriteConfirmationError("下载确认参数无效")
-            nsfw_source_id = ""
-            if "nsfw_source_id" in value:
-                if target != "guangya":
-                    raise TelegramWriteConfirmationError("NSFW 下载目标无效")
-                nsfw_source_id = str(value.get("nsfw_source_id") or "").strip()
+            nsfw_source_id = str(value["nsfw_source_id"] or "").strip() if "nsfw_source_id" in value else None
+            item = _pending_download_input(row)
+            try:
+                destination = download_target_destination(
+                    item, target, nsfw_source_id=nsfw_source_id,
+                    expected_gy_target_dir=str(value.get("gy_target_dir") or ""),
+                )
+            except DirectDownloadPreconditionError as exc:
+                notice = str(exc)
+                keyboard = _download_target_picker_markup(
+                    telebot,
+                    request_id=request_id,
+                    item=item,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    message_thread_id=_telegram_thread_id(call),
+                )
+                picker_text = (
+                    "<b>选择下载目标</b>\n"
+                    f"任务: {html.escape(download_display_title(row))}\n"
+                    f"{html.escape(notice)}"
+                )
                 try:
-                    download_target_destination(target, nsfw_source_id=nsfw_source_id)
-                except DirectDownloadPreconditionError:
-                    notice = (
-                        "未配置 NSFW 整理来源，本次未提交；请先配置或选择其他目标。"
-                        if not nsfw_source_id
-                        else "NSFW 来源已变更，本次未提交，请重新选择。"
+                    bot.edit_message_text(
+                        picker_text,
+                        call.message.chat.id,
+                        call.message.message_id,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
                     )
-                    keyboard = _download_target_picker_markup(
-                        telebot,
-                        request_id=request_id,
-                        chat_id=chat_id,
-                        user_id=user_id,
-                        message_thread_id=_telegram_thread_id(call),
-                    )
-                    picker_text = (
-                        "<b>选择下载目标</b>\n"
-                        f"任务: {html.escape(download_display_title(row))}\n"
-                        f"{notice}"
-                    )
-                    try:
-                        bot.edit_message_text(
-                            picker_text,
-                            call.message.chat.id,
-                            call.message.message_id,
-                            parse_mode="HTML",
-                            reply_markup=keyboard,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - fall back from Telegram edits
-                        logger.info(
-                            "Telegram NSFW 重新选择卡更新失败 type=%s",
-                            type(exc).__name__,
-                        )
-                        _reply_to_source(bot,
-                            call.message,
-                            picker_text,
-                            reply_markup=keyboard,
-                        )
-                    bot.answer_callback_query(call.id, notice, show_alert=True)
-                    return
+                except Exception as edit_exc:
+                    logger.info("Telegram 下载目标卡更新失败 type=%s", type(edit_exc).__name__)
+                    _reply_to_source(bot, call.message, picker_text, reply_markup=keyboard)
+                bot.answer_callback_query(call.id, notice, show_alert=True)
+                return
             from app.modules.telegram_topic_routing import bind_download_request_thread
 
             bind_download_request_thread(
@@ -2506,9 +2509,11 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                 bot, call.message, "下载请求已确认", "正在提交到所选下载目标…"
             )
             bot.answer_callback_query(call.id, "正在提交下载任务")
-            thread_options: _DownloadDispatchOptions = (
-                {"kwargs": {"nsfw_source_id": nsfw_source_id}} if nsfw_source_id else {}
-            )
+            thread_options: _DownloadDispatchOptions = {}
+            if nsfw_source_id:
+                thread_options["kwargs"] = {"nsfw_source_id": nsfw_source_id}
+            elif destination:
+                thread_options["kwargs"] = {"destination": destination}
             threading.Thread(
                 target=_dispatch_download_callback,
                 args=(
@@ -3059,16 +3064,21 @@ def _dispatch_download_callback(
     target: str,
     *,
     nsfw_source_id: str | None = None,
+    destination: dict[str, str] | None = None,
 ) -> None:
-    from app.indexers.downloads import DirectDownloadPreconditionError, download_target_destination
+    from app.indexers.downloads import DirectDownloadPreconditionError, nsfw_download_destination
     from app.modules.download_dispatcher import (
         dispatch_request,
         public_dispatch_summary,
     )
     from app.modules.download_tracker import get_download_tracker
 
+    destination = destination or {}
     try:
-        destination = download_target_destination(target, nsfw_source_id=nsfw_source_id)
+        if nsfw_source_id is not None:
+            if target != "guangya":
+                raise DirectDownloadPreconditionError("NSFW 下载目标无效")
+            destination = nsfw_download_destination(nsfw_source_id)
     except DirectDownloadPreconditionError as exc:
         try:
             bot.edit_message_text(
@@ -3117,9 +3127,11 @@ def _dispatch_download_callback(
     text = f"<b>{title}</b>\n请求: #{request_id}"
     labels = {"qb": "qBittorrent", "guangya": "光鸭云盘"}
     succeeded = summary["succeeded"]
-    if destination and status != "duplicate":
+    if nsfw_source_id and status != "duplicate":
         source_name = destination["gy_target_name"] or destination["gy_target_dir"]
         text += f"\nNSFW 整理来源：{html.escape(source_name)}（按 NSFW 规则整理）"
+    elif destination and "guangya" in succeeded:
+        text += f"\n光鸭接收目录：{html.escape(destination['gy_target_name'])}"
     if succeeded:
         text += "\n成功: " + "、".join(labels[item] for item in succeeded)
     if summary["failed"]:

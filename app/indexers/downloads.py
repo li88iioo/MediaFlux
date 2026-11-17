@@ -84,6 +84,11 @@ class DirectDownloadPreconditionError(ValueError):
     """直接下载前置校验拒绝，尚未创建请求或调用下载后端。"""
 
 
+class DirectDownloadTargetChanged(DirectDownloadPreconditionError):
+    def __init__(self):
+        super().__init__("光鸭接收目录已变化，请核对最新目标后重新确认")
+
+
 class DownloadSnapshotChanged(IndexerValidationError):
     code = "confirmation_stale"
     default_public_message = "资源或下载配置已变化，请重新预检"
@@ -230,26 +235,30 @@ def indexer_download_destination(item: Any, target: str) -> _DownloadDestination
     return {"gy_target_dir": sources[0]["id"], "gy_target_name": sources[0]["name"]}
 
 
-def download_target_labels() -> dict[str, str]:
-    """普通下载目标的展示名；光鸭使用页面配置的离线目录名。"""
+def download_target_labels(guangya_dir_name: str | None = None) -> dict[str, str]:
+    """下载目标的展示名；尚未取得下载输入时展示配置的默认目录名。"""
     from app.modules.offline import DEFAULT_TARGET_DIR_NAME
 
-    name = " ".join((config.get("OFFLINE_TARGET_DIR_NAME", "") or "").split()) or DEFAULT_TARGET_DIR_NAME
+    if guangya_dir_name is None:
+        guangya_dir_name = config.get("OFFLINE_TARGET_DIR_NAME", "")
+    name = " ".join(guangya_dir_name.split()) or DEFAULT_TARGET_DIR_NAME
     if len(name) > 40:
         name = name[:39].rstrip() + "…"
     cloud = f"光鸭·{name}"
     return {"qb": "qBittorrent", "guangya": cloud, "both": f"{cloud} + qBittorrent"}
 
 
-def download_target_options() -> list[dict[str, str]]:
+def download_target_options(item: DownloadInput) -> list[dict[str, str]]:
     """TG 选择卡与 Web 下载卡共用的目标顺序和名称；NSFW 选项来自成人专用整理来源。
 
     带 nsfw_source_id 键的选项提交到对应来源目录；值为空表示尚未配置，仅作提示不可提交。
     """
     from app.modules.organize_sources import list_nsfw_download_sources
 
-    labels = download_target_labels()
-    options = [{"target": "guangya", "label": labels["guangya"]}, {"target": "qb", "label": labels["qb"]}]
+    destination = download_target_destination(item, "guangya")
+    labels = download_target_labels(destination["gy_target_name"])
+    cloud = {"gy_target_dir": destination["gy_target_dir"]}
+    options = [{"target": "guangya", "label": labels["guangya"], **cloud}, {"target": "qb", "label": labels["qb"]}]
     sources = list_nsfw_download_sources()
     names = [" ".join((source.get("name") or "未命名来源").split()) for source in sources]
     counts = Counter(names)
@@ -263,26 +272,49 @@ def download_target_options() -> list[dict[str, str]]:
         options.append({"target": "guangya", "nsfw_source_id": source["id"].strip(), "label": f"光鸭·NSFW · {label}"})
     if not sources:
         options.append({"target": "guangya", "nsfw_source_id": "", "label": "光鸭·NSFW"})
-    options.append({"target": "both", "label": labels["both"]})
+    options.append({"target": "both", "label": labels["both"], **cloud})
     return options
 
 
-def download_target_destination(target: str, *, nsfw_source_id: str | None = None) -> _DownloadDestination:
-    """Web/TG 共用目标解析；显式 NSFW 选择失效时拒绝，不回退到普通离线目录。"""
+def nsfw_download_destination(source_id: str) -> _DownloadDestination:
     from app.modules.organize_sources import find_nsfw_download_source
 
-    if target not in DOWNLOAD_TARGETS:
-        raise DirectDownloadPreconditionError("下载目标无效")
-    if nsfw_source_id is None:
-        return {}
-    if target != "guangya":
-        raise DirectDownloadPreconditionError("NSFW 下载目标无效")
-    source_id = nsfw_source_id.strip()
+    source_id = source_id.strip()
     source = find_nsfw_download_source(source_id)
     if source is None:
         raise DirectDownloadPreconditionError(
             "NSFW 来源已变更，本次未提交，请重新选择" if source_id else "未配置 NSFW 整理来源，本次未提交")
     return {"gy_target_dir": source["id"], "gy_target_name": source["name"]}
+
+
+def download_target_destination(
+    item: DownloadInput,
+    target: str,
+    *,
+    nsfw_source_id: str | None = None,
+    expected_gy_target_dir: str | None = None,
+) -> _DownloadDestination:
+    """同一离线决策用于 Web/TG 展示、复验和确认后的目录提交。"""
+    from app.modules.offline import DEFAULT_TARGET_DIR_NAME, analyze_offline_url
+
+    if target not in DOWNLOAD_TARGETS:
+        raise DirectDownloadPreconditionError("下载目标无效")
+    if nsfw_source_id is not None:
+        if target != "guangya":
+            raise DirectDownloadPreconditionError("NSFW 下载目标无效")
+        return nsfw_download_destination(nsfw_source_id)
+    if target == "qb":
+        return {}
+    decision = analyze_offline_url(
+        item.source_value, item.title,
+        content_type="application/x-bittorrent" if item.torrent_data is not None else item.content_type,
+    )
+    if expected_gy_target_dir is not None and expected_gy_target_dir != decision.target_dir_id:
+        raise DirectDownloadTargetChanged()
+    return {
+        "gy_target_dir": decision.target_dir_id,
+        "gy_target_name": decision.target_dir_name.strip() or DEFAULT_TARGET_DIR_NAME,
+    }
 
 
 def download_target_readiness(target: str) -> dict[str, bool]:
@@ -873,12 +905,15 @@ def preview_direct_download(item: DownloadInput, target: str) -> tuple[dict, dic
 def submit_direct_download(item: DownloadInput, target: str, *, origin: str,
                            expected_snapshot: dict | None = None,
                            check_cancelled: Callable[[], None] | None = None,
-                           nsfw_source_id: str | None = None) -> dict:
+                           nsfw_source_id: str | None = None,
+                           expected_gy_target_dir: str | None = None) -> dict:
     """直接链接或种子只准入首次提交；已有活跃请求不会隐式补投失败后端。
 
     nsfw_source_id 与 TG 的 NSFW 目标一致：只用于光鸭，按当前配置解析为专用整理来源目录。
     """
-    destination = download_target_destination(target, nsfw_source_id=nsfw_source_id)
+    destination = download_target_destination(
+        item, target, nsfw_source_id=nsfw_source_id, expected_gy_target_dir=expected_gy_target_dir,
+    )
     try:
         preview, snapshot = preview_direct_download(item, target)
     except ValueError as exc:

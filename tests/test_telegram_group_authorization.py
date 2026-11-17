@@ -4,7 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.modules.download_dispatcher import DownloadInput
 from tests.support import FakeTelegramBot, fake_telebot_types
+
+ORDINARY_DOWNLOAD = DownloadInput("magnet", "待下载任务", "magnet:?xt=urn:btih:" + "a" * 40)
 
 
 class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
@@ -579,6 +582,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             markup = handlers._download_target_picker_markup(
                 telebot,
                 request_id=77,
+                item=ORDINARY_DOWNLOAD,
                 chat_id="100",
                 user_id="9",
             )
@@ -644,13 +648,13 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         ):
             with (
                 self.subTest(directory=configured),
-                patch("app.config.get", return_value=configured),
+                patch.dict("os.environ", {"OFFLINE_TARGET_DIR": "default", "OFFLINE_TARGET_DIR_NAME": configured}),
                 patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[
                     {"id": "adult-only", "name": "成人专区"},
                 ]),
             ):
                 markup = handlers._download_target_picker_markup(
-                    fake_telebot_types(), request_id=77, chat_id="100", user_id="9",
+                    fake_telebot_types(), request_id=77, item=ORDINARY_DOWNLOAD, chat_id="100", user_id="9",
                 )
                 self.assertEqual([item.text for item in markup.buttons], [
                     f"光鸭·{displayed}", "qBittorrent", "光鸭·NSFW · 成人专区",
@@ -659,7 +663,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 action = get_telegram_write_confirmation_store().claim(
                     markup.buttons[3].callback_data[4:], chat_id="100", user_id="9",
                 )
-                self.assertEqual(action["value"], {"request_id": 77, "target": "both"})
+                self.assertEqual(action["value"], {"request_id": 77, "target": "both", "gy_target_dir": "default"})
 
     def test_single_nsfw_source_is_named_and_stored_in_ticket(self):
         from app.bot import handlers
@@ -677,6 +681,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             markup = handlers._download_target_picker_markup(
                 fake_telebot_types(),
                 request_id=77,
+                item=ORDINARY_DOWNLOAD,
                 chat_id="100",
                 user_id="9",
             )
@@ -721,6 +726,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             markup = handlers._download_target_picker_markup(
                 telebot,
                 request_id=77,
+                item=ORDINARY_DOWNLOAD,
                 chat_id="100",
                 user_id="9",
             )
@@ -781,6 +787,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             markup = handlers._download_target_picker_markup(
                 telebot,
                 request_id=77,
+                item=ORDINARY_DOWNLOAD,
                 chat_id="100",
                 user_id="9",
             )
@@ -850,6 +857,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             markup = handlers._download_target_picker_markup(
                 telebot,
                 request_id=77,
+                item=ORDINARY_DOWNLOAD,
                 chat_id="100",
                 user_id="9",
             )

@@ -655,6 +655,7 @@
         else form.append('url', source.url);
         if (option) form.append('target', option.target);
         if (option && 'nsfw_source_id' in option) form.append('nsfw_source_id', option.nsfw_source_id);
+        if (option && 'gy_target_dir' in option) form.append('expected_gy_target_dir', option.gy_target_dir);
         return form;
     }
 
@@ -679,32 +680,15 @@
         meta.textContent = preview.kind === 'torrent'
             ? `种子 · ${preview.file_count || 0} 个文件 · ${formatBytes(preview.total_size)}`
             : '磁力链接';
-        const targets = Array.isArray(preview.targets) ? preview.targets : [];
-        const backendLabels = {qb: 'qBittorrent'};
-        for (const option of targets) if (!('nsfw_source_id' in option) && option.target !== 'both') backendLabels[option.target] = option.label;
         const group = element('div', 'agent-download-targets');
         group.setAttribute('role', 'radiogroup');
         group.setAttribute('aria-label', '下载目标');
         const name = `agent-download-target-${++downloadCardCount}`;
-        const radios = targets.map((option, index) => {
-            const label = element('label', 'agent-download-option');
-            if (option.target === 'both' || 'nsfw_source_id' in option) label.classList.add('is-wide');
-            const input = element('input');
-            input.type = 'radio';
-            input.name = name;
-            input.value = String(index);
-            input.disabled = !option.ready;
-            label.append(input, element('span', 'agent-download-option-label', String(option.label || option.target)));
-            if (!option.ready) label.append(element('small', 'agent-download-option-note', option.nsfw_source_id === '' ? '未配置' : '未就绪'));
-            group.append(label);
-            return input;
-        });
-        const firstReady = radios.find(input => !input.disabled);
-        if (firstReady) firstReady.checked = true;
+        let targets = [];
+        let radios = [];
         const chosen = () => targets[Number(radios.find(input => input.checked)?.value)];
         const submit = element('button', 'agent-download-submit', '提交下载');
         submit.type = 'button';
-        submit.disabled = !firstReady;
         const cancel = element('button', 'agent-download-cancel', '取消');
         cancel.type = 'button';
         const review = element('a', 'jump-btn', '查看下载记录');
@@ -713,6 +697,29 @@
         const actions = element('div', 'agent-download-actions');
         actions.append(submit, cancel, review);
         card.append(group, actions);
+        function renderTargets(nextTargets) {
+            const previous = chosen();
+            targets = Array.isArray(nextTargets) ? nextTargets : [];
+            group.replaceChildren();
+            radios = targets.map((option, index) => {
+                const label = element('label', 'agent-download-option');
+                if (option.target === 'both' || 'nsfw_source_id' in option) label.classList.add('is-wide');
+                const input = element('input');
+                input.type = 'radio';
+                input.name = name;
+                input.value = String(index);
+                input.disabled = !option.ready;
+                label.append(input, element('span', 'agent-download-option-label', String(option.label || option.target)));
+                if (!option.ready) label.append(element('small', 'agent-download-option-note', option.nsfw_source_id === '' ? '未配置' : '未就绪'));
+                group.append(label);
+                return input;
+            });
+            const selected = radios.find((input, index) => !input.disabled && targets[index].target === previous?.target
+                && targets[index].nsfw_source_id === previous.nsfw_source_id) || radios.find(input => !input.disabled);
+            if (selected) selected.checked = true;
+            submit.disabled = !selected;
+        }
+        renderTargets(preview.targets);
         const setChoicesDisabled = disabled => radios.forEach((input, index) => { input.disabled = disabled || !targets[index].ready; });
         const showRecovery = (retryable) => {
             group.hidden = submit.hidden = !retryable;
@@ -735,9 +742,11 @@
             try {
                 const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, option)});
                 const status = String(result.status || 'manual_review');
+                const cloudLabel = option.nsfw_source_id ? option.label
+                    : targets.find(item => item.target === 'guangya' && !('nsfw_source_id' in item))?.label;
                 const succeeded = (result.succeeded || [])
                     .map(target => status === 'duplicate' ? ({qb: 'qBittorrent', guangya: '光鸭云盘'})[target]
-                        : target === 'guangya' && option.nsfw_source_id ? option.label : backendLabels[target])
+                        : ({qb: 'qBittorrent', guangya: cloudLabel})[target])
                     .filter(Boolean);
                 meta.textContent = [result.summary || `下载请求 #${result.request_id} 受理结果待核对`,
                     succeeded.length ? `已提交：${succeeded.join('、')}` : '', result.error || ''].filter(Boolean).join(' · ');
@@ -751,6 +760,13 @@
                 }
             } catch (error) {
                 const notSubmitted = error?.status === 400 && error?.payload?.code === 'download_not_submitted';
+                if (notSubmitted && Array.isArray(error.payload.targets)) {
+                    renderTargets(error.payload.targets);
+                    meta.textContent = error.message;
+                    submit.textContent = '提交下载';
+                    cancel.disabled = false;
+                    return;
+                }
                 meta.textContent = notSubmitted ? `本次未提交：${error.message}。可修改目标或返回重新选择资源。`
                     : `提交状态未知，请先在下载页核对，勿重复提交。${error?.message || ''}`;
                 showRecovery(notSubmitted);
