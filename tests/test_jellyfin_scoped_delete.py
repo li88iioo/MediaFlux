@@ -1079,7 +1079,7 @@ class JellyfinScopedDeleteTests(IsolatedDatabaseTestCase):
         args, kwargs = self.fx.manager.start_operation.call_args
         self.assertEqual(
             kwargs,
-            {"queue_if_busy": False, "dedupe_key": deletion.delete_key(expected)},
+            {"dedupe_key": deletion.delete_key(expected)},
         )
         self.fx.factory.assert_not_called()
         self.assert_no_write()

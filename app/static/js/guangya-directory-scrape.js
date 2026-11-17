@@ -229,6 +229,12 @@
 
     function bindMediaRow(row, item, action) {
         row.dataset.mediaId = String(item.file_id);
+        const tracked = [...taskPollEntries.values()].find((entry) => entry.fileId === row.dataset.mediaId);
+        if (tracked) {
+            tracked.row = row;
+            tracked.action = action;
+            setRowState(row, action, 'running', '正在同步任务状态');
+        }
         action.addEventListener('click', (event) => openMenu(
             item, row, action, event, true,
         ));
@@ -1040,12 +1046,39 @@
 
     const TASK_POLL_INTERVAL_MS = 1000;
     const TASK_POLL_MAX_ATTEMPTS = 1800;
+    const ACTIVE_SCRAPE_TASKS_KEY = 'mediaflux.directory-scrape.active-tasks';
     const taskPollEntries = new Map();
     let taskPollTimer = null;
     let taskPollController = null;
     let taskPollInFlight = false;
     let taskPollGeneration = 0;
     let taskPollingDisposed = false;
+
+    function saveTrackedScrapes() {
+        const active = [...taskPollEntries.values()]
+            .filter((entry) => entry.kind === 'scrape')
+            .map(({taskId, fileId, parentId}) => ({taskId, fileId, parentId}));
+        try {
+            if (active.length) sessionStorage.setItem(ACTIVE_SCRAPE_TASKS_KEY, JSON.stringify(active));
+            else sessionStorage.removeItem(ACTIVE_SCRAPE_TASKS_KEY);
+        } catch (_error) {
+            // 存储被浏览器禁用时，当前页面仍可按任务 ID 跟踪。
+        }
+    }
+
+    function restoreTrackedScrapes() {
+        try {
+            const active = JSON.parse(sessionStorage.getItem(ACTIVE_SCRAPE_TASKS_KEY) || '[]');
+            for (const entry of active.slice(-32)) {
+                if (typeof entry.taskId === 'string' && entry.taskId) {
+                    taskPollEntries.set(entry.taskId, {...entry, kind: 'scrape', attempts: 0});
+                }
+            }
+        } catch (_error) {
+            // 无可恢复的浏览器记录时，等待下一次提交。
+        }
+        scheduleTaskPoll();
+    }
 
     function clearTaskPollTimer() {
         if (taskPollTimer !== null) window.clearTimeout(taskPollTimer);
@@ -1088,12 +1121,11 @@
         ].reduce((total, key) => total + countFailure(stats[key]), 0);
     }
 
-    async function applyTaskPollStatus(entry, status) {
-        const {taskId, row, action} = entry;
-        const matchesTask = (item) => String(item?.id || '') === taskId;
-        const queued = (status.operation_queue?.items || []).find(matchesTask);
-        if (queued) {
-            const ahead = Number(queued.ahead || 0);
+    async function applyTaskPollStatus(entry, task) {
+        const {row, action} = entry;
+        if (!task) return false;
+        if (task.status === 'queued') {
+            const ahead = Math.max(0, Number(task.queue_position || 1) - 1);
             setRowState(
                 row,
                 action,
@@ -1102,10 +1134,7 @@
             );
             return false;
         }
-        const history = (status.operation_history || []).find(matchesTask);
-        const task = matchesTask(status) ? status : history;
-        if (!task) return false;
-        if (task.status === 'running') {
+        if (['running', 'stopping'].includes(task.status)) {
             setRowState(
                 row,
                 action,
@@ -1165,9 +1194,10 @@
                 return true;
             }
             setRowState(row, action, 'done', '目录刮削完成');
+            if (!row?.isConnected) window.showToast?.('目录刮削完成');
             return true;
         }
-        if (['failed', 'stopped'].includes(task.status)) {
+        if (['failed', 'stopped', 'cancelled', 'manual_review'].includes(task.status)) {
             throw new Error(
                 task.error
                 || task.message
@@ -1185,14 +1215,17 @@
         taskPollController = controller;
         const refreshParents = new Set();
         try {
-            const response = await fetch('/api/guangya/organize/status', {signal: controller.signal});
+            const entries = [...taskPollEntries.entries()].slice(0, 32);
+            const ids = entries.map(([taskId]) => taskId).join(',');
+            const response = await fetch(`/api/guangya/organize/status?task_ids=${encodeURIComponent(ids)}`, {signal: controller.signal});
             const status = await response.json();
             if (!response.ok) throw new Error(status.error || '任务状态读取失败');
             if (generation !== taskPollGeneration || document.hidden || taskPollingDisposed) return;
-            for (const [taskId, entry] of [...taskPollEntries.entries()]) {
+            const tasks = new Map(status.tasks.map((task) => [task.id, task]));
+            for (const [taskId, entry] of entries) {
                 entry.attempts += 1;
                 try {
-                    const finished = await applyTaskPollStatus(entry, status);
+                    const finished = await applyTaskPollStatus(entry, tasks.get(taskId));
                     if (finished) {
                         taskPollEntries.delete(taskId);
                         if (entry.kind !== 'delete') refreshParents.add(entry.parentId);
@@ -1237,6 +1270,7 @@
         } finally {
             if (taskPollController === controller) taskPollController = null;
             taskPollInFlight = false;
+            saveTrackedScrapes();
             scheduleTaskPoll();
         }
     }
@@ -1255,7 +1289,7 @@
         const current = taskPollEntries.get(normalizedTaskId);
         taskPollEntries.set(normalizedTaskId, {
             taskId: normalizedTaskId,
-            directory,
+            fileId: String(directory?.file_id || directory?.id || ''),
             row,
             action,
             parentId,
@@ -1264,6 +1298,7 @@
             itemName: options.itemName || current?.itemName || directory?.name || '',
             attempts: current?.attempts || 0,
         });
+        saveTrackedScrapes();
         scheduleTaskPoll();
     }
 
@@ -1489,5 +1524,6 @@
         bindMediaRow,
         closeMenu,
     };
+    restoreTrackedScrapes();
     renderIcons(menu);
 }(window));

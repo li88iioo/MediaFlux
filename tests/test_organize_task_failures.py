@@ -1209,179 +1209,65 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         finish.assert_called_once()
         self.assertEqual(finish.call_args.args[1]["status"], "partial")
 
-    def test_manual_operations_queue_fifo_and_keep_terminal_history(self):
-        manager = OrganizeTaskManager()
-        manager._lock = cast(CrossProcessLock, threading.Lock())
-        first_started = threading.Event()
-        release_first = threading.Event()
-        second_finished = threading.Event()
-        order: list[str] = []
-
-        def first_callback():
-            order.append("first")
-            first_started.set()
-            self.assertTrue(release_first.wait(timeout=2))
-            return {"stats": {"moved": 1}}
-
-        def second_callback():
-            order.append("second")
-            second_finished.set()
-            return {"stats": {"moved": 1}}
-
-        first = manager.start_operation(
-            "目录刮削",
-            "first",
-            first_callback,
-            queue_if_busy=True,
-            dedupe_key="manual:first",
-        )
-        self.assertTrue(first["ok"])
-        self.assertTrue(first_started.wait(timeout=2))
-
-        second = manager.start_operation(
-            "目录刮削",
-            "second",
-            second_callback,
-            queue_if_busy=True,
-            dedupe_key="manual:second",
-        )
-        self.assertTrue(second["ok"])
-        self.assertTrue(second["queued"])
-        self.assertEqual(second["queue_position"], 1)
-        queued = manager.task_status()["operation_queue"]["items"]
-        self.assertEqual([item["id"] for item in queued], [second["task_id"]])
-
-        replayed = manager.start_operation(
-            "目录刮削",
-            "second",
-            second_callback,
-            queue_if_busy=True,
-            dedupe_key="manual:second",
-        )
-        self.assertTrue(replayed["replayed"])
-        self.assertEqual(replayed["task_id"], second["task_id"])
-
-        release_first.set()
-        self.assertTrue(second_finished.wait(timeout=3))
-        deadline = monotonic() + 3
-        history = manager.task_status()["operation_history"]
-        while len(history) < 2 and monotonic() < deadline:
-            sleep(0.01)
-            history = manager.task_status()["operation_history"]
-
-        self.assertEqual(order, ["first", "second"])
-        self.assertEqual(
-            [item["id"] for item in history[:2]],
-            [second["task_id"], first["task_id"]],
-        )
-        self.assertTrue(all(item["status"] == "completed" for item in history[:2]))
-        manager.begin_shutdown()
-
-    def test_manual_operation_queued_behind_full_organize_starts_after_release(self):
+    def test_persistent_operations_wait_for_full_organize_and_keep_fifo_receipts(self):
         manager = OrganizeTaskManager()
         manager._lock = cast(CrossProcessLock, threading.Lock())
         organize_started = threading.Event()
         release_organize = threading.Event()
-        operation_finished = threading.Event()
         organizer = MagicMock()
-        organizer._validate_target_outside_source.return_value = None
+        order = []
 
         def organize(*_args, **_kwargs):
             organize_started.set()
             self.assertTrue(release_organize.wait(timeout=3))
             return [], {"total": 1, "moved": 1, "failed": 0}
 
+        def execute(row):
+            order.append(row["reference"])
+            return {"stats": {"moved": 1}}
+
+        def submit(name, *, queue_if_busy=True):
+            return manager.start_durable_operation(
+                "目录刮削", name, job_kind="directory_scrape", owner="web-test",
+                payload={}, dedupe_key=name, queue_if_busy=queue_if_busy,
+            )
+
         organizer.organize.side_effect = organize
-
-        with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
-            "app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run
-        ), patch.object(OrganizeTaskManager, "_wake_download_tracker"):
-            full = manager.start(
-                [{"id": "source", "name": "源目录"}],
-                OrganizeRules(target_dir_id="target", notify_enabled=False, library_notify=False),
-            )
-            self.assertTrue(full["ok"])
-            self.assertTrue(organize_started.wait(timeout=2))
-
-            queued = manager.start_operation(
-                "目录刮削",
-                "manual",
-                lambda: operation_finished.set() or {"stats": {"moved": 1}},
-                queue_if_busy=True,
-                dedupe_key="manual:after-full",
-            )
-            self.assertTrue(queued["ok"])
-            self.assertTrue(queued["queued"])
-
-            release_organize.set()
-            self.assertTrue(operation_finished.wait(timeout=4))
-            deadline = monotonic() + 3
-            while monotonic() < deadline:
-                queued_result = manager.task_result(queued["task_id"])
-                assert queued_result is not None
-                if queued_result["status"] == "completed":
-                    break
-                sleep(0.01)
-
-        task_result_result = manager.task_result(full["task_id"])
-        assert task_result_result is not None
-        self.assertEqual(task_result_result["status"], "completed")
-        task_result_result_2 = manager.task_result(queued["task_id"])
-        assert task_result_result_2 is not None
-        self.assertEqual(task_result_result_2["status"], "completed")
-        manager.begin_shutdown()
-
-    def test_manual_operation_queue_rolls_back_when_dispatcher_start_fails(self):
-        manager = OrganizeTaskManager()
-        manager._lock = cast(CrossProcessLock, threading.Lock())
-        manager._lock.acquire()
-        dispatcher = MagicMock()
-        dispatcher.is_alive.return_value = False
-        dispatcher.start.side_effect = RuntimeError("thread unavailable")
         try:
-            with patch(
-                "app.modules.organize_tasks.threading.Thread",
-                return_value=dispatcher,
+            with (
+                patch("app.modules.organize_tasks.Organizer", return_value=organizer),
+                patch.object(manager, "_execute_durable_operation", side_effect=execute),
+                patch.object(manager, "_wake_download_tracker"),
             ):
-                result = manager.start_operation(
-                    "目录刮削",
-                    "queue-start-failure",
-                    lambda: {"stats": {"moved": 1}},
-                    queue_if_busy=True,
-                    dedupe_key="manual:queue-start-failure",
+                full = manager.start(
+                    [{"id": "source", "name": "源目录"}],
+                    OrganizeRules(target_dir_id="target", notify_enabled=False, library_notify=False),
                 )
+                self.assertTrue(full["ok"])
+                self.assertTrue(organize_started.wait(timeout=2))
+                self.assertFalse(submit("auto-while-busy", queue_if_busy=False)["ok"])
+                first, second = submit("first"), submit("second")
+                self.assertTrue(first["queued"] and second["queued"])
+                self.assertEqual((first["queue_position"], second["queue_position"]), (1, 2))
+                replay = submit("second")
+                self.assertTrue(replay["replayed"])
+                self.assertEqual(replay["task_id"], second["task_id"])
+                self.assertEqual(manager.task_status()["operation_queue"]["total"], 2)
+
+                release_organize.set()
+                deadline = monotonic() + 4
+                ids = [full["task_id"], first["task_id"], second["task_id"]]
+                while monotonic() < deadline:
+                    statuses = [(manager.task_result(task_id) or {}).get("status") for task_id in ids]
+                    if statuses == ["completed"] * 3:
+                        break
+                    sleep(0.01)
+                else:
+                    self.fail(f"待执行操作未按期收敛: {statuses}")
+                self.assertEqual(order, ["first", "second"])
         finally:
-            manager._lock.release()
-
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["retryable"])
-        self.assertEqual(result["error_code"], "queue_dispatcher_start_failed")
-        self.assertEqual(manager.task_status()["operation_queue"]["items"], [])
-        self.assertIsNone(manager._operation_dispatcher)
-
-    def test_shutdown_records_queued_manual_operation_as_stopped(self):
-        manager = OrganizeTaskManager()
-        manager._lock = cast(CrossProcessLock, threading.Lock())
-        manager._lock.acquire()
-        queued = manager.start_operation(
-            "目录刮削",
-            "queued-on-shutdown",
-            lambda: {"stats": {"moved": 1}},
-            queue_if_busy=True,
-            dedupe_key="manual:shutdown",
-        )
-        self.assertTrue(queued["queued"])
-
-        manager.begin_shutdown()
-        manager._lock.release()
-
-        terminal = manager.task_result(queued["task_id"])
-        assert (terminal) is not None
-        self.assertEqual(terminal["status"], "stopped")
-        self.assertIn("服务关闭", terminal["error"])
-        history = manager.task_status()["operation_history"]
-        self.assertEqual(history[0]["id"], queued["task_id"])
-        self.assertEqual(history[0]["status"], "stopped")
+            release_organize.set()
+            manager.shutdown(timeout=4)
 
     def test_single_operation_cleanup_failure_is_reported_as_partial(self):
         manager = OrganizeTaskManager()

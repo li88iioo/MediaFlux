@@ -12,7 +12,7 @@ import uuid
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from typing import Any, Callable
 
@@ -61,7 +61,6 @@ from app.repositories.organize_operation_jobs import (
     get_organize_operation_job,
     get_organize_operation_job_for_owner,
     is_organize_operation_cancel_requested,
-    list_pending_organize_operation_jobs,
     organize_operation_job_id_from_public_ref,
     organize_operation_owner_digest,
     organize_operation_queue_position,
@@ -420,7 +419,6 @@ class OrganizeTaskManager:
         self._cancel_event = threading.Event()
         self._task: dict[str, Any] = {}
         self._worker: threading.Thread | None = None
-        self._operation_queue: deque[dict[str, Any]] = deque()
         self._operation_history: deque[dict[str, Any]] = deque(maxlen=16)
         self._task_history: deque[dict[str, Any]] = deque(maxlen=32)
         self._operation_queue_wakeup = threading.Event()
@@ -488,7 +486,7 @@ class OrganizeTaskManager:
                     "error": "无法检查网盘整理任务状态",
                     "retryable": True,
                 }
-            if self._operation_queue or pending_operation:
+            if pending_operation:
                 self._admission_lock.release()
                 return {"ok": False, "error": "网盘整理任务正在运行"}
         try:
@@ -705,7 +703,6 @@ class OrganizeTaskManager:
         with self._admission_lock:
             with self._state_lock:
                 self._shutting_down = True
-                self._cancel_queued_operations_locked("服务关闭，排队任务未执行")
         self._operation_queue_wakeup.set()
 
     def shutdown(self, timeout: float = 30.0) -> bool:
@@ -713,7 +710,6 @@ class OrganizeTaskManager:
         with self._admission_lock:
             with self._state_lock:
                 self._shutting_down = True
-                self._cancel_queued_operations_locked("服务关闭，排队任务未执行")
                 worker = self._worker
                 stoppable = self._task.get("stoppable") is not False
                 running = self._task.get("status") in {"running", "stopping"}
@@ -791,7 +787,9 @@ class OrganizeTaskManager:
             result["operation_history"] = history_payload
             return result
 
-    def task_result(self, task_id: str, *, owner: str | None = None) -> dict | None:
+    def task_result(
+        self, task_id: str, *, owner: str | None = None, web_owner: str | None = None,
+    ) -> dict | None:
         """按任务 ID 查询当前或近期终态；公开编号必须绑定调用主体。"""
         expected = (task_id or "").strip()
         if not expected:
@@ -821,14 +819,19 @@ class OrganizeTaskManager:
                 if not result.get("durable") and not result.get("operation") and isinstance(result.get("result"), dict):
                     result["result"] = read_organize_result(result["result"])
                 return result
+        if web_owner is not None and not web_owner:
+            return None
+        job_owner = web_owner if web_owner is not None else owner
         try:
             row = (
-                get_organize_operation_job_for_owner(expected, str(owner))
-                if owner_digest else get_organize_operation_job(expected)
+                get_organize_operation_job_for_owner(expected, job_owner)
+                if job_owner else get_organize_operation_job(expected)
             )
         except ValueError:
             row = None
-        if row is None or row["purged_at"] is not None:
+        if row is None or row["purged_at"] is not None or (
+            web_owner is not None and row["job_kind"] != "directory_scrape"
+        ):
             return None
         try:
             persisted_result = json.loads(str(row["result_json"] or "{}"))
@@ -836,7 +839,7 @@ class OrganizeTaskManager:
             persisted_result = {}
         status = str(row["status"] or "")
         public_status = "queued" if status == "pending" else status
-        return {
+        result = {
             "id": str(row["job_id"] or ""),
             "status": public_status,
             "message": (
@@ -857,6 +860,9 @@ class OrganizeTaskManager:
             "result": persisted_result if isinstance(persisted_result, dict) else {},
             "durable": True,
         }
+        if web_owner is not None:
+            result["queue_position"] = organize_operation_queue_position(expected) if status == "pending" else 0
+        return result
 
     def status(self) -> dict:
         result = self.task_status()
@@ -882,9 +888,7 @@ class OrganizeTaskManager:
             with self._state_lock:
                 if self._shutting_down:
                     return {"ok": False, "error": "服务正在停止，暂不接受新的整理操作"}
-                if self._operation_queue:
-                    return {"ok": False, "error": "网盘整理任务正在运行"}
-            if not self._lock.acquire(blocking=False):
+            if count_pending_organize_operation_jobs() or not self._lock.acquire(blocking=False):
                 return {"ok": False, "error": "网盘整理任务正在运行"}
             organizer = None
             try:
@@ -972,15 +976,9 @@ class OrganizeTaskManager:
         reference: str,
         callback: Callable[[], object],
         *,
-        queue_if_busy: bool = False,
         dedupe_key: str = "",
     ) -> dict:
-        """提交与全量整理共用互斥锁的单次云盘写操作。
-
-        默认保持旧行为：锁忙时立即返回冲突。人工目录刮削可显式开启
-        ``queue_if_busy``，在同一进程内按 FIFO 串行执行，避免快速连续
-        提交时让用户反复等待和重试。
-        """
+        """提交与全量整理共用互斥锁的单次即时云盘写操作。"""
         operation = (operation or "操作").strip() or "操作"
         reference = (reference or "").strip()
         dedupe_key = (dedupe_key or "").strip()
@@ -997,11 +995,10 @@ class OrganizeTaskManager:
                         "ok": True,
                         "task_id": duplicate["id"],
                         "message": duplicate["message"],
-                        "queued": duplicate["status"] == "queued",
-                        "queue_position": duplicate.get("queue_position", 0),
+                        "queued": False,
+                        "queue_position": 0,
                         "replayed": True,
                     }
-                queue_has_items = bool(self._operation_queue)
             try:
                 durable_has_items = (
                     count_pending_organize_operation_jobs() > 0
@@ -1014,8 +1011,7 @@ class OrganizeTaskManager:
                 durable_has_items = True
 
             if (
-                not queue_has_items
-                and not durable_has_items
+                not durable_has_items
                 and self._lock.acquire(blocking=False)
             ):
                 return self._launch_operation_with_lock(
@@ -1026,47 +1022,7 @@ class OrganizeTaskManager:
                     dedupe_key=dedupe_key,
                 )
 
-            if not queue_if_busy:
-                return {"ok": False, "error": "网盘整理任务正在运行"}
-
-            queued_item = {
-                "id": task_id,
-                "status": "queued",
-                "message": f"{operation}已排队",
-                "operation": operation,
-                "reference": reference,
-                "callback": callback,
-                "dedupe_key": dedupe_key,
-                "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-            }
-            with self._state_lock:
-                self._operation_queue.append(queued_item)
-                queue_position = len(self._operation_queue)
-            try:
-                self._ensure_operation_dispatcher()
-            except Exception:
-                logger.exception(
-                    "启动光鸭整理排队调度线程失败 operation=%s", operation
-                )
-                with self._state_lock:
-                    try:
-                        self._operation_queue.remove(queued_item)
-                    except ValueError:
-                        pass
-                return {
-                    "ok": False,
-                    "error": f"{operation}排队失败",
-                    "retryable": True,
-                    "error_code": "queue_dispatcher_start_failed",
-                }
-            self._operation_queue_wakeup.set()
-            return {
-                "ok": True,
-                "task_id": task_id,
-                "message": f"{operation}已排队，前方 {max(0, queue_position - 1)} 项",
-                "queued": True,
-                "queue_position": queue_position,
-            }
+            return {"ok": False, "error": "网盘整理任务正在运行"}
 
     def start_durable_operation(
         self,
@@ -1077,6 +1033,8 @@ class OrganizeTaskManager:
         owner: str,
         payload: dict[str, Any],
         dedupe_key: str,
+        job_id: str | None = None,
+        queue_if_busy: bool = True,
         ttl_seconds: int = 3_600,
         on_admitted: Callable[[Any, Any, bool], None] | None = None,
     ) -> dict:
@@ -1088,11 +1046,21 @@ class OrganizeTaskManager:
         """
         operation = (operation or "操作").strip() or "操作"
         reference = (reference or "").strip()
-        with self._admission_lock:
+        busy = {"ok": False, "error": "网盘整理任务正在运行"}
+        with self._admission_lock, ExitStack() as writer:
             with self._state_lock:
                 if self._shutting_down:
                     return {"ok": False, "error": "服务正在停止，暂不接受新的整理操作"}
+                available = self._worker is None and not self._has_unpersisted_settlement_locked()
+            if not queue_if_busy:
+                if not available or not self._lock.acquire(blocking=False):
+                    return busy
+                writer.callback(self._lock.release)
             try:
+                if not queue_if_busy and (
+                    count_pending_organize_operation_jobs() or count_running_organize_operation_jobs()
+                ):
+                    return busy
                 row, replayed = enqueue_organize_operation_job(
                     job_kind=job_kind,
                     owner=owner,
@@ -1100,6 +1068,7 @@ class OrganizeTaskManager:
                     reference=reference,
                     payload=payload,
                     dedupe_key=dedupe_key,
+                    job_id=job_id,
                     ttl_seconds=ttl_seconds,
                     on_admitted=on_admitted,
                 )
@@ -1139,14 +1108,15 @@ class OrganizeTaskManager:
 
             with self._state_lock:
                 can_launch_now = (
-                    self._worker is None and not self._operation_queue
+                    self._worker is None
                     and not self._has_unpersisted_settlement_locked()
                 )
-            if can_launch_now and self._lock.acquire(blocking=False):
+            if can_launch_now and (not queue_if_busy or self._lock.acquire(blocking=False)):
+                if queue_if_busy:
+                    writer.callback(self._lock.release)
                 try:
                     claimed = claim_organize_operation_job(task_id)
                 except Exception as exc:
-                    self._lock.release()
                     logger.warning(
                         "领取新建光鸭持久化操作失败 operation=%s type=%s",
                         operation, type(exc).__name__,
@@ -1156,8 +1126,14 @@ class OrganizeTaskManager:
                         "retryable": True, "error_code": "durable_queue_claim_failed",
                     }
                 if claimed is not None:
+                    writer.pop_all()  # worker 接管互斥锁。
                     return self._launch_durable_operation_with_lock(claimed)
-                self._lock.release()
+                if not queue_if_busy:
+                    fail_pending_organize_operation_job(
+                        task_id, error_code="operation_busy", error=busy["error"],
+                    )
+                    return busy
+                writer.close()
 
             try:
                 self._ensure_operation_dispatcher()
@@ -1276,7 +1252,9 @@ class OrganizeTaskManager:
 
         cancel_check()
         kind = str(row.get("job_kind") or "")
-        if kind == "agent_directory_scrape":
+        if kind == "directory_scrape" and payload.get("version") != 3:
+            raise ValueError("旧目录刮削任务缺少可恢复的预览")
+        if kind in {"agent_directory_scrape", "directory_scrape"}:
             from app.modules.directory_scrape import (
                 execute_durable_directory_scrape_job,
             )
@@ -1327,12 +1305,13 @@ class OrganizeTaskManager:
                     else "操作检查点未能保存，请核对云端结果，勿重复提交" if status == "manual_review"
                     else f"{operation}失败，请重新检查后重试"
                 )
-            safe_result = sanitize_organize_operation_result(result)
+            result_payload = result if isinstance(result, dict) else {}
+            safe_result = sanitize_organize_operation_result(result_payload)
             try:
                 persisted = False
                 if status == "queued":
                     persisted = defer_organize_operation_job(task_id,
-                        expected_lease_generation=generation, result=safe_result)
+                        expected_lease_generation=generation, result=result_payload)
                     if not persisted:
                         cancelled = is_organize_operation_cancel_requested(task_id, expected_lease_generation=generation)
                         status = "cancelled" if cancelled else "manual_review"
@@ -1341,7 +1320,7 @@ class OrganizeTaskManager:
                 if status != "queued":
                     persisted = finish_organize_operation_job(task_id,
                         expected_lease_generation=generation, status=status,
-                        error_code=error_code, error=error, result=safe_result)
+                        error_code=error_code, error=error, result=result_payload)
             except Exception as persist_exc:
                 logger.warning("持久化光鸭操作状态写入异常 type=%s", type(persist_exc).__name__)
                 persisted = False
@@ -1435,37 +1414,12 @@ class OrganizeTaskManager:
         ):
             return {
                 "id": str(self._task.get("id") or ""),
-                "status": str(self._task.get("status") or "running"),
                 "message": str(self._task.get("message") or "任务正在运行"),
-                "queue_position": 0,
             }
-        for position, item in enumerate(self._operation_queue, start=1):
-            if item.get("dedupe_key") == dedupe_key:
-                return {
-                    "id": str(item.get("id") or ""),
-                    "status": "queued",
-                    "message": str(item.get("message") or "任务已排队"),
-                    "queue_position": position,
-                }
         return None
 
     def _operation_queue_payload_locked(self) -> dict[str, Any]:
-        # 通用 Web 状态只展开请求期回调队列；owner 隔离的持久队列仅暴露
-        # 聚合数量，详情必须通过 owner-bound GY 编号查询。
-        items = [
-            {
-                "id": str(item.get("id") or ""),
-                "status": "queued",
-                "message": str(item.get("message") or "任务已排队"),
-                "operation": str(item.get("operation") or ""),
-                "reference": str(item.get("reference") or ""),
-                "queued_at": str(item.get("queued_at") or ""),
-                "queue_position": position,
-                "ahead": position - 1,
-                "durable": False,
-            }
-            for position, item in enumerate(self._operation_queue, start=1)
-        ]
+        # 通用状态仅显示聚合数量，详细回执按调用主体查询。
         try:
             durable_count = count_pending_organize_operation_jobs()
         except Exception as exc:
@@ -1474,8 +1428,8 @@ class OrganizeTaskManager:
             )
             durable_count = 0
         return {
-            "total": len(items) + durable_count,
-            "items": items,
+            "total": durable_count,
+            "items": [],
             "durable_pending_count": durable_count,
         }
 
@@ -1503,23 +1457,6 @@ class OrganizeTaskManager:
             "owner_digest": str(task.get("owner_digest") or ""),
             "durable": bool(task.get("durable")),
         })
-
-    def _cancel_queued_operations_locked(self, message: str) -> None:
-        finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        while self._operation_queue:
-            item = self._operation_queue.popleft()
-            terminal = {
-                "id": str(item.get("id") or ""),
-                "status": "stopped",
-                "message": message,
-                "error": message,
-                "operation": str(item.get("operation") or ""),
-                "reference": str(item.get("reference") or ""),
-                "finished_at": finished_at,
-                "result": {},
-            }
-            self._remember_task_locked(terminal)
-            self._remember_operation_locked(terminal)
 
     def _remember_operation_locked(self, task: dict[str, Any]) -> None:
         if bool(task.get("durable")):
@@ -1569,7 +1506,6 @@ class OrganizeTaskManager:
                     with self._state_lock:
                         if self._shutting_down:
                             return
-                        memory_pending = bool(self._operation_queue)
                         if self._worker is not None:
                             break
                     if time.monotonic() >= self._settlement_retry_at:
@@ -1587,7 +1523,7 @@ class OrganizeTaskManager:
                         )
                         durable_pending = False
                         durable_running = False
-                    if not memory_pending and not durable_pending and not durable_running:
+                    if not durable_pending and not durable_running:
                         break
                     if self._lock.acquire(blocking=False):
                         if durable_running:
@@ -1598,63 +1534,14 @@ class OrganizeTaskManager:
                                         "已处理 %s 个中断光鸭操作：可核对计划重排，其余保留人工核验",
                                         recovered,
                                     )
-                                    durable_pending = count_pending_organize_operation_jobs() > 0
                             except Exception as exc:
                                 logger.warning(
                                     "收束光鸭孤儿操作失败 type=%s", type(exc).__name__
                                 )
                                 self._lock.release()
                                 break
-                        durable_row = None
-                        if durable_pending:
-                            try:
-                                pending_rows = list_pending_organize_operation_jobs(limit=1, ready_only=True)
-                                durable_row = pending_rows[0] if pending_rows else None
-                            except Exception as exc:
-                                logger.warning(
-                                    "读取光鸭持久化队首失败 type=%s",
-                                    type(exc).__name__,
-                                )
-                        with self._state_lock:
-                            memory_item = (
-                                self._operation_queue[0]
-                                if self._operation_queue
-                                else None
-                            )
-                        memory_key = (
-                            str(memory_item.get("queued_at") or ""),
-                            str(memory_item.get("id") or ""),
-                        ) if memory_item is not None else None
-                        durable_key = (
-                            str(durable_row["created_at"] or ""),
-                            str(durable_row["job_id"] or ""),
-                        ) if durable_row is not None else None
-                        launch_memory = (
-                            memory_key is not None
-                            and (durable_key is None or memory_key <= durable_key)
-                        )
-                        if launch_memory:
-                            with self._state_lock:
-                                item = (
-                                    self._operation_queue.popleft()
-                                    if self._operation_queue
-                                    else None
-                                )
-                            if item is not None:
-                                self._launch_operation_with_lock(
-                                    str(item["id"]),
-                                    str(item["operation"]),
-                                    str(item["reference"]),
-                                    item["callback"],
-                                    dedupe_key=str(item.get("dedupe_key") or ""),
-                                )
-                                break
                         try:
-                            row = claim_organize_operation_job(
-                                str(durable_row["job_id"])
-                                if durable_row is not None
-                                else None
-                            )
+                            row = claim_organize_operation_job()
                         except Exception as exc:
                             logger.warning(
                                 "领取光鸭持久化操作失败 type=%s", type(exc).__name__

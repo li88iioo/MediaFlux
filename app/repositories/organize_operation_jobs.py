@@ -224,7 +224,7 @@ def _sanitize_operation_items(value: object) -> list[dict[str, Any]]:
     return items
 
 
-def sanitize_organize_operation_result(value: object) -> dict[str, Any]:
+def sanitize_organize_operation_result(value: object, *, web_scrape_id: str = "") -> dict[str, Any]:
     """仅保留安全统计与有界、脱敏的逐项执行回执。"""
     if not isinstance(value, dict):
         return {}
@@ -252,6 +252,27 @@ def sanitize_organize_operation_result(value: object) -> dict[str, Any]:
         result["stats"] = stats
     if "operation_items" in value:
         result["operation_items"] = _sanitize_operation_items(value["operation_items"])
+    if web_scrape_id and isinstance(value.get("directory"), str):
+        log_ids = value.get("log_ids")
+        result.update(
+            preview_id=web_scrape_id,
+            directory=_safe_text(value["directory"], limit=240),
+            log_ids=[log_id for log_id in log_ids[:_MAX_OPERATION_ITEMS] if type(log_id) is int]
+            if isinstance(log_ids, list) else [],
+        )
+        if isinstance(raw_stats, dict):
+            pending_count = raw_stats.get("pending_confirmation", 0)
+            if type(pending_count) is int:
+                stats["pending_confirmation"] = max(0, pending_count)
+            pending_files = raw_stats.get("pending_files")
+            if isinstance(pending_files, list):
+                stats["pending_files"] = [
+                    {key: _safe_text(item.get(key), limit=240) for key in ("file_id", "name", "relative_dir", "reason")}
+                    for item in pending_files[:10] if isinstance(item, dict)
+                ]
+            scan_errors = raw_stats.get("scan_errors")
+            if isinstance(scan_errors, list):
+                stats["scan_errors"] = [_safe_text(item, limit=240) for item in scan_errors[:32]]
     return result
 
 
@@ -806,12 +827,6 @@ def finish_organize_operation_job(
     safe_status = (status or "").strip().lower()
     if safe_status not in _TERMINAL_STATUSES:
         raise ValueError("光鸭操作任务终态无效")
-    safe_result_payload = sanitize_organize_operation_result(result or {})
-    safe_result = _safe_json(
-        safe_result_payload,
-        field="光鸭操作任务结果",
-        max_bytes=_MAX_RESULT_JSON_BYTES,
-    )
     safe_error_code = re.sub(r"[^A-Za-z0-9_.-]", "", (error_code or ""))[:80]
     safe_error = _safe_text(error, limit=500)
     timestamp = now()
@@ -824,6 +839,12 @@ def finish_organize_operation_job(
         ).fetchone()
         if row is None:
             return False
+        safe_result_payload = sanitize_organize_operation_result(
+            result or {}, web_scrape_id=safe_id if row["job_kind"] == "directory_scrape" else "",
+        )
+        safe_result = _safe_json(
+            safe_result_payload, field="光鸭操作任务结果", max_bytes=_MAX_RESULT_JSON_BYTES,
+        )
         cur = conn.execute(
             "UPDATE organize_operation_jobs SET status=?,reference='',payload_json='{}',payload_auth='',"
             "result_json=?,error_code=?,error=?,finished_at=?,updated_at=? "

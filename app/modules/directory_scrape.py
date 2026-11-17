@@ -172,7 +172,7 @@ def _scrape_execution_context(payload: dict[str, Any]) -> tuple[str, str, dict[s
         "version", "execution_owner", "expected_context", "flow",
     }:
         raise ValueError("持久化刮削任务参数无效")
-    if payload.get("version") not in {1, 2} or type(payload.get("version")) is not int:
+    if payload.get("version") not in {1, 2, 3} or type(payload.get("version")) is not int:
         raise ValueError("持久化刮削任务版本无效")
     owner = str(payload.get("execution_owner") or "").strip().casefold()
     expected = str(payload.get("expected_context") or "").strip().casefold()
@@ -183,6 +183,8 @@ def _scrape_execution_context(payload: dict[str, Any]) -> tuple[str, str, dict[s
         raise ValueError("持久化刮削任务上下文无效")
     if payload["version"] == 2 and snapshot.get("selection_source") != "automatic":
         raise ValueError("原生刮削任务选择来源无效")
+    if payload["version"] == 3 and snapshot.get("selection_source") not in {"manual", "automatic"}:
+        raise ValueError("网页刮削任务选择来源无效")
     kind, identifier = snapshot.get("scope_type"), snapshot.get("scope_id")
     candidate, arguments, guard = (snapshot.get(key) for key in (
         "selected_candidate", "preview_arguments", "preview_guard",
@@ -227,8 +229,8 @@ def _restore_directory_scrape_preview(
     if not inspection_id:
         raise ValueError("持久化刮削检查无法恢复")
     options = {key: arguments.get(key) for key in ("season", "episode", "numbering_mode")}
-    if payload["version"] == 2:
-        options["selection_source"] = "automatic"
+    if payload["version"] >= 2:
+        options["selection_source"] = snapshot["selection_source"]
     tmdb_id = candidate.get("tmdb_id") or candidate["external_id"]
     if candidate["provider"] == "metatube":
         options.update(provider="metatube", external_id=candidate["external_id"])
@@ -1001,24 +1003,88 @@ class DirectoryScrapeService:
             record = self.store.get_preview(execution_owner, preview_id)
             candidate = {"candidate_number": 1, "provider": provider, "external_id": selected_id,
                          "tmdb_id": selected_id if provider == "tmdb" else "", "media_type": media_type}
-            summary = summarize_scrape_preview(preview, {**candidate, "title": record.match.title, "year": record.match.year})
-            snapshot = {
-                "scope_type": inspected["scope_type"], "scope_id": file_id,
-                "selected_candidate": candidate,
-                "preview_arguments": {"candidate_number": 1, "numbering_mode": record.numbering_mode,
-                    **({"season": season} if season is not None else {}),
-                    **({"episode": episode} if episode is not None else {})},
-                "preview_guard": {key: summary[key] for key in (
-                    "candidate_number", "plan_count", "companion_count", "conflict_count", "actions")},
-                "selection_source": "automatic",
-            }
-            fingerprint = scrape_execution_fingerprint(snapshot, record)
+            payload = self._execution_payload(
+                record, candidate, execution_owner, version=2, season=season, episode=episode,
+            )
             return {"preview": {key: value for key, value in preview.items() if key not in {"inspection_id", "preview_id"}},
-                    "fingerprint": fingerprint,
-                    "execution_payload": {"version": 2, "execution_owner": execution_owner,
-                        "expected_context": fingerprint, "flow": snapshot}}
+                    "fingerprint": payload["expected_context"], "execution_payload": payload}
         finally:
             self.store.consume_preview(execution_owner, preview_id)
+
+    @staticmethod
+    def _execution_payload(
+        record: PreviewRecord, candidate: dict, execution_owner: str, *,
+        version: int, season: int | None, episode: int | None,
+    ) -> dict:
+        summary = summarize_scrape_preview(
+            record.payload, {**candidate, "title": record.match.title, "year": record.match.year},
+        )
+        snapshot = {
+            "scope_type": record.scope_type, "scope_id": record.scope_id,
+            "selected_candidate": candidate,
+            "preview_arguments": {
+                "candidate_number": candidate["candidate_number"], "numbering_mode": record.numbering_mode,
+                **({"season": season} if season is not None else {}),
+                **({"episode": episode} if episode is not None else {}),
+            },
+            "preview_guard": {key: summary[key] for key in (
+                "candidate_number", "plan_count", "companion_count", "conflict_count", "actions",
+            )},
+            "selection_source": record.selection_source,
+        }
+        return {
+            "version": version, "execution_owner": execution_owner,
+            "expected_context": scrape_execution_fingerprint(snapshot, record), "flow": snapshot,
+        }
+
+    @_directory_scrape_operation
+    def submit_preview(self, owner: str, preview_id: str, *, queue_if_busy: bool) -> dict:
+        """以原预览 ID 幂等受理 Web 请求，重启后同一会话仍可查询。"""
+        from app.modules.organize_tasks import get_organize_manager
+
+        manager = get_organize_manager()
+
+        def replay():
+            task = manager.task_result(preview_id, web_owner=owner)
+            if task and task.get("durable") and task.get("error_code") != "operation_busy":
+                return {
+                    "ok": True, "task_id": preview_id, "message": task["message"],
+                    "queued": task["status"] == "queued", "queue_position": task.get("queue_position", 0),
+                    "replayed": True,
+                }
+            return None
+
+        existing = replay()
+        if existing:
+            return existing
+        try:
+            record = self.store.get_preview(owner, preview_id)
+        except DirectoryScrapeGoneError:
+            existing = replay()
+            if existing:
+                return existing
+            raise
+        match = record.match
+        candidate = {
+            "candidate_number": 1, "provider": Organizer._match_provider(match),
+            "external_id": Organizer._match_external_id(match), "tmdb_id": str(match.tmdb_id or ""),
+            "media_type": match.media_type,
+        }
+        execution_owner = signed_context_fingerprint({"owner": owner}, domain="guangya-directory-scrape-job-owner")
+        payload = self._execution_payload(
+            record, candidate, execution_owner, version=3,
+            season=record.season_override, episode=record.episode_override,
+        )
+        _scrape_execution_context(payload)
+        task = manager.start_durable_operation(
+            "目录刮削", record.inspection.directory_name,
+            job_kind="directory_scrape", owner=owner, payload=payload,
+            dedupe_key=f"directory-scrape:{preview_id}", job_id=preview_id, queue_if_busy=queue_if_busy,
+        )
+        if task["ok"]:
+            self.store.consume_preview(owner, preview_id)
+            return task
+        return replay() or task
 
     @_directory_scrape_operation
     def submit_execution(
@@ -1569,10 +1635,6 @@ class DirectoryScrapeService:
             external_id=str(getattr(match, "external_id", "") or ""),
         )
         return {"status": "matched", **preview}
-
-    @_directory_scrape_operation
-    def preview_reference(self, owner: str, preview_id: str) -> str:
-        return self.store.get_preview(owner, preview_id).inspection.directory_name
 
     @_directory_scrape_operation
     def execute_preview(

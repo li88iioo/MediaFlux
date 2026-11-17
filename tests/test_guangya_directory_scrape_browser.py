@@ -123,6 +123,9 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.page = self.browser.new_page(viewport={"width": 1280, "height": 900})
         self.page_errors: list[str] = []
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        self._load_harness()
+
+    def _load_harness(self):
         self.page.set_content(HARNESS.replace("__SCRAPE_MODAL__", self.modal_markup))
         self.page.add_style_tag(content=MAIN_STYLES)
         self.page.add_style_tag(content=STYLES)
@@ -993,8 +996,8 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                 if (String(path).endsWith('/run')) {
                     return {ok: true, json: async () => ({task_id: 'handoff-test'})};
                 }
-                if (String(path) === '/api/guangya/organize/status') {
-                    return {ok: true, json: async () => ({operation_history: [{
+                if (String(path) === '/api/guangya/organize/status?task_ids=handoff-test') {
+                    return {ok: true, json: async () => ({tasks: [{
                         id: 'handoff-test', status: 'partial', result: {stats: {
                             moved: 1, failed: 0, strm: {ok: false, error: 'STRM 调度器正在停止'},
                         }},
@@ -1034,13 +1037,14 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                         window.__requests.push({path: String(path), body: JSON.parse(options.body || '{}')});
                         return {ok: true, json: async () => ({task_id: taskId})};
                     }
-                    if (String(path) === '/api/guangya/organize/status') {
+                    if (String(path).startsWith('/api/guangya/organize/status?')) {
                         window.__statusRequests += 1;
+                        const ids = new URLSearchParams(path.split('?')[1]).get('task_ids').split(',');
                         return {
                             ok: true,
                             json: async () => ({
-                                operation_history: [1, 2].map(index => ({
-                                    id: `task-${index}`,
+                                tasks: ids.map(id => ({
+                                    id,
                                     status: 'completed',
                                     result: {stats: {}},
                                 })),
@@ -1093,7 +1097,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.evaluate("window.__reloads"), 1)
         self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 0)
 
-    def test_task_polling_pauses_while_hidden_and_pagehide_discards_pending_work(self):
+    def test_task_polling_pauses_while_hidden_and_pagehide_disposes_the_old_loop(self):
         first = self._bind(is_directory=True, left=180, top=80)
         second = self._bind(is_directory=True, left=220, top=120)
         self.page.evaluate(
@@ -1114,12 +1118,12 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                         window.__runTasks += 1;
                         return {ok: true, json: async () => ({task_id: `task-${window.__runTasks}`})};
                     }
-                    if (String(path) === '/api/guangya/organize/status') {
+                    if (String(path).startsWith('/api/guangya/organize/status?')) {
                         window.__statusRequests += 1;
                         return {
                             ok: true,
                             json: async () => ({
-                                operation_history: [...window.__terminalTasks].map(id => ({
+                                tasks: [...window.__terminalTasks].map(id => ({
                                     id,
                                     status: 'completed',
                                     result: {stats: {}},
@@ -1193,6 +1197,49 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.page.evaluate("window.__clearedPoll?.()")
         self.assertEqual(self.page.evaluate("window.__statusRequests"), 1)
 
+
+    def test_reload_resumes_polling_the_accepted_scrape_id(self):
+        self.page.route("**/*", lambda route: route.fulfill(body="", content_type="text/html"))
+        self.page.goto("http://mediaflux.test/scrape")
+        self._load_harness()
+        self.page.evaluate("""() => {
+            window.appConfirm = async () => true;
+            const originalFetch = window.fetch;
+            window.fetch = async (path, options = {}) => {
+                if (path.endsWith('/run')) {
+                    return {ok: true, json: async () => ({task_id: 'durable-task', queued: true})};
+                }
+                if (path.includes('/organize/status?')) {
+                    return {ok: true, json: async () => ({tasks: [{id: 'durable-task', status: 'queued'}]})};
+                }
+                return originalFetch(path, options);
+            };
+        }""")
+        row = self._bind(is_directory=True, left=180, top=80)
+        self._open_button(row)
+        self.page.locator('[data-scrape-action="auto"]').click()
+        self.page.wait_for_function("() => sessionStorage.getItem('mediaflux.directory-scrape.active-tasks')?.includes('durable-task')")
+
+        self.page.reload()
+        self._load_harness()
+        self.page.evaluate("""() => {
+            const originalFetch = window.fetch;
+            window.__resumed = [];
+            window.fetch = async (path, options = {}) => {
+                if (path.includes('/organize/status?')) {
+                    window.__resumed.push(path);
+                    return {ok: true, json: async () => ({tasks: [{id: 'durable-task', status: 'completed'}]})};
+                }
+                return originalFetch(path, options);
+            };
+        }""")
+        restored = self._bind(is_directory=True, left=180, top=80)
+        self.page.locator(restored["action"] + '[data-state="done"]').wait_for()
+        self.assertEqual(self.page.evaluate("window.__resumed"), [
+            "/api/guangya/organize/status?task_ids=durable-task",
+        ])
+        self.assertFalse(self.page.evaluate("!!sessionStorage.getItem('mediaflux.directory-scrape.active-tasks')"))
+        self.assertFalse(self.page_errors)
 
 
 if __name__ == "__main__":

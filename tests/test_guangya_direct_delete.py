@@ -171,7 +171,6 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
                 self.assertEqual(response.json()["task_id"], f"delete-{file_id}")
                 args = self.manager.start_operation.call_args
                 self.assertEqual(args.args[:2], ("删除光鸭目录项", "Season 1" if is_dir else "广告.txt"))
-                self.assertFalse(args.kwargs["queue_if_busy"])
                 self.assertEqual(args.kwargs["dedupe_key"], f"guangya-direct-delete:{file_id}")
 
                 result = self._scheduled_callback()()

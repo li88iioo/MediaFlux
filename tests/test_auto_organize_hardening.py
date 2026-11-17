@@ -455,7 +455,6 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "completed")
         self.assertEqual(update.call_args.kwargs["organize_status"], "skipped")
         self.assertIsNone(update.call_args.kwargs["organize_next_retry_at"])
-        self.assertFalse(manager.start_operation.call_args.kwargs["queue_if_busy"])
 
     def test_tracker_renames_multi_item_staging_to_release_name_without_flattening(self):
         tracker = DownloadTracker()

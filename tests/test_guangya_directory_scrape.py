@@ -2828,6 +2828,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
         self.scraper.confirm.assert_not_called()
 
     def test_manual_run_parameters_cannot_promote_an_auto_preview(self):
+        from app.modules import directory_scrape, organize_tasks
         import app.routes.guangya_scrape_api as scrape_api
 
         self.scraper.confirm = Mock()
@@ -2837,19 +2838,21 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
         # 展示 payload 不能替代服务端预览记录中的来源。
         self.store.get_preview("owner", preview_id).payload["selection_source"] = "manual"
         manager = Mock()
-        manager.start_operation.return_value = {"ok": True, "task_id": "resume-auto"}
+        manager.task_result.return_value = None
+        manager.start_durable_operation.return_value = {"ok": True, "task_id": preview_id}
         with (
             patch.object(scrape_api, "require_api_login"),
             patch.object(scrape_api, "get_directory_scrape_service", return_value=self.service),
-            patch.object(scrape_api, "get_organize_manager", return_value=manager),
+            patch.object(organize_tasks, "get_organize_manager", return_value=manager),
         ):
             response = scrape_api.run_directory(
                 scrape_api.Request({"type": "http", "session": {"csrf_token": "owner"}}),
                 {"mode": "manual", "preview_id": preview_id, "selection_source": "manual"},
             )
         self.assertEqual(response.status_code, 202)
-        callback = manager.start_operation.call_args.args[2]
-        result = callback()
+        frozen = manager.start_durable_operation.call_args.kwargs["payload"]
+        with patch.object(directory_scrape, "get_directory_scrape_service", return_value=self.service):
+            result = directory_scrape.execute_durable_directory_scrape_job(frozen)
 
         self.assertEqual(result["stats"]["moved"], 1)
         self.scraper.confirm.assert_not_called()
@@ -4420,11 +4423,8 @@ class _RouteService:
     def auto_match(self, *_args, **_kwargs) -> dict:
         return dict(self.auto_result)
 
-    def execute_preview(self, _owner: str, _preview_id: str) -> dict:
-        return {"stats": {"moved": 1}}
-
-    def preview_reference(self, _owner: str, _preview_id: str) -> str:
-        return "钢铁侠"
+    def submit_preview(self, _owner: str, _preview_id: str, *, queue_if_busy: bool) -> dict:
+        return {"ok": True, "task_id": "task-1", "message": "目录刮削已启动"}
 
 
 class DirectoryScrapeApiTests(InitializedWebTestCase):
@@ -4432,29 +4432,19 @@ class DirectoryScrapeApiTests(InitializedWebTestCase):
         import app.routes.guangya_scrape_api as scrape_api
 
         self.service = _RouteService()
-        self.manager = Mock()
-        self.manager.start_operation.return_value = {
-            "ok": True,
-            "task_id": "task-1",
-            "message": "目录刮削已启动",
-        }
+        self.submission = self.enterContext(patch.object(
+            self.service, "submit_preview", wraps=self.service.submit_preview,
+        ))
         self.service_patch = patch.object(
             scrape_api,
             "get_directory_scrape_service",
             return_value=self.service,
         )
-        self.manager_patch = patch.object(
-            scrape_api,
-            "get_organize_manager",
-            return_value=self.manager,
-        )
         self.service_patch.start()
-        self.manager_patch.start()
         self.client = TestClient(create_app(start_background=False))
 
     def tearDown(self):
         self.client.close()
-        self.manager_patch.stop()
         self.service_patch.stop()
 
     @staticmethod
@@ -4614,14 +4604,7 @@ class DirectoryScrapeApiTests(InitializedWebTestCase):
         )
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json()["task_id"], "task-1")
-        self.manager.start_operation.assert_called_once()
-        operation, reference, callback = self.manager.start_operation.call_args.args
-        self.assertEqual((operation, reference), ("目录刮削", "钢铁侠"))
-        self.assertEqual(callback(), {"stats": {"moved": 1}})
-        kwargs = self.manager.start_operation.call_args.kwargs
-        self.assertTrue(kwargs["queue_if_busy"])
-        self.assertTrue(kwargs["dedupe_key"].startswith("directory-scrape:"))
-        self.assertTrue(kwargs["dedupe_key"].endswith(":preview-1"))
+        self.submission.assert_called_once_with(headers["X-CSRF-Token"], "preview-1", queue_if_busy=True)
 
     def test_auto_low_confidence_returns_manual_payload_without_task(self):
         headers = self._login()
@@ -4633,10 +4616,10 @@ class DirectoryScrapeApiTests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "requires_manual")
         self.assertEqual(response.json()["suggested_query"], "钢铁侠")
-        self.manager.start_operation.assert_not_called()
+        self.submission.assert_not_called()
 
     def test_existing_organize_task_returns_conflict(self):
-        self.manager.start_operation.return_value = {
+        self.submission.return_value = {
             "ok": False,
             "error": "网盘整理任务正在运行",
         }
@@ -4657,14 +4640,8 @@ class DirectoryScrapeSecretBoundaryTests(IsolatedDatabaseTestCase):
         import app.routes.guangya_scrape_api as scrape_api
 
         service = _RouteService()
-        manager = Mock()
-        manager.start_operation.return_value = {
-            "ok": True, "task_id": "task-1", "message": "目录刮削已启动",
-        }
         with patch.object(
             scrape_api, "get_directory_scrape_service", return_value=service
-        ), patch.object(
-            scrape_api, "get_organize_manager", return_value=manager
         ), TestClient(create_app(start_background=False)) as client:
             page = client.get("/login")
             csrf = DirectoryScrapeApiTests._csrf(page.text)
@@ -4687,7 +4664,7 @@ class DirectoryScrapeSecretBoundaryTests(IsolatedDatabaseTestCase):
                 ("preview", "/api/guangya/directory-scrape/preview", {
                     "inspection_id": "inspection-1", "tmdb_id": "1", "media_type": "movie",
                 }),
-                ("preview_reference", "/api/guangya/directory-scrape/run", {
+                ("submit_preview", "/api/guangya/directory-scrape/run", {
                     "mode": "manual", "preview_id": "preview-1",
                 }),
             )

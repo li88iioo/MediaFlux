@@ -180,8 +180,8 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
         api.include_router(router)
 
         @api.post("/__test/login")
-        def login(request: Request):
-            request.session.update(authenticated_session())
+        def login(request: Request, session_owner: str = "web-scrape-session"):
+            request.session.update(authenticated_session(csrf_token=session_owner))
             return {"ok": True}
 
         with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), TestClient(api) as client:
@@ -196,6 +196,20 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
             self.assertEqual(client.get("/api/guangya/organize/status?task_id=next").status_code, 404)
             manager._task = {"id": "private", "operation": "Agent任务", "durable": True, "owner_digest": "another-owner"}
             self.assertEqual(client.get("/api/guangya/organize/status?task_id=private").status_code, 404)
+            web_job, _ = enqueue_organize_operation_job(
+                job_kind="directory_scrape", owner="web-scrape-session", operation="目录刮削",
+                reference="Web 目录", payload={}, dedupe_key="web",
+            )
+            agent_job, _ = enqueue_organize_operation_job(
+                job_kind="agent_directory_scrape", owner="web-scrape-session", operation="目录刮削",
+                reference="Agent 目录", payload={}, dedupe_key="agent",
+            )
+            web_id, agent_id = web_job["job_id"], agent_job["job_id"]
+            response = client.get("/api/guangya/organize/status", params={"task_ids": f"batch,{agent_id},{web_id}"})
+            self.assertEqual([(row["id"], row["status"]) for row in response.json()["tasks"]],
+                             [("batch", "partial"), (web_id, "queued")])
+            client.post("/__test/login", params={"session_owner": "another-session"})
+            self.assertEqual(client.get("/api/guangya/organize/status", params={"task_id": web_id}).status_code, 404)
 
     def test_enqueue_is_idempotent_and_public_reference_round_trips(self) -> None:
         first, first_replayed = self._enqueue()

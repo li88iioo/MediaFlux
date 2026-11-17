@@ -369,7 +369,7 @@ class JellyfinDeleteTests(IsolatedDatabaseTestCase):
         self.manager.start_operation.assert_called_once()
         args, kwargs = self.manager.start_operation.call_args
         self.assertTrue(callable(args[2]))
-        self.assertEqual(kwargs, {"queue_if_busy": False, "dedupe_key": deletion.delete_key(deletion.prepare_delete(payload))})
+        self.assertEqual(kwargs, {"dedupe_key": deletion.delete_key(deletion.prepare_delete(payload))})
         self.factory.assert_not_called()
         self.assert_no_write()
         operation_result = args[2]()
@@ -638,7 +638,6 @@ class JellyfinDeleteTests(IsolatedDatabaseTestCase):
         response = client.post("/api/jellyfin/delete", json=payload, headers=headers)
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["error"], "Writer busy")
-        self.assertFalse(self.manager.start_operation.call_args.kwargs["queue_if_busy"])
         self.factory.assert_not_called()
         self.assert_no_write()
 

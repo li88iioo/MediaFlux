@@ -136,7 +136,7 @@ def schedule_staging_reconciliation() -> int:
     try:
         result = manager.start_operation(
             '复核下载确认收尾', '持久确认收尾队列', reconcile,
-            queue_if_busy=False, dedupe_key='download-staging-reconcile',
+            dedupe_key='download-staging-reconcile',
         )
     except Exception:
         for job in due:

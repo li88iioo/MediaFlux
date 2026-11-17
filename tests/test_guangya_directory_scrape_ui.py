@@ -425,7 +425,7 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             "modalLifecycle.open(state.activeAction, {initialFocus: elements.query})",
             "const taskPollEntries = new Map()",
             "taskPollInFlight",
-            "fetch('/api/guangya/organize/status', {signal: controller.signal})",
+            "/api/guangya/organize/status?task_ids=",
             "document.addEventListener('visibilitychange'",
             "window.addEventListener('pagehide'",
             "window.addEventListener('pageshow'",
@@ -506,16 +506,12 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
                         method: options.method || 'GET',
                         body: options.body ? JSON.parse(options.body) : null,
                     });
-                    if (path === '/api/guangya/organize/status') {
+                    if (path === '/api/guangya/organize/status?task_ids=delete-task') {
                         return {
                             ok: true,
                             status: 200,
                             json: async () => ({
-                                id: 'delete-task',
-                                status: 'completed',
-                                result: {stats: {deleted: 1}},
-                                operation_queue: {items: []},
-                                operation_history: [],
+                                tasks: [{id: 'delete-task', status: 'completed', result: {stats: {deleted: 1}}}],
                             }),
                         };
                     }
@@ -625,7 +621,7 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
                     },
                 },
                 {
-                    "path": "/api/guangya/organize/status",
+                    "path": "/api/guangya/organize/status?task_ids=delete-task",
                     "method": "GET",
                     "body": None,
                 },

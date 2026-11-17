@@ -11,7 +11,6 @@ from app.modules.directory_scrape_errors import (
     DirectoryScrapeRequestError,
     public_error_message,
 )
-from app.modules.organize_tasks import get_organize_manager
 from app.web import require_api_login
 
 logger = get_logger(__name__)
@@ -160,25 +159,14 @@ def run_directory(request: Request, data: dict | None = Body(default=None)):
             if result.get("status") == "requires_manual":
                 return result
             preview_id = str(result.get("preview_id") or "")
-            reference = str(
-                (result.get("directory") or {}).get("name")
-                or service.preview_reference(owner, preview_id)
-            )
         elif mode == "manual":
             preview_id = str(payload.get("preview_id") or "").strip()
             if not preview_id:
                 return JSONResponse({"error": "缺少预览 ID"}, status_code=400)
-            reference = service.preview_reference(owner, preview_id)
         else:
             return JSONResponse({"error": "执行模式只能是 manual 或 auto"}, status_code=400)
 
-        task = get_organize_manager().start_operation(
-            "目录刮削",
-            reference,
-            lambda: service.execute_preview(owner, preview_id),
-            queue_if_busy=mode == "manual",
-            dedupe_key=f"directory-scrape:{owner}:{preview_id}",
-        )
+        task = service.submit_preview(owner, preview_id, queue_if_busy=mode == "manual")
         if not task.get("ok"):
             return JSONResponse(
                 {"error": task.get("error") or "网盘整理任务正在运行"},

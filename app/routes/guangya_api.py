@@ -329,7 +329,6 @@ def delete_item(request: Request, data: dict | None = Body(default=None)):
         "删除光鸭目录项",
         expected_name or file_id,
         execute_delete,
-        queue_if_busy=False,
         dedupe_key=f"guangya-direct-delete:{file_id}",
     )
     if not result.get("ok"):
@@ -427,18 +426,33 @@ def organize_run(request: Request, data: dict | None = Body(default=None)):
 
 
 @router.get("/organize/status")
-def organize_status(request: Request, task_id: str = ""):
+def organize_status(request: Request, task_id: str = "", task_ids: str = ""):
     require_api_login(request)
     from app.modules.organize_tasks import get_organize_manager
 
     manager = get_organize_manager()
+    web_owner = str(request.session.get("csrf_token") or "")
+
+    def receipt(identifier: str) -> dict | None:
+        task = manager.task_result(identifier, web_owner=web_owner)
+        if not task or not task.get("operation"):
+            return None
+        fields = ("id", "status", "message", "error", "result")
+        if task.get("durable"):
+            fields += ("queue_position",)
+        return {key: task.get(key) for key in fields}
+
+    if task_ids:
+        identifiers = dict.fromkeys(value for value in task_ids.split(",") if value)
+        if len(identifiers) > 32:
+            return JSONResponse({"error": "一次最多查询 32 个整理任务"}, status_code=400)
+        return {"tasks": [task for identifier in identifiers if (task := receipt(identifier)) is not None]}
     if not task_id:
         return manager.status()
-    task = manager.task_result(task_id)
-    # 日志页只消费普通操作；Agent 持久任务继续使用绑定 owner 的查询链路。
-    if not task or not task.get("operation") or task.get("durable"):
+    task = receipt(task_id)
+    if task is None:
         return JSONResponse({"error": "未找到该整理操作，请刷新日志核对结果"}, status_code=404)
-    return {key: task.get(key) for key in ("id", "status", "message", "error", "result")}
+    return task
 
 
 @router.post("/organize/stop")

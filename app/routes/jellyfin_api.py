@@ -33,7 +33,7 @@ def delete_media(request: Request, data: Annotated[dict | None, Body()] = None):
         return JSONResponse({"error": public_error_message(exc)}, status_code=exc.status_code)
     result = get_organize_manager().start_operation(
         "Jellyfin 联动删除", f"{len(targets)} 个 STRM 文件",
-        lambda: execute_delete(payload, targets), queue_if_busy=False,
+        lambda: execute_delete(payload, targets),
         dedupe_key=delete_key(targets),
     )
     return JSONResponse(result, status_code=202 if result.get("ok") else 409)

@@ -913,7 +913,6 @@ class DownloadTracker:
             "收口光鸭下载目录",
             expected_name,
             finalize,
-            queue_if_busy=False,
             dedupe_key=f"download-staging-finalize:{request_id}:{staging_id}",
         )
         if not result.get("ok"):

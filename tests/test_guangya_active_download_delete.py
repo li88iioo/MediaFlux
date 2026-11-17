@@ -85,7 +85,7 @@ class _DeleteCase:
         call = self.manager.start_operation.call_args
         assert call.args[:2] == ("删除光鸭目录项", item.name)
         assert call.kwargs == {
-            "queue_if_busy": False, "dedupe_key": f"guangya-direct-delete:{file_id}",
+            "dedupe_key": f"guangya-direct-delete:{file_id}",
         }
         self.provider.file_info.assert_not_called()
         self.provider.delete.assert_not_called()
