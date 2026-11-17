@@ -66,6 +66,7 @@ class MediaProxyRepositoryTests(unittest.TestCase):
                     selected = repository.get_media_proxy_binding(
                         instance_id, ("item-1",), (source,), upstream_identity=identity,
                     )
+                    assert selected is not None
                     self.assertEqual(selected["id"], expected["id"])
             repository.record_media_proxy_playback_attempt(
                 instance_id=instance_id,
@@ -143,6 +144,7 @@ class MediaProxyRepositoryTests(unittest.TestCase):
             self.assertIsNone(repository.get_media_proxy_binding(instance_id, ("item",), upstream_identity=identity))
             second = repository.create_media_proxy_binding(**{**binding, "guangya_file_id": "new-file"})
             selected = repository.get_media_proxy_binding(instance_id, ("item",), upstream_identity=identity)
+            assert selected is not None
             self.assertEqual(selected["guangya_file_id"], "new-file")
             self.assertEqual([row["id"] for row in repository.list_media_proxy_bindings(instance_id)], [7, first["id"], second["id"]])
 

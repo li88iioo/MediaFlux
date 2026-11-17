@@ -71,7 +71,12 @@ def enqueue_media_refresh_paths(
             for provider, intent in (entry.get("refresh_targets") or {}).items():
                 grouped.setdefault((provider, intent["upstream"], intent["mappings"]), []).append(entry)
         batches = [
-            (provider, {"upstream": upstream, "mappings": mappings}, [entry["path"] for entry in batch], batch)
+            (
+                provider,
+                MediaRefreshIntent(upstream=upstream, mappings=mappings),
+                [entry["path"] for entry in batch],
+                batch,
+            )
             for (provider, upstream, mappings), batch in grouped.items()
         ]
     results: dict[str, str] = {}

@@ -4079,7 +4079,7 @@ def rewrite_playback_info(
             auth_scope=auth_scope,
         )
         file_id = str(binding["guangya_file_id"] or "") if binding else _extract_guangya_file_id(source.get("Path"))
-        if not binding and not file_id:
+        if file_id is None:
             continue
 
         normalized_source_id = _normalized_media_identifier(source_id)
