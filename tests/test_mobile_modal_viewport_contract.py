@@ -20,7 +20,7 @@ def test_shared_mobile_modals_use_dynamic_viewport_and_single_scroll_owner():
     assert re.search(r"\.organize-detail-body \{[^}]*min-height: 0[^}]*flex: 1 1 auto[^}]*overflow-y: auto", css)
     assert re.search(r"\.organize-detail-footer \{[^}]*flex: 0 0 auto", css)
     assert ".organize-detail-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr));" in css
-    assert "#organizeDeleteBtn, #organizeReorganizeBtn { grid-column: 1 / -1; }" in css
+    # 按钮铺满底栏由 test_mobile_skip_footer_and_toolbar_use_full_width_without_overflow 实测。
     assert re.search(r"\.settings-dir-dialog \{[^}]*100dvh[^}]*safe-area-inset-bottom", css)
     assert ".rss-sub-modal { display: none;" in css
     rss_overlay = css.split(".rss-sub-modal {", 1)[1].split("}", 1)[0]
