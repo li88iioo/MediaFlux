@@ -51,6 +51,8 @@ class JellyfinPluginPackagingTests(unittest.TestCase):
             "timestamp": "2026-10-24T00:00:00Z", "assemblies": ["MediaFlux.Jellyfin.dll"], "imagePath": "logo.png",
         }
         self.write_meta()
+        self.changelog = {"0.1.3.0": "本版真实变更"}
+        self.write_changelog()
         (self.plugin / "Plugin.cs").write_text(self.meta["guid"], encoding="utf-8")
         self.dll = self.plugin / "bin" / "Release" / "net10.0" / "MediaFlux.Jellyfin.dll"
         self.dll.parent.mkdir(parents=True)
@@ -83,6 +85,9 @@ if args == ["--version"]:
 
     def write_meta(self):
         (self.plugin / "meta.json").write_text(json.dumps(self.meta), encoding="utf-8")
+
+    def write_changelog(self):
+        (self.plugin / "changelog.json").write_text(json.dumps(self.changelog, ensure_ascii=False), encoding="utf-8")
 
     def executable(self, name, code):
         path = self.bin / name
@@ -131,6 +136,27 @@ if args == ["--version"]:
                     self.package()
                 self.meta[key] = saved
         self.assertFalse((self.plugin / "artifacts").exists())
+
+    def test_release_needs_a_real_changelog_and_never_falls_back_to_overview(self):
+        self.assertEqual(self.update()[0]["versions"][0]["changelog"], "本版真实变更")
+        shutil.rmtree(self.plugin / "artifacts")
+        for changelog in ({}, {"0.1.3.0": "  "}, {"0.1.3.0": "说明", "v0.1.2": "格式错误"}):
+            with self.subTest(changelog=changelog):
+                self.changelog = changelog
+                self.write_changelog()
+                with self.assertRaises(ValueError):
+                    self.package()
+                self.assertFalse((self.plugin / "artifacts").exists())
+
+    def test_changelog_file_corrects_published_history_without_touching_assets(self):
+        history = self.history()
+        self.previous.write_text(json.dumps(history), encoding="utf-8")
+        self.changelog["0.1.2.0"] = "旧版真实变更"
+        self.write_changelog()
+        old = self.update()[0]["versions"][1]
+        self.assertEqual(old["changelog"], "旧版真实变更")
+        self.assertEqual({k: v for k, v in old.items() if k != "changelog"},
+                         {k: v for k, v in history[0]["versions"][0].items() if k != "changelog"})
 
     def test_production_baseline_is_fixed_at_12_2(self):
         self.project.write_text(self.project.read_text().replace("12.2.0", "12.3.0"))

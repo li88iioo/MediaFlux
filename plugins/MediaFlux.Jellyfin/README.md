@@ -106,4 +106,6 @@ DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.4
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 ```
 
-脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.5.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。
+发版前在 `changelog.json` 写入新版本的真实更新说明（以上一插件标签到本次提交的变更为准）；缺少当前版本说明时打包直接失败，不再以简介代替。发布清单同时用该文件修正已发布版本的说明文字，资产地址与校验值不变。
+
+脚本校验版本、框架 / ABI、插件 ID、更新说明，生成 `artifacts/MediaFlux.Jellyfin-0.1.5.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。

@@ -23,6 +23,15 @@ def version_key(version):
     return tuple(map(int, version.split(".")))
 
 
+def changelogs(plugin):
+    """各版本真实更新说明的唯一来源；发布时也用于修正已发布版本的说明文字。"""
+    entries = json.loads((plugin / "changelog.json").read_text(encoding="utf-8"))
+    if not isinstance(entries, dict) or not all(
+            isinstance(text, str) and text.strip() and version_key(version) for version, text in entries.items()):
+        raise ValueError("changelog.json must map four-part versions to non-empty text")
+    return entries
+
+
 def metadata(plugin):
     meta = json.loads((plugin / "meta.json").read_text(encoding="utf-8"))
     project = ET.parse(plugin / "MediaFlux.Jellyfin.csproj").getroot()
@@ -46,7 +55,10 @@ def metadata(plugin):
     if meta.get("imagePath") != "logo.png":
         raise ValueError("meta imagePath must refer to the packaged logo.png")
     datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00"))
-    return {**meta, "assembly": assembly, "framework": framework,
+    changelog = changelogs(plugin).get(meta["version"])
+    if changelog is None:
+        raise ValueError(f"changelog.json has no entry for {meta['version']}")
+    return {**meta, "changelog": changelog, "assembly": assembly, "framework": framework,
             "tag": f"jellyfin-plugin-v{version}", "archive": f"MediaFlux.Jellyfin-{meta['version']}.zip"}
 
 
@@ -101,6 +113,7 @@ def update(plugin, previous, archive, output):
         raise ValueError("Refusing to replace an unknown manifest")
     entry = history[0] if history else {**{k: meta[k] for k in FIELDS}, "versions": []}
     versions = entry["versions"]
+    texts = changelogs(plugin)
     seen = set()
     for item in versions:
         version_key(item["version"])
@@ -109,11 +122,13 @@ def update(plugin, previous, archive, output):
                 or not item["sourceUrl"].startswith(DOWNLOAD + "/") or not item.get("timestamp")):
             raise ValueError("Refusing to replace an unknown manifest version")
         seen.add(item["version"])
+        # 只修正说明文字；已发布资产的地址、校验值与时间保持不变。
+        item["changelog"] = texts.get(item["version"], item.get("changelog", ""))
     # Jellyfin InstallationManager 使用 ZIP 的 MD5；发布资产另以 SHA256 回读验证。
     release = {"version": meta["version"], "targetAbi": meta["targetAbi"],
                "sourceUrl": f"{DOWNLOAD}/{meta['tag']}/{meta['archive']}",
                "checksum": hashlib.md5(archive.read_bytes(), usedforsecurity=False).hexdigest(),
-               "timestamp": meta["timestamp"], "changelog": meta.get("changelog", meta["overview"])}
+               "timestamp": meta["timestamp"], "changelog": meta["changelog"]}
     for item in versions:
         if item["version"] == release["version"]:
             if (item["checksum"].lower() != release["checksum"]
