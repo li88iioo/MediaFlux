@@ -4430,6 +4430,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
         width: 100%;
         justify-content: center;
     }
+    /* 跳过独占一行，避免与纠正、回退组成奇数网格时留下空格。 */
+    #organizeBatchSkipBtn,
     #organizeBatchDeleteBtn {
         grid-column: 1 / -1;
         width: 100%;
@@ -4675,7 +4677,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .organize-detail-footer { padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
     .organize-detail-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); width: 100%; gap: 8px; }
     .organize-detail-actions .jump-btn, .organize-detail-actions .btn { width: 100%; min-width: 0; min-height: 42px; height: 42px; white-space: nowrap; }
-    #organizeDeleteBtn, #organizeReorganizeBtn { grid-column: 1 / -1; }
+    #organizeDeleteBtn, #organizeSkipBtn, #organizeReorganizeBtn { grid-column: 1 / -1; }
     .organize-detail-modal.is-batch-correction .organize-batch-actions { display: grid; grid-template-columns: minmax(84px, .65fr) minmax(0, 1.35fr); }
     .organize-batch-actions { grid-template-columns: minmax(84px, .65fr) minmax(0, 1.35fr); }
     .organize-batch-actions #organizeBatchCancelBtn, .organize-batch-actions #organizeBatchExecuteBtn { min-width: 0; }

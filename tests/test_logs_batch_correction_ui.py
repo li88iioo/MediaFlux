@@ -97,8 +97,10 @@ const detailFor=id=>{
   const allowed=id==='11'&&window.__testConfig.detail11Reorganize===false
     ? {search:true,preview:true,reorganize:false,return_to_source:true,revert:true,delete:true}
     : {search:true,preview:true,reorganize:true,return_to_source:true,revert:true,delete:true};
+  const skipped=window.__testConfig.skippedIds?.includes(Number(id));
+  allowed.skip=Boolean(window.__testConfig.detailSkip)&&!skipped;
   return {
-    id:Number(id),version:id==='10'?4:7,status:'manual',title:'旧识别标题',year:2020,
+    id:Number(id),version:id==='10'?4:7,status:skipped?'skipped':'manual',title:'旧识别标题',year:2020,
     media_type:'unknown',provider:nsfw?'metatube':'tmdb',tmdb_id:'wrong-old-id',
     original_name:'Series.S01E02.mkv',original_path:'/incoming/series',
     safety_notice:nsfw?'NSFW 专用来源 · 仅 MetaTube / 清洗标题':'' ,
@@ -168,6 +170,13 @@ window.fetch=async(input,options={})=>{
     return jsonResponse(result);
   }
   if(url.pathname==='/api/logs/organize/batch'&&method==='POST')return jsonResponse({task_id:'batch-task'});
+  if(url.pathname==='/api/logs/organize/batch/skip'&&method==='POST'){
+    const items=body.log_ids.map(id=>(config.skipFailIds||[]).includes(id)?{log_id:id,skipped:false,error:'该日志没有可跳过的待确认组'}:{log_id:id,skipped:true});
+    config.skippedIds=[...(config.skippedIds||[]),...items.filter(item=>item.skipped).map(item=>item.log_id)];
+    for(const row of config.rows||[])if(config.skippedIds.includes(row.id))row.status='skipped';
+    const skipped=items.filter(item=>item.skipped).length;
+    return jsonResponse({items,skipped,failed:items.length-skipped});
+  }
   if(url.pathname==='/api/guangya/organize/status'&&method==='GET'){
     if(!taskId)return jsonResponse({error:'task_id is required'},400);
     if((config.holdTaskIds||[]).includes(taskId))return new Promise(resolve=>window.__pendingTaskStatuses.push({taskId,resolve}));
@@ -1086,6 +1095,124 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         action = next(call for call in self.calls() if call["path"] == "/api/logs/organize/10/reorganize")
         self.assertIn("expected_version", action["body"])
         self.assertFalse(self.batch_previews())
+
+    def skip_calls(self):
+        return [call for call in self.page.evaluate('window.__apiCalls') if call['path'] == '/api/logs/organize/batch/skip']
+
+    def test_batch_skip_targets_only_selected_pending_logs_after_confirmation(self):
+        skip = self.page.locator('#organizeBatchSkipBtn')
+        self.page.locator('.organize-row-select').nth(1).check()
+        self.assertTrue(skip.is_disabled())  # 只选了失败日志，没有可跳过的待确认
+        self.page.locator('.organize-row-select').nth(0).check()
+        self.assertTrue(skip.is_enabled())
+        self.page.evaluate('window.__confirmAnswer=false')
+        skip.click()
+        self.page.wait_for_function("() => window.__confirmCalls.length === 1")
+        self.assertEqual(self.skip_calls(), [])
+        self.assertIn('文件保持原位', self.page.evaluate('window.__confirmCalls[0].message'))
+        self.page.evaluate('window.__confirmAnswer=true')
+        timelines = len([call for call in self.page.evaluate('window.__apiCalls') if call['path'] == '/api/logs/organize/timeline'])
+        skip.click()
+        self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.startsWith('已跳过')")
+        self.assertEqual([call['body'] for call in self.skip_calls()], [{'log_ids': [10]}])
+        state = self.page.locator('#organizeBatchState')
+        self.assertIn('已跳过 1 条待确认日志，文件保持原位', state.inner_text())
+        self.assertIn('is-success', state.get_attribute('class') or '')
+        self.page.wait_for_function(f"() => window.__apiCalls.filter(call => call.path === '/api/logs/organize/timeline').length > {timelines}")
+
+    def test_batch_skip_reports_logs_without_a_pending_group(self):
+        self.page.evaluate("() => { window.__testConfig.skipFailIds=[10]; }")
+        self.page.locator('.organize-row-select').nth(0).check()
+        self.page.locator('#organizeBatchSkipBtn').click()
+        self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.startsWith('已跳过')")
+        state = self.page.locator('#organizeBatchState')
+        self.assertIn('1 条未跳过：该日志没有可跳过的待确认组', state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+
+    def test_detail_offers_skip_only_when_the_log_has_a_pending_group(self):
+        self.page.evaluate("() => openOrganizeDetail(11)")
+        self.page.locator('#organizeDetailModal').wait_for(state='visible')
+        self.page.wait_for_function("() => document.getElementById('organizeOperationState').textContent === ''")
+        self.assertTrue(self.page.locator('#organizeSkipBtn').is_hidden())
+        self.page.evaluate("() => { window.__testConfig.detailSkip=true; return openOrganizeDetail(10); }")
+        skip = self.page.locator('#organizeSkipBtn')
+        skip.wait_for(state='visible')
+        details = len([call for call in self.page.evaluate('window.__apiCalls') if call['path'] == '/api/logs/organize/10'])
+        skip.click()
+        self.page.wait_for_function("() => document.getElementById('organizeOperationState').textContent.startsWith('已跳过')")
+        self.assertEqual([call['body'] for call in self.skip_calls()], [{'log_ids': [10]}])
+        self.assertIn('跳过此组', self.page.evaluate('window.__confirmCalls.at(-1).confirmText'))
+        self.assertGreater(len([call for call in self.page.evaluate('window.__apiCalls') if call['path'] == '/api/logs/organize/10']), details)
+
+    def test_batch_skip_keeps_only_failed_logs_selected_after_refresh(self):
+        self.page.evaluate("""async () => {
+            window.__testConfig.rows.forEach(row=>row.status='manual');
+            window.__testConfig.skipFailIds=[11];
+            await loadOrganize(1);
+        }""")
+        self.page.locator('#organizeSelectAll').check()
+        self.page.locator('#organizeBatchSkipBtn').click()
+        self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.includes('1 条未跳过') && !document.getElementById('organizeBatchSkipBtn').disabled")
+        self.assertFalse(self.page.locator('.organize-row-select').nth(0).is_checked())
+        self.assertTrue(self.page.locator('.organize-row-select').nth(1).is_checked())
+        self.assertIn('当前页已选 1 条', self.page.locator('#organizeBatchCount').inner_text())
+        self.assertIn('跳过', self.page.locator('#organizeList tr').nth(0).inner_text())
+        self.assertIn('待确认', self.page.locator('#organizeList tr').nth(1).inner_text())
+
+    def test_detail_skip_blocks_duplicate_requests_and_cancel_restores_button(self):
+        self.page.evaluate("""async () => {
+            window.__testConfig.detailSkip=true;
+            window.appConfirm=options=>{window.__confirmCalls.push(options);return new Promise(resolve=>window.__finishSkipConfirmation=resolve);};
+            await openOrganizeDetail(10);
+        }""")
+        skip = self.page.locator('#organizeSkipBtn')
+        self.page.wait_for_function("() => document.getElementById('organizeDetailModal').getAnimations({subtree:true}).every(animation=>animation.playState==='finished')")
+        size = skip.bounding_box()
+        skip.click()
+        self.assertTrue(skip.is_disabled())
+        self.assertEqual(skip.bounding_box(), size)
+        self.page.evaluate('skipOrganizeGroup()')
+        self.assertEqual(len(self.page.evaluate('window.__confirmCalls')), 1)
+        self.page.evaluate('window.__finishSkipConfirmation(false)')
+        self.page.wait_for_function("() => !document.getElementById('organizeSkipBtn').disabled")
+        self.assertEqual(self.skip_calls(), [])
+        skip.click()
+        self.page.evaluate('window.__finishSkipConfirmation(true)')
+        self.page.wait_for_function("() => document.getElementById('organizeOperationState').textContent.startsWith('已跳过')")
+        self.assertEqual(len(self.skip_calls()), 1)
+        self.assertTrue(skip.is_hidden())
+
+    def test_mobile_skip_footer_and_toolbar_use_full_width_without_overflow(self):
+        self.page.set_viewport_size({'width': 320, 'height': 740})
+        self.page.evaluate("window.__testConfig.detailSkip=true")
+        toolbar = self.page.locator('.logs-batch-actions').bounding_box()
+        skip_batch = self.page.locator('#organizeBatchSkipBtn').bounding_box()
+        self.assertIsNotNone(toolbar)
+        self.assertIsNotNone(skip_batch)
+        self.assertAlmostEqual(toolbar['width'], skip_batch['width'], delta=1)
+        self.page.locator('.detail-btn').first.click()
+        self.page.locator('#organizeSkipBtn').wait_for(state='visible')
+        self.page.wait_for_function("() => document.getElementById('organizeDetailModal').getAnimations({subtree:true}).every(animation=>animation.playState==='finished')")
+        footer = self.page.locator('.organize-single-actions').bounding_box()
+        self.assertIsNotNone(footer)
+        for selector in ('#organizeSkipBtn', '#organizeDeleteBtn', '#organizeReorganizeBtn'):
+            box = self.page.locator(selector).bounding_box()
+            self.assertIsNotNone(box)
+            self.assertAlmostEqual(box['width'], footer['width'], delta=1)
+            self.assertGreaterEqual(box['height'], 42)
+        self.assertTrue(self.page.locator('#organizeDetailModal').evaluate('node=>node.scrollWidth<=node.clientWidth'))
+
+    def test_batch_skip_uses_real_confirmation_and_keeps_file_actions_idle(self):
+        self.use_real_confirmation()
+        self.page.locator('.organize-row-select').first.check()
+        self.page.locator('#organizeBatchSkipBtn').click()
+        self.page.locator('#appConfirmModal').wait_for(state='visible')
+        self.assertIn('文件保持原位', self.page.locator('#appConfirmMessage').inner_text())
+        self.assertEqual(self.skip_calls(), [])
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.startsWith('已跳过')")
+        self.assertEqual(len(self.skip_calls()), 1)
+        self.assertFalse(any(call['method']=='DELETE' or call['path']=='/api/logs/organize/batch' for call in self.calls()))
 
 
 if __name__ == "__main__":

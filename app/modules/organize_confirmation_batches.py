@@ -6,6 +6,7 @@ import json
 
 from app import database as db
 from app.agent import feature_gate
+from app.logger import get_logger
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.modules import organize_confirmations as confirmations
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot_changes
@@ -13,6 +14,7 @@ from app.modules.scraper import MatchResult
 from app.sensitive_data import redact_sensitive_text
 
 MAX_SELECTION = 1000
+logger = get_logger(__name__)
 
 
 def _tokens(values: object) -> list[str]:
@@ -147,14 +149,40 @@ def skip_confirmations(confirmation_ids: list[str], *, chat_id: str | None = Non
             row = _row(token, chat_id)
             if row["status"] != "pending":
                 raise ValueError("该组已不在待确认状态")
+            payload = confirmations.decode_row(row)
+            if confirmations.confirmation_kind(payload) != "guangya":
+                raise ValueError("当前批量审阅仅支持光鸭整理，本地任务请使用原确认入口")
             owner = str(row["chat_id"] or "")
-            if confirmations.decode_row(row).get("allow_skip_terminal"):
+            if payload.get("allow_skip_terminal"):
                 confirmations.skip_confirmation(token, chat_id=owner)
             else:
                 confirmations.cancel_confirmation(token, chat_id=owner)
             results.append({"confirmation_id": token, "skipped": True})
         except ValueError as exc:
-            results.append({"confirmation_id": token, "skipped": False, "error": str(exc)})
+            results.append({"confirmation_id": token, "skipped": False, "error": redact_sensitive_text(str(exc))})
+        except Exception as exc:
+            logger.warning("跳过待确认组失败 token=%s type=%s", token[:6], type(exc).__name__)
+            results.append({"confirmation_id": token, "skipped": False, "error": "跳过失败，请刷新状态后重试"})
+    skipped = sum(1 for item in results if item["skipped"])
+    return {"items": results, "skipped": skipped, "failed": len(results) - skipped}
+
+
+def skip_logs(log_ids: list[int]) -> dict:
+    """按整理日志跳过所属待确认组；同组的多条日志一并结束，没有可跳过组的日志单独报告。"""
+    if (not isinstance(log_ids, list) or not 1 <= len(log_ids) <= 50
+            or any(type(value) is not int or value <= 0 for value in log_ids)):
+        raise ValueError("请选择 1–50 条整理日志")
+    tokens = organize_confirmations_repo.pending_confirmation_tokens_by_log(log_ids)
+    outcome = {item["confirmation_id"]: item for item in (
+        skip_confirmations(list(dict.fromkeys(tokens.values())))["items"] if tokens else [])}
+    results = []
+    for log_id in dict.fromkeys(log_ids):
+        token = tokens.get(log_id)
+        item = outcome.get(token or "")
+        if item is None:
+            results.append({"log_id": log_id, "skipped": False, "error": "该日志没有可跳过的待确认组"})
+        else:
+            results.append({"log_id": log_id, "skipped": item["skipped"], **({"error": item["error"]} if "error" in item else {})})
     skipped = sum(1 for item in results if item["skipped"])
     return {"items": results, "skipped": skipped, "failed": len(results) - skipped}
 

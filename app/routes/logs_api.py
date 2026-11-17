@@ -561,6 +561,17 @@ def _closing_operation(service: OrganizeCorrectionService, callback):
     return run
 
 
+@router.post("/organize/batch/skip")
+def skip_organize_logs(request: Request, data: dict = Body(...)):
+    """跳过所选待确认日志所属的确认组；文件保持原位，日志标记为跳过。"""
+    require_api_login(request)
+    from app.modules.organize_confirmation_batches import skip_logs
+    try:
+        return skip_logs(data.get("log_ids", []))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
 @router.post("/organize/batch/preview")
 def preview_organize_batch(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)

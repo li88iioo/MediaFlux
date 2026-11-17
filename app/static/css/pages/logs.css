@@ -103,6 +103,10 @@
     #confirmationReviewRefresh { justify-self: end; }
     .confirmation-review-footer { align-items: stretch; flex-direction: column; gap: 8px; }
     .confirmation-review-actions { justify-content: flex-end; }
+    .confirmation-review-queue-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+    #confirmationReviewSelectionCount { grid-area: 1 / 2; margin-left: 0; }
+    .confirmation-review-savebar { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .confirmation-review-savebar [data-review-action="skip"] { grid-column: 1 / -1; }
 }
 @media (max-width: 640px) {
     .confirmation-review-launch { align-items: stretch; flex-direction: column; }
@@ -120,6 +124,7 @@
     .confirmation-review-workspace { display: flex; flex-direction: column; overflow-y: auto; overscroll-behavior: contain; }
     .confirmation-review-queue { flex: 0 0 360px; min-height: 360px; border-right: 0; border-bottom: 1px solid var(--border); }
     .confirmation-review-queue-head { padding-right: 16px; }
+    .confirmation-review-page-select { min-height: 44px; }
     .confirmation-review-empty { min-height: 200px; }
     .confirmation-review-inspector { flex-shrink: 0; min-height: 280px; padding: 16px 16px 0; overflow: visible; }
     .confirmation-review-footer { padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0px)); }

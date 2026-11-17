@@ -201,6 +201,8 @@ class OrganizeCorrectionService:
             "return_to_source": complete and status in RETURN_STATUSES,
             "revert": complete and has_reversible_step and status in REVERT_STATUSES,
             "delete": complete and status in DELETE_STATUSES,
+            # 待确认日志可按所属确认组跳过（与 Telegram 每组的终止按钮一致），文件保持原位。
+            "skip": status == "manual" and bool(organize_confirmations_repo.pending_confirmation_tokens_by_log([log_id])),
         }
         if not complete:
             data["safety_notice"] = safety_notice

@@ -486,3 +486,61 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         # 失败的组仍保持勾选，成功跳过的组离开待确认队列与选择。
         self.assertIn('已选 1 / 1000 组', self.page.locator('#confirmationReviewSelectionCount').inner_text())
         self.assertIn('媒体组 002', self.page.locator('#confirmationReviewList').inner_text())
+
+    def test_skipping_last_group_keeps_receipt_clears_detail_and_refreshes_logs(self):
+        self.open(groups(1))
+        before = len([call for call in self.page.evaluate('window.__apiCalls') if call['path'] == '/api/logs/organize/timeline'])
+        self.page.locator('#confirmationReviewDetail [data-review-action="skip"]').click()
+        self.page.wait_for_function("() => document.getElementById('confirmationReviewList').textContent.includes('没有匹配')")
+        self.idle()
+        self.assertIn('已跳过 1 组', self.page.locator('#confirmationReviewState').inner_text())
+        self.assertEqual(self.page.locator('#confirmationReviewDetail [data-review-action="skip"]').count(), 0)
+        self.assertGreater(len([call for call in self.page.evaluate('window.__apiCalls') if call['path'] == '/api/logs/organize/timeline']), before)
+
+    def test_skipping_only_group_on_last_page_returns_to_existing_page(self):
+        self.open(groups(21))
+        self.page.locator('#confirmationReviewNext').click()
+        self.idle()
+        self.page.locator('#confirmationReviewDetail [data-review-action="skip"]').click()
+        self.page.wait_for_function("() => document.getElementById('confirmationReviewPageInfo').textContent.includes('1 / 1')")
+        self.idle()
+        self.assertEqual(self.page.locator('.confirmation-review-row').count(), 20)
+        self.assertIn('已跳过 1 组', self.page.locator('#confirmationReviewState').inner_text())
+
+    def test_skip_success_remains_visible_when_status_readback_fails(self):
+        self.open(groups(1))
+        self.page.evaluate('window.__confirmationConfig.failQuery=true')
+        self.page.locator('#confirmationReviewDetail [data-review-action="skip"]').click()
+        self.page.wait_for_function("() => document.getElementById('confirmationReviewState').textContent.includes('状态回读失败')")
+        self.idle()
+        message = self.page.locator('#confirmationReviewState').inner_text()
+        self.assertIn('已跳过 1 组', message)
+        self.assertIn('刷新核对', message)
+        self.assertEqual(len(self.calls('/skip')), 1)
+
+    def test_batch_skip_does_not_send_already_queued_selection(self):
+        self.open(groups(2))
+        self.select_all()
+        self.page.evaluate("window.__confirmationConfig.items[0].status='queued'")
+        self.page.evaluate("window.appConfirm=async()=>true")
+        self.page.locator('#confirmationReviewSkip').click()
+        self.page.wait_for_function("() => document.getElementById('confirmationReviewState').textContent.startsWith('已跳过')")
+        self.idle()
+        self.assertEqual(self.calls('/skip')[0]['body'], {'confirmation_ids': ['group-002']})
+        self.assertIn('已选 1 / 1000', self.page.locator('#confirmationReviewSelectionCount').inner_text())
+        self.assertEqual(self.page.evaluate('window.__confirmationConfig.items[0].status'), 'queued')
+
+    def test_narrow_mobile_skip_controls_fit_and_are_reachable(self):
+        self.open(groups(1))
+        for width in (320, 390, 768, 1024, 1280):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({'width': width, 'height': 740})
+                for selector in ('.confirmation-review-dialog', '.confirmation-review-workspace',
+                                 '.confirmation-review-queue-head', '#confirmationReviewDetail'):
+                    self.assertTrue(self.page.locator(selector).evaluate('node=>node.scrollWidth<=node.clientWidth'), selector)
+                for button in self.page.locator('.confirmation-review-savebar button').all():
+                    box = button.bounding_box()
+                    self.assertIsNotNone(box)
+                    self.assertGreaterEqual(box['height'], 44 if width <= 640 else 40)
+                    self.assertGreaterEqual(box['x'], 0)
+                    self.assertLessEqual(box['x'] + box['width'], width)

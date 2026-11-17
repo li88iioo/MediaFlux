@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from threading import Barrier
 from unittest.mock import patch
 
 from app import database as db
@@ -28,9 +31,15 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.enterContext(patch.object(OrganizeRules, "for_source", return_value=self.rules))
         self.enterContext(patch.object(confirmations, "wake_confirmation_dispatcher"))
         self.enterContext(patch.object(confirmations, "wake_recognition_review_dispatcher"))
+        self.enterContext(patch.object(confirmations, "_dispatch_due_confirmation_delivery"))
 
     def row(self, token: str):
         row = organize_confirmations_repo.get_organize_confirmation(token)
+        assert row is not None
+        return row
+
+    def log(self, log_id: int) -> sqlite3.Row:
+        row = db.get_organize_log(log_id)
         assert row is not None
         return row
 
@@ -257,6 +266,173 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertEqual({token: self.row(token)["status"] for token in ("candidates", "no-metadata", "done")},
                          {"candidates": "cancelled", "no-metadata": "cancelled", "done": "completed"})
         self.assertNotEqual(self.row("old")["status"], "pending")
+
+    def test_logs_skip_their_pending_group_and_detail_offers_skip_only_for_those(self):
+        from unittest.mock import MagicMock
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.modules.organize_correction import OrganizeCorrectionService
+        from app.routes import logs_api
+
+        manual, sibling = (db.add_organize_log("guangya", "/incoming/group", "", file_id, "manual", "",
+                                               original_name=f"{file_id}.mkv", legacy_incomplete=False)
+                           for file_id in ("group", "group-2"))
+        self.create("group")
+        payload = json.loads(self.row("group")["payload_json"])
+        payload["files"].append({**payload["files"][0], "file_id": "group-2", "name": "group-2.mkv"})
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='group'",
+                         (json.dumps(payload, ensure_ascii=False),))
+        done = db.add_organize_log("guangya", "/incoming/done", "/archive/done", "done", "success", "", legacy_incomplete=False)
+        orphan = db.add_organize_log("guangya", "/incoming/orphan", "", "orphan", "manual", "", legacy_incomplete=False)
+        service = OrganizeCorrectionService(client=MagicMock(), scraper=MagicMock())
+        try:
+            self.assertEqual([service.detail(log_id)["allowed_actions"]["skip"] for log_id in (manual, done, orphan)],
+                             [True, False, False])
+        finally:
+            service.close()
+        app = FastAPI()
+        app.include_router(logs_api.router)
+        with patch.object(logs_api, "require_api_login"), TestClient(app) as client:
+            result = client.post("/api/logs/organize/batch/skip", json={"log_ids": [manual, done, orphan]}).json()
+            for invalid in ([], "x", [0], list(range(1, 52))):
+                self.assertEqual(client.post("/api/logs/organize/batch/skip", json={"log_ids": invalid}).status_code, 400)
+        self.assertEqual([(item["log_id"], item["skipped"]) for item in result["items"]],
+                         [(manual, True), (done, False), (orphan, False)])
+        self.assertEqual((result["skipped"], result["failed"]), (1, 2))
+        # 整组结束：同组的另一条待确认日志一并标记为跳过，文件不动。
+        self.assertEqual(self.row("group")["status"], "cancelled")
+        self.assertEqual([self.log(log_id)["status"] for log_id in (manual, sibling, done, orphan)],
+                         ["skipped", "skipped", "success", "manual"])
+
+    def test_log_skip_deduplicates_group_and_replay_does_not_change_logs_or_files(self):
+        log_ids = [db.add_organize_log("guangya", "/incoming/group", "", "group", "manual", "",
+                                       original_name="group.mkv", original_parent_id="parent",
+                                       current_name="group.mkv", current_parent_id="parent") for _ in range(2)]
+        self.create("group")
+        with patch.object(confirmations, "GuangYaClient") as cloud:
+            result = batches.skip_logs([*log_ids, log_ids[0]])
+            self.assertEqual((result["skipped"], result["failed"]), (2, 0))
+            logs = [dict(self.log(log_id)) for log_id in log_ids]
+            self.assertEqual((batches.skip_logs(log_ids)["failed"], batches.skip_confirmations(["group"])["failed"]), (2, 1))
+            self.assertEqual([dict(self.log(log_id)) for log_id in log_ids], logs)
+            self.assertTrue(all(log["current_parent_id"] == "parent" and log["current_name"] == "group.mkv" for log in logs))
+            cloud.assert_not_called()
+        self.assertIsNone(organize_confirmations_repo.get_next_queued_organize_confirmation())
+
+    def test_new_logs_are_not_owned_by_an_older_confirmation(self):
+        self.create("group")
+        log_id = db.add_organize_log("guangya", "/incoming/group", "", "group", "manual", "")
+        result = batches.skip_logs([log_id])
+        self.assertEqual((result["skipped"], result["failed"]), (0, 1))
+        self.assertEqual(self.row("group")["status"], "pending")
+        self.assertEqual(self.log(log_id)["status"], "manual")
+
+    def test_confirmation_terminal_actions_never_settle_later_scan_logs(self):
+        for action in ('defer', 'skip', 'expire', 'legacy'):
+            with self.subTest(action=action):
+                old = db.add_organize_log('guangya', '/incoming', '', action, 'manual', '')
+                self.create(action)
+                payload = json.loads(self.row(action)['payload_json'])
+                if action == 'skip':
+                    payload['allow_skip_terminal'] = True
+                if action == 'legacy':
+                    payload.pop('_organize_log_upper_bound')
+                with db.get_conn() as conn:
+                    conn.execute('UPDATE organize_confirmations SET payload_json=? WHERE token=?', (json.dumps(payload), action))
+                    conn.execute("UPDATE organize_log SET updated_at='2000-01-01 00:00:00' WHERE id=?", (old,))
+                newer = db.add_organize_log('guangya', '/incoming', '', action, 'manual', '')
+                if action == 'legacy':
+                    with db.get_conn() as conn:
+                        conn.execute("UPDATE organize_log SET updated_at='2999-01-01 00:00:00' WHERE id=?", (newer,))
+                before = dict(self.log(newer))
+                if action == 'expire':
+                    with db.get_conn() as conn:
+                        conn.execute("UPDATE organize_confirmations SET expires_at='2000-01-01 00:00:00' WHERE token=?", (action,))
+                batches.skip_confirmations([action])
+                self.assertEqual(self.log(old)['status'], 'skipped')
+                self.assertEqual(dict(self.log(newer)), before)
+
+    def test_latest_queued_confirmation_does_not_fall_back_to_an_older_pending_group(self):
+        log_id = db.add_organize_log("guangya", "/incoming/group", "", "old", "manual", "")
+        self.create("old")
+        payload = self.create("new")
+        payload["files"][0]["file_id"] = "old"
+        # 新快照的指纹不同，旧待确认仍存在；不能按 pending 筛选后命中旧组。
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='new'",
+                         (json.dumps(payload),))
+        organize_confirmations_repo.claim_organize_confirmation("new", chat_id="chat", selected_index=0)
+        result = batches.skip_logs([log_id])
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual([self.row(token)["status"] for token in ("old", "new")], ["pending", "queued"])
+        self.assertEqual(self.log(log_id)["status"], "manual")
+
+    def test_legacy_log_lookup_uses_strict_timestamp_and_ignores_local_or_corrupt_payloads(self):
+        log_id = db.add_organize_log("guangya", "/incoming/group", "", "group", "manual", "")
+        self.create("group")
+        payload = json.loads(self.row("group")["payload_json"])
+        payload.pop("_organize_log_upper_bound")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_log SET updated_at='2000-01-01 00:00:00' WHERE id=?", (log_id,))
+            conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='group'", (json.dumps(payload),))
+        for token, encoded in (("local", json.dumps({"kind": "local_media", "files": payload["files"]})),
+                               ("corrupt", "{broken")):
+            self.create(token)
+            with db.get_conn() as conn:
+                conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token=?", (encoded, token))
+        self.assertEqual(organize_confirmations_repo.pending_confirmation_tokens_by_log([log_id]), {log_id: "group"})
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_log SET updated_at=? WHERE id=?", (self.row("group")["created_at"], log_id))
+        self.assertEqual(batches.skip_logs([log_id])["skipped"], 0)
+        self.assertEqual(batches.skip_confirmations(["local"])["skipped"], 0)
+        self.assertEqual(self.row("local")["status"], "pending")
+
+    def test_concurrent_skip_claims_the_group_once(self):
+        log_id = db.add_organize_log("guangya", "/incoming/group", "", "group", "manual", "")
+        self.create("group", review=True)
+        barrier, original_row = Barrier(2), batches._row
+
+        def simultaneous_read(*args, **kwargs):
+            row = original_row(*args, **kwargs)
+            barrier.wait(timeout=5)
+            return row
+
+        with patch.object(batches, "_row", side_effect=simultaneous_read), ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(lambda _: batches.skip_confirmations(["group"]), range(2)))
+        self.assertEqual(sorted(result["skipped"] for result in results), [0, 1])
+        self.assertEqual((self.row("group")["status"], self.row("group")["review_status"]), ("cancelled", "cancelled"))
+        self.assertEqual(self.log(log_id)["status"], "skipped")
+
+    def test_enqueue_wins_between_skip_lookup_and_atomic_cancellation(self):
+        log_id = db.add_organize_log("guangya", "/incoming/group", "", "group", "manual", "")
+        self.create("group")
+        cancel = confirmations.cancel_confirmation
+
+        def enqueue_then_cancel(*args, **kwargs):
+            organize_confirmations_repo.claim_organize_confirmation("group", chat_id="chat", selected_index=1)
+            return cancel(*args, **kwargs)
+
+        with patch.object(confirmations, "cancel_confirmation", side_effect=enqueue_then_cancel):
+            result = batches.skip_logs([log_id])
+        self.assertEqual((result["skipped"], result["failed"]), (0, 1))
+        self.assertEqual((self.row("group")["status"], self.row("group")["selected_index"]), ("queued", 1))
+        self.assertEqual(self.log(log_id)["status"], "manual")
+
+    def test_batch_skip_continues_after_one_storage_failure(self):
+        for token in ("bad", "good"):
+            self.create(token)
+        cancel = organize_confirmations_repo.cancel_organize_confirmation
+
+        def fail_one(token, **kwargs):
+            if token == "bad":
+                raise sqlite3.OperationalError("database is locked")
+            return cancel(token, **kwargs)
+
+        with patch.object(organize_confirmations_repo, "cancel_organize_confirmation", side_effect=fail_one):
+            result = batches.skip_confirmations(["bad", "good"])
+        self.assertEqual((result["skipped"], result["failed"]), (1, 1))
+        self.assertEqual([self.row(token)["status"] for token in ("bad", "good")], ["pending", "cancelled"])
 
     def test_api_roundtrip_uses_saved_selection_and_same_durable_queue(self):
         from fastapi import FastAPI

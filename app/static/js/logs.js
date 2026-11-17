@@ -101,7 +101,7 @@ function currentOrganizeFilters() {
     };
 }
 
-function loadOrganize(page=organizePage) {
+function loadOrganize(page=organizePage,preserveSelection=false) {
     const requestSerial = ++organizeRequestSerial;
     loadingOrg = true;
     organizePage=Math.max(1,Number(page)||1);
@@ -121,7 +121,12 @@ function loadOrganize(page=organizePage) {
         const body = document.getElementById('organizeList');
         const releaseHeight=lockElementHeight(body.closest('.table-wrap'));
         if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="table-empty">暂无整理日志</td></tr>'; organizeRows=[];selectedOrganizeLogs.clear();updateOrganizeBatchState();revealOrganizePagination();releaseHeight();return; }
-        organizeRows=rows;selectedOrganizeLogs.clear();
+        organizeRows=rows;
+        if(preserveSelection){
+            const keys=new Set(selectedOrganizeLogs.keys());
+            selectedOrganizeLogs.clear();
+            rows.filter(row=>row.actions?.batch&&keys.has(row.record_key)).forEach(row=>selectedOrganizeLogs.set(row.record_key,row));
+        }else selectedOrganizeLogs.clear();
         body.innerHTML = rows.map(r=>{
             const st = orgStatusMap[r.status] || [r.raw_status||r.status, ''];
             const tmdbTag = r.tmdb_id ? `<span class="tag-mini" style="margin-left:6px;">${_esc(r.tmdb_id)}</span>` : '';
@@ -147,6 +152,7 @@ function loadOrganize(page=organizePage) {
             </tr>`;
         }).join('');
         body.querySelectorAll('.organize-row-select').forEach(input=>{
+            input.checked=selectedOrganizeLogs.has(input.dataset.key);
             input.addEventListener('change',()=>toggleOrganizeSelection(input.dataset.key,input.checked));
         });
         body.querySelectorAll('.detail-btn').forEach(btn=>{
@@ -172,20 +178,49 @@ function updateOrganizeBatchState(){
     const count=selectedOrganizeLogs.size;
     const selectable=organizeRows.filter(row=>row.actions?.batch);
     document.getElementById('organizeBatchCount').textContent=`当前页已选 ${count} 条光鸭记录`;
-    ['organizeBatchRenameBtn','organizeBatchRevertBtn'].forEach(id=>document.getElementById(id).disabled=count<2||count>50);
-    document.getElementById('organizeBatchDeleteBtn').disabled=organizeBatchDeletePending||count<1||count>50;
-    document.querySelectorAll('.organize-row-select').forEach(input=>{input.disabled=!input.checked&&count>=50;});
+    const busy=organizeBatchSkipPending||organizeBatchDeletePending;
+    ['organizeBatchRenameBtn','organizeBatchRevertBtn'].forEach(id=>document.getElementById(id).disabled=busy||count<2||count>50);
+    document.getElementById('organizeBatchDeleteBtn').disabled=busy||count<1||count>50;
+    document.getElementById('organizeBatchSkipBtn').disabled=busy||![...selectedOrganizeLogs.values()].some(row=>row.status==='manual');
+    document.querySelectorAll('.organize-row-select').forEach(input=>{input.disabled=organizeBatchSkipPending||(!input.checked&&count>=50);});
     const all=selectable.length>0&&selectable.every(row=>selectedOrganizeLogs.has(row.record_key));
     document.getElementById('organizeSelectAll').checked=all;
     document.getElementById('organizeSelectAll').indeterminate=count>0&&!all;
+    document.getElementById('organizeSelectAll').disabled=organizeBatchSkipPending;
 }
 function _setOrganizeBatchState(message,type=''){const el=document.getElementById('organizeBatchState');el.textContent=message||'';el.className='inline-save-state'+(type?' is-'+type:'');}
 document.getElementById('organizeSelectAll').addEventListener('change',event=>{const checked=event.currentTarget.checked;let remaining=Math.max(0,50-selectedOrganizeLogs.size);document.querySelectorAll('.organize-row-select').forEach(input=>{if(checked&&!input.checked&&remaining<=0)return;input.checked=checked;if(checked&&!selectedOrganizeLogs.has(input.dataset.key))remaining--;toggleOrganizeSelection(input.dataset.key,checked);});});
-let organizeBatchTaskSerial=0,organizeBatchDeletePending=false;
+let organizeBatchTaskSerial=0,organizeBatchDeletePending=false,organizeBatchSkipPending=false;
+// 与 Telegram 每组的终止按钮一致：按日志所属待确认组跳过，文件保持原位，同组日志一并结束。
+async function skipOrganizeLogs(logIds){
+    const response=await api('/api/logs/organize/batch/skip',{method:'POST',body:JSON.stringify({log_ids:logIds})});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error||'跳过失败，请刷新后重试');
+    const failed=(data.items||[]).filter(item=>!item.skipped);
+    return {items:data.items||[],failed,
+        message:`已跳过 ${data.skipped||0} 条待确认日志，文件保持原位${failed.length?`；${failed.length} 条未跳过：${failed[0].error||'状态已变化'}`:''}。以后重新执行整理时仍会再次识别。`};
+}
+async function runOrganizeBatchSkip(){
+    if(organizeBatchSkipPending||organizeBatchDeletePending)return;
+    const rows=[...selectedOrganizeLogs.values()].filter(row=>row.status==='manual');
+    if(!rows.length)return;
+    organizeBatchSkipPending=true;updateOrganizeBatchState();
+    try{
+        const confirmed=await appConfirm({title:'批量跳过待确认',message:`将结束 ${rows.length} 条待确认日志所属的确认组：文件保持原位，日志标记为“跳过”，不会移动或删除任何文件。同组的其他日志会一并结束；以后重新执行整理时仍会再次识别。`,confirmText:'批量跳过',trigger:document.getElementById('organizeBatchSkipBtn')});
+        if(!confirmed)return;
+        _setOrganizeBatchState('正在跳过所选待确认…');
+        const {items,failed,message}=await skipOrganizeLogs(rows.map(row=>row.id));
+        const skipped=new Set(items.filter(item=>item.skipped).map(item=>item.log_id));
+        for(const [key,row] of selectedOrganizeLogs)if(skipped.has(row.id))selectedOrganizeLogs.delete(key);
+        _setOrganizeBatchState(message,failed.length?'error':'success');
+        await Promise.all([loadOverview(),loadOrganize(organizePage,true)]);
+    }catch(error){_setOrganizeBatchState(error.message||'跳过失败，请刷新后重试','error');}
+    finally{organizeBatchSkipPending=false;updateOrganizeBatchState();}
+}
 async function runOrganizeBatch(action){
+    if(organizeBatchSkipPending||organizeBatchDeletePending)return;
     if(action==='reorganize'){await openBatchCorrection();return;}
     const deleting=action==='delete';
-    if(deleting&&organizeBatchDeletePending)return;
     const rows=[...selectedOrganizeLogs.values()];
     if(rows.length<(deleting?1:2)||rows.length>50)return;
     const movieRows=rows.filter(row=>row.media_type!=='tv');
@@ -559,6 +594,7 @@ async function executeBatchCorrection(){
 document.getElementById('organizeBatchRenameBtn').addEventListener('click',()=>runOrganizeBatch('reorganize'));
 document.getElementById('organizeBatchRevertBtn').addEventListener('click',()=>runOrganizeBatch('revert'));
 document.getElementById('organizeBatchDeleteBtn').addEventListener('click',()=>runOrganizeBatch('delete'));
+document.getElementById('organizeBatchSkipBtn').addEventListener('click',runOrganizeBatchSkip);
 document.getElementById('organizeBatchExecuteBtn').addEventListener('click',executeBatchCorrection);
 document.getElementById('clearOrganizeLogsBtn').addEventListener('click',async(event)=>{
     const button=event.currentTarget;
@@ -816,6 +852,8 @@ function _renderOrganizeDetail(data){
     document.getElementById('organizeReorganizeBtn').disabled=true;
     document.getElementById('organizeReturnBtn').disabled=!data.allowed_actions.return_to_source;
     document.getElementById('organizeRevertBtn').disabled=!data.allowed_actions.revert;
+    const skipButton=document.getElementById('organizeSkipBtn');
+    skipButton.hidden=skipButton.disabled=!data.allowed_actions.skip;
     const deleteButton=document.getElementById('organizeDeleteBtn');
     deleteButton.disabled=!data.allowed_actions.delete;
     deleteButton.hidden=!data.allowed_actions.delete;
@@ -1070,6 +1108,23 @@ document.getElementById('organizeReorganizeBtn').addEventListener('click',runOrg
 document.getElementById('organizeReturnBtn').addEventListener('click',returnOrganizeToSource);
 document.getElementById('organizeRevertBtn').addEventListener('click',revertOrganize);
 document.getElementById('organizeDeleteBtn').addEventListener('click',deleteOrganizeGroup);
+async function skipOrganizeGroup(){
+    const serial=organizeDetailSerial,logId=organizeDetail?.id,button=document.getElementById('organizeSkipBtn');
+    if(!logId||button.disabled||!organizeDetail.allowed_actions?.skip)return;
+    button.disabled=true;
+    try{
+        const confirmed=await appConfirm({title:'跳过待确认',message:'结束这条日志所属的待确认组：文件保持原位，日志标记为“跳过”。同组的其他日志会一并结束；以后重新执行整理时仍会再次识别。',confirmText:'跳过此组',trigger:button});
+        if(!confirmed||serial!==organizeDetailSerial)return;
+        const {failed,message}=await skipOrganizeLogs([logId]);
+        loadOverview();loadOrganize(organizePage);
+        if(serial!==organizeDetailSerial)return;
+        const reopen=openOrganizeDetail(logId),reopened=organizeDetailSerial;
+        await reopen;
+        if(reopened===organizeDetailSerial)_setOrganizeState(message,failed.length?'error':'success');
+    }catch(error){if(serial===organizeDetailSerial)_setOrganizeState(error.message||'跳过失败，请刷新后重试','error');}
+    finally{if(serial===organizeDetailSerial)button.disabled=!organizeDetail?.allowed_actions?.skip;}
+}
+document.getElementById('organizeSkipBtn').addEventListener('click',skipOrganizeGroup);
 
 function renderRuntimeLogs(){
     const filter=document.getElementById('runtimeFilter').value.trim().toLowerCase();
@@ -1382,6 +1437,10 @@ if (initialTab === 'runtime') {
             const data=scope==='pending'?await request('?'+params):frozen.length?
                 await request('/query',{confirmation_ids:frozen,status:'all',page,page_size:pageSize}):{items:[],total:0,pages:0,confirmation_ids:[],counts:{}};
             if(serial!==state.serial||!visible())return;
+            if(page>Math.max(1,Number(data.pages)||0)){
+                state.loading=false;
+                return load(Math.max(1,Number(data.pages)||0),quiet);
+            }
             // pending 队列中的项入队后会消失，详情仍回读其真实运行状态。
             const active=state.active;
             let activeItems=[];
@@ -1413,12 +1472,18 @@ if (initialTab === 'runtime') {
         invalidatePreview();
         const data=await request('/skip',{confirmation_ids:tokens});
         const results=Array.isArray(data.items)?data.items:[];
-        results.filter(item=>item.skipped).forEach(item=>{state.selected.delete(item.confirmation_id);state.drafts.delete(item.confirmation_id);});
+        const skipped=new Set(results.filter(item=>item.skipped).map(item=>item.confirmation_id));
+        const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.confirmation_id);
+        const index=order.indexOf(state.active);
+        if(skipped.has(state.active))state.active=order.slice(index+1).concat(order.slice(0,index)).find(token=>!skipped.has(token))||'';
+        skipped.forEach(token=>{state.selected.delete(token);state.drafts.delete(token);});
         persist();
-        merge(await snapshot(tokens));
         const failed=results.filter(item=>!item.skipped);
-        say(`已跳过 ${data.skipped||0} 组，文件保持原位，日志标记为“跳过”${failed.length?`；${failed.length} 组未跳过：${failed[0].error||'状态已变化'}`:''}。以后重新执行整理时仍会再次识别。`,failed.length>0);
-        return failed.length===0;
+        const message=`已跳过 ${data.skipped||0} 组，文件保持原位，日志标记为“跳过”${failed.length?`；${failed.length} 组未跳过：${failed[0].error||'状态已变化'}`:''}。以后重新执行整理时仍会再次识别。`;
+        say(message,failed.length>0);
+        try{merge(await snapshot(tokens));}
+        catch(error){say(`${message} 状态回读失败：${error.message}，请刷新核对。`,true);}
+        if(skipped.size)await Promise.all([loadOverview(),loadOrganize(organizePage)]);
     }
     async function next(){
         const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.confirmation_id);
@@ -1500,7 +1565,7 @@ if (initialTab === 'runtime') {
         // 跳过的组离开待确认队列：结束后静默回读列表，保留跳过结果提示。
         act(async()=>{
             if(action==='next'){await next();return;}
-            if(action==='skip'){if(await skip([state.active]))await next();return;}
+            if(action==='skip'){await skip([state.active]);return;}
             const token=state.active,index=state.drafts.get(token);
             if(!Number.isInteger(index))return;
             invalidatePreview();

@@ -1036,10 +1036,12 @@ def finalize_pending_organize_logs(
     file_ids: Iterable[str],
     *,
     status: str,
+    max_log_id: int | None,
+    confirmation_created_at: str,
     error: str = "",
     confirmation_actor: str = "",
 ) -> int:
-    """结束仍待人工处理的整理日志；用于取消或不可重试失败。"""
+    """仅结束确认冻结范围内的待处理日志，保留之后的新扫描或改写。"""
     normalized_status = (status or "").strip()
     if normalized_status not in {"skipped", "failed"}:
         raise ValueError("不支持的人工确认终态")
@@ -1051,6 +1053,11 @@ def finalize_pending_organize_logs(
     )
     if not normalized_source or not normalized_ids:
         return 0
+    if not confirmation_created_at or (max_log_id is not None and type(max_log_id) is not int):
+        return 0
+    # 旧确认没有日志 ID 上界，秒级同时间记录无法证明归属，保持原样。
+    boundary = "id<=? AND updated_at<=?" if max_log_id is not None else "updated_at<?"
+    bounds = (max_log_id, confirmation_created_at) if max_log_id is not None else (confirmation_created_at,)
     placeholders = ",".join("?" for _ in normalized_ids)
     stamp = now()
     message = (error or "").strip()
@@ -1058,12 +1065,13 @@ def finalize_pending_organize_logs(
     if actor not in {"", "human", "agent"}:
         raise ValueError("确认执行者无效")
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             f"SELECT id FROM organize_log WHERE source=? AND file_id IN ({placeholders}) "
-            "AND (status='manual' OR (status='skipped' AND ("
+            f"AND {boundary} AND (status='manual' OR (status='skipped' AND ("
             "instr(COALESCE(error,''),'人工确认')>0 OR "
             "instr(COALESCE(error,''),'待确认')>0)))",
-            (normalized_source, *normalized_ids),
+            (normalized_source, *normalized_ids, *bounds),
         ).fetchall()
         log_ids = [int(row["id"]) for row in rows]
         if not log_ids:

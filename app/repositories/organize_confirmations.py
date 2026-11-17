@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from datetime import datetime
 
 from app import database as db
@@ -80,6 +81,35 @@ def create_organize_confirmation(
         )
         assert cursor.lastrowid is not None
         return cursor.lastrowid
+
+
+def pending_confirmation_tokens_by_log(log_ids: Iterable[int]) -> dict[int, str]:
+    """按冻结日志范围定位最新确认单，禁止从已入队项回退到旧待确认单。"""
+    ids = list(dict.fromkeys(log_ids))
+    if not ids:
+        return {}
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            WITH matches AS (
+                SELECT l.id AS log_id,l.updated_at AS log_updated_at,c.*,
+                       ROW_NUMBER() OVER (PARTITION BY l.id ORDER BY c.id DESC) AS latest
+                FROM organize_log l JOIN organize_confirmations c
+                JOIN json_each(CASE WHEN json_valid(c.payload_json)
+                               THEN c.payload_json ELSE '{}' END,'$.files') f
+                  ON json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id')=l.file_id
+                WHERE l.id IN (SELECT value FROM json_each(?))
+                  AND l.source='guangya' AND l.status='manual' AND l.file_id<>''
+                  AND COALESCE(json_extract(CASE WHEN json_valid(c.payload_json)
+                                            THEN c.payload_json ELSE '{}' END,'$.kind'),'guangya')='guangya'
+            )
+            SELECT log_id,token FROM matches WHERE latest=1 AND status='pending' AND expires_at>?
+              AND ((json_type(payload_json,'$._organize_log_upper_bound')='integer'
+                    AND log_id<=json_extract(payload_json,'$._organize_log_upper_bound') AND log_updated_at<=created_at)
+                   OR (json_type(payload_json,'$._organize_log_upper_bound') IS NULL AND log_updated_at<created_at))
+            """, (json.dumps(ids), db.now()),
+        ).fetchall()
+    return {row["log_id"]: row["token"] for row in rows}
 
 
 def get_organize_confirmation(token: str) -> sqlite3.Row | None:

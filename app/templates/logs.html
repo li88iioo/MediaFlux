@@ -86,6 +86,7 @@
         <div class="logs-batch-actions">
             <button type="button" class="jump-btn" id="organizeBatchRenameBtn" disabled><i data-lucide="scan-search"></i>批量纠正识别</button>
             <button type="button" class="jump-btn" id="organizeBatchRevertBtn" disabled><i data-lucide="undo-2"></i>批量回退</button>
+            <button type="button" class="jump-btn" id="organizeBatchSkipBtn" title="结束所选待确认日志所属的确认组，文件保持原位" disabled><i data-lucide="skip-forward"></i>批量跳过</button>
             <button type="button" class="jump-btn danger" id="organizeBatchDeleteBtn" title="选择当前页 1–50 条光鸭日志，回收媒体及相关空目录；自有下载任务可清理到 MF 暂存目录" disabled><i data-lucide="trash-2"></i>批量移入光鸭回收站</button>
         </div>
     </div>
@@ -235,6 +236,7 @@
             <span id="organizeOperationState" class="inline-save-state"></span>
             <div class="organize-detail-actions organize-single-actions">
                 <button type="button" class="jump-btn danger" id="organizeDeleteBtn"><i data-lucide="trash-2"></i>移入光鸭回收站</button>
+                <button type="button" class="jump-btn" id="organizeSkipBtn" title="结束这条待确认日志所属的确认组，文件保持原位" hidden><i data-lucide="skip-forward"></i>跳过此组</button>
                 <button type="button" class="jump-btn" id="organizeReturnBtn"><i data-lucide="corner-up-left"></i>送回源目录</button>
                 <button type="button" class="jump-btn" id="organizeRevertBtn"><i data-lucide="undo-2"></i>回退最近操作</button>
                 <button type="button" class="btn btn-primary" id="organizeReorganizeBtn" disabled><i data-lucide="wand-sparkles"></i>执行重新整理</button>

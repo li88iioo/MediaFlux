@@ -89,7 +89,8 @@ def test_logs_responsive_css_contract():
     assert "grid-column: 1 / -1" in css
     assert ".organize-detail-actions .jump-btn, .organize-detail-actions .btn { width: auto; min-height: 38px; height: 38px; font-size: 12px; font-weight: 600; border-radius: 7px; }" in css
     assert ".organize-detail-actions .jump-btn, .organize-detail-actions .btn { width: 100%; min-width: 0; min-height: 42px; height: 42px; white-space: nowrap; }" in css
-    assert "#organizeDeleteBtn, #organizeReorganizeBtn { grid-column: 1 / -1; }" in css
+    # 详情底栏的通栏布局由 test_mobile_skip_footer_and_toolbar_use_full_width_without_overflow
+    # 在真实浏览器中按可见尺寸验证，避免选择器合并方式锁死样式重构。
     assert ".organize-flow-hero { grid-template-columns: 1fr; gap: 8px; }" in css
     assert ".organize-flow-connector svg { transform: rotate(90deg); }" in css
     assert ".organize-meta-chip { min-width: 0; white-space: normal; overflow-wrap: anywhere; }" in css

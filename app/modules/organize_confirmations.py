@@ -922,7 +922,7 @@ def decode_row(row) -> dict:
 
 
 def _finalize_guangya_manual_logs(
-    payload: dict, *, status: str, error: str, confirmation_actor: str = "human",
+    payload: dict, *, created_at: str, status: str, error: str, confirmation_actor: str = "human",
 ) -> None:
     """同步确认终态到光鸭整理时间线；本地媒体使用自身任务状态机。"""
     try:
@@ -940,6 +940,8 @@ def _finalize_guangya_manual_logs(
                 status=status,
                 error=error,
                 confirmation_actor=confirmation_actor,
+                max_log_id=payload.get("_organize_log_upper_bound"),
+                confirmation_created_at=created_at,
             )
     except Exception as exc:
         # 确认操作的终态已经持久化，日志投影同步失败只能降级告警，
@@ -1142,6 +1144,7 @@ def _publish_expired_confirmation(row) -> bool:
         _dispatch_due_confirmation_delivery(token)
     _finalize_guangya_manual_logs(
         payload,
+        created_at=str(row["created_at"] or ""),
         status="skipped",
         error="人工确认已过期",
         confirmation_actor="",
@@ -1225,7 +1228,7 @@ def cancel_confirmation(
     if delivery_enabled:
         _dispatch_due_confirmation_delivery(token)
     _finalize_guangya_manual_logs(
-        payload, status="skipped", error="用户选择暂不处理",
+        payload, created_at=str(current["created_at"] or ""), status="skipped", error="用户选择暂不处理",
     )
     try:
         _maybe_update_parent_organize_rollup(
@@ -1282,7 +1285,7 @@ def skip_confirmation(
         resolution="skipped",
     )
     reason = "用户选择跳过：暂无可用元数据"
-    _finalize_guangya_manual_logs(payload, status="skipped", error=reason)
+    _finalize_guangya_manual_logs(payload, created_at=str(current["created_at"] or ""), status="skipped", error=reason)
     if delivery_enabled:
         _dispatch_due_confirmation_delivery(token)
     try:
@@ -3103,7 +3106,8 @@ def _execute_guangya_confirmation(
             _dispatch_due_confirmation_delivery(token)
         if not actions:
             _finalize_guangya_manual_logs(
-                payload, status="failed", error=message, confirmation_actor=actor,
+                payload, created_at=str(current["created_at"] or "") if current is not None else "",
+                status="failed", error=message, confirmation_actor=actor,
             )
         raise
     finally:
