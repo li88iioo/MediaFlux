@@ -1271,20 +1271,29 @@ async def _test_ai_provider(
             pass
 
 
+def _ai_diagnostic_api_key(data: dict) -> str:
+    clear_api_key = data.get("clear_api_key", False)
+    if not isinstance(clear_api_key, bool):
+        raise ValueError("清除 API Key 的参数必须为布尔值")
+    if clear_api_key:
+        return ""
+    api_key = str(data.get("api_key") or "").strip()
+    if not api_key or api_key == "********":
+        return config.get("AGENT_LLM_API_KEY", "").strip()
+    return api_key
+
+
 @router.post("/ai/models")
 def ai_models(request: Request, data: dict | None = Body(default=None)):
     """读取管理员配置 Provider 的模型列表；不允许跳转。"""
     require_api_login(request)
     data = data or {}
-    unknown = sorted(set(data) - {"base_url", "api_key", "protocol"})
+    unknown = sorted(set(data) - {"base_url", "api_key", "clear_api_key", "protocol"})
     if unknown:
         return api_error("模型读取包含不支持的参数", 400)
     base_url = str(data.get("base_url") or config.get("AGENT_LLM_API_URL", "") or "").strip()
     if not base_url:
         return api_error("请先填写 API Base URL", 400)
-    api_key = str(data.get("api_key") or "").strip()
-    if not api_key or api_key == "********":
-        api_key = config.get("AGENT_LLM_API_KEY", "").strip()
     raw_protocol = str(
         data.get("protocol") or config.get("AGENT_LLM_PROTOCOL", "auto") or "auto"
     ).strip().lower().replace("-", "_")
@@ -1293,7 +1302,7 @@ def ai_models(request: Request, data: dict | None = Body(default=None)):
     protocol = resolve_protocol(raw_protocol, base_url)
     try:
         models = run_awaitable_sync(fetch_ai_models(
-            base_url=base_url, api_key=api_key, protocol=protocol,
+            base_url=base_url, api_key=_ai_diagnostic_api_key(data), protocol=protocol,
             timeout_seconds=_AI_MODEL_LIST_TIMEOUT_SECONDS
         ))
     except (ValueError, HttpError) as exc:
@@ -1310,7 +1319,8 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
     data = data or {}
     unknown = sorted(
-        set(data) - {"base_url", "api_key", "protocol", "model", "timeout_seconds", "reasoning_effort"}
+        set(data)
+        - {"base_url", "api_key", "clear_api_key", "protocol", "model", "timeout_seconds", "reasoning_effort"}
     )
     if unknown:
         return api_error("模型测试包含不支持的参数", 400)
@@ -1326,9 +1336,6 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
     ).strip()
     if not base_url:
         return api_error("请先填写 API Base URL", 400)
-    api_key = str(data.get("api_key") or "").strip()
-    if not api_key or api_key == "********":
-        api_key = config.get("AGENT_LLM_API_KEY", "").strip()
     raw_protocol = str(
         data.get("protocol")
         if "protocol" in data
@@ -1359,6 +1366,7 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
     if reasoning_effort and reasoning_effort not in REASONING_EFFORTS:
         return api_error("推理强度仅支持留空、low、medium 或 high", 400)
     try:
+        api_key = _ai_diagnostic_api_key(data)
         timeout_seconds = _ai_model_test_timeout(timeout_raw)
         normalize_provider_location(base_url)
         provider_headers("responses", api_key)

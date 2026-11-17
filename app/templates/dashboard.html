@@ -790,7 +790,7 @@
         const tokenField=panel.querySelector(`[data-key="${type==='jellyfin'?'JELLYFIN_API_KEY':'EMBY_TOKEN'}"]`);
         invalidateMediaTest(panel);
         const controller=new AbortController();
-        const snapshot={url:urlField.value,token:tokenField.value};
+        const snapshot={url:urlField.value,token:readSecretDraft(tokenField)};
         const ticket={controller,snapshot,button:btn};
         mediaTestTickets.set(panel,ticket);
         btn.disabled=true;
@@ -804,7 +804,7 @@
             });
             const data=await response.json();
             if(mediaTestTickets.get(panel)!==ticket||controller.signal.aborted)return;
-            if(urlField.value!==snapshot.url||tokenField.value!==snapshot.token){
+            if(urlField.value!==snapshot.url||readSecretDraft(tokenField)!==snapshot.token){
                 invalidateMediaTest(panel,{announce:true});
                 return;
             }

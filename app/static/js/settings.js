@@ -321,9 +321,11 @@
     }
     function getAgentModelDraft(){
         const panel=form.querySelector('[data-settings-panel="agent"]');
+        const apiKey=readSecretDraft(panel.querySelector('[data-key="AGENT_LLM_API_KEY"]')).trim();
         return {
             base_url:panel.querySelector('[data-key="AGENT_LLM_API_URL"]').value.trim(),
-            api_key:panel.querySelector('[data-key="AGENT_LLM_API_KEY"]').value,
+            api_key:apiKey,
+            clear_api_key:apiKey==='',
             protocol:panel.querySelector('[data-key="AGENT_LLM_PROTOCOL"]').value,
             model:panel.querySelector('[data-key="AGENT_LLM_MODEL"]').value.trim(),
             timeout_seconds:Number(panel.querySelector('[data-key="AGENT_LLM_TIMEOUT_SECONDS"]').value),
@@ -341,13 +343,13 @@
         ...form.querySelectorAll('[data-settings-panel="agent"] [data-key^="AGENT_LLM_"]'),
     ],agentModelRequestGate);
     fetchAgentModelsButton?.addEventListener('click',async event=>{
-        const draft=getAgentModelDraft();
-        if(!draft.base_url){setAgentModelState('请先填写 API Base URL','error');form.querySelector('[data-key="AGENT_LLM_API_URL"]').focus();return;}
+        const {base_url,api_key,clear_api_key,protocol}=getAgentModelDraft();
+        if(!base_url){setAgentModelState('请先填写 API Base URL','error');form.querySelector('[data-key="AGENT_LLM_API_URL"]').focus();return;}
         const ticket=agentModelRequestGate.begin();
         agentModelActiveButton=event.currentTarget;
         setAgentModelActionsBusy(agentModelActiveButton,true);setAgentModelState('正在读取 Provider 模型列表…','testing');
         try{
-            const response=await fetch('/api/tools/ai/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:draft.base_url,api_key:draft.api_key,protocol:draft.protocol}),signal:ticket.signal});
+            const response=await fetch('/api/tools/ai/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url,api_key,clear_api_key,protocol}),signal:ticket.signal});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'模型列表读取失败');
             if(!agentModelRequestGate.isCurrent(ticket))return;
@@ -421,12 +423,6 @@
             diag.title=detail;
         }
     }
-    function settingsSecretDraft(field){
-        const state=field.dataset.secretState||'empty';
-        if(state==='saved'&&!field.value)return '********';
-        if(state==='clear'||state==='empty')return '';
-        return field.value;
-    }
     const qbPanel=form.querySelector('[data-settings-panel="downloads"]');
     const qbUrlField=qbPanel?.querySelector('[data-key="QB_URL"]');
     const qbUsernameField=qbPanel?.querySelector('[data-key="QB_USERNAME"]');
@@ -435,8 +431,8 @@
     const getQbDraft=()=>({
         url:qbUrlField?.value.trim()||'',
         username:qbUsernameField?.value.trim()||'',
-        password:settingsSecretDraft(qbPasswordField),
-        api_key:settingsSecretDraft(qbApiKeyField),
+        password:readSecretDraft(qbPasswordField),
+        api_key:readSecretDraft(qbApiKeyField),
     });
     const setQbBusy=busy=>{
         if(!testQbButton)return;
@@ -488,7 +484,7 @@
     const tgTokenField=telegramPanel?.querySelector('[data-key="TG_BOT_TOKEN"]');
     const tgChatIdField=telegramPanel?.querySelector('[data-key="TG_CHAT_ID"]');
     const tgConnectionBadge=document.getElementById('tgConnectionBadge');
-    const getTelegramDraft=()=>({token:settingsSecretDraft(tgTokenField).trim(),chat_id:tgChatIdField?.value.trim()||''});
+    const getTelegramDraft=()=>({token:readSecretDraft(tgTokenField).trim(),chat_id:tgChatIdField?.value.trim()||''});
     const telegramRequestGate=createDraftRequestGate(getTelegramDraft,()=>{
         if(testTelegramButton)testTelegramButton.disabled=false;
         if(telegramState){telegramState.className='';telegramState.textContent='配置已变化，请重新测试';}
@@ -559,7 +555,7 @@
         const qbCatPreview=document.getElementById('qbCategoryPreview');
         if(qbCatPreview)qbCatPreview.textContent=qbCat||'未指定';
 
-        const qbApiKey=form.querySelector('[data-key="QB_API_KEY"]')?.value?.trim();
+        const qbApiKey=readSecretDraft(qbApiKeyField).trim();
         const qbAuthPreview=document.getElementById('qbAuthModePreview');
         if(qbAuthPreview)qbAuthPreview.textContent=qbApiKey?'API Key':'密码认证';
     }
@@ -740,7 +736,7 @@
     const tavilyApiKeyInput=document.getElementById('tavilyApiKeyInput');
     const tavilyTimeoutInput=form.querySelector('[data-key="TAVILY_TIMEOUT_SECONDS"]');
     const tavilyConnectionState=document.getElementById('tavilyConnectionState');
-    const getTavilyDraft=()=>({api_key:settingsSecretDraft(tavilyApiKeyInput),timeout_seconds:tavilyTimeoutInput.value});
+    const getTavilyDraft=()=>({api_key:readSecretDraft(tavilyApiKeyInput),timeout_seconds:tavilyTimeoutInput.value});
     function setTavilyState(tone,message){
         tavilyConnectionState.dataset.tone=tone;
         tavilyConnectionState.textContent=message;
@@ -776,7 +772,7 @@
     const tmdbConnectionState=document.getElementById('tmdbConnectionState');
     const tmdbApiKeyInput=document.getElementById('tmdbApiKeyInput');
     const tmdbApiUrlInput=document.getElementById('tmdbApiUrlInput');
-    const getTmdbDraft=()=>({api_key:settingsSecretDraft(tmdbApiKeyInput).trim(),api_url:tmdbApiUrlInput?.value||''});
+    const getTmdbDraft=()=>({api_key:readSecretDraft(tmdbApiKeyInput).trim(),api_url:tmdbApiUrlInput?.value||''});
     const setTmdbConnectionState=(tone,message,iconName='')=>{
         if(!tmdbConnectionState)return;
         tmdbConnectionState.className=`tmdb-connection-status is-${tone}`;

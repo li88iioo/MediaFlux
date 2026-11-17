@@ -36,6 +36,7 @@ READY = {
     "/guangya/offline": "!document.getElementById('saveOfflineBtn')?.disabled",
     "/settings": "document.getElementById('settingsForm')?.getAttribute('aria-busy') === 'false'",
     "/rss": "typeof rssSubsLoaded !== 'undefined' && rssSubsLoaded === true",
+    "/": "!!document.querySelector('[data-open-media-config]')",
 }
 
 
@@ -161,6 +162,84 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
             page.locator('#testTmdbBtn').click()
             expect(page.locator('#tmdbConnectionState')).to_contain_text('API Key')
             get.assert_not_called()
+
+    def test_model_diagnostics_follow_cleared_key_before_saving(self):
+        from playwright.sync_api import expect
+
+        self._write(
+            AGENT_LLM_API_URL="https://original.example.invalid/v1",
+            AGENT_LLM_API_KEY="stored-test-key",
+            AGENT_LLM_MODEL="fixture-model",
+        )
+        page = self._open("/settings#agent")
+        key = page.locator('[data-key="AGENT_LLM_API_KEY"]')
+        key.locator("..").get_by_role("button", name="清除已保存凭据").click()
+        draft_url = "https://draft.example.invalid/v1"
+        page.locator('[data-key="AGENT_LLM_API_URL"]').fill(draft_url)
+        state = page.locator("#agentModelState")
+        with patch("app.routes.tools_api.fetch_ai_models", return_value=["fixture-model"]) as models, patch(
+            "app.routes.tools_api._test_ai_provider", return_value={"protocol": "chat_completions"}
+        ) as probe:
+            page.locator("#fetchAgentModelsBtn").click()
+            expect(page.locator("#agentModelPickerModal")).to_be_visible()
+            page.keyboard.press("Escape")
+            page.locator("#testAgentModelBtn").click()
+            expect(state).to_have_attribute("data-tone", "warning")
+        for call in (models.await_args, probe.await_args):
+            self.assertEqual((call.kwargs["base_url"], call.kwargs["api_key"]), (draft_url, ""))
+        self.assertEqual(self.config_posts, [])
+        self.assertEqual(config.get("AGENT_LLM_API_KEY"), "stored-test-key")
+
+    def test_qb_auth_preview_matches_saved_draft_and_cleared_key(self):
+        from playwright.sync_api import expect
+
+        self._write(QB_API_KEY="stored-test-key")
+        page = self._open("/settings#downloads")
+        key = page.locator('[data-key="QB_API_KEY"]')
+        preview = page.locator("#qbAuthModePreview")
+        expect(preview).to_have_text("API Key")
+        key.locator("..").get_by_role("button", name="清除已保存凭据").click()
+        expect(preview).to_have_text("密码认证")
+        key.fill("replacement-test-key")
+        expect(preview).to_have_text("API Key")
+        page.locator('[data-settings-panel="downloads"] [data-save-settings]').click()
+        expect(key).to_have_attribute("data-secret-state", "saved")
+        expect(preview).to_have_text("API Key")
+        self.assertEqual(config.get("QB_API_KEY"), "replacement-test-key")
+
+    def test_dashboard_media_test_reuses_saved_credential_only_at_saved_address(self):
+        from playwright.sync_api import expect
+
+        address = "http://jellyfin.example.invalid:8096"
+        self._write(JELLYFIN_URL=address, JELLYFIN_API_KEY="stored-test-key", JELLYFIN_ENABLED="1")
+        page = self._open("/")
+        page.locator(".dashboard-config-button[data-open-media-config]").click()
+        page.locator('#mediaConfigModal [data-tab-target="jellyfin"]').click()
+        key = page.locator('[data-key="JELLYFIN_API_KEY"]')
+        expect(key).to_have_attribute("data-secret-state", "saved")
+        expect(key).to_have_value("")
+        action = page.locator('[data-test-media="jellyfin"]')
+        state = page.locator('[data-tab-panel="jellyfin"] [data-save-state]')
+        url = page.locator('[data-key="JELLYFIN_URL"]')
+        reply = SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                json=lambda: {"ServerName": "fixture-media", "Version": "12.0.0"})
+        with patch("app.routes.api.requests.get", return_value=reply) as get:
+            action.click()
+            expect(state).to_contain_text("fixture-media")
+            self.assertIn("stored-test-key", get.call_args.kwargs["headers"]["Authorization"])
+            url.fill("http://other.example.invalid:8096")
+            action.click()
+            expect(state).to_contain_text("请重新输入")
+            url.fill(address)
+            key.locator("..").get_by_role("button", name="清除已保存凭据").click()
+            action.click()
+            expect(state).to_have_text("请输入有效的访问凭据")
+            self.assertEqual(get.call_count, 1)
+            key.fill("replacement-test-key")
+            action.click()
+            expect(state).to_contain_text("fixture-media")
+            self.assertIn("replacement-test-key", get.call_args.kwargs["headers"]["Authorization"])
+        self.assertEqual(self.config_posts, [])
 
     def test_organize_both_views_show_missing_defaults_explicit_empty_and_truthy_text(self):
         self._write(

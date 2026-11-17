@@ -38,12 +38,12 @@ def http_provider():
             self.wfile.write(body)
 
         def do_GET(self):
-            seen.append((self.path, self.headers.get('Host')))
+            self.record_request()
             assert self.path == '/v1/models'
             self.reply(b'{"data":[{"id":"local-model"}]}')
 
         def do_POST(self):
-            seen.append((self.path, self.headers.get('Host')))
+            self.record_request()
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             protocol = next(key for key, path in PATHS.items() if path == self.path)
             if not body.get('stream'):
@@ -73,6 +73,10 @@ def http_provider():
             if protocol == 'chat_completions':
                 payload += 'data: [DONE]\n\n'
             self.reply(payload.encode(), 'text/event-stream')
+
+        def record_request(self):
+            credential = self.headers.get('Authorization') or self.headers.get('X-Api-Key')
+            seen.append((self.path, self.headers.get('Host'), credential))
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -117,7 +121,24 @@ def test_http_save_models_probe_stream_and_shared_recognition(config_api, http_p
         'additionalProperties': False,
     }) == {'ok': True}
     assert len(seen) == 6  # 模型列表、三种探测、流式调用、识别复用。
-    assert {host for _, host in seen} == {base.split('/')[2]}
+    assert {host for _, host, _ in seen} == {base.split('/')[2]}
+
+
+@pytest.mark.parametrize(('draft', 'expected_credential'), [
+    ({}, 'Bearer synthetic-preserved-key'),
+    ({'api_key': ''}, 'Bearer synthetic-preserved-key'),
+    ({'api_key': '********'}, 'Bearer synthetic-preserved-key'),
+    ({'api_key': 'fixture-draft'}, 'Bearer fixture-draft'),
+    ({'api_key': '', 'clear_api_key': True}, None),
+], ids=['missing', 'empty', 'masked', 'draft', 'clear'])
+def test_http_model_diagnostics_resolve_credential_draft(config_api, http_provider, draft, expected_credential):
+    base, seen = http_provider
+    models = config_api.post('/api/tools/ai/models', json={'base_url': base, **draft})
+    assert models.status_code == 200
+    probe = config_api.post('/api/tools/ai/test', json={'base_url': base, **draft})
+    assert probe.status_code == 200
+    assert [path for path, _, _ in seen] == ['/v1/models', *(['/v1/chat/completions'] * 3)]
+    assert {credential for _, _, credential in seen} == {expected_credential}
 
 
 @pytest.mark.parametrize('url', [

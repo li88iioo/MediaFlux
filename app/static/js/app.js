@@ -222,6 +222,13 @@
         shell.classList.toggle('has-saved-secret', state === 'saved' && !hasDraft);
     }
 
+    window.readSecretDraft = function (field) {
+        const state = field?.dataset.secretState || 'empty';
+        if (state === 'saved' && !field.value) return '********';
+        if (state === 'clear' || state === 'empty') return '';
+        return field.value;
+    };
+
     function enhanceSecretInput(input) {
         if (!(input instanceof HTMLInputElement)) return;
         if (input.type !== 'password' || input.getAttribute('data-secret-toggle') === 'off') return;
