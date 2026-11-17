@@ -1,68 +1,75 @@
-<div class="share-transfer-shell">
-        <section class="card settings-section strm-settings-section share-main-card">
+<div class="share-transfer-shell" id="shareTransferShell" data-step="1">
+    <div class="share-workspace-grid">
+        <section class="card settings-section strm-settings-section share-main-card" aria-labelledby="shareMainTitle">
             <header class="strm-section-head">
                 <div class="strm-card-icon-wrap">
                     <i data-lucide="link-2"></i>
                 </div>
                 <div class="title-group">
-                    <h3>光鸭分享链接解析</h3>
-                    <p class="desc">粘贴光鸭云盘分享链接（包含密码或提取码），一键解析并选择文件进行云端转存</p>
+                    <h3 id="shareMainTitle">光鸭分享转存</h3>
+                    <p class="desc">粘贴别人分享的光鸭链接，解析后勾选文件，选择目录即可保存到自己的光鸭。</p>
                 </div>
-                <span class="share-status-badge" id="shareStateTag"><i data-lucide="clock"></i><span>等待解析</span></span>
             </header>
 
             <div class="strm-card-body share-card-body">
-                <!-- 1. 分享链接输入 -->
-                <div class="strm-field-group">
-                    <div class="strm-field-header">
-                        <label class="strm-field-label">光鸭云盘分享链接</label>
-                        <span class="strm-field-hint">支持包含密码、提取码或短链接</span>
+                <ol class="share-steps" aria-label="分享转存步骤">
+                    <li data-step="1"><b>01</b><span>粘贴并解析链接</span></li>
+                    <li data-step="2"><b>02</b><span>勾选要转存的文件</span></li>
+                    <li data-step="3"><b>03</b><span>选择目录并保存</span></li>
+                </ol>
+
+                <div class="share-link-field">
+                    <label class="strm-field-label" for="shareUrl">分享链接</label>
+                    <div class="strm-composite-input-wrap">
+                        <i data-lucide="link" class="strm-composite-icon"></i>
+                        <input type="text" class="form-input strm-composite-input" id="shareUrl" placeholder="https://www.guangyapan.com/s/…  可直接带上提取码，如 pwd=1234" autocomplete="off">
+                        <button type="button" class="btn btn-primary strm-composite-btn share-inspect-btn" id="inspectShareBtn">
+                            <i data-lucide="scan-line"></i><span>解析分享</span>
+                        </button>
                     </div>
-                    <div class="strm-field-control">
-                        <div class="strm-composite-input-wrap">
-                            <i data-lucide="link" class="strm-composite-icon"></i>
-                            <input type="text" class="form-input strm-composite-input" id="shareUrl" placeholder="输入分享链接：https://www.guangyapan.com/s/...（支持带 code/pwd 提取码）" autocomplete="off">
-                            <button type="button" class="btn btn-primary strm-composite-btn share-inspect-btn" id="inspectShareBtn">
-                                <i data-lucide="scan-line"></i><span>解析分享</span>
-                            </button>
-                        </div>
-                        <div id="shareMessage" class="share-message-notice"></div>
-                    </div>
+                    <div id="shareMessage" class="share-message-notice" role="status" aria-live="polite"></div>
                 </div>
 
-                <!-- 2. 文件选择与解析结果 -->
-                <div class="strm-field-group share-file-field-group">
-                    <div class="strm-field-header">
-                        <label class="strm-field-label">解析文件列表</label>
+                <div class="share-files">
+                    <div class="share-files-head">
+                        <strong>分享内容</strong>
                         <div class="share-file-toolbar" id="shareFileToolbar" hidden>
                             <label class="share-check-all">
                                 <input type="checkbox" id="shareCheckAll" checked>
-                                <span>全选文件</span>
+                                <span>全选</span>
                             </label>
                             <span class="share-count-badge" id="shareSelectionCount">已选择 0 项</span>
                         </div>
                     </div>
-                    <div class="strm-field-control">
-                        <div id="shareFileList" class="share-file-list">
-                            <div class="share-empty-state">
-                                <div class="share-empty-icon"><i data-lucide="folder-search"></i></div>
-                                <strong>等待解析光鸭分享</strong>
-                                <p>请在上方输入框粘贴分享链接并点击“解析分享”，解析完成后可在此勾选拟转存的文件。</p>
-                                <div class="share-link-tips">
-                                    <span>支持格式示例：</span>
-                                    <code>https://www.guangyapan.com/s/xxxx 密码: 1234</code>
-                                </div>
-                            </div>
+                    <div id="shareFileList" class="share-file-list">
+                        <div class="share-empty-state">
+                            <div class="share-empty-icon"><i data-lucide="folder-search"></i></div>
+                            <strong>还没有解析分享</strong>
+                            <p>在上方粘贴分享链接并点击“解析分享”，分享里的文件会列在这里。</p>
+                            <code>https://www.guangyapan.com/s/xxxx 密码: 1234</code>
                         </div>
                     </div>
-                </div>
-                <div class="share-save-actions">
-                    <span class="text-muted">选定保存目录并确认后转存，预览有效期为 15 分钟。</span>
-                    <button type="button" class="btn btn-primary share-execute-btn" id="restoreShareBtn" disabled>
-                        <i data-lucide="cloud-download"></i><span>保存到光鸭</span>
-                    </button>
                 </div>
             </div>
         </section>
 
+        <aside class="card settings-section strm-settings-section share-side-card" aria-labelledby="shareSideTitle">
+            <header class="share-side-head">
+                <h3 id="shareSideTitle">转存到光鸭</h3>
+                <span class="share-status-badge" id="shareStateTag"><i data-lucide="clock"></i><span>等待解析</span></span>
+            </header>
+            <dl class="share-summary">
+                <div><dt>已选文件</dt><dd id="shareSummaryCount">0 项</dd></div>
+                <div><dt>合计大小</dt><dd id="shareSummarySize">—</dd></div>
+            </dl>
+            <ul class="share-notes">
+                <li>点击保存后选择目标目录，确认后提交转存。</li>
+                <li>解析结果 15 分钟内有效，过期请重新解析。</li>
+                <li>转存进度可在下载或日志页面查看。</li>
+            </ul>
+            <button type="button" class="btn btn-primary share-execute-btn" id="restoreShareBtn" disabled>
+                <i data-lucide="cloud-download"></i><span>保存到光鸭</span>
+            </button>
+        </aside>
+    </div>
 </div>

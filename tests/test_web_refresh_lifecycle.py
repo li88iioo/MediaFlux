@@ -773,6 +773,9 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               },
               shareMessage: {textContent: ''},
               inspectShareBtn: {disabled: false, innerHTML: ''},
+              shareTransferShell: {dataset: {}},
+              shareSummaryCount: {textContent: ''},
+              shareSummarySize: {innerHTML: ''},
             };
             const document = {
               getElementById: id => elements[id],

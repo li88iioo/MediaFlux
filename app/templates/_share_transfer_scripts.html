@@ -27,6 +27,9 @@
         tag.className = 'share-status-badge ' + tone;
         window.renderLucideIcons?.(tag);
     }
+    const setStep=step=>{document.getElementById('shareTransferShell').dataset.step=String(step);};
+    const fileIcon=item=>item.is_dir?'folder':/\.(mkv|mp4|avi|mov|ts|m2ts|wmv|flv|rmvb|iso|webm)$/i.test(item.name||'')?'file-video':
+        /\.(ass|ssa|srt|sup|vtt)$/i.test(item.name||'')?'captions':'file-text';
     function renderActionButton(id,busy,label,icon){
         const button=document.getElementById(id);
         button.disabled=busy;
@@ -41,6 +44,13 @@
         const currentUrl=document.getElementById('shareUrl').value.trim();
         const validPreview=Boolean(previewId&&previewUrl&&previewUrl===currentUrl);
         document.getElementById('shareSelectionCount').textContent=`已选择 ${selected.length} / ${files.length} 项`;
+        const chosen=files.filter(item=>selected.includes(String(item.id)));
+        const folders=chosen.filter(item=>item.is_dir).length;
+        const bytes=chosen.reduce((sum,item)=>sum+(item.is_dir?0:Number(item.size)||0),0);
+        document.getElementById('shareSummaryCount').textContent=`${selected.length} 项`;
+        // 文件夹大小在预览中未知，单列说明，不计入合计。
+        document.getElementById('shareSummarySize').innerHTML=(bytes?formatSize(bytes):'—')
+            +(folders?`<small>另含 ${folders} 个文件夹</small>`:'');
         document.getElementById('shareCheckAll').checked=files.length>0&&selected.length===files.length;
         document.getElementById('shareCheckAll').indeterminate=selected.length>0&&selected.length<files.length;
         document.getElementById('restoreShareBtn').disabled=submitting||!validPreview||!selected.length;
@@ -57,6 +67,7 @@
         cancelPicker();
         document.getElementById('shareFileToolbar').hidden=true;
         document.getElementById('shareFileList').replaceChildren();
+        setStep(1);
         updateSelection();
         if(message&&hadPreview){
             document.getElementById('shareMessage').textContent=message;
@@ -68,14 +79,16 @@
         document.getElementById('shareFileToolbar').hidden=false;
         list.innerHTML=files.map(item=>`<label class="share-file-row">
             <input type="checkbox" class="share-file-check" value="${escapeHtml(item.id)}" checked>
-            <span class="share-file-type-icon"><i data-lucide="${item.is_dir?'folder':'file-text'}"></i></span>
-            <div class="share-file-meta">
+            <span class="share-file-type-icon${item.is_dir?' is-folder':''}"><i data-lucide="${fileIcon(item)}"></i></span>
+            <span class="share-file-meta">
                 <strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
-                <small>${item.is_dir?'目录 / 文件夹':formatSize(item.size)} · ID ${escapeHtml(item.id)}</small>
-            </div>
+                <small>${item.is_dir?'文件夹':'文件'} · ID ${escapeHtml(item.id)}</small>
+            </span>
+            <span class="share-file-size">${item.is_dir?'—':formatSize(item.size)}</span>
         </label>`).join('');
         window.renderLucideIcons?.(list);
         list.querySelectorAll('.share-file-check').forEach(el=>el.addEventListener('change',selectionChanged));
+        setStep(2);
         updateSelection();
     }
     async function inspectShare(){
@@ -99,8 +112,8 @@
             if(error.name==='AbortError'||generation!==inspectGeneration)return;
             document.getElementById('shareMessage').textContent=error.message;
             document.getElementById('shareFileToolbar').hidden=true;
-            document.getElementById('shareFileList').innerHTML=`<div class="share-empty-state">
-                <div class="share-empty-icon" style="color:var(--danger);background:rgba(239,68,68,0.1);"><i data-lucide="alert-triangle"></i></div>
+            document.getElementById('shareFileList').innerHTML=`<div class="share-empty-state is-error">
+                <div class="share-empty-icon"><i data-lucide="alert-triangle"></i></div>
                 <strong>解析失败</strong>
                 <p>${escapeHtml(error.message||'请检查提取码与分享链接有效性')}</p>
             </div>`;
@@ -149,6 +162,7 @@
                 }
                 if(data.success){
                     renderTransferStatus('转存成功',`转存请求 ${requestId} 已完成 · 目标「${data.target_dir_name||targetName}」`,'is-success');
+                    setStep('done');
                 }else{
                     renderTransferStatus(data.status==='manual_review'?'需要核对':'转存失败',data.error||`转存请求 ${requestId} 未完成，请重新解析后重试`,'is-danger');
                 }
@@ -192,6 +206,7 @@
             if(!ownsPreview(session)||session.selection!==selectionGeneration)return;
             confirmed=await appConfirm({title:'确认分享转存',message:`把 ${session.ids.length} 项文件保存到「${target.name}」。`,confirmText:'保存到此目录',trigger:button});
             if(!confirmed||!ownsPreview(session)||session.selection!==selectionGeneration)return;
+            setStep(3);
             renderActionButton('restoreShareBtn',true,'保存到光鸭','cloud-download');
             const body={preview_id:session.previewId,file_ids:session.ids,target_dir_id:target.id,target_dir_name:target.name};
             const response=await fetch('/api/share/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -204,6 +219,7 @@
                 if(data.request_id)void followShareRequest(data.request_id,target.name,session);
             }else{
                 renderTransferStatus('转存成功',`已成功转存 ${data.count||0} 项到「${data.target_dir_name||target.name}」`,'is-success');
+                setStep('done');
             }
         }catch(error){
             if(ownsPreview(session)){setState('转存失败','is-danger');document.getElementById('shareMessage').textContent=error.message;}
