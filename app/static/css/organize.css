@@ -120,9 +120,10 @@
 }
 .organize-section-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    gap: 8px 12px;
 }
 .organize-section-title-wrap {
     display: inline-flex;
@@ -138,6 +139,14 @@
     font-size: 13px;
     font-weight: 600;
     color: var(--text-primary);
+    white-space: nowrap;
+}
+/* 说明按钮在标题行内收小，不撑高标题行。 */
+.organize-section-title-wrap .organize-source-help {
+    flex: 0 0 32px;
+    width: 32px;
+    height: 32px;
+    margin: -6px -4px;
 }
 .organize-section-subtext {
     font-size: 12px;
@@ -152,6 +161,7 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    white-space: nowrap;
     color: var(--accent);
     background: transparent;
     border: 0;

@@ -55,6 +55,19 @@
                 <div class="organize-section-title-wrap">
                     <i data-lucide="folder-search" class="organize-section-icon"></i>
                     <span class="organize-section-heading">扫描源目录</span>
+                    <button type="button" class="metadata-help-trigger organize-source-help" data-help-tooltip="organizeSourceHelpTooltip" aria-label="扫描源目录的作用范围" aria-describedby="organizeSourceHelpTooltip">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4m0-4h.01"/></svg>
+                    </button>
+                    <div class="metadata-help-tooltip is-wide" id="organizeSourceHelpTooltip" role="tooltip">
+                        <table class="help-tooltip-table">
+                            <caption>以下情况不走这里的配置目录，也会整理入库：</caption>
+                            <tbody>
+                                <tr><th scope="row">MF 光鸭下载完成</th><td>使用该下载任务的保存目录，通常是 MF-xxx 隔离目录；不要求它在整理源目录列表里。</td></tr>
+                                <tr><th scope="row">分享转存完成</th><td>配置了有效归档目标、转存到非根目录时，会接入下载跟踪器，后续触发整理；也不检查扫描来源列表。</td></tr>
+                                <tr><th scope="row">指定目录刮削、人工确认、日志纠正重整</th><td>这些入口处理明确选择或原任务记录的文件范围，不以扫描来源列表作为准入条件。</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
                     <span class="organize-section-subtext" id="organizeSourceCountText">(支持多选 · 已选 {{ organize_initial_sources|length }} 项)</span>
                 </div>
                 <button type="button" class="organize-action-link" id="addOrganizeSourceBtn" disabled>

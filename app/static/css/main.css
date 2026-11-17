@@ -417,6 +417,14 @@ svg { display: block; flex: 0 0 auto; }
 .metadata-help-tooltip[data-open] { visibility: visible; pointer-events: auto; }
 .metadata-help-tooltip > span { display: block; }
 .metadata-help-tooltip > span + span { margin-top: 8px; }
+/* 多场景说明：宽版浮层内放两列表格。 */
+.metadata-help-tooltip.is-wide { width: min(480px, calc(100vw - 24px)); }
+.help-tooltip-table { width: 100%; border-collapse: collapse; }
+.help-tooltip-table th, .help-tooltip-table td { padding: 6px 0; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border-soft); }
+.help-tooltip-table tr > :first-child { width: 112px; padding-right: 12px; }
+.help-tooltip-table caption { padding-bottom: 6px; color: var(--text-primary); font-weight: 650; text-align: left; }
+.help-tooltip-table tbody th { color: var(--text-primary); font-weight: 600; }
+.help-tooltip-table tbody tr:last-child > * { padding-bottom: 0; border-bottom: 0; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 #toggleSidebar { display: none; }
 .content { width: 100%; flex: 1; padding: clamp(18px, 2.6vw, 36px) clamp(20px, 3vw, 42px) clamp(28px, 4vw, 54px); animation: none; }
