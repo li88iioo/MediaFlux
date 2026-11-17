@@ -200,6 +200,26 @@ class RssDirectoryPickerLayerBrowserTests(unittest.TestCase):
         self.assertTrue(page.locator('[title="编辑订阅"]').evaluate("e => e === document.activeElement"))
         self.assertFalse(page.evaluate("document.body.classList.contains('modal-open')"))
 
+    def test_reset_directory_keeps_the_draft_and_returns_to_inherited_root(self):
+        for viewport in ((1280, 900), (320, 640)):
+            with self.subTest(viewport=viewport):
+                page, _ = self.make_page(viewport)
+                self.open_editor(page)
+                reset = page.get_by_role("button", name="使用离线转存默认目录")
+                size = reset.evaluate("button => [button.offsetWidth, button.offsetHeight]")
+                reset.click()
+                self.assert_editor_preserved(page, "")
+                self.assertEqual(page.locator("#f_gy_target_name").input_value(), "")
+                self.assertIn("离线转存默认目录：根目录", page.locator("#rssGyTargetValue").inner_text())
+                self.assertTrue(reset.is_disabled())
+                self.assertEqual(reset.evaluate("button => [button.offsetWidth, button.offsetHeight]"), size)
+                self.assert_no_overflow(page)
+                page.keyboard.press("Escape")
+                self.open_editor(page)
+                self.assertTrue(reset.is_enabled())
+                self.assertEqual(page.locator("#f_gy_target").input_value(), "old-dir")
+                page.close()
+
     def test_backdrop_closes_only_top_layer_at_all_widths(self):
         for viewport in VIEWPORTS:
             with self.subTest(viewport=viewport):

@@ -3327,6 +3327,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .rss-entry-actions { display: flex; gap: 6px; flex: 0 0 auto; }
 .rss-target-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 8px; }
 .rss-target-control .organize-target-value { margin-top: 0; height: 42px; min-height: 42px; padding: 0 14px; }
+.rss-target-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .rss-target-control .jump-btn { width: auto; height: 42px; margin: 0; display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; }
 #rssQbPathRow.is-disabled, #rssGyTargetRow.is-disabled { opacity: .45; }
 
@@ -4731,7 +4732,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .rss-entry-actions { grid-column: 2 / 4; }
     .rss-entry-actions .jump-btn { width: 100%; }
     .rss-target-control { grid-template-columns: 1fr; }
-    .rss-target-control .jump-btn { width: 100%; }
+    .rss-target-control .jump-btn { flex: 1 1 auto; min-height: 44px; }
     .organize-flow-tabs { display: flex; margin-right: -11px; margin-left: -11px; padding-right: 11px; padding-left: 11px; overflow-x: auto; border-right: 0; border-left: 0; border-radius: 0; }
     .organize-flow-tab { min-width: 150px; }
     .settings-save-actions { width: 100%; flex-direction: column; }

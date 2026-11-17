@@ -196,7 +196,16 @@
                 <span class="form-label" id="rssGyTargetLabel">光鸭目标目录</span>
                 <input type="hidden" id="f_gy_target">
                 <input type="hidden" id="f_gy_target_name">
-                <div class="rss-target-control"><div class="organize-target-value" id="rssGyTargetValue" data-inherited-name="{{ rss_inherited_dir_name }}" data-inherited-id="{{ rss_inherited_dir_id }}"><strong>{{ ('离线转存默认目录：' ~ rss_inherited_dir_name) if rss_inherited_dir_id else '未配置' }}</strong><span>{{ ('ID: ' ~ rss_inherited_dir_id) if rss_inherited_dir_id else '请选择目录或配置离线转存默认目录' }}</span></div><button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button></div>
+                <div class="rss-target-control">
+                    <div class="organize-target-value" id="rssGyTargetValue" data-inherited-name="{{ rss_inherited_dir_name }}" data-inherited-id="{{ rss_inherited_dir_id }}">
+                        <strong>{{ ('离线转存默认目录：' ~ rss_inherited_dir_name) if rss_inherited_dir_id else '未配置' }}</strong>
+                        <span>{{ ('ID: ' ~ rss_inherited_dir_id) if rss_inherited_dir_id else '请选择目录或配置离线转存默认目录' }}</span>
+                    </div>
+                    <div class="rss-target-actions">
+                        <button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button>
+                        <button type="button" class="jump-btn" id="useRssDefaultTargetBtn" disabled><i data-lucide="rotate-ccw"></i>{{ '使用离线转存默认目录' if rss_inherited_dir_id else '清除手选目录' }}</button>
+                    </div>
+                </div>
                 <p class="subscription-source-field-hint"><a href="/guangya/offline">设置离线转存默认目录</a></p>
             </div>
         </div>
@@ -325,6 +334,7 @@ function parseEntryTitle(rawTitle) {
 function renderRssTarget(id,name){
     document.getElementById('f_gy_target').value=id||'';
     document.getElementById('f_gy_target_name').value=name||'';
+    document.getElementById('useRssDefaultTargetBtn').disabled=!id;
     const box=document.getElementById('rssGyTargetValue');box.replaceChildren();
     const strong=document.createElement('strong');const span=document.createElement('span');
     strong.textContent=id?(name||id):(box.dataset.inheritedId?`离线转存默认目录：${box.dataset.inheritedName}`:'未配置');
@@ -839,6 +849,10 @@ async function dlEntry(id,trigger){
 }
 
 document.getElementById('f_method').addEventListener('change',updateTargetRows);
+document.getElementById('useRssDefaultTargetBtn').addEventListener('click',()=>{
+    renderRssTarget('','');
+    document.getElementById('pickRssTargetBtn').focus({preventScroll:true});
+});
 document.getElementById('pickRssTargetBtn').addEventListener('click',event=>{
     const generation=rssSubFormGeneration;
     rssTargetPicker=openGuangYaDirectoryPicker({
