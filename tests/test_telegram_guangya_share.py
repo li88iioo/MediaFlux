@@ -1026,8 +1026,8 @@ class WebShareLifecycleBrowserTests(unittest.TestCase):
         self.page.route("**/*", self.route)
         self.page.add_init_script("""
             window.calls=[];
-            window.fetch=(url,options={})=>new Promise(resolve=>{
-                const call={url:String(url),options,resolve}; calls.push(call);
+            window.fetch=(url,options={})=>new Promise((resolve,reject)=>{
+                const call={url:String(url),options,resolve,reject}; calls.push(call);
                 if(call.url.startsWith('/api/guangya/dirs')){
                     const parent=new URL(call.url,location.origin).searchParams.get('parent_id');
                     const files=parent==='0'?[{file_id:'drive',name:'我的光鸭',is_dir:true}]:
@@ -1163,14 +1163,46 @@ class WebShareLifecycleBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator("#appConfirmTitle").inner_text(), "新的确认")
         self.assertTrue(self.page.evaluate("Boolean(document.activeElement.closest('#appConfirmModal'))"))
 
-    def test_failure_releases_submission_for_retry(self):
+    def test_explicit_rejection_releases_submission_for_retry(self):
         self.ready_preview()
         pending = self.submit()
-        self.page.evaluate("index=>reply(index,{error:'当前请求失败'},502)", pending)
+        self.page.evaluate("index=>reply(index,{error:'目标目录不可用'},400)", pending)
         self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
-        self.assertEqual(self.page.locator("#shareMessage").inner_text(), "当前请求失败")
+        self.assertEqual(self.page.locator("#shareMessage").inner_text(), "目标目录不可用")
         self.submit("任意目录 B")
         self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 2)
+
+    def test_lost_reply_then_duplicate_shows_existing_completion(self):
+        from playwright.sync_api import expect
+
+        self.ready_preview()
+        pending = self.submit()
+        self.page.evaluate("index=>calls[index].reject(new TypeError('NetworkError'))", pending)
+        expect(self.page.locator("#shareStateTag")).to_have_text("状态待确认")
+        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
+        self.assertEqual(self.page.get_by_role("link", name="查看下载日志").get_attribute("href"), "/downloads?view=logs")
+
+        self.ready_preview()
+        pending = self.submit()
+        self.page.evaluate("index=>reply(index,{success:true,duplicate:true,request_id:7,count:0})", pending)
+        message = self.page.locator("#shareMessage")
+        expect(message).to_contain_text("请求 #7 此前已完成")
+        self.assertNotIn("0 项", message.inner_text())
+
+    def test_request_id_in_error_reply_follows_manual_review_status(self):
+        from playwright.sync_api import expect
+
+        self.ready_preview()
+        self.page.clock.install()
+        pending = self.submit()
+        self.page.evaluate("index=>reply(index,{error:'需要核对',request_id:7},502)", pending)
+        expect(self.page.locator("#shareStateTag")).to_have_text("状态待确认")
+        self.page.clock.fast_forward(2000)
+        self.page.wait_for_function("calls.at(-1).url==='/api/share/requests/7'")
+        self.page.evaluate("reply(calls.length-1,{terminal:true,status:'manual_review',error:'请核对云端结果'})")
+        expect(self.page.locator("#shareStateTag")).to_have_text("需要核对")
+        expect(self.page.locator("#shareMessage")).to_contain_text("请核对云端结果")
+        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
 
     def test_old_submission_response_does_not_clear_new_preview(self):
         self.ready_preview()

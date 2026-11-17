@@ -3762,6 +3762,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .share-inspect-btn svg { width: 15px; height: 15px; flex-shrink: 0; }
 .share-message-notice { padding: 8px 12px; color: var(--text-secondary); background: var(--bg-input); border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .share-message-notice:empty { display: none; }
+.share-message-notice a { color: var(--accent); text-decoration: underline; white-space: nowrap; }
 
 .share-files { display: grid; gap: 10px; min-width: 0; }
 .share-files-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 28px; }

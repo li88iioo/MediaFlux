@@ -145,9 +145,32 @@
             &&document.getElementById('shareUrl').value.trim()===session.url;
     }
     const wait=milliseconds=>new Promise(resolve=>window.setTimeout(resolve,milliseconds));
-    function renderTransferStatus(state,message,tone=''){
+    function renderTransferStatus(state,message,tone='',showLogs=false){
         setState(state,tone);
-        document.getElementById('shareMessage').textContent=message;
+        const notice=document.getElementById('shareMessage');
+        notice.textContent=message;
+        if(showLogs){
+            const link=document.createElement('a');
+            link.href='/downloads?view=logs';
+            link.textContent='查看下载日志';
+            notice.append(' ',link);
+        }
+    }
+    function renderUnconfirmedTransfer(requestId){
+        const request=requestId?`请求 #${requestId}`:'转存请求';
+        renderTransferStatus('状态待确认',`${request}的结果暂未确认。请先核对，再决定是否重试。`,'',true);
+    }
+    function renderCompletedTransfer(result,targetName){
+        const request=result.request_id?`请求 #${result.request_id}`:'转存请求';
+        const target=result.target_dir_name||targetName;
+        const count=result.count;
+        const message=result.duplicate
+            ? `${request} 此前已完成 · 目标「${target}」`
+            : Number.isInteger(count)&&count>0
+                ? `已成功转存 ${count} 项到「${target}」`
+                : `${request} 已完成 · 目标「${target}」`;
+        renderTransferStatus('转存成功',message,'is-success',Boolean(result.duplicate));
+        setStep('done');
     }
     async function followShareRequest(requestId,targetName,session){
         let queryFailures=0;
@@ -160,26 +183,24 @@
                 if(!ownsPreview(session))return;
                 if(!response.ok) throw new Error(data.error||'状态查询失败');
                 queryFailures=0;
-                if(!data.terminal){
-                    document.getElementById('shareMessage').textContent=`转存请求 ${requestId} 正在处理`;
-                    continue;
-                }
+                if(!data.terminal)continue;
                 if(data.success){
-                    renderTransferStatus('转存成功',`转存请求 ${requestId} 已完成 · 目标「${data.target_dir_name||targetName}」`,'is-success');
-                    setStep('done');
+                    renderCompletedTransfer({...data,request_id:requestId},targetName);
+                }else if(data.status==='manual_review'){
+                    renderTransferStatus('需要核对',data.error||`请求 #${requestId} 需要核对云端结果。`,'',true);
                 }else{
-                    renderTransferStatus(data.status==='manual_review'?'需要核对':'转存失败',data.error||`转存请求 ${requestId} 未完成，请重新解析后重试`,'is-danger');
+                    renderTransferStatus('转存失败',data.error||`请求 #${requestId} 未完成，请重新解析后重试`,'is-danger',true);
                 }
                 return;
             }catch(error){
                 if(!ownsPreview(session))return;
                 if(++queryFailures>=3){
-                    renderTransferStatus('状态待确认',`转存请求 ${requestId} 已受理，但暂时无法查询状态，请稍后在下载或日志页面核对`);
+                    renderUnconfirmedTransfer(requestId);
                     return;
                 }
             }
         }
-        renderTransferStatus('仍在处理',`转存请求 ${requestId} 仍在处理，请稍后在下载或日志页面核对`);
+        renderTransferStatus('仍在处理',`请求 #${requestId} 仍在处理，请稍后核对。`,'',true);
     }
 
     function restoreShare(){
@@ -213,20 +234,25 @@
             setStep(3);
             renderActionButton('restoreShareBtn',true,'保存到光鸭','cloud-download');
             const body={preview_id:session.previewId,file_ids:session.ids,target_dir_id:target.id,target_dir_name:target.name};
-            const response=await fetch('/api/share/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-            const data=await response.json();
+            const response=await fetch('/api/share/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).catch(()=>null);
+            const data=response?await response.json().catch(()=>null):null;
             if(!ownsPreview(session))return;
-            if(!response.ok)throw new Error(data.error||'转存失败');
-            previewId='';previewUrl='';
-            if(response.status===202||(data.accepted&&data.duplicate)){
-                renderTransferStatus('请求处理中',`转存请求已受理${data.request_id?` · 请求 ${data.request_id}`:''}`);
-                if(data.request_id)void followShareRequest(data.request_id,target.name,session);
-            }else{
-                renderTransferStatus('转存成功',`已成功转存 ${data.count||0} 项到「${data.target_dir_name||target.name}」`,'is-success');
-                setStep('done');
+            const requestId=data?.request_id;
+            if(!requestId&&response&&response.status>=400&&response.status<500&&response.status!==408){
+                renderTransferStatus('转存失败',data?.error||'转存未受理，请检查后重试','is-danger');
+                return;
             }
-        }catch(error){
-            if(ownsPreview(session)){setState('转存失败','is-danger');document.getElementById('shareMessage').textContent=error.message;}
+            previewId='';previewUrl='';
+            if(response?.ok&&data?.success===true){
+                renderCompletedTransfer(data,target.name);
+                return;
+            }
+            if(requestId&&response?.ok&&(response.status===202||data.accepted)){
+                renderTransferStatus('请求处理中',`转存请求已受理 · 请求 #${requestId}`);
+            }else{
+                renderUnconfirmedTransfer(requestId);
+            }
+            if(requestId)void followShareRequest(requestId,target.name,session);
         }finally{
             submitting=false;
             renderActionButton('restoreShareBtn',false,'保存到光鸭','cloud-download');
