@@ -5,7 +5,7 @@ import hashlib
 import json
 import secrets
 from base64 import b64decode
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from typing import Any
 
@@ -104,10 +104,6 @@ def _normalize_indexer_site_ids(
     return tuple(site_id for site_id in MANUAL_INDEXER_SITE_ORDER if site_id in requested)
 
 
-def encode_indexer_site_ids(value: Any) -> str:
-    return ",".join(normalize_indexer_site_ids(value))
-
-
 def build_indexer_site_updates(value: Any) -> dict[str, str]:
     site_ids = normalize_indexer_site_ids(value)
     return {
@@ -188,14 +184,24 @@ _SITE_CONFIG_KEYS = ("INDEXER_SEARCH_ENABLED", "INDEXER_ENABLED_SITES",
                      INDEXER_SITE_CONFIG_VERSION_KEY, "INDEXER_SUKEBEI_ENABLED")
 
 
-def current_indexer_site_ids() -> tuple[str, ...]:
-    raw = config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS)) or ""
+def current_indexer_site_ids(*, pending: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """读取有效选择，可叠加保存前已规范化的更新。"""
+    pending = pending or {}
+    raw = pending.get("INDEXER_ENABLED_SITES")
+    if raw is None or config.has_external_override("INDEXER_ENABLED_SITES"):
+        raw = config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS)) or ""
     try:
         requested = set(normalize_persisted_indexer_site_ids(raw))
     except ValueError:
         requested = {part.strip().lower() for part in raw.split(",")
                      if part.strip().lower() in MANUAL_INDEXER_SITE_ORDER}
-    if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
+    legacy_update = pending.get("INDEXER_SUKEBEI_ENABLED")
+    legacy_enabled = (
+        config.get_bool("INDEXER_SUKEBEI_ENABLED", False)
+        if legacy_update is None or config.has_external_override("INDEXER_SUKEBEI_ENABLED")
+        else legacy_update == "1"
+    )
+    if legacy_enabled:
         requested.add("sukebei")
     return tuple(site for site in MANUAL_INDEXER_SITE_ORDER if site in requested)
 

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import unittest
 from unittest.mock import patch
@@ -91,6 +92,51 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(config.get_bool("AGENT_LLM_ENABLED"))
         self.assertFalse(config.get_bool("TG_AGENT_ENABLED"))
+
+    def test_indexer_switch_without_a_site_rejects_publish_and_accepts_site_in_same_save(self):
+        from app.indexers.config import current_indexer_site_ids
+
+        self._write_raw(INDEXER_SEARCH_ENABLED="0", INDEXER_ENABLED_SITES="nyaa")
+        cleared = self.client.post("/api/config", json={"INDEXER_ENABLED_SITES": ""}, headers=self.headers)
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(current_indexer_site_ids(), ())
+        before = config.ENV_FILE.read_bytes()
+        refused = self.client.post("/api/config", json={"INDEXER_SEARCH_ENABLED": "1"}, headers=self.headers)
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("至少选择一个资源站点", refused.json()["error"])
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+        self.assertEqual(self.client.get("/api/indexers/sites").status_code, 404)
+        enabled = self.client.post(
+            "/api/config", json={"INDEXER_SEARCH_ENABLED": "1", "INDEXER_ENABLED_SITES": "nyaa"}, headers=self.headers,
+        )
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(config.get_bool("INDEXER_SEARCH_ENABLED"))
+        self.assertEqual(current_indexer_site_ids(), ("nyaa",))
+        self.assertEqual(self.client.get("/api/indexers/sites").status_code, 200)
+
+    def test_indexer_switch_validates_effective_legacy_and_managed_sites(self):
+        from app.indexers.config import current_indexer_site_ids
+
+        self._write_raw(INDEXER_SEARCH_ENABLED="0", INDEXER_ENABLED_SITES="1lou,aipan", INDEXER_SUKEBEI_ENABLED="1")
+        enable = {"INDEXER_SEARCH_ENABLED": "1"}
+        enabled = self.client.post("/api/config", json=enable, headers=self.headers)
+        self.assertEqual(enabled.status_code, 200)
+        self.assertEqual(current_indexer_site_ids(), ("sukebei",))
+        refused = self.client.post("/api/config", json={"INDEXER_SUKEBEI_ENABLED": "0"}, headers=self.headers)
+        self.assertEqual(refused.status_code, 400)
+        disabled = self.client.post(
+            "/api/config", json={"INDEXER_SUKEBEI_ENABLED": "0", "INDEXER_SEARCH_ENABLED": "0"}, headers=self.headers,
+        )
+        self.assertEqual(disabled.status_code, 200)
+        self.assertEqual(current_indexer_site_ids(), ())
+        key = "INDEXER_ENABLED_SITES"
+        with patch.dict(os.environ, {key: "mikan"}), patch.object(
+            config, "_STARTUP_ENV_OVERRIDES", config._STARTUP_ENV_OVERRIDES | {key},
+        ):
+            enabled = self.client.post("/api/config", json=enable, headers=self.headers)
+            self.assertEqual(enabled.status_code, 200)
+            self.assertEqual(current_indexer_site_ids(), ("mikan",))
+            self.assertEqual(config.all_items()[key], "1lou,aipan")
 
     def test_strm_extension_conflicts_reject_partial_and_default_updates_atomically(self):
         self._write_raw(STRM_VIDEO_EXTS="mkv,mp4", STRM_METADATA_EXTS="nfo,srt", STRM_METADATA_ENABLED="1")

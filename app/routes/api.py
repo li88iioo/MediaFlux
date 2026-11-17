@@ -33,7 +33,7 @@ from app.indexers.config import (
     DEFAULT_INDEXER_SITE_IDS,
     INDEXER_SITE_CONFIG_VERSION_KEY,
     build_indexer_site_updates,
-    encode_indexer_site_ids,
+    current_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
 from app.logger import get_logger
@@ -334,17 +334,16 @@ def _validate_indexer_updates(data: dict[str, Any]) -> dict[str, str]:
             raise ValueError(f"BTBTLA 最小请求间隔必须在 {low} 到 {high} 秒之间")
         normalized[key] = str(interval)
     if "INDEXER_ENABLED_SITES" in data:
-        sites = encode_indexer_site_ids(str(data.get("INDEXER_ENABLED_SITES") or ""))
-        search_enabled = normalized.get(
-            "INDEXER_SEARCH_ENABLED", "1" if config.get_bool("INDEXER_SEARCH_ENABLED") else "0",
-        )
-        if search_enabled == "1" and not sites:
-            raise ValueError("启用多站资源索引时至少选择一个资源站点")
-        normalized.update(build_indexer_site_updates(sites))
+        normalized.update(build_indexer_site_updates(str(data["INDEXER_ENABLED_SITES"] or "")))
     elif "INDEXER_SUKEBEI_ENABLED" in data:
         normalized["INDEXER_SUKEBEI_ENABLED"] = normalize_boolean(
             "INDEXER_SUKEBEI_ENABLED", data["INDEXER_SUKEBEI_ENABLED"]
         )
+    if {"INDEXER_SEARCH_ENABLED", "INDEXER_ENABLED_SITES", "INDEXER_SUKEBEI_ENABLED"} & normalized.keys():
+        search_update = normalized.get("INDEXER_SEARCH_ENABLED")
+        enabled = config.get_bool("INDEXER_SEARCH_ENABLED") if search_update is None else search_update == "1"
+        if enabled and not current_indexer_site_ids(pending=normalized):
+            raise ValueError("启用多站资源索引时至少选择一个资源站点")
     return normalized
 
 
