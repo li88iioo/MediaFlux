@@ -251,7 +251,9 @@ class TaskConsumerBrowserTests(AgentShellBrowserCase):
             rail_support.open_sessions(page)
             page.locator(f'[data-session-open="{a}"]').click()
             page.wait_for_function("window.__held===true")
-            self.assertEqual(page.locator("#agentTaskSnapshot").count(), 0)
+            # A 的响应未返回时，当前会话和任务面板都应属于 B。
+            self.assertEqual(page.evaluate("localStorage.getItem('mediaflux.agent.kernel.session.v1')"), b)
+            self.assertEqual(page.locator("#agentTaskSnapshot").get_attribute("data-task-status"), "complete")
             if reset:
                 page.locator("#agentNewSession").evaluate("(n)=>n.click()")
             else:
