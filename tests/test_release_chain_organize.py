@@ -591,7 +591,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             )
         )
         self.enterContext(
-            patch.object(service, "_ensure_target_dir", return_value=("new-season", []))
+            patch.object(service.organizer, "_ensure_dir_chain", return_value="new-season")
         )
         self.enterContext(
             patch.object(service, "_notify_reorganize_result", return_value=[])

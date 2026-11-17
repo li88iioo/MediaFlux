@@ -277,9 +277,12 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
             first, second = source_root / "A.mkv", source_root / "B.mkv"
             first.write_bytes(b"a"); second.write_bytes(b"b")
             adapter = LocalFilesystemAdapter(source_root)
+            existing = target_root / "TV"
+            existing.mkdir()
+            season = existing / "New Show" / "Season 1"
             plans = [
-                Plan(adapter.snapshot(first), target_root / "A.mkv"),
-                Plan(adapter.snapshot(second), target_root / "B.mkv"),
+                Plan(adapter.snapshot(first), season / "A.mkv"),
+                Plan(adapter.snapshot(second), season / "B.mkv"),
             ]
             real_publish = LocalMoveTransaction._publish_no_replace
             calls = 0
@@ -298,7 +301,36 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
                     LocalMoveTransaction([source_root], [target_root]).execute(plans)
             self.assertTrue(first.exists())
             self.assertTrue(second.exists())
-            self.assertFalse((target_root / "A.mkv").exists())
+            self.assertEqual(list(target_root.iterdir()), [existing])
+            self.assertEqual(list(existing.iterdir()), [])
+
+    def test_rollback_preserves_new_occupants_and_replacement_directories(self):
+        for replaced in (False, True):
+            with self.subTest(replaced=replaced), tempfile.TemporaryDirectory() as tmp:
+                source_root, target_root = Path(tmp) / "source", Path(tmp) / "library"
+                source_root.mkdir()
+                target_root.mkdir()
+                source = source_root / "Movie.mkv"
+                source.write_bytes(b"original")
+                destination = target_root / "Movie"
+                unrelated = destination / "new.nfo"
+                plan = Plan(LocalFilesystemAdapter(source_root).snapshot(source), destination / source.name)
+
+                def fail(_src, _dst):
+                    if replaced:
+                        destination.rmdir()
+                        destination.mkdir()
+                    else:
+                        unrelated.write_bytes(b"external")
+                    raise OSError("injected failure")
+
+                with patch.object(LocalMoveTransaction, "_publish_no_replace", side_effect=fail):
+                    with self.assertRaisesRegex(LocalMoveError, "injected failure"):
+                        LocalMoveTransaction([source_root], [target_root]).execute([plan])
+                self.assertEqual(source.read_bytes(), b"original")
+                self.assertTrue(destination.is_dir())
+                if not replaced:
+                    self.assertEqual(unrelated.read_bytes(), b"external")
 
     def test_changed_snapshot_and_existing_target_abort_without_writes(self):
         with tempfile.TemporaryDirectory() as root_raw:

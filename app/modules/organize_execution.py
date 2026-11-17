@@ -371,6 +371,8 @@ def execute_organize_plans(
         replacement_backup_name = ""
         existing_original_name = ""
         target_id: str = ""
+        created_dirs: list[GuangYaFile] = []
+        files_committed = False
         rollback_incomplete = False
         companion_rollback_errors: dict[str, str] = {}
         moved_metadata: list[tuple[GuangYaFile, str]] = []
@@ -412,6 +414,7 @@ def execute_organize_plans(
                 rules.target_dir_id,
                 p.target_path,
                 directory_chain_cache,
+                created=created_dirs,
             )
             if (
                 p.original_parent_id
@@ -536,6 +539,7 @@ def execute_organize_plans(
                         elif role == "replacement":
                             replacement_backup_name = ""
                 raise
+            files_committed = True
             if existing and replacement_backup_name:
                 candidate = DeleteCandidate(
                     existing.file_id, replacement_backup_name, target_id,
@@ -794,6 +798,14 @@ def execute_organize_plans(
         except Exception as e:
             if target_id:
                 runtime.invalidate_inventory(target_id)
+            if created_dirs and not files_committed:
+                if not rollback_incomplete:
+                    organizer._cleanup_created_dirs(
+                        created_dirs, target_root_id=rules.target_dir_id, source_root_id=source_dir_id,
+                    )
+                for directory in created_dirs:
+                    directory_chain_cache.pop((directory.parent_id, directory.name), None)
+                runtime.remember_target_path(rules.target_dir_id, p.target_path, None)
             failure_message = safe_organize_failure(e)
             if existing and rollback_incomplete:
                 failure_message += "；替换回滚未完成，请人工核验新旧文件"

@@ -3515,6 +3515,43 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
         return service, store, client
 
+    def test_lost_move_response_reclaims_owned_empty_folders_and_preserves_occupied_ones(self):
+        for occupy in (False, True):
+            with self.subTest(occupied=occupy):
+                episode = _file("episode-1", "Arifureta Shokugyou de Sekai Saikyou - 01.mkv", "source")
+                service, _, client = self._build(clean_empty=True, source_items=[episode])
+                self.addCleanup(service.close)
+                inspection = service.inspect("owner", "source")
+                preview = service.preview("owner", inspection["inspection_id"], "86034", "tv")
+                category = preview["plans"][0]["target_path"].split("/")[0]
+                existing = _dir("existing-category", category, "archive")
+                client.tree["archive"].append(existing)
+                client.infos[existing.file_id] = existing
+                preview = service.preview("owner", inspection["inspection_id"], "86034", "tv")
+                move = client.move
+
+                def lost_response(file_ids, target_id):
+                    move(file_ids, target_id)
+                    if target_id != "source":
+                        if occupy:
+                            later_file = _file("new-file", "external.txt", target_id)
+                            client.tree[target_id].append(later_file)
+                            client.infos[later_file.file_id] = later_file
+                        raise TimeoutError("move committed before response was lost")
+                    return True
+
+                with patch.object(client, "move", side_effect=lost_response):
+                    result = service.execute_preview("owner", preview["preview_id"])
+                self.assertEqual((result["stats"]["moved"], result["stats"]["failed"]), (0, 1))
+                self.assertEqual(client.file_info(episode.file_id), episode)
+                self.assertEqual(client.list_dir("archive"), [existing])
+                if occupy:
+                    self.assertIsNotNone(client.file_info("new-file"))
+                    self.assertEqual(client.deleted, [])
+                else:
+                    self.assertFalse(client.list_dir(existing.file_id))
+                    self.assertEqual(client.deleted, ["created-2", "created-1"])
+
     def _build_mf_staging(self, *, active=False, with_confirmation=False):
         from app.repositories import download_requests, organize_confirmations
 

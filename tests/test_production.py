@@ -451,7 +451,7 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
             target_path="电影",
         )
         organizer = Organizer(client=cast(GuangYaClient, FakeClient()), scraper=cast(TMDBScraper, object()))
-        organizer._ensure_dir_chain = lambda root_id, path, cache=None: "target-id"
+        organizer._ensure_dir_chain = lambda root_id, path, cache=None, *, created=None: "target-id"
         stats = {
             "moved": 0,
             "renamed": 0,

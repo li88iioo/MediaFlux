@@ -7517,6 +7517,8 @@ class Organizer:
         *,
         protected_source_ids: set[str] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        expected_locations: dict[str, tuple[str, str]] | None = None,
+        trigger: str = "empty_dir_cleanup",
     ) -> dict:
         """安全清理空目录，并返回不泄露目录标识的结构化保留原因。"""
         cleaned = 0
@@ -7602,6 +7604,12 @@ class Organizer:
                 if current is None or not bool(getattr(current, "is_dir", False)):
                     unavailable += 1
                     continue
+                if expected_locations is not None and (
+                    current.file_id != dir_id
+                    or expected_locations[dir_id] != (current.parent_id, current.name)
+                ):
+                    unavailable += 1
+                    continue
                 parent_infos[dir_id] = current
                 if source_inside_protected_staging(self.client, dir_id, staging_ids, info_cache=parent_infos):
                     protected_count += 1
@@ -7628,8 +7636,11 @@ class Organizer:
 
                 execute_recycle_bin_delete(
                     self.client,
-                    trigger="empty_dir_cleanup",
-                    reason="整理完成后清理本次扫描确认的空目录",
+                    trigger=trigger,
+                    reason=(
+                        "整理失败补偿：清理本次创建且仍为空的目标目录"
+                        if expected_locations is not None else "整理完成后清理本次扫描确认的空目录"
+                    ),
                     candidate=DeleteCandidate(
                         file_id=dir_id,
                         name=str(current.name),
@@ -7683,11 +7694,34 @@ class Organizer:
             report["stopped"] = 1
         return report
 
+    def _cleanup_created_dirs(
+        self, created: list[GuangYaFile], *, target_root_id: str, source_root_id: str,
+        trigger: str = "organize_rollback_empty_dir_cleanup",
+    ) -> None:
+        if not created:
+            return
+        from app.modules.organize_tasks import _protected_organize_root_ids
+
+        try:
+            protected, error = _protected_organize_root_ids(OrganizeRules.from_config())
+            if error:
+                raise RuntimeError(error)
+            self._clean_empty_dirs_report(
+                [(item.file_id, depth) for depth, item in enumerate(created)],
+                protected_source_ids=protected | {target_root_id, source_root_id},
+                expected_locations={item.file_id: (item.parent_id, item.name) for item in created},
+                trigger=trigger,
+            )
+        except Exception as exc:
+            logger.warning("整理失败后回收本次新建的空目标目录失败 type=%s", type(exc).__name__)
+
     def _ensure_dir_chain(
         self,
         root_id: str,
         path: str,
         cache: dict[tuple[str, str], str] | None = None,
+        *,
+        created: list[GuangYaFile] | None = None,
     ) -> str:
         cur = root_id
         for part in path.split("/"):
@@ -7726,6 +7760,8 @@ class Organizer:
                     raise
                 if not new_id:
                     raise RuntimeError(f"创建目标目录失败: {part}")
+                if created is not None:
+                    created.append(GuangYaFile(new_id, part, True, parent_id=cur))
                 if cache is not None:
                     cache[cache_key] = new_id
                 cur = new_id

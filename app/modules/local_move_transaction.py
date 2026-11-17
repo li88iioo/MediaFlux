@@ -1,6 +1,7 @@
 """本地媒体同盘/跨盘安全移动事务。"""
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
@@ -101,6 +102,7 @@ class LocalMoveTransaction:
         self._replaced_backups: dict[
             Path, tuple[Path, tuple[int, int, int, int], Path]
         ] = {}
+        self._created_target_dirs: list[tuple[Path, int]] = []
 
     def _temporary_path(self, path: Path, kind: str) -> Path:
         # 合法 basename 可能已接近 NAME_MAX；内部名称只用有界摘要，
@@ -127,6 +129,7 @@ class LocalMoveTransaction:
         roots: Sequence[Path],
         *,
         create_parent: bool = False,
+        track_created: bool = False,
     ) -> Generator[tuple[Path, Path], None, None]:
         """将最终目录项固定到逐段打开的目录句柄，避免父目录被并发替换。"""
         display = self._within_any(path, roots)
@@ -151,8 +154,11 @@ class LocalMoveTransaction:
         opened: list[int] = []
         current_fd = os.open(root, flags)
         opened.append(current_fd)
+        parent = root
         try:
             for part in relative.parts[:-1]:
+                parent /= part
+                created = False
                 try:
                     next_fd = os.open(part, flags, dir_fd=current_fd)
                 except FileNotFoundError:
@@ -162,9 +168,15 @@ class LocalMoveTransaction:
                         os.mkdir(part, mode=0o755, dir_fd=current_fd)
                     except FileExistsError:
                         pass
+                    else:
+                        created = track_created
                     next_fd = os.open(part, flags, dir_fd=current_fd)
                 current_fd = next_fd
-                opened.append(current_fd)
+                if created:
+                    # 持有目录句柄直到事务结束，防止原目录删除后 inode 被复用。
+                    self._created_target_dirs.append((parent, current_fd))
+                else:
+                    opened.append(current_fd)
             yield display, proc_fd_root / str(current_fd) / relative.name
         finally:
             for fd in reversed(opened):
@@ -500,7 +512,7 @@ class LocalMoveTransaction:
         with self._pinned_entry(
             source_display, self.source_roots
         ) as (_source_display, source), self._pinned_entry(
-            target_display, self.target_roots, create_parent=True
+            target_display, self.target_roots, create_parent=True, track_created=True
         ) as (_target_display, target):
             self._require_identity(source, plan.source.identity, label="源文件")
             current_target_identity = self._identity_or_none(target)
@@ -717,6 +729,20 @@ class LocalMoveTransaction:
                 )
             except Exception as exc:
                 errors.append(f"{restore_target}: {exc}")
+        for path, fd in reversed(self._created_target_dirs):
+            try:
+                with self._pinned_entry(path, self.target_roots) as (display, entry):
+                    current, expected = entry.lstat(), os.fstat(fd)
+                    if (
+                        display == path and stat_module.S_ISDIR(current.st_mode)
+                        and (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
+                    ):
+                        entry.rmdir()
+            except (FileNotFoundError, NotADirectoryError, LocalMoveError):
+                continue
+            except OSError as exc:
+                if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST, errno.ELOOP}:
+                    errors.append(f"{path}: {exc}")
         return errors
 
     def _execute_locked(self, plans: Sequence[MovePlanLike]) -> MoveTransactionResult:
@@ -763,6 +789,10 @@ class LocalMoveTransaction:
             if rollback_errors:
                 message += "；部分回滚失败，需要人工核验: " + " | ".join(rollback_errors)
             raise LocalMoveError(message, rollback_errors=rollback_errors) from exc
+        finally:
+            for _path, fd in self._created_target_dirs:
+                os.close(fd)
+            self._created_target_dirs.clear()
 
     def execute(self, plans: Sequence[MovePlanLike]) -> MoveTransactionResult:
         if not plans:

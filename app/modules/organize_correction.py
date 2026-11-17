@@ -790,40 +790,6 @@ class OrganizeCorrectionService:
                 raise RuntimeError(f"GCID/size 与日志快照不一致: {item.current_name}")
         return remotes
 
-    def _ensure_target_dir(self, root_id: str, path: str) -> tuple[str, list[str]]:
-        current = (root_id or "0")
-        created: list[str] = []
-        for part in (piece for piece in path.split("/") if piece):
-            children = self.client.list_dir(current)
-            match = next((entry for entry in children if entry.is_dir and entry.name == part), None)
-            if match:
-                current = match.file_id
-                continue
-            new_id = self.client.create_dir(part, current)
-            if not new_id:
-                raise RuntimeError(f"创建目标目录失败: {part}")
-            created.append(new_id)
-            current = new_id
-        return current, created
-
-    def _cleanup_created_dirs(self, created: list[str]) -> None:
-        for dir_id in reversed(created):
-            try:
-                if self.client.list_dir(dir_id):
-                    continue
-                execute_recycle_bin_delete(
-                    self.client,
-                    trigger="correction_empty_dir_cleanup",
-                    reason="整理纠偏失败补偿：清理本次创建且仍为空的目录",
-                    candidate=DeleteCandidate(
-                        file_id=dir_id,
-                        name=f"纠偏临时目录 {dir_id}",
-                        parent_id="",
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("清理本次纠偏创建的空目录失败 type=%s", type(exc).__name__)
-
     def _directory_targets(self, directory_ids: list[str], *, recreate: bool = True
                            ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
         """只读解析原目录和成功恢复凭据；待重建目录保留原 ID，按父先子后排列。"""
@@ -1757,10 +1723,12 @@ class OrganizeCorrectionService:
             log_id, operation_token, "reorganizing", tuple(REORGANIZE_STATUSES), expected_version,
         ):
             raise RuntimeError("日志状态或版本已变化，请刷新后重试")
-        created_dirs: list[str] = []
+        created_dirs: list[GuangYaFile] = []
         completed: list[AppliedTransition] = []
         try:
-            target_id, created_dirs = self._ensure_target_dir(preview["target_root_id"], preview["target_path"])
+            target_id = self.organizer._ensure_dir_chain(
+                preview["target_root_id"] or "0", preview["target_path"], created=created_dirs,
+            )
             targets = [(item, target_id, planned["to_name"]) for item, planned in zip(items, preview["items"])]
             self._verify_targets_available(targets)
             vacated_items = [item for item in items if item.current_parent_id != target_id]
@@ -1813,8 +1781,13 @@ class OrganizeCorrectionService:
                             transition.item.id, status="rollback_failed",
                             error=f"业务前像恢复失败，必须人工核验: {type(restore_exc).__name__}",
                         )
-            self._cleanup_created_dirs(created_dirs)
-            db.update_organize_log(log_id, status=self._failure_status(log_id, "failed"), error=str(exc))
+            failure_status = self._failure_status(log_id, "failed")
+            if failure_status != "partial_failed":
+                self.organizer._cleanup_created_dirs(
+                    created_dirs, target_root_id=preview["target_root_id"],
+                    source_root_id=previous_log["source_dir_id"] or "", trigger="correction_empty_dir_cleanup",
+                )
+            db.update_organize_log(log_id, status=failure_status, error=str(exc))
             raise
         post_warnings = self._run_post_actions(
             items=items, rules=rules, match=match, transitions=completed,
