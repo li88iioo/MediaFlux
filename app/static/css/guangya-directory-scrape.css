@@ -193,6 +193,8 @@
 #gyDirList.is-grid .gy-dir-action-btn[data-state="deleting"],
 #gyDirList.is-grid .gy-dir-action-btn[data-state="queued"],
 #gyDirList.is-grid .gy-dir-action-btn[data-state="running"],
+#gyDirList.is-grid .gy-dir-action-btn[data-state="syncing"],
+#gyDirList.is-grid .gy-dir-action-btn[data-state="attention"],
 #gyDirList.is-grid .gy-dir-action-btn[data-state="done"],
 #gyDirList.is-grid .gy-dir-action-btn[data-state="error"] {
     opacity: 1;
@@ -448,6 +450,10 @@
 .gy-dir-action-btn[data-state="queued"],
 .gy-dir-action-btn[data-state="running"] {
     color: var(--accent);
+}
+.gy-dir-action-btn[data-state="syncing"],
+.gy-dir-action-btn[data-state="attention"] {
+    color: var(--warning);
 }
 .gy-dir-action-btn[data-state="done"] {
     color: var(--success);

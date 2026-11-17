@@ -109,20 +109,27 @@
 
     function setRowState(row, action, value, message = '') {
         if (!row || !action) return;
-        action.dataset.state = value;
         const defaultLabels = {
             loading: '检查中',
             deleting: '删除中',
             queued: '排队中',
             running: '整理中',
+            syncing: '状态同步中',
+            attention: '待核对',
             done: '已完成',
             error: '失败',
         };
-        action.title = message || defaultLabels[value] || '操作';
+        const title = message || defaultLabels[value] || '操作';
+        if (action.dataset.state === value && action.title === title) return;
+        action.dataset.state = value;
+        action.title = title;
+        action.setAttribute('aria-description', title);
         if (value === 'loading') setButtonContent(action, 'loader-circle', '检查中', true);
         else if (value === 'deleting') setButtonContent(action, 'loader-circle', '删除中', true);
         else if (value === 'queued') setButtonContent(action, 'clock-3', '排队中');
         else if (value === 'running') setButtonContent(action, 'loader-circle', '整理中', true);
+        else if (value === 'syncing') setButtonContent(action, 'rotate-cw', '同步中');
+        else if (value === 'attention') setButtonContent(action, 'circle-alert', '待核对');
         else if (value === 'done') setButtonContent(action, 'circle-check', '已完成');
         else if (value === 'error') setButtonContent(action, 'triangle-alert', '失败');
         else setButtonContent(action, 'ellipsis', '操作');
@@ -1045,6 +1052,8 @@
     }
 
     const TASK_POLL_INTERVAL_MS = 1000;
+    const TASK_POLL_RETRY_MS = 2500;
+    const TASK_POLL_TIMEOUT_MS = 8000;
     const TASK_POLL_MAX_ATTEMPTS = 1800;
     const ACTIVE_SCRAPE_TASKS_KEY = 'mediaflux.directory-scrape.active-tasks';
     const taskPollEntries = new Map();
@@ -1123,7 +1132,10 @@
 
     async function applyTaskPollStatus(entry, task) {
         const {row, action} = entry;
-        if (!task) return false;
+        if (!task) {
+            setRowState(row, action, 'syncing', '暂未取得任务回执，正在重试');
+            return false;
+        }
         if (task.status === 'queued') {
             const ahead = Math.max(0, Number(task.queue_position || 1) - 1);
             setRowState(
@@ -1197,12 +1209,20 @@
             if (!row?.isConnected) window.showToast?.('目录刮削完成');
             return true;
         }
-        if (['failed', 'stopped', 'cancelled', 'manual_review'].includes(task.status)) {
-            throw new Error(
-                task.error
-                || task.message
-                || (entry.kind === 'delete' ? `${entry.itemLabel}删除未完成` : '目录刮削未完成')
-            );
+        const label = entry.kind === 'delete' ? `${entry.itemLabel}删除` : '目录刮削';
+        if (task.status === 'failed') {
+            const message = task.error || task.message || `${label}失败`;
+            setRowState(row, action, 'error', message);
+            window.appAlert?.({type: 'error', title: `${label}失败`, message});
+            return true;
+        }
+        if (['stopped', 'cancelled', 'manual_review'].includes(task.status)) {
+            const outcome = {stopped: '已停止', cancelled: '已取消', manual_review: '需要人工核对'}[task.status];
+            const title = `${label}${outcome}`;
+            const message = task.error || task.message || title;
+            setRowState(row, action, 'attention', message);
+            window.appAlert?.({type: 'warning', title, message});
+            return true;
         }
         return false;
     }
@@ -1214,38 +1234,31 @@
         const controller = new AbortController();
         taskPollController = controller;
         const refreshParents = new Set();
+        const timeout = window.setTimeout(() => controller.abort(), TASK_POLL_TIMEOUT_MS);
+        let delay = TASK_POLL_INTERVAL_MS;
         try {
             const entries = [...taskPollEntries.entries()].slice(0, 32);
             const ids = entries.map(([taskId]) => taskId).join(',');
             const response = await fetch(`/api/guangya/organize/status?task_ids=${encodeURIComponent(ids)}`, {signal: controller.signal});
             const status = await response.json();
-            if (!response.ok) throw new Error(status.error || '任务状态读取失败');
+            if (!response.ok || !Array.isArray(status?.tasks)) throw new Error('任务状态读取失败');
             if (generation !== taskPollGeneration || document.hidden || taskPollingDisposed) return;
             const tasks = new Map(status.tasks.map((task) => [task.id, task]));
             for (const [taskId, entry] of entries) {
                 entry.attempts += 1;
-                try {
-                    const finished = await applyTaskPollStatus(entry, tasks.get(taskId));
-                    if (finished) {
-                        taskPollEntries.delete(taskId);
-                        if (entry.kind !== 'delete') refreshParents.add(entry.parentId);
+                const task = tasks.get(taskId);
+                if (await applyTaskPollStatus(entry, task)) {
+                    taskPollEntries.delete(taskId);
+                    if (entry.kind !== 'delete' && ['completed', 'partial'].includes(task.status)) {
+                        refreshParents.add(entry.parentId);
                     }
-                    else if (entry.attempts >= TASK_POLL_MAX_ATTEMPTS) {
-                        setRowState(
-                            entry.row,
-                            entry.action,
-                            'running',
-                            '任务仍在后台运行，请稍后查看整理日志',
-                        );
-                        taskPollEntries.delete(taskId);
-                    }
-                } catch (error) {
-                    setRowState(entry.row, entry.action, 'error', error.message);
-                    window.appAlert?.({
-                        type: 'error',
-                        title: entry.kind === 'delete' ? `${entry.itemLabel}删除失败` : '目录刮削失败',
-                        message: error.message,
-                    });
+                } else if (entry.attempts >= TASK_POLL_MAX_ATTEMPTS) {
+                    setRowState(
+                        entry.row,
+                        entry.action,
+                        'attention',
+                        '尚未收到任务结果，请到整理日志核对',
+                    );
                     taskPollEntries.delete(taskId);
                 }
             }
@@ -1260,18 +1273,18 @@
                     });
                 }
             }
-        } catch (error) {
-            if (error?.name === 'AbortError' || generation !== taskPollGeneration) return;
+        } catch (_error) {
+            if (generation !== taskPollGeneration || document.hidden || taskPollingDisposed) return;
+            delay = TASK_POLL_RETRY_MS;
             for (const entry of taskPollEntries.values()) {
-                setRowState(entry.row, entry.action, 'error', error.message);
+                setRowState(entry.row, entry.action, 'syncing', '暂时无法查询任务状态，正在重试');
             }
-            taskPollEntries.clear();
-            window.appAlert?.({type: 'error', title: '目录刮削失败', message: error.message});
         } finally {
+            window.clearTimeout(timeout);
             if (taskPollController === controller) taskPollController = null;
             taskPollInFlight = false;
             saveTrackedScrapes();
-            scheduleTaskPoll();
+            scheduleTaskPoll(delay);
         }
     }
 

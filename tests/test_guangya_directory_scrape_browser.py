@@ -1241,6 +1241,54 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.assertFalse(self.page.evaluate("!!sessionStorage.getItem('mediaflux.directory-scrape.active-tasks')"))
         self.assertFalse(self.page_errors)
 
+    def test_poll_timeout_keeps_both_tasks_until_their_backend_receipts(self):
+        self.page.set_viewport_size({"width": 390, "height": 844})
+        first = self._bind(is_directory=True, left=100, top=80)
+        second = self._bind(is_directory=True, left=120, top=170)
+        self.page.evaluate("""() => {
+            window.appConfirm = async () => true;
+            window.__alerts = [];
+            window.appAlert = async (message) => { window.__alerts.push(message); };
+            window.__accepted = 0;
+            window.__statusReads = [];
+            const nativeFetch = window.fetch;
+            window.fetch = async (path, options = {}) => {
+                if (path.endsWith('/run')) {
+                    return {ok: true, json: async () => ({task_id: 'task-' + (++window.__accepted)})};
+                }
+                if (!path.includes('/organize/status?')) return nativeFetch(path, options);
+                const ids = new URLSearchParams(path.split('?')[1]).get('task_ids');
+                window.__statusReads.push(ids);
+                if (window.__statusReads.length === 1) {
+                    return new Promise((_resolve, reject) => {
+                        options.signal.addEventListener('abort', () => reject(new DOMException('timed out', 'AbortError')));
+                    });
+                }
+                return {ok: true, json: async () => ({tasks: [
+                    {id: 'task-1', status: 'completed'},
+                    {id: 'task-2', status: 'failed', error: '写入被拒绝'},
+                ]})};
+            };
+        }""")
+        for binding in (first, second):
+            self._open_button(binding)
+            self.page.locator('[data-scrape-action="auto"]').click()
+        first_action = self.page.locator(first["action"])
+        second_action = self.page.locator(second["action"])
+        first_action.locator("xpath=self::*[@data-state='syncing']").wait_for(timeout=12000)
+        self.assertEqual(second_action.get_attribute("data-state"), "syncing")
+        self.assertIn("正在重试", first_action.get_attribute("aria-description") or "")
+        self.assertEqual(self.page.evaluate("window.__alerts"), [])
+
+        first_action.locator("xpath=self::*[@data-state='done']").wait_for()
+        self.assertEqual(second_action.get_attribute("data-state"), "error")
+        self.assertEqual(self.page.evaluate("window.__accepted"), 2)
+        self.assertEqual(self.page.evaluate("window.__statusReads"), ["task-1,task-2"] * 2)
+        self.assertEqual(self.page.evaluate("window.__alerts"), [
+            {"type": "error", "title": "目录刮削失败", "message": "写入被拒绝"},
+        ])
+        self.assertFalse(self.page_errors)
+
 
 if __name__ == "__main__":
     unittest.main()
