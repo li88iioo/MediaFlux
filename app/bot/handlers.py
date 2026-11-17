@@ -196,22 +196,27 @@ def _pending_download_input(row):
     )
 
 
-def _download_target_picker_markup(
+def _download_target_picker_view(
     telebot,
     *,
     request_id: int,
     item,
+    title: str,
     chat_id: str,
     user_id: str,
     message_thread_id: object = None,
+    notice: str = "",
 ):
     from app.modules.telegram_write_confirmations import (
         get_telegram_write_confirmation_store,
     )
+    from app.indexers.downloads import (
+        download_target_options,
+        download_target_readiness,
+        download_target_readiness_error,
+    )
 
-    from app.indexers.downloads import download_target_options
-
-    def choice(option: dict[str, str]):
+    def choice(option: dict[str, Any]):
         value: dict[str, object] = {"request_id": request_id, "target": option["target"]}
         if "nsfw_source_id" in option:
             value["nsfw_source_id"] = option["nsfw_source_id"]
@@ -219,10 +224,12 @@ def _download_target_picker_markup(
             value["gy_target_dir"] = option["gy_target_dir"]
         return option["label"], "confirm", value
 
-    cancel = ("取消", "cancel", {"request_id": request_id})
-    # 与 Web 下载卡同序：普通光鸭与 qB 同行，其余各占一行，最后取消。
-    choices = [choice(option) for option in download_target_options(item)]
-    rows = [choices[:2], *[[choice] for choice in choices[2:]], [cancel]]
+    backends = download_target_readiness("both")
+    options = download_target_options(item, backends)
+    ordinary = [choice(option) for option in options[:2] if option["ready"]]
+    rows = [ordinary] if ordinary else []
+    rows.extend([choice(option)] for option in options[2:] if option["ready"])
+    rows.append([("取消", "cancel", {"request_id": request_id})])
 
     action_ids = get_telegram_write_confirmation_store().create_group(
         chat_id=chat_id,
@@ -238,7 +245,15 @@ def _download_target_picker_markup(
             telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{next(action_iter)}")
             for label, _decision, _value in row
         ])
-    return keyboard
+    lines = ["<b>选择下载目标</b>", f"任务: {html.escape(title or '未命名任务')}"]
+    unavailable = download_target_readiness_error("both", backends)
+    for message in dict.fromkeys((notice, unavailable)):
+        if message:
+            lines.append(html.escape(message))
+    if backends.get("guangya") and any(option.get("nsfw_source_id") == "" for option in options):
+        if "未配置 NSFW" not in notice:
+            lines.append("未配置 NSFW 整理来源")
+    return "\n".join(lines), keyboard
 
 
 def _configured_local_organize_sources() -> list[LocalMediaSource]:
@@ -1910,26 +1925,17 @@ def _register_commands(bot, telebot):
     ):
         if not chat_id or not user_id:
             chat_id, user_id = _telegram_identity(msg)
-        keyboard = _download_target_picker_markup(
+        text, keyboard = _download_target_picker_view(
             telebot,
             request_id=request_id,
             item=item,
+            title=title,
             chat_id=chat_id,
             user_id=user_id,
             message_thread_id=_telegram_thread_id(msg),
+            notice="原确认已失效，已为你重新生成一次性按钮。" if reissued else "相同链接或种子只会创建一份请求。",
         )
-        _reply_to_source(
-            bot,
-            msg,
-            "<b>选择下载目标</b>\n"
-            f"任务: {html.escape(title or '未命名任务')}\n"
-            + (
-                "原确认已失效，已为你重新生成一次性按钮。"
-                if reissued
-                else "相同链接或种子只会创建一份请求。"
-            ),
-            reply_markup=keyboard,
-        )
+        _reply_to_source(bot, msg, text, reply_markup=keyboard)
 
     def reissue_pending_picker(msg, request: dict) -> bool:
         if str(request.get("status") or "") != "pending":
@@ -2382,7 +2388,11 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
 
 
 def _handle_write_confirmation_callback(bot, call, telebot) -> None:
-    from app.indexers.downloads import DirectDownloadPreconditionError, download_target_destination
+    from app.indexers.downloads import (
+        DirectDownloadPreconditionError,
+        download_target_destination,
+        require_download_target_ready,
+    )
     from app.modules.telegram_write_confirmations import (
         TelegramWriteConfirmationError,
         get_telegram_write_confirmation_store,
@@ -2473,20 +2483,18 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                     item, target, nsfw_source_id=nsfw_source_id,
                     expected_gy_target_dir=str(value.get("gy_target_dir") or ""),
                 )
+                require_download_target_ready(target)
             except DirectDownloadPreconditionError as exc:
                 notice = str(exc)
-                keyboard = _download_target_picker_markup(
+                picker_text, keyboard = _download_target_picker_view(
                     telebot,
                     request_id=request_id,
                     item=item,
+                    title=download_display_title(row),
                     chat_id=chat_id,
                     user_id=user_id,
                     message_thread_id=_telegram_thread_id(call),
-                )
-                picker_text = (
-                    "<b>选择下载目标</b>\n"
-                    f"任务: {html.escape(download_display_title(row))}\n"
-                    f"{html.escape(notice)}"
+                    notice=notice,
                 )
                 try:
                     bot.edit_message_text(

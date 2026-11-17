@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.modules.download_dispatcher import DownloadInput
 from tests.support import FakeTelegramBot, fake_telebot_types
 
 ORDINARY_DOWNLOAD = DownloadInput("magnet", "待下载任务", "magnet:?xt=urn:btih:" + "a" * 40)
+
+
+def ready_download_backends():
+    return patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True})
 
 
 class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
@@ -369,6 +373,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 "app.modules.organize_sources.list_nsfw_download_sources",
                 return_value=[{"id": "adult-a", "name": "成人来源 A"}],
             ),
+            ready_download_backends(),
         ):
             handlers._register_commands(bot, telebot)
             receive_link = next(
@@ -575,14 +580,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
         telebot = fake_telebot_types()
-        with patch(
-            "app.modules.organize_sources.list_nsfw_download_sources",
-            return_value=sources,
+        with (
+            ready_download_backends(),
+            patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=sources),
         ):
-            markup = handlers._download_target_picker_markup(
+            _, markup = handlers._download_target_picker_view(
                 telebot,
                 request_id=77,
                 item=ORDINARY_DOWNLOAD,
+                title=ORDINARY_DOWNLOAD.title,
                 chat_id="100",
                 user_id="9",
             )
@@ -649,12 +655,14 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             with (
                 self.subTest(directory=configured),
                 patch.dict("os.environ", {"OFFLINE_TARGET_DIR": "default", "OFFLINE_TARGET_DIR_NAME": configured}),
+                ready_download_backends(),
                 patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[
                     {"id": "adult-only", "name": "成人专区"},
                 ]),
             ):
-                markup = handlers._download_target_picker_markup(
-                    fake_telebot_types(), request_id=77, item=ORDINARY_DOWNLOAD, chat_id="100", user_id="9",
+                _, markup = handlers._download_target_picker_view(
+                    fake_telebot_types(), request_id=77, item=ORDINARY_DOWNLOAD,
+                    title=ORDINARY_DOWNLOAD.title, chat_id="100", user_id="9",
                 )
                 self.assertEqual([item.text for item in markup.buttons], [
                     f"光鸭·{displayed}", "qBittorrent", "光鸭·NSFW · 成人专区",
@@ -674,14 +682,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
         reset_telegram_write_confirmation_store_for_tests()
         source = {"id": "adult-only", "name": "成人专区"}
-        with patch(
-            "app.modules.organize_sources.list_nsfw_download_sources",
-            return_value=[source],
+        with (
+            ready_download_backends(),
+            patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[source]),
         ):
-            markup = handlers._download_target_picker_markup(
+            _, markup = handlers._download_target_picker_view(
                 fake_telebot_types(),
                 request_id=77,
                 item=ORDINARY_DOWNLOAD,
+                title=ORDINARY_DOWNLOAD.title,
                 chat_id="100",
                 user_id="9",
             )
@@ -719,14 +728,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             "source_value": "magnet:?xt=urn:btih:fixture",
             "title": "普通下载",
         }
-        with patch(
-            "app.modules.organize_sources.list_nsfw_download_sources",
-            return_value=[],
+        with (
+            ready_download_backends(),
+            patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[]),
         ):
-            markup = handlers._download_target_picker_markup(
+            _, markup = handlers._download_target_picker_view(
                 telebot,
                 request_id=77,
                 item=ORDINARY_DOWNLOAD,
+                title=ORDINARY_DOWNLOAD.title,
                 chat_id="100",
                 user_id="9",
             )
@@ -759,9 +769,50 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         self.assertEqual(thread.call_args.kwargs["args"][-1], "qb")
         self.assertNotIn("kwargs", thread.call_args.kwargs)
 
-    def test_empty_nsfw_choice_does_not_submit_and_keeps_other_targets_available(self):
+    def test_both_cannot_be_confirmed_after_qb_is_removed_and_cloud_remains_available(self):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import reset_telegram_write_confirmation_store_for_tests
+
+        reset_telegram_write_confirmation_store_for_tests()
+        telebot = fake_telebot_types()
+        bot = Mock()
+        row = {
+            "id": 77, "status": "pending", "kind": ORDINARY_DOWNLOAD.kind,
+            "source_value": ORDINARY_DOWNLOAD.source_value, "title": ORDINARY_DOWNLOAD.title,
+        }
+
+        def click(button):
+            call = self._call(prefix="", chat_id=100, user_id=9)
+            call.data = button.callback_data
+            handlers._handle_write_confirmation_callback(bot, call, telebot)
+
+        with (
+            patch.dict("os.environ", {"QB_URL": "http://qb-fixture.invalid"}),
+            patch("app.indexers.downloads.GuangYaClient", return_value=Mock(logged_in=True)),
+            patch("app.repositories.download_requests.bind_pending_download_request_owner", return_value=row),
+            patch("app.bot.handlers.threading.Thread") as thread,
+        ):
+            _, markup = handlers._download_target_picker_view(
+                telebot, request_id=77, item=ORDINARY_DOWNLOAD, title=ORDINARY_DOWNLOAD.title,
+                chat_id="100", user_id="9",
+            )
+            both = next(button for button in markup.buttons if " + qBittorrent" in button.text)
+            with patch.dict("os.environ", {"QB_URL": " "}):
+                click(both)
+                thread.assert_not_called()
+                edit = bot.edit_message_text.call_args
+                self.assertIn("qBittorrent 尚未配置", edit.args[0])
+                replacement = edit.kwargs["reply_markup"]
+                self.assertEqual([button.text for button in replacement.buttons], ["光鸭·默认目录", "取消"])
+                click(replacement.buttons[0])
+
+        thread.assert_called_once()
+        self.assertEqual(thread.call_args.kwargs["args"][-1], "guangya")
+
+    def test_legacy_empty_nsfw_choice_does_not_submit_and_keeps_other_targets_available(self):
         from app.bot import handlers
         from app.modules.telegram_write_confirmations import (
+            get_telegram_write_confirmation_store,
             reset_telegram_write_confirmation_store_for_tests,
         )
 
@@ -780,19 +831,13 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
         telebot = fake_telebot_types()
-        with patch(
-            "app.modules.organize_sources.list_nsfw_download_sources",
-            return_value=[],
+        with (
+            ready_download_backends(),
+            patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[]),
         ):
-            markup = handlers._download_target_picker_markup(
-                telebot,
-                request_id=77,
-                item=ORDINARY_DOWNLOAD,
-                chat_id="100",
-                user_id="9",
-            )
-            button = next(
-                button for button in markup.buttons if button.text == "光鸭·NSFW"
+            legacy, _ = get_telegram_write_confirmation_store().create_pair(
+                chat_id="100", user_id="9", operation="download_request",
+                value={"request_id": 77, "target": "guangya", "nsfw_source_id": ""},
             )
             row = {
                 "id": 77,
@@ -803,7 +848,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             }
             call = SimpleNamespace(
                 id="empty-nsfw-choice",
-                data=button.callback_data,
+                data=f"tgc:{legacy}",
                 from_user=SimpleNamespace(id=9),
                 message=SimpleNamespace(
                     chat=SimpleNamespace(id=100),
@@ -826,7 +871,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         replacement = bot.edits[-1][1]["reply_markup"]
         self.assertTrue(any(item.text == "qBittorrent" for item in replacement.buttons))
         self.assertTrue(any(item.text == "光鸭·默认目录 + qBittorrent" for item in replacement.buttons))
-        self.assertTrue(any(item.text == "光鸭·NSFW" for item in replacement.buttons))
+        self.assertFalse(any(item.text == "光鸭·NSFW" for item in replacement.buttons))
+        self.assertIn("未配置 NSFW 整理来源", bot.edits[-1][0][0])
 
     def test_stale_nsfw_choice_refreshes_picker_without_submitting(self):
         from app.bot import handlers
@@ -850,14 +896,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot = Bot()
         telebot = fake_telebot_types()
         current_sources = [{"id": "adult-old", "name": "旧来源"}]
-        with patch(
-            "app.modules.organize_sources.list_nsfw_download_sources",
-            side_effect=lambda: list(current_sources),
+        with (
+            ready_download_backends(),
+            patch("app.modules.organize_sources.list_nsfw_download_sources", side_effect=lambda: list(current_sources)),
         ):
-            markup = handlers._download_target_picker_markup(
+            _, markup = handlers._download_target_picker_view(
                 telebot,
                 request_id=77,
                 item=ORDINARY_DOWNLOAD,
+                title=ORDINARY_DOWNLOAD.title,
                 chat_id="100",
                 user_id="9",
             )

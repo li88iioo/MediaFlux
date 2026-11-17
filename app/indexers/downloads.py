@@ -248,7 +248,7 @@ def download_target_labels(guangya_dir_name: str | None = None) -> dict[str, str
     return {"qb": "qBittorrent", "guangya": cloud, "both": f"{cloud} + qBittorrent"}
 
 
-def download_target_options(item: DownloadInput) -> list[dict[str, str]]:
+def download_target_options(item: DownloadInput, backends: dict[str, bool]) -> list[dict[str, Any]]:
     """TG 选择卡与 Web 下载卡共用的目标顺序和名称；NSFW 选项来自成人专用整理来源。
 
     带 nsfw_source_id 键的选项提交到对应来源目录；值为空表示尚未配置，仅作提示不可提交。
@@ -273,7 +273,10 @@ def download_target_options(item: DownloadInput) -> list[dict[str, str]]:
     if not sources:
         options.append({"target": "guangya", "nsfw_source_id": "", "label": "光鸭·NSFW"})
     options.append({"target": "both", "label": labels["both"], **cloud})
-    return options
+    return [
+        {**option, "ready": option.get("nsfw_source_id") != "" and not download_target_readiness_error(option["target"], backends)}
+        for option in options
+    ]
 
 
 def nsfw_download_destination(source_id: str) -> _DownloadDestination:
@@ -330,6 +333,22 @@ def download_target_readiness(target: str) -> dict[str, bool]:
             readiness["guangya"] = False
         finally:
             close_guangya_client(client)
+    return readiness
+
+
+def download_target_readiness_error(target: str, backends: dict[str, bool]) -> str:
+    labels = {"qb": "qBittorrent", "guangya": "光鸭"}
+    unavailable = [label for backend, label in labels.items() if target in (backend, "both") and not backends.get(backend)]
+    return "、".join(unavailable) + " 尚未配置或登录" if unavailable else ""
+
+
+def require_download_target_ready(target: str) -> dict[str, bool]:
+    if target not in DOWNLOAD_TARGETS:
+        raise DirectDownloadPreconditionError("下载目标无效")
+    readiness = download_target_readiness(target)
+    error = download_target_readiness_error(target, readiness)
+    if error:
+        raise DirectDownloadPreconditionError(error)
     return readiness
 
 
@@ -885,13 +904,7 @@ def direct_download_details(item: DownloadInput) -> dict:
 
 def preview_direct_download(item: DownloadInput, target: str) -> tuple[dict, dict]:
     """直接链接或种子的只读预检；共享协议身份与后端就绪事实，不创建请求。"""
-    if target not in DOWNLOAD_TARGETS:
-        raise ValueError("下载目标无效")
-    readiness = download_target_readiness(target)
-    unavailable = [name for name, ready in readiness.items() if not ready]
-    if unavailable:
-        labels = {"qb": "qBittorrent", "guangya": "光鸭"}
-        raise ValueError("、".join(labels[name] for name in unavailable) + " 尚未配置或登录")
+    readiness = require_download_target_ready(target)
     preview = {
         "source_type": "direct_url", **direct_download_details(item), "target": target, "backends": readiness,
         "effects": ["创建幂等下载请求", "提交到所选下载后端", "保留后续整理与 STRM 跟踪"],

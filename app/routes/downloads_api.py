@@ -650,7 +650,7 @@ def _direct_item(url: str, upload: UploadFile | None):
 def preview_direct_download(request: Request, url: str = Form(""), file: UploadFile | None = File(None)):
     """只读解析种子或链接，返回标题、文件摘要与各下载后端就绪状态；不创建请求。"""
     require_api_login(request)
-    from app.indexers.downloads import direct_download_details, download_target_readiness
+    from app.indexers.downloads import direct_download_details, download_target_options, download_target_readiness
 
     try:
         item = _direct_item(url, file)
@@ -658,19 +658,7 @@ def preview_direct_download(request: Request, url: str = Form(""), file: UploadF
     except ValueError as exc:
         return api_error(str(exc), 400)
     backends = download_target_readiness("both")
-    return api_response({**details, "backends": backends, "targets": _direct_target_options(item, backends)})
-
-
-def _direct_target_options(item, backends: dict[str, bool]) -> list[dict]:
-    from app.indexers.downloads import download_target_options
-
-    targets = []
-    for option in download_target_options(item):
-        ready = bool(backends.get("qb") and backends.get("guangya")) if option["target"] == "both" else bool(backends.get(option["target"]))
-        if option.get("nsfw_source_id") == "":
-            ready = False
-        targets.append({**option, "ready": ready})
-    return targets
+    return api_response({**details, "backends": backends, "targets": download_target_options(item, backends)})
 
 
 async def _direct_nsfw_source_id(request: Request, nsfw_source_id: str | None = Form(None)) -> str | None:
@@ -700,7 +688,7 @@ def submit_direct_download(request: Request, target: str = Form(""), url: str = 
     except downloads.DirectDownloadTargetChanged as exc:
         return api_response({
             "error": str(exc), "code": "download_not_submitted",
-            "targets": _direct_target_options(item, downloads.download_target_readiness("both")),
+            "targets": downloads.download_target_options(item, downloads.download_target_readiness("both")),
         }, 400)
     except downloads.DirectDownloadPreconditionError as exc:
         return api_response({"error": str(exc), "code": "download_not_submitted"}, 400)
