@@ -176,7 +176,9 @@ class DiscoveryConfigTests(unittest.TestCase):
             response, persist, shutdown = self._save({"DISCOVERY_CACHE_TTL_SECONDS": "3600"})
         self.assertIsInstance(response, dict)
         self.assertTrue(response["success"] and response["restart_required"])
-        self.assertIn("运行中实例未能热更新", response["warnings"][0])
+        warnings = response["warnings"]
+        assert isinstance(warnings, list)
+        self.assertIn("运行中实例未能热更新", warnings[0])
         persist.assert_called_once_with({"DISCOVERY_CACHE_TTL_SECONDS": "3600"})
         shutdown.assert_called_once_with()
 

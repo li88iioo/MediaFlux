@@ -8,6 +8,7 @@ import threading
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from typing import TypeGuard
 
 from app import config
 from app.logger import get_logger
@@ -33,7 +34,7 @@ class RuntimeFence:
     config_digest: str
 
 
-def _is_lower_hex(value: object, size: int) -> bool:
+def _is_lower_hex(value: object, size: int) -> TypeGuard[str]:
     return isinstance(value, str) and len(value) == size and all(c in "0123456789abcdef" for c in value)
 
 
