@@ -15,6 +15,7 @@ public sealed class PluginConfiguration : BasePluginConfiguration
     public string Password { get; set; } = "";
 
     public int TaskTimeoutSeconds { get; set; } = 120;
+    public bool StrmFastStart { get; set; }
     public PathMapping[] MfMappings { get; set; } = [];
     public LibraryScope[] MfLibraries { get; set; } = [];
     public string SyncedMfUrl { get; set; } = "";

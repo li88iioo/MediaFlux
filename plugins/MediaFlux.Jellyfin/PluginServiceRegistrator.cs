@@ -13,5 +13,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<MfClient>();
         services.AddScoped<ExplicitDeleteFilter>();
         services.Configure<MvcOptions>(options => options.Filters.AddService<ExplicitDeleteFilter>());
+        services.AddSingleton<StrmProbeLedger>();
+        if (StrmProbeMediaSourceManager.Decorate(services)) services.AddHostedService<StrmPreProbeService>();
     }
 }

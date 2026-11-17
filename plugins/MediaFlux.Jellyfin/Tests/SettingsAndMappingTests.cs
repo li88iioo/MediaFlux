@@ -28,7 +28,7 @@ public sealed class SettingsAndMappingTests
     [Fact]
     public void PluginAssemblyHasReleaseVersionAndUsesTheUpstreamApi()
     {
-        Assert.Equal("0.1.4.0", typeof(Plugin).Assembly.GetName().Version!.ToString());
+        Assert.Equal("0.1.5.0", typeof(Plugin).Assembly.GetName().Version!.ToString());
         Assert.Equal("Jellyfin.Api", typeof(global::Jellyfin.Api.Controllers.LibraryController).Assembly.GetName().Name);
     }
 
@@ -50,7 +50,7 @@ public sealed class SettingsAndMappingTests
         }
         using var metadata = JsonDocument.Parse(await settings.Content.ReadAsStringAsync());
         Assert.Equal("12.2.0", metadata.RootElement.GetProperty("compiled_baseline").GetString());
-        Assert.Equal("12.2 / 12.3", metadata.RootElement.GetProperty("source_checked_versions").GetString());
+        Assert.Equal("12.2 / 12.3 / 12.4", metadata.RootElement.GetProperty("source_checked_versions").GetString());
         Assert.False(metadata.RootElement.TryGetProperty("mapping_mode", out _));
         Assert.False(metadata.RootElement.TryGetProperty("manual_mappings", out _));
         var direct = JsonSerializer.Serialize((BasePluginConfiguration)f.Plugin.Configuration, f.Plugin.ConfigurationType);

@@ -7,8 +7,8 @@ repo=$(cd "$plugin/../.." && pwd)
 cache=${JELLYFIN_VERIFY_CACHE:-"$repo/.superpowers/tmp/jellyfin-plugin"}
 dotnet_bin=${DOTNET_BIN:-dotnet}
 version=${1:-12.2}
-if [ "$#" -gt 1 ] || [[ "$version" != 12.2 && "$version" != 12.3 ]]; then
-  echo "Usage: $0 [12.2|12.3]" >&2
+if [ "$#" -gt 1 ] || [[ "$version" != 12.2 && "$version" != 12.3 && "$version" != 12.4 ]]; then
+  echo "Usage: $0 [12.2|12.3|12.4]" >&2
   exit 2
 fi
 if [ "$("$dotnet_bin" --version)" != "10.0.402" ]; then

@@ -3,57 +3,100 @@
 <head><meta charset="utf-8"><title>MediaFlux</title></head>
 <body>
 <div id="MediaFluxConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+  <style>
+    #MediaFluxConfigPage .content-primary { max-width:54em; }
+    #MediaFluxConfigPage .mfHeader { display:flex; align-items:center; gap:1em; margin-bottom:1.5em; }
+    #MediaFluxConfigPage .mfHeader h2 { margin:0; }
+    #MediaFluxConfigPage .mfHeader p { margin:.25em 0 0; }
+    #MediaFluxConfigPage .mfSection { margin:0 0 2.5em; }
+    #MediaFluxConfigPage .mfSection > .sectionTitle { margin:0 0 .5em; }
+    #MediaFluxConfigPage .mfSection > .fieldDescription { margin:0 0 1em; }
+    #MediaFluxConfigPage .mfActions { display:flex; flex-wrap:wrap; gap:.75em; margin-top:.5em; }
+    #MediaFluxConfigPage .mfActions .emby-button { margin:0; }
+    #MediaFluxConfigPage #mfStatus { min-height:1.5em; margin:1em 0 2em; overflow-wrap:anywhere; }
+    #MediaFluxConfigPage .mfScope h4 { margin:1.25em 0 .5em; font-weight:600; }
+    #MediaFluxConfigPage .mfScope ul { list-style:none; margin:0; padding:0; }
+    #MediaFluxConfigPage .mfScope li { padding:.6em 0; border-top:1px solid rgba(128,128,128,.25); overflow-wrap:anywhere; }
+    #MediaFluxConfigPage .mfScope li:last-child { border-bottom:1px solid rgba(128,128,128,.25); }
+    #MediaFluxConfigPage .mfScope code { font-size:.9em; }
+    #MediaFluxConfigPage .mfScope .mfSub { display:block; margin-top:.2em; opacity:.7; }
+    #MediaFluxConfigPage .mfEmpty { opacity:.7; padding:.6em 0; }
+    #MediaFluxConfigPage #mfVersion { margin-top:1.25em; }
+    #MediaFluxConfigPage #mfLastError { margin-top:1em; padding:.6em .9em; border-left:3px solid rgba(128,128,128,.5); overflow-wrap:anywhere; }
+    #MediaFluxConfigPage #mfLastError.mfHasError { border-left-color:#e05252; }
+  </style>
   <div data-role="content"><div class="content-primary">
-    <div style="display:flex;align-items:center;gap:.75em;margin-bottom:1em">
+    <div class="mfHeader">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="44" height="44" role="img" aria-label="MediaFlux" style="flex:none">
         <rect width="16" height="16" rx="2.5" fill="#18201d"/>
         <path fill="#65f0c2" d="M2 3h3l3 2 3-2h3v3h-2L8 8 4 6H2V3Z"/>
         <path fill="#9de8ff" d="M2 13v-3h2l4-2 4 2h2v3h-3l-3-2-3 2H2Z"/>
         <path fill="#18201d" d="m6 5.5 6 2.5-6 2.5v-5Z"/>
       </svg>
-      <h2 style="margin:0;min-width:0">MediaFlux · STRM 联动删除</h2>
+      <div style="min-width:0">
+        <h2>MediaFlux</h2>
+        <p class="fieldDescription">STRM 联动删除 · STRM 起播加速</p>
+      </div>
     </div>
-    <p>联动 MediaFlux 删除云盘内容。保存连接信息并同步管理范围后，即可启用。</p>
-    <p class="fieldDescription">支持电影、单集、季和整剧。云端删除确认成功后继续本地删除；普通本地媒体保持原功能，扫库和条目消失不会触发云端删除。</p>
     <form id="MediaFluxConfigForm" autocomplete="off">
       <fieldset id="mfFields" disabled style="border:0;padding:0;margin:0;min-width:0">
-        <div class="inputContainer">
-          <label class="inputLabel inputLabelUnfocused" for="mfUrl">MediaFlux URL</label>
-          <input is="emby-input" type="url" id="mfUrl" placeholder="https://mediaflux.example" autocomplete="off">
-          <div class="fieldDescription">必须能由 Jellyfin 服务端访问；HTTPS 使用标准证书验证，不能绕过自签名或过期证书。</div>
-        </div>
-        <div class="inputContainer">
-          <label class="inputLabel inputLabelUnfocused" for="mfUsername">MF 用户名</label>
-          <input is="emby-input" type="text" id="mfUsername" maxlength="128" autocomplete="off">
-        </div>
-        <div class="inputContainer">
-          <label class="inputLabel inputLabelUnfocused" for="mfPassword">MF 密码</label>
-          <input is="emby-input" type="password" id="mfPassword" maxlength="512" autocomplete="new-password">
-          <div class="fieldDescription" id="mfPasswordInfo" style="min-height:4.5em">密码只保存在 Jellyfin 服务端；不回显。</div>
-        </div>
-        <div class="inputContainer">
-          <label class="inputLabel inputLabelUnfocused" for="mfTimeout">云任务等待上限（秒）</label>
-          <input is="emby-input" type="number" id="mfTimeout" min="5" max="600" step="1" value="120" required>
-        </div>
-        <div class="checkboxContainer checkboxContainer-withDescription">
-          <label class="emby-checkbox-label">
-            <input is="emby-checkbox" type="checkbox" id="mfEnabled"><span>启用联动删除</span>
-          </label>
-          <div class="fieldDescription">映射和媒体库统一从 MediaFlux 同步。首次使用请先保存连接、同步范围，再勾选启用并保存。</div>
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:.75em">
+        <section class="verticalSection mfSection" aria-labelledby="mfConnTitle">
+          <h3 class="sectionTitle" id="mfConnTitle">MediaFlux 连接</h3>
+          <p class="fieldDescription">联动删除通过此连接提交云端任务；起播加速不需要连接。</p>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="mfUrl">MediaFlux URL</label>
+            <input is="emby-input" type="url" id="mfUrl" placeholder="https://mediaflux.example" autocomplete="off">
+            <div class="fieldDescription">必须能由 Jellyfin 服务端访问；HTTPS 使用标准证书验证，不能绕过自签名或过期证书。</div>
+          </div>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="mfUsername">MF 用户名</label>
+            <input is="emby-input" type="text" id="mfUsername" maxlength="128" autocomplete="off">
+          </div>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="mfPassword">MF 密码</label>
+            <input is="emby-input" type="password" id="mfPassword" maxlength="512" autocomplete="new-password">
+            <div class="fieldDescription" id="mfPasswordInfo">密码只保存在 Jellyfin 服务端；不回显。</div>
+          </div>
+        </section>
+        <section class="verticalSection mfSection" aria-labelledby="mfDeleteTitle">
+          <h3 class="sectionTitle" id="mfDeleteTitle">联动删除</h3>
+          <p class="fieldDescription">在 Jellyfin 删除电影、单集、季或整剧时，先由 MediaFlux 删除云盘内容，确认成功后继续本地删除。普通本地媒体保持原功能，扫库和条目消失不会触发云端删除。</p>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="mfTimeout">云任务等待上限（秒）</label>
+            <input is="emby-input" type="number" id="mfTimeout" min="5" max="600" step="1" value="120" required>
+          </div>
+          <div class="checkboxContainer checkboxContainer-withDescription">
+            <label class="emby-checkbox-label">
+              <input is="emby-checkbox" type="checkbox" id="mfEnabled"><span>启用联动删除</span>
+            </label>
+            <div class="fieldDescription">映射和媒体库统一从 MediaFlux 同步。首次使用请先保存连接、同步范围，再勾选启用并保存。</div>
+          </div>
+        </section>
+        <section class="verticalSection mfSection" aria-labelledby="mfFastTitle">
+          <h3 class="sectionTitle" id="mfFastTitle">STRM 起播加速</h3>
+          <div class="checkboxContainer checkboxContainer-withDescription">
+            <label class="emby-checkbox-label">
+              <input is="emby-checkbox" type="checkbox" id="mfStrmFastStart"><span>启用 STRM 起播加速</span>
+            </label>
+            <div class="fieldDescription" id="mfStrmFastStartInfo">Jellyfin 每次播放 .strm 都会远程探测片源。开启后，已探测且内容未变的 .strm 直接使用已保存的媒体信息；新入库或洗版改写的 .strm 在后台逐个预探测一次。不需要 MediaFlux 连接，保存后立即生效。</div>
+          </div>
+        </section>
+        <div class="mfActions">
           <button is="emby-button" type="submit" class="raised button-submit emby-button"><span>保存配置</span></button>
           <button is="emby-button" type="button" id="mfTest" class="raised emby-button"><span>测试已保存连接</span></button>
           <button is="emby-button" type="button" id="mfSync" class="raised emby-button"><span>同步 MF 范围</span></button>
         </div>
       </fieldset>
     </form>
-    <p id="mfStatus" role="status" aria-live="polite" style="min-height:4.5em;overflow-wrap:anywhere">正在读取配置…</p>
-    <h3>当前已保存的管理范围</h3>
-    <p class="fieldDescription" id="mfCacheInfo" style="min-height:3em">范围以最后一次成功同步为准。MediaFlux 离线时保留已同步范围，不执行纳管删除。</p>
-    <pre id="mfScope" tabindex="0" style="height:16em;overflow:auto;scrollbar-gutter:stable;white-space:pre-wrap;overflow-wrap:anywhere;margin:0">尚未读取范围。</pre>
-    <p class="fieldDescription">范围变更后请重新同步。部分 Jellyfin 客户端仅显示通用删除失败提示；详细错误也显示在下面（仅管理员可读）。禁止盲目重试云端删除。</p>
-    <p id="mfLastError" role="note" style="min-height:4.5em;overflow-wrap:anywhere">最近删除错误：无。</p>
+    <p id="mfStatus" role="status" aria-live="polite">正在读取配置…</p>
+    <section class="verticalSection mfSection" aria-labelledby="mfScopeTitle">
+      <h3 class="sectionTitle" id="mfScopeTitle">当前已保存的管理范围</h3>
+      <p class="fieldDescription" id="mfCacheInfo">范围以最后一次成功同步为准。MediaFlux 离线时保留已同步范围，不执行纳管删除。</p>
+      <div id="mfScope" class="mfScope" tabindex="0" aria-label="已同步的映射与媒体库"><p class="mfEmpty">尚未读取范围。</p></div>
+      <p class="fieldDescription" id="mfVersion"></p>
+      <p class="fieldDescription">范围变更后请重新同步。部分 Jellyfin 客户端仅显示通用删除失败提示；详细错误也显示在下面（仅管理员可读）。禁止盲目重试云端删除。</p>
+      <p id="mfLastError" role="note">最近删除错误：无。</p>
+    </section>
   </div></div>
   <script>
   (function () {
@@ -65,6 +108,12 @@
     var busy = false;
     var loaded = false;
     function el(id) { return page.querySelector('#' + id); }
+    function node(tag, text, className) {
+      var n = document.createElement(tag);
+      if (text !== undefined) n.textContent = text;
+      if (className) n.className = className;
+      return n;
+    }
     function controls() {
       fields.disabled = busy || !loaded;
       page.setAttribute('aria-busy', String(busy));
@@ -75,6 +124,38 @@
         contentType: 'application/json', data: data === undefined ? undefined : JSON.stringify(data)
       });
     }
+    function localTime(value) {
+      var date = value ? new Date(value) : null;
+      return date && !isNaN(date.getTime()) ? date.toLocaleString('zh-CN', { hour12: false }) : (value || '未同步');
+    }
+    function list(title, rows, empty) {
+      var box = document.createDocumentFragment();
+      box.appendChild(node('h4', title));
+      if (!rows.length) { box.appendChild(node('p', empty, 'mfEmpty')); return box; }
+      var ul = node('ul');
+      rows.forEach(function(row) {
+        var li = node('li');
+        li.appendChild(row[0]);
+        var sub = node('span', undefined, 'mfSub');
+        sub.appendChild(document.createTextNode(row[1]));
+        if (row[2]) sub.appendChild(node('code', row[2]));
+        li.appendChild(sub);
+        ul.appendChild(li);
+      });
+      box.appendChild(ul);
+      return box;
+    }
+    function renderScope(c) {
+      var scope = el('mfScope');
+      scope.replaceChildren(
+        list('路径映射', c.active_mappings.map(function(m) {
+          return [node('code', m.server), '→ MediaFlux ', m.local];
+        }), '尚无有效映射，不能启用联动删除。'),
+        list('媒体库（展示用途；管理边界以映射为准）', c.libraries.map(function(l) {
+          return [node('strong', l.Name || l.name || '(未命名)'), (l.Locations || l.locations || []).join('，') || '无路径'];
+        }), '尚未同步媒体库。'));
+      el('mfVersion').textContent = '编译 API 基线 ' + c.compiled_baseline + ' · 已验证 Jellyfin ' + c.source_checked_versions;
+    }
     function render(c) {
       loaded = true;
       el('mfEnabled').checked = c.enabled;
@@ -83,14 +164,14 @@
       // Never set the password field from a server response.
       el('mfPasswordInfo').textContent = c.password_set ? '密码已保存；留空保持不变，输入新密码后保存可替换。' : '尚未保存密码；密码只保存在 Jellyfin 服务端，不回显。';
       el('mfTimeout').value = c.task_timeout_seconds;
-      el('mfCacheInfo').textContent = '同步时间：' + (c.synced_at_utc || '未同步') + '；连接缓存：' + (c.cache_current ? '匹配' : '需重新同步') + '。MediaFlux 离线时保留已同步范围。';
-      var lines = ['编译 API 基线：' + c.compiled_baseline, '已验证 Jellyfin 版本：' + c.source_checked_versions, '', '映射（Jellyfin server → MF local）：'];
-      c.active_mappings.forEach(function(m) { lines.push(m.server + ' → ' + m.local); });
-      if (!c.active_mappings.length) lines.push('尚无有效映射，不能启用。');
-      lines.push('', '媒体库（展示用途；管理边界以映射为准）：');
-      c.libraries.forEach(function(l) { lines.push((l.Name || l.name || '(未命名)') + ': ' + (l.Locations || l.locations || []).join('，')); });
-      el('mfScope').textContent = lines.join('\n');
+      el('mfStrmFastStart').checked = c.strm_fast_start;
+      var fastInfo = el('mfStrmFastStartInfo');
+      fastInfo.dataset.text = fastInfo.dataset.text || fastInfo.textContent;
+      fastInfo.textContent = c.strm_fast_start_available ? fastInfo.dataset.text : '当前 Jellyfin 未能接入起播加速，开关不会生效；请确认插件与 Jellyfin 版本匹配后重启。';
+      el('mfCacheInfo').textContent = '同步时间：' + localTime(c.synced_at_utc) + '；连接缓存：' + (c.cache_current ? '匹配' : '需重新同步') + '。MediaFlux 离线时保留已同步范围。';
+      renderScope(c);
       el('mfLastError').textContent = '最近删除错误：' + (c.last_delete_error || '无。');
+      el('mfLastError').classList.toggle('mfHasError', !!c.last_delete_error);
       controls();
     }
     function readableError(e) {
@@ -116,7 +197,8 @@
       run(function() {
         return request('Settings', 'POST', {
           enabled: el('mfEnabled').checked, mf_url: el('mfUrl').value, username: el('mfUsername').value,
-          password: el('mfPassword').value || null, task_timeout_seconds: Number(el('mfTimeout').value)
+          password: el('mfPassword').value || null, task_timeout_seconds: Number(el('mfTimeout').value),
+          strm_fast_start: el('mfStrmFastStart').checked
         }).then(function(c) { el('mfPassword').value = ''; render(c); status.textContent = '配置已保存。更改 MediaFlux 连接后，请重新同步管理范围。'; });
       }, '正在保存配置…');
     });

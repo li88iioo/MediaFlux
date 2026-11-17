@@ -164,7 +164,7 @@ with tarfile.open(args[args.index("-o") + 1], "w:gz") as archive:
 ''')
         script = self.plugin / "scripts" / "verify.sh"
         production = self.project.read_bytes()
-        for version in ("12.2", "12.3"):
+        for version in ("12.2", "12.3", "12.4"):
             with self.subTest(version=version):
                 result = subprocess.run(["bash", str(script), version], env=self.env,
                                         capture_output=True, text=True, timeout=15)
@@ -178,7 +178,7 @@ with tarfile.open(args[args.index("-o") + 1], "w:gz") as archive:
         self.assertEqual(production, self.project.read_bytes())
 
     def test_verify_rejects_unsupported_versions_before_using_sdk_or_network(self):
-        for args in (("12.4",), ("12.2", "extra")):
+        for args in (("12.5",), ("12.2", "extra")):
             result = subprocess.run(["bash", str(self.plugin / "scripts" / "verify.sh"), *args],
                                     env=self.env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 2, result.stderr)

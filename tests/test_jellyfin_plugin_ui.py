@@ -14,7 +14,8 @@ API = """() => {
         enabled: false, mf_url: 'http://mf.invalid', username: 'admin', password_set: true,
         task_timeout_seconds: 120, active_mappings: [{local:'/data/strm',server:'/media/strm'}],
         libraries: [], synced_at_utc: '2026-10-23T12:00:00Z', cache_current: true,
-        last_delete_error: '', compiled_baseline: '12.2.0', source_checked_versions: '12.2 / 12.3'
+        last_delete_error: '', compiled_baseline: '12.2.0', source_checked_versions: '12.2 / 12.3 / 12.4',
+        strm_fast_start: false, strm_fast_start_available: true
     };
     window.requests = []; window.fail = false; window.hold = false;
     window.ApiClient = {
@@ -65,10 +66,17 @@ class JellyfinPluginBrowserTests(unittest.TestCase):
         self.assertEqual(self.errors, [])
 
     def test_single_synced_scope_logo_and_mobile_layout(self):
-        self.assertEqual(self.page.locator("h2").inner_text(), "MediaFlux · STRM 联动删除")
+        self.assertEqual(self.page.locator("h2").inner_text(), "MediaFlux")
+        self.assertEqual(self.page.locator("h3.sectionTitle").all_inner_texts(),
+                         ["MediaFlux 连接", "联动删除", "STRM 起播加速", "当前已保存的管理范围"])
         self.assertEqual(self.page.locator("select, textarea").count(), 0)
         self.assertEqual(self.page.locator("#mfPassword").input_value(), "")
-        self.assertIn("/media/strm", self.page.locator("#mfScope").inner_text())
+        mapping = self.page.locator("#mfScope li").first.inner_text()
+        self.assertIn("/media/strm", mapping)
+        self.assertIn("→ MediaFlux /data/strm", mapping)
+        self.assertIn("尚未同步媒体库", self.page.locator("#mfScope").inner_text())
+        self.assertEqual(self.page.locator("#mfVersion").inner_text(), "编译 API 基线 12.2.0 · 已验证 Jellyfin 12.2 / 12.3 / 12.4")
+        self.assertNotIn("T12:00:00Z", self.page.locator("#mfCacheInfo").inner_text())
         self.assertFalse(self.page.locator("#mfEnabled").is_checked())
         for width in (1100, 360):
             self.page.set_viewport_size({"width": width, "height": 1100})
@@ -83,7 +91,8 @@ class JellyfinPluginBrowserTests(unittest.TestCase):
         self.page.get_by_role("button", name="保存配置", exact=True).click()
         self.page.wait_for_function("document.querySelector('#mfStatus').textContent.startsWith('配置已保存')")
         body = self.page.evaluate("requests.at(-1).body")
-        self.assertEqual(set(body), {"enabled", "mf_url", "username", "password", "task_timeout_seconds"})
+        self.assertEqual(set(body), {"enabled", "mf_url", "username", "password", "task_timeout_seconds", "strm_fast_start"})
+        self.assertFalse(body["strm_fast_start"])
         self.assertTrue(body["enabled"])
         self.assertEqual(self.page.locator("#mfPassword").input_value(), "")
         self.page.get_by_role("button", name="保存配置", exact=True).click()
@@ -115,6 +124,25 @@ class JellyfinPluginBrowserTests(unittest.TestCase):
         self.page.evaluate("window.hold = false; window.fail = false")
         self.page.locator("#mfSync").click()
         self.page.wait_for_function("document.querySelector('#mfStatus').textContent.startsWith('MF 范围同步成功')")
+
+    def test_strm_fast_start_saves_independently_and_reports_unavailable_host(self):
+        info = self.page.locator("#mfStrmFastStartInfo").inner_text()
+        self.assertFalse(self.page.locator("#mfStrmFastStart").is_checked())
+        self.page.locator("#mfStrmFastStart").check()
+        self.page.get_by_role("button", name="保存配置", exact=True).click()
+        self.page.wait_for_function("document.querySelector('#mfStatus').textContent.startsWith('配置已保存')")
+        body = self.page.evaluate("requests.at(-1).body")
+        self.assertTrue(body["strm_fast_start"])
+        self.assertFalse(body["enabled"])
+        self.assertTrue(self.page.locator("#mfStrmFastStart").is_checked())
+        self.assertEqual(self.page.locator("#mfStrmFastStartInfo").inner_text(), info)
+        # 宿主未接入包装层时明确提示开关不生效；恢复可用后回到原说明。
+        self.page.evaluate("settings.strm_fast_start_available = false")
+        self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")
+        self.page.wait_for_function("document.querySelector('#mfStrmFastStartInfo').textContent.includes('不会生效')")
+        self.page.evaluate("settings.strm_fast_start_available = true")
+        self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")
+        self.page.wait_for_function("document.querySelector('#mfStrmFastStartInfo').textContent === %r" % info)
 
     def test_refresh_does_not_accumulate_event_handlers(self):
         self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")

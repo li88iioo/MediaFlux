@@ -12,7 +12,7 @@ namespace MediaFlux.Jellyfin;
 public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
 {
     public const string CompiledBaseline = "12.2.0";
-    public const string SourceCheckedVersions = "12.2 / 12.3";
+    public const string SourceCheckedVersions = "12.2 / 12.3 / 12.4";
     public static Plugin? Instance { get; private set; }
     private readonly IServerApplicationHost _host;
     private readonly object _gate = new();
@@ -42,7 +42,7 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
             return new PluginConfiguration
             {
                 Enabled = c.Enabled, MfUrl = c.MfUrl, Username = c.Username, Password = c.Password,
-                TaskTimeoutSeconds = c.TaskTimeoutSeconds,
+                TaskTimeoutSeconds = c.TaskTimeoutSeconds, StrmFastStart = c.StrmFastStart,
                 MfMappings = c.MfMappings.Select(m => m with { }).ToArray(),
                 MfLibraries = c.MfLibraries.Select(l => l with { Locations = l.Locations.ToArray() }).ToArray(),
                 SyncedMfUrl = c.SyncedMfUrl, SyncedUsername = c.SyncedUsername,
@@ -50,6 +50,8 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
             };
         }
     }
+
+    public bool StrmFastStart { get { lock (_gate) return Configuration.StrmFastStart; } }
 
     public static bool CacheCurrent(PluginConfiguration c) => c.SyncedAtUtc.Length > 0
         && c.MfUrl == c.SyncedMfUrl && c.Username == c.SyncedUsername;

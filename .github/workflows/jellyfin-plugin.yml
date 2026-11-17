@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        jellyfin: ['12.2', '12.3']
+        jellyfin: ['12.2', '12.3', '12.4']
     steps:
       - uses: actions/checkout@v6
         with:

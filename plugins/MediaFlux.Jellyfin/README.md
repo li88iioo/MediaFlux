@@ -1,6 +1,6 @@
 # MediaFlux Jellyfin 插件
 
-版本 **0.1.4**（程序集 / manifest：**0.1.4.0**）。验证 **Jellyfin 12.2 / 12.3，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
+版本 **0.1.5**（程序集 / manifest：**0.1.5.0**）。验证 **Jellyfin 12.2 / 12.3 / 12.4，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
 
 插件默认关闭，仅拦截用户明确发起的 Jellyfin `DELETE /Items/{itemId}`、`DELETE /Items?ids=...`。扫描发现 STRM 消失、清库或定时任务不会触发 MF 云端删除；插件关闭或请求完全不涉及映射内 STRM 时，继续原生删除行为。
 
@@ -66,6 +66,15 @@ Jellyfin 在所选电影／单集中明确记录的 `AdditionalParts` 可一并�
 
 单次最多 1000 个 STRM，单项原生文件范围 / 递归对象检查最多 10000 条。最后一次复核与 Jellyfin 原生操作并非跨进程文件系统事务；不要在明确删除期间并发向该目录写入媒体。MF 的已完成任务也无法因本地复核拒绝而回滚。
 
+## STRM 起播加速
+
+Jellyfin 12.2–12.4 的 `MediaSourceManager.GetPlaybackMediaSources` 对 `.strm` 无条件执行带远程探测的 `FullRefresh`，`MediaInfoHelper` 总以 `allowMediaProbe=true` 调用。插件服务注册晚于核心服务：`StrmProbeMediaSourceManager.Decorate` 取出按类型注册的官方单例，改由包装层提供 `IMediaSourceManager`，其余成员全部委托官方实现。宿主改为工厂 / 实例注册时不接管，设置接口返回 `strm_fast_start_available=false`。
+
+- 开关 `StrmFastStart` 默认关闭，在调用时读取（`IMediaSourceManager` 在插件实例创建前已被解析）。
+- 仅当条目是视频 `.strm`、`StrmProbeLedger` 中的指纹与当前 `.strm` 原始字节 SHA256 一致、且库内同时有音视频流时，以 `allowMediaProbe=false` 调用官方实现；否则照常探测，成功取得音视频流后记录指纹。
+- `StrmPreProbeService` 处理 `ItemAdded` 的视频 `.strm`，以及已记录但内容变化的 `ItemUpdated`；等待入库扫描结束后串行执行与播放前相同的 `RefreshMetadata(FullRefresh, EnableRemoteContentProbe)`。待预探测最多 200 个，超出部分留到首次播放；`ItemRemoved` 删除记录，不批量补探存量。
+- 指纹记录为插件配置目录下的追加式 TSV，重复和墓碑行过多时启动加载时重写；写盘失败只影响重启后的命中。
+
 ## 本地构建与官方 TestServer 测试
 
 使用 .NET SDK 10.0.402：
@@ -74,11 +83,12 @@ Jellyfin 在所选电影／单集中明确记录的 `AdditionalParts` 可一并�
 dotnet build plugins/MediaFlux.Jellyfin/MediaFlux.Jellyfin.csproj -c Release
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.2
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
+DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.4
 ```
 
 可用 `DOTNET_BIN` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定官方源码缓存。脚本复用已下载源码，不改变生产插件 12.2.0 的编译基线。
 
-测试在 ASP.NET TestServer 中分别加载**真实官方 12.2 / 12.3 `LibraryController` / `PluginsController`**，不是复制控制器；底层媒体库 / 用户存储和 MF HTTP 响应为可控测试替身。覆盖五种范围、分片归属、完整指纹、能力握手、权限 / 版本保护、文件竞态、失败不重放、配置迁移和 Logo HTTP 接口。不启动生产 Jellyfin，不连接生产 MF / 云盘。
+测试在 ASP.NET TestServer 中分别加载**真实官方 12.2 / 12.3 / 12.4 `LibraryController` / `PluginsController`**，不是复制控制器；底层媒体库 / 用户存储和 MF HTTP 响应为可控测试替身。覆盖五种范围、分片归属、完整指纹、能力握手、权限 / 版本保护、文件竞态、失败不重放、配置迁移、Logo HTTP 接口，以及 STRM 起播加速的包装注册、指纹记录、预探测与设置接口。不启动生产 Jellyfin，不连接生产 MF / 云盘。
 
 需要核验插件与 MF 的请求契约时，设置 `MEDIAFLUX_DELETE_CONTRACT_DIR` 后运行上述验证脚本，再用 MF 测试环境执行：
 
@@ -96,4 +106,4 @@ DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 ```
 
-脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.4.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。
+脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.5.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。

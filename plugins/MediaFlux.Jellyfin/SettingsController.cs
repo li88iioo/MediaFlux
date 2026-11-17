@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using MediaBrowser.Common.Api;
+using MediaBrowser.Controller.Entities;
 using MediaFlux.Jellyfin.Configuration;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -23,6 +24,7 @@ public sealed class SettingsController(Plugin plugin, MfClient mf) : ControllerB
             c.Enabled = request.Enabled; c.MfUrl = request.MfUrl; c.Username = request.Username;
             if (!string.IsNullOrEmpty(request.Password)) c.Password = request.Password;
             c.TaskTimeoutSeconds = request.TaskTimeoutSeconds;
+            c.StrmFastStart = request.StrmFastStart;
             plugin.UpdateConfiguration(c);
             return View();
         }
@@ -58,7 +60,8 @@ public sealed class SettingsController(Plugin plugin, MfClient mf) : ControllerB
         var c = plugin.Snapshot();
         return new SettingsView(c.Enabled, c.MfUrl, c.Username, c.Password.Length > 0,
             Plugin.ActiveMappings(c).Mappings, c.MfLibraries,
-            c.TaskTimeoutSeconds, c.SyncedAtUtc, Plugin.CacheCurrent(c), plugin.LastDeleteError, Plugin.CompiledBaseline, Plugin.SourceCheckedVersions);
+            c.TaskTimeoutSeconds, c.SyncedAtUtc, Plugin.CacheCurrent(c), plugin.LastDeleteError, Plugin.CompiledBaseline, Plugin.SourceCheckedVersions,
+            c.StrmFastStart, BaseItem.MediaSourceManager is StrmProbeMediaSourceManager);
     }
 
     private static ObjectResult Error(PluginFault e) => new(new MessageReply(e.Message)) { StatusCode = e.StatusCode };
@@ -73,6 +76,7 @@ public sealed class SettingsRequest
     [JsonPropertyName("username")] public string Username { get; set; } = "";
     [JsonPropertyName("password")] public string? Password { get; set; }
     [JsonPropertyName("task_timeout_seconds")] public int TaskTimeoutSeconds { get; set; } = 120;
+    [JsonPropertyName("strm_fast_start")] public bool StrmFastStart { get; set; }
 }
 
 public sealed record SettingsView(
@@ -87,4 +91,7 @@ public sealed record SettingsView(
     [property: JsonPropertyName("cache_current")] bool CacheCurrent,
     [property: JsonPropertyName("last_delete_error")] string LastDeleteError,
     [property: JsonPropertyName("compiled_baseline")] string CompiledBaseline,
-    [property: JsonPropertyName("source_checked_versions")] string SourceCheckedVersions);
+    [property: JsonPropertyName("source_checked_versions")] string SourceCheckedVersions,
+    [property: JsonPropertyName("strm_fast_start")] bool StrmFastStart,
+    // 宿主未能接入包装层时开关不生效，设置页据此提示。
+    [property: JsonPropertyName("strm_fast_start_available")] bool StrmFastStartAvailable);

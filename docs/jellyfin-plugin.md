@@ -1,4 +1,4 @@
-# Jellyfin 插件：MediaFlux 云端删除联动
+# Jellyfin 插件：MediaFlux 云端删除联动与 STRM 起播加速
 
 ## 功能与范围
 
@@ -14,8 +14,8 @@
 
 ### 支持范围与边界
 
-- 已验证平台：**Jellyfin 12.2 / 12.3，.NET 10**。官方源码分别为 `v12.2` / `v12.3`；插件仍以 NuGet `Jellyfin.Controller`／`Jellyfin.Model` **12.2.0** 编译，TFM 为 `net10.0`。最低 ABI 不是只允许一个小版本；12.3 不再被误拦截。未来版本仍需独立验收，跨主版本不直接放行。
-- 插件版本：**0.1.4**（清单版本 `0.1.4.0`），`targetAbi=12.2.0.0`；插件 GUID 保持不变。
+- 已验证平台：**Jellyfin 12.2 / 12.3 / 12.4，.NET 10**。官方源码分别为 `v12.2` / `v12.3` / `v12.4`；插件仍以 NuGet `Jellyfin.Controller`／`Jellyfin.Model` **12.2.0** 编译，TFM 为 `net10.0`。最低 ABI 不是只允许一个小版本；12.3 不再被误拦截。未来版本仍需独立验收，跨主版本不直接放行。
+- 插件版本：**0.1.5**（清单版本 `0.1.5.0`），`targetAbi=12.2.0.0`；插件 GUID 保持不变。
 - 支持 MF 纳管的光鸭 **电影／单集／整季／整剧／明确文件夹**，以及明确选择多项的原生批量删除；最多 1000 个 STRM，目录文件清单另有规模限制。
 - 删除独立电影（含 NSFW 作品）时，若原生删除拥有该作品目录且云端没有未选择的视频，会回收视频、NFO、字幕、图片等目录内容，最终回收空作品目录。
 - 删除单集时，只回收该集视频和明确同名的伴随文件（包括语言字幕、NFO、缩略图），保留其他集、`tvshow.nfo`、共享海报等。最后一集删除不等于整剧授权，仍有共享素材时保留目录。
@@ -29,6 +29,20 @@
 - 不清空回收站，不删除媒体库根、配置来源根或归档根。不扩大到所选媒体范围以外，也不把“同目录”直接等同于“同一集伴随文件”。目录出现新增内容或状态不明时保留，实际结果记录在 MF 任务及删除审计中。
 - 本地文件由 Jellyfin 原生删除；MF 只退役本次已确认回收对象的 STRM／元数据索引并取消对应元数据下载任务，不再为此扫描整个 STRM 来源或反向刷新 Jellyfin。确认云任务成功后，插件仍复验原生范围，防止等待期间出现的新媒体被连带删除。
 - 同一云端文件若还被本次选择之外的 MF STRM 索引引用，MF 会拒绝删除，避免破坏其他来源。
+
+## STRM 起播加速
+
+Jellyfin 每次为 `.strm` 返回播放信息（PlaybackInfo）时，都会对 STRM 内的远程地址完整刷新元数据并用 ffprobe 探测，即使库里已保存音视频流；普通视频文件只在缺少媒体流时才探测。STRM 指向 MediaFlux 播放地址时，每次起播都要先解析网盘直链、读取片源头部，通常多等 1–2 秒。
+
+开启“启用 STRM 起播加速”后：
+
+- 已探测过、`.strm` 内容未变且库里有音视频流的条目，播放时不再远程探测，直接使用已保存的媒体信息；直接播放、转码判断和其余流程仍由 Jellyfin 原样处理。
+- 新入库的 `.strm`，以及洗版等原因内容被改写的 `.strm`，在入库扫描结束后由后台逐个预探测一次（串行，每次间隔 1 秒），首次播放也不必等待。
+- 存量 `.strm` 不批量补探，首次播放时由 Jellyfin 探测一次，之后即可加速；避免集中请求网盘直链。重建媒体库等一次新增大量条目时，待预探测超过 200 个的部分同样留到首次播放。
+- 判断“内容未变”使用 `.strm` 原始字节的 SHA256，记录保存在 Jellyfin 插件配置目录的 `MediaFlux.Jellyfin.strm-probe.tsv`，重启后仍然有效；删除条目时同步移除。删除该文件只会让各条目下次播放时重新探测一次。
+- 该开关独立于联动删除，不需要 MediaFlux 连接，保存后立即生效；关闭后恢复 Jellyfin 原生行为。
+- 只作用于视频 `.strm`；普通文件、音乐 `.strm` 和直播源保持原生行为。
+- 如果设置页提示“未能接入起播加速”，说明当前 Jellyfin 的服务注册方式与插件不兼容，开关不会生效，请安装与 Jellyfin 版本匹配的插件后重启。
 
 ## 安装
 
@@ -50,7 +64,7 @@
 ### 离线安装
 
 1. 停止 Jellyfin，备份插件配置。
-2. 解压 `MediaFlux.Jellyfin-0.1.4.0.zip` 到 Jellyfin **数据目录**下的 `plugins/MediaFlux/`。目录内直接包含 `MediaFlux.Jellyfin.dll`、`meta.json`、`logo.png`、README 和 LICENSE。升级时替换原插件目录内容，不要并排保留两份 DLL；保留独立的插件 XML 配置。
+2. 解压 `MediaFlux.Jellyfin-0.1.5.0.zip` 到 Jellyfin **数据目录**下的 `plugins/MediaFlux/`。目录内直接包含 `MediaFlux.Jellyfin.dll`、`meta.json`、`logo.png`、README 和 LICENSE。升级时替换原插件目录内容，不要并排保留两份 DLL；保留独立的插件 XML 配置。
 3. 不要复制构建目录中的 Jellyfin、ASP.NET 或测试 DLL；宿主提供这些程序集。
 4. 重启 Jellyfin，进入管理后台 → 插件 → MediaFlux，按下述步骤配置。先用可恢复的测试条目验证。
 
@@ -121,13 +135,14 @@ HTTP 202 仅表示 MF 接收任务，不表示云端已删除。等待上限可�
   tests/test_guangya_active_download_delete.py tests/test_guangya_direct_delete.py
 ```
 
-插件验证脚本分别下载并构建**官方 Git tag `v12.2` / `v12.3` 的真实 LibraryController／PluginsController**，在 ASP.NET TestServer 中调用 HTTP 删除及配置路由。插件始终按 12.2.0 编译，测试宿主依赖随所测版本切换，用于检查同一插件程序集的兼容性：
+插件验证脚本分别下载并构建**官方 Git tag `v12.2` / `v12.3` / `v12.4` 的真实 LibraryController／PluginsController**，在 ASP.NET TestServer 中调用 HTTP 删除及配置路由。插件始终按 12.2.0 编译，测试宿主依赖随所测版本切换，用于检查同一插件程序集的兼容性：
 
 ```bash
 bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.2
 bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
+bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.4
 ```
 
-需要 .NET SDK **10.0.402**、curl、tar，以及 GitHub codeload／NuGet 网络；可用 `DOTNET_BIN=/path/to/dotnet` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定缓存目录。默认缓存位于 `.superpowers/tmp/jellyfin-plugin/`。发布工作流独立于主程序 Docker/FPK 发布，只由 `jellyfin-plugin-v*` 标签触发；先完成双版本测试和 ZIP 发布，再更新稳定仓库清单，保留历史版本与校验和。
+需要 .NET SDK **10.0.402**、curl、tar，以及 GitHub codeload／NuGet 网络；可用 `DOTNET_BIN=/path/to/dotnet` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定缓存目录。默认缓存位于 `.superpowers/tmp/jellyfin-plugin/`。发布工作流独立于主程序 Docker/FPK 发布，只由 `jellyfin-plugin-v*` 标签触发；先完成多版本测试和 ZIP 发布，再更新稳定仓库清单，保留历史版本与校验和。
 
 MF HTTP 响应、媒体库管理器及云端行为为隔离模拟，不连接生产。自动化验证不等于运行完整生产 Jellyfin 或实际删除云盘文件。安装到实际实例后仍应先用单个可恢复测试条目确认挂载、权限及云端回执，再扩大使用范围。
