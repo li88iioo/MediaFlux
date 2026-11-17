@@ -813,7 +813,41 @@
             syncFailureActions();
         }
     }
-    async function validateCron(){const value=cron.value.trim();const box=document.getElementById('cronPreview');if(!value){box.innerHTML='';box.style.display='none';return;}try{const response=await fetch('/api/strm/schedule/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cron:value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Cron 校验失败');box.style.display='inline-flex';if(data.valid){box.style.color='var(--accent)';box.style.borderColor='var(--accent-border)';box.style.background='var(--accent-soft)';box.innerHTML=`<i data-lucide="clock" style="width:13px;height:13px;"></i><span>下次运行：${esc(data.next_run)}</span>`;}else{box.style.color='var(--danger)';box.style.borderColor='var(--danger-border)';box.style.background='var(--danger-soft)';box.innerHTML=`<i data-lucide="alert-circle" style="width:13px;height:13px;"></i><span>格式无效：需要 5 段 cron 表达式</span>`;}}catch(error){box.style.display='inline-flex';box.style.color='var(--danger)';box.style.borderColor='var(--danger-border)';box.style.background='var(--danger-soft)';box.textContent=error.message||'Cron 校验失败';}window.renderLucideIcons?.(box);}
+    const cronPreview=document.getElementById('cronPreview');
+    const readCronDraft=()=>cron.value.trim();
+    const cronRequestGate=createDraftRequestGate(readCronDraft,()=>{cronPreview.textContent='';});
+    let cronDebounce;
+
+    async function validateCron(){
+        clearTimeout(cronDebounce);
+        const value=readCronDraft();
+        if(!value){
+            cronRequestGate.invalidate();
+            return;
+        }
+        const ticket=cronRequestGate.begin();
+        try{
+            const response=await fetch('/api/strm/schedule/validate',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({cron:value}),
+                signal:ticket.signal,
+            });
+            const data=await response.json();
+            if(!cronRequestGate.isCurrent(ticket))return;
+            if(!response.ok)throw new Error(data.error||'Cron 校验失败');
+            cronPreview.dataset.tone=data.valid?'success':'error';
+            cronPreview.innerHTML=data.valid
+                ? `<i data-lucide="clock"></i><span>下次运行：${esc(data.next_run)}</span>`
+                : '<i data-lucide="alert-circle"></i><span>格式无效：需要 5 段 cron 表达式</span>';
+        }catch(error){
+            if(!cronRequestGate.isCurrent(ticket)||error.name==='AbortError')return;
+            cronPreview.dataset.tone='error';
+            cronPreview.textContent=error.message||'Cron 校验失败';
+        }finally{
+            if(cronRequestGate.finish(ticket))window.renderLucideIcons?.(cronPreview);
+        }
+    }
 
     loadAppConfig().then(cfg=>{
         fillConfigFields(form,cfg);
@@ -902,7 +936,11 @@
     document.querySelectorAll('[data-ext-preset]').forEach(btn=>btn.addEventListener('click',()=>metadataTagInput.setTagsFromString(btn.dataset.extPreset)));
     document.querySelectorAll('[data-video-ext-preset]').forEach(btn=>btn.addEventListener('click',()=>videoTagInput.setTagsFromString(btn.dataset.videoExtPreset)));
 
-    let debounce;cron.addEventListener('input',()=>{clearTimeout(debounce);debounce=setTimeout(validateCron,350);});
+    cron.addEventListener('input',()=>{
+        clearTimeout(cronDebounce);
+        cronRequestGate.invalidate();
+        if(readCronDraft())cronDebounce=setTimeout(validateCron,350);
+    });
     document.getElementById('refreshStrmStatusBtn').addEventListener('click',()=>loadStatus());
     diagnosticRefreshBtn.addEventListener('click',loadIndexDiagnostics);
     diagnosticCleanupBtn.addEventListener('click',cleanupConfirmedTestIndexes);

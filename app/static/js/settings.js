@@ -5,30 +5,6 @@
     const lockModal=createAppModal(document.getElementById('tmdbLocksModal'));
     const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const isAbortError=error=>error?.name==='AbortError';
-    function createDraftRequestGate(readDraft,onInvalidate){
-        let generation=0;
-        let controller=null;
-        const fingerprint=()=>JSON.stringify(readDraft());
-        return {
-            begin(){
-                controller?.abort();
-                controller=new AbortController();
-                return {generation:++generation,fingerprint:fingerprint(),signal:controller.signal};
-            },
-            isCurrent(ticket){return ticket?.generation===generation&&ticket.fingerprint===fingerprint();},
-            finish(ticket){
-                if(!this.isCurrent(ticket))return false;
-                controller=null;
-                return true;
-            },
-            invalidate(){
-                generation+=1;
-                controller?.abort();
-                controller=null;
-                onInvalidate?.();
-            },
-        };
-    }
     function bindDraftInvalidation(fields,gate){
         fields.filter(Boolean).forEach(field=>{
             field.addEventListener('input',gate.invalidate);

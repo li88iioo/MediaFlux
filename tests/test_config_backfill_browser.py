@@ -39,6 +39,25 @@ READY = {
     "/rss": "typeof rssSubsLoaded !== 'undefined' && rssSubsLoaded === true",
     "/": "!!document.querySelector('[data-open-media-config]')",
 }
+# 让已取消的 HTTP 请求仍可完成，以便验证页面对迟到响应的判断。
+DELIVER_STALE_CRON_VALIDATIONS = """
+(() => {
+    const original = window.fetch.bind(window);
+    window.cronValidationResponses = [];
+    window.fetch = async (url, options) => {
+        if (url !== '/api/strm/schedule/validate') return original(url, options);
+        const response = await original(url, {...options, signal: undefined});
+        const expression = JSON.parse(options.body).cron;
+        const json = response.json.bind(response);
+        response.json = async () => {
+            const data = await json();
+            requestAnimationFrame(() => window.cronValidationResponses.push(expression));
+            return data;
+        };
+        return response;
+    };
+})();
+"""
 
 
 @unittest.skipIf(sync_playwright is None, "未安装 Playwright")
@@ -343,6 +362,46 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual([status for status, _ in self.config_posts], [400])
         self.assertEqual(page.locator('[data-key="STRM_SCHEDULE_CRON"]').input_value(), "   ")
         self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_strm_cron_preview_keeps_the_latest_generation_for_the_same_expression(self):
+        from playwright.sync_api import expect
+
+        self._write(STRM_SCHEDULE_CRON="0 4 * * *")
+        expression = "15 5 * * *"
+        latest = "2035-02-03 05:15:00"
+        held = []
+
+        def hold_expression(route):
+            if route.request.post_data_json["cron"] != expression:
+                route.fallback()
+            elif held:
+                route.fulfill(json={"valid": True, "next_run": latest})
+            else:
+                held.append(route)
+
+        self.context.add_init_script(DELIVER_STALE_CRON_VALIDATIONS)
+        self.context.route("**/api/strm/schedule/validate", hold_expression)
+        page = self._open("/guangya/strm#schedule")
+        cron = page.locator("#strmCron")
+        preview = page.locator("#cronPreview")
+        expect(preview).to_contain_text("下次运行")
+
+        def validates_expression(request):
+            return request.url.endswith("/schedule/validate") and request.post_data_json["cron"] == expression
+
+        with page.expect_request(validates_expression):
+            cron.fill(expression)
+        cron.fill("invalid cron")
+        expect(preview).to_contain_text("格式无效")
+        with page.expect_request(validates_expression):
+            cron.fill(expression)
+        expect(preview).to_contain_text(latest)
+        held.pop().fulfill(status=500, json={"error": "迟到的校验失败"})
+        page.wait_for_function(
+            "value => window.cronValidationResponses.filter(result => result === value).length === 2", arg=expression,
+        )
+        expect(preview).to_contain_text(latest)
+        self.assertEqual(cron.input_value(), expression)
 
     def test_offline_and_settings_use_the_shared_truth_values(self):
         self._write(

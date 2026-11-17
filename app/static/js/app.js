@@ -766,6 +766,33 @@
         return instance;
     };
 
+    window.createDraftRequestGate = function (readDraft, onInvalidate) {
+        let generation = 0;
+        let controller = null;
+        const fingerprint = () => JSON.stringify(readDraft());
+        return {
+            begin() {
+                controller?.abort();
+                controller = new AbortController();
+                return {generation: ++generation, fingerprint: fingerprint(), signal: controller.signal};
+            },
+            isCurrent(ticket) {
+                return ticket?.generation === generation && ticket.fingerprint === fingerprint();
+            },
+            finish(ticket) {
+                if (!this.isCurrent(ticket)) return false;
+                controller = null;
+                return true;
+            },
+            invalidate() {
+                generation += 1;
+                controller?.abort();
+                controller = null;
+                onInvalidate?.();
+            },
+        };
+    };
+
     window.loadAppConfig = async function ({signal} = {}) {
         const response = await fetch('/api/config', {signal});
         const data = await response.json();

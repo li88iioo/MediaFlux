@@ -414,16 +414,22 @@ class StrmStatusPollingLifecycleTests(unittest.TestCase):
 
 class SettingsDraftLifecycleTests(unittest.TestCase):
     def test_draft_gate_aborts_and_invalidates_stale_results(self):
+        app_source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
         source = (ROOT / "app/static/js/settings.js").read_text(encoding="utf-8")
         gate_block = _extract(
+            app_source, "    window.createDraftRequestGate =", "\n\n    window.loadAppConfig",
+        )
+        binding_block = _extract(
             source,
-            "    const isAbortError=",
+            "    function bindDraftInvalidation",
             "\n    const INDEXER_SITE_ORDER",
         )
         script = textwrap.dedent(
             f"""
             const assert = require('node:assert/strict');
+            const window = globalThis;
             {gate_block}
+            {binding_block}
             let draft = {{url: 'https://old.example'}};
             let invalidations = 0;
             const handlers = {{}};
@@ -817,6 +823,8 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
 
     def test_dashboard_config_requests_are_bound_to_modal_and_current_draft(self):
         source = (ROOT / "app/templates/dashboard.html").read_text(encoding="utf-8")
+        app_source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
+        secret_draft = _extract(app_source, "    window.readSecretDraft =", "\n\n    function enhanceSecretInput")
         block = _extract(
             source,
             "    const modalEl=document.getElementById('mediaConfigModal');",
@@ -836,7 +844,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               };
             }
             const urlField = control({key: 'JELLYFIN_URL'});
-            const tokenField = control({key: 'JELLYFIN_API_KEY'});
+            const tokenField = control({key: 'JELLYFIN_API_KEY', secretState: 'draft'});
             const state = {textContent: '', className: '', classList: {contains(name) {return state.className.split(/\\s+/).includes(name);}}};
             const detected = {textContent: '尚未识别', dataset: {}};
             const testButton = control({testMedia: 'jellyfin'});
@@ -895,7 +903,11 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             const collectConfigFields = () => pendingFields ? {JELLYFIN_URL: urlField.value} : {};
             const saveAppConfig = async () => ({});
             let resolveTest;
-            const fetch = () => new Promise(resolve => {resolveTest = resolve;});
+            let testPayload;
+            const fetch = (_url, options) => {
+              testPayload = JSON.parse(options.body);
+              return new Promise(resolve => {resolveTest = resolve;});
+            };
             let nextTimer = 0;
             const timers = new Map();
             const cancelledTimers = [];
@@ -907,6 +919,8 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             };
             """
             )
+            + secret_draft
+            + "\nconst {readSecretDraft} = window;\n"
             + block
             + textwrap.dedent(
                 """
@@ -928,6 +942,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               tokenField.value = 'token-a';
               const testRequest = testButton.handlers.click();
               await new Promise(setImmediate);
+              assert.equal(testPayload.token, 'token-a');
               urlField.value = 'https://changed';
               modalHandlers.input({target: urlField});
               resolveTest({ok: true, json: async () => ({server_name: 'Old', product: 'Jellyfin', version: '1', latency_ms: 2})});

@@ -1798,6 +1798,7 @@ globalThis.clearInterval=()=>{};
 globalThis.loadAppConfig=()=>new Promise(()=>{});
 globalThis.fillConfigFields=()=>{};
 globalThis.saveAppConfig=async()=>{};
+globalThis.createDraftRequestGate=()=>({});
 globalThis.openGuangYaDirectoryPicker=()=>{};
 globalThis.appConfirm=async()=>true;
 globalThis.__MEDIAFLUX_STRM_TEST_HOOK__=true;

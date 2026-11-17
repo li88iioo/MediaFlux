@@ -1196,6 +1196,7 @@ html[data-media-proxy-initial-tab="records"] #proxyTab_records { display: block 
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    min-height: 30px;
     margin-top: 8px;
     padding: 5px 10px;
     background: var(--accent-soft);
@@ -1204,7 +1205,11 @@ html[data-media-proxy-initial-tab="records"] #proxyTab_records { display: block 
     color: var(--accent);
     font-size: 12px;
     font-weight: 500;
+    line-height: 1.5;
 }
+.cron-preview-badge svg { width: 13px; height: 13px; flex-shrink: 0; }
+.cron-preview-badge[data-tone="error"] { color: var(--danger); border-color: var(--danger-border); background: var(--danger-soft); }
+.cron-preview-badge:empty { border-color: transparent; background: transparent; }
 .strm-field-header {
     display: flex;
     align-items: center;
