@@ -59,6 +59,39 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
+    def test_telegram_revocation_and_reenable_follow_the_effective_agent_switch(self):
+        self._write_raw(
+            AGENT_LLM_ENABLED="1", TG_AGENT_ENABLED="1", TG_NOTIFICATION_ENABLED="0",
+            TG_BOT_TOKEN="123:fixture-token", TG_CHAT_ID="456", TG_AGENT_ALLOWED_USER_IDS="9",
+        )
+        revoke = {"__clear_secrets": ["TG_BOT_TOKEN"], "TG_AGENT_ALLOWED_USER_IDS": ""}
+        refused = self.client.post("/api/config", json=revoke, headers=self.headers)
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("Bot Token", refused.json()["error"])
+
+        disabled = self.client.post("/api/config", json={"AGENT_LLM_ENABLED": "0", **revoke}, headers=self.headers)
+        self.assertEqual(disabled.status_code, 200)
+        self.assertEqual(config.get("TG_BOT_TOKEN"), "")
+        self.assertEqual(config.get("TG_AGENT_ALLOWED_USER_IDS"), "")
+        self.assertTrue(config.get_bool("TG_AGENT_ENABLED"))
+
+        for restore, missing in (({}, "Bot Token"), ({"TG_BOT_TOKEN": "123:fixture-token"}, "允许的用户 ID")):
+            with self.subTest(missing=missing):
+                refused = self.client.post(
+                    "/api/config", json={"AGENT_LLM_ENABLED": "1", **restore}, headers=self.headers,
+                )
+                self.assertEqual(refused.status_code, 400)
+                self.assertIn(missing, refused.json()["error"])
+                self.assertFalse(config.get_bool("AGENT_LLM_ENABLED"))
+                self.assertEqual(config.get("TG_BOT_TOKEN"), "")
+
+        enabled = self.client.post(
+            "/api/config", json={"AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "0"}, headers=self.headers,
+        )
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(config.get_bool("AGENT_LLM_ENABLED"))
+        self.assertFalse(config.get_bool("TG_AGENT_ENABLED"))
+
     def test_strm_extension_conflicts_reject_partial_and_default_updates_atomically(self):
         self._write_raw(STRM_VIDEO_EXTS="mkv,mp4", STRM_METADATA_EXTS="nfo,srt", STRM_METADATA_ENABLED="1")
         for updates in (

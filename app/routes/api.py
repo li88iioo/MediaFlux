@@ -229,12 +229,17 @@ def _normalize_telegram_agent_user_ids(value: Any) -> str:
     return ",".join(normalized)
 
 
-def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
+def _validate_telegram_agent_updates(
+    data: dict[str, Any], *, master_update: str | None,
+) -> dict[str, str]:
     relevant = {
         "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_NOTIFICATION_ENABLED",
         "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS",
     }
-    if not relevant & data.keys():
+    current_master = config.get_bool("AGENT_LLM_ENABLED", False)
+    current_telegram = config.get_bool("TG_AGENT_ENABLED", False)
+    reopening_telegram = master_update == "1" and not current_master and current_telegram
+    if not relevant & data.keys() and not reopening_telegram:
         return {}
 
     token_value = data.get("TG_BOT_TOKEN", _CONFIG_MASK)
@@ -268,9 +273,10 @@ def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
         updates["TG_AGENT_ENABLED"] = normalize_boolean(
             "TG_AGENT_ENABLED", data["TG_AGENT_ENABLED"]
         )
-    effective_enabled = (
+    master_enabled = current_master if master_update is None else master_update == "1"
+    effective_enabled = master_enabled and (
         updates["TG_AGENT_ENABLED"] == "1" if "TG_AGENT_ENABLED" in updates
-        else config.get_bool("TG_AGENT_ENABLED", False)
+        else current_telegram
     )
 
     if "TG_AGENT_ALLOWED_USER_IDS" in data:
@@ -1176,13 +1182,15 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 web_updates["ENV_WEB_PASSWORD"] = password
 
         try:
-            telegram_agent_updates = _validate_telegram_agent_updates(data)
             discovery_updates = _validate_discovery_updates(data)
             indexer_updates = _validate_indexer_updates(data)
             ai_recognition_updates = _validate_ai_recognition_updates(data)
             organize_tavily_updates = _validate_organize_tavily_updates(data)
             organize_policy_updates = _validate_organize_policy_updates(data)
             agent_llm_updates = _validate_agent_llm_updates(data)
+            telegram_agent_updates = _validate_telegram_agent_updates(
+                data, master_update=agent_llm_updates.get("AGENT_LLM_ENABLED"),
+            )
             episode_research_updates = _validate_agent_episode_research_updates(data)
             web_access_updates = _validate_web_access_updates(data)
             login_wallpaper_updates = _validate_login_wallpaper_updates(data)

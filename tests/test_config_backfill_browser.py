@@ -465,6 +465,7 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self._write(
             AGENT_LLM_ENABLED="0", AGENT_LIBRARY_PATROL_ENABLED="1", AGENT_RECOGNITION_REVIEW_ENABLED="1",
             AI_RECOGNITION_ENABLED="1", TG_AGENT_ENABLED="1", TG_NOTIFICATION_ENABLED="1",
+            TG_BOT_TOKEN="123:fixture-token", TG_CHAT_ID="-100", TG_AGENT_ALLOWED_USER_IDS="9",
             AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED="1",
             AGENT_LLM_API_URL="https://model.invalid/v1", AGENT_LLM_MODEL="fixture-model",
         )
