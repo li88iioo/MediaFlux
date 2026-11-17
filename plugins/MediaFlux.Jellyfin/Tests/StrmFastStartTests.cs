@@ -219,6 +219,16 @@ public sealed class StrmFastStartTests
         Assert.NotNull(Assert.Single(factory, d => d.ServiceType == typeof(IMediaSourceManager)).ImplementationFactory);
     }
 
+    [Fact]
+    public void WrapperLoadFailureOnlyDisablesFastStart()
+    {
+        // 宿主接口变化时包装类型加载失败：只放弃起播加速，不让注册异常停用整个插件；其它异常照常暴露。
+        Assert.False(PluginServiceRegistrator.TryWrap(() => throw new TypeLoadException("IMediaSourceManager changed")));
+        Assert.False(PluginServiceRegistrator.TryWrap(() => throw new MissingMethodException()));
+        Assert.Throws<InvalidOperationException>(() => PluginServiceRegistrator.TryWrap(() => throw new InvalidOperationException()));
+        Assert.True(PluginServiceRegistrator.TryWrap(() => true));
+    }
+
     private sealed class PreProbeHarness : IDisposable
     {
         public Harness H { get; } = new();

@@ -61,7 +61,8 @@ public sealed class SettingsController(Plugin plugin, MfClient mf) : ControllerB
         return new SettingsView(c.Enabled, c.MfUrl, c.Username, c.Password.Length > 0,
             Plugin.ActiveMappings(c).Mappings, c.MfLibraries,
             c.TaskTimeoutSeconds, c.SyncedAtUtc, Plugin.CacheCurrent(c), plugin.LastDeleteError, Plugin.CompiledBaseline, Plugin.SourceCheckedVersions,
-            c.StrmFastStart, BaseItem.MediaSourceManager is StrmProbeMediaSourceManager);
+            // 按类型名判断，不加载包装类型；宿主接口变化导致包装类型不可用时设置页仍能打开。
+            c.StrmFastStart, BaseItem.MediaSourceManager?.GetType().Name == nameof(StrmProbeMediaSourceManager));
     }
 
     private static ObjectResult Error(PluginFault e) => new(new MessageReply(e.Message)) { StatusCode = e.StatusCode };

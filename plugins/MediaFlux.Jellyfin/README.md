@@ -68,7 +68,7 @@ Jellyfin 在所选电影／单集中明确记录的 `AdditionalParts` 可一并�
 
 ## STRM 起播加速
 
-Jellyfin 12.2–12.4 的 `MediaSourceManager.GetPlaybackMediaSources` 对 `.strm` 无条件执行带远程探测的 `FullRefresh`，`MediaInfoHelper` 总以 `allowMediaProbe=true` 调用。插件服务注册晚于核心服务：`StrmProbeMediaSourceManager.Decorate` 取出按类型注册的官方单例，改由包装层提供 `IMediaSourceManager`，其余成员全部委托官方实现。宿主改为工厂 / 实例注册时不接管，设置接口返回 `strm_fast_start_available=false`。
+Jellyfin 12.2–12.4 的 `MediaSourceManager.GetPlaybackMediaSources` 对 `.strm` 无条件执行带远程探测的 `FullRefresh`，`MediaInfoHelper` 总以 `allowMediaProbe=true` 调用。插件服务注册晚于核心服务：`StrmProbeMediaSourceManager.Decorate` 取出按类型注册的官方单例，改由包装层提供 `IMediaSourceManager`，其余成员全部委托官方实现。宿主改为工厂 / 实例注册时不接管；新版宿主若改动 `IMediaSourceManager` 导致包装类型加载失败，`PluginServiceRegistrator.TryWrap` 只放弃起播加速，不让 Jellyfin 因注册异常把整个插件标记为故障。两种情况设置接口都返回 `strm_fast_start_available=false`（按类型名判断，不加载包装类型）。
 
 - 开关 `StrmFastStart` 默认关闭，在调用时读取（`IMediaSourceManager` 在插件实例创建前已被解析）。
 - 仅当条目是视频 `.strm`、`StrmProbeLedger` 中的指纹与当前 `.strm` 原始字节 SHA256 一致、且库内同时有音视频流时，以 `allowMediaProbe=false` 调用官方实现；否则照常探测，成功取得音视频流后记录指纹。
