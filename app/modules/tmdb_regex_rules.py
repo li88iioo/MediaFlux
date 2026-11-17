@@ -333,6 +333,12 @@ def _integer(value: Any, field: str, *, minimum: int, maximum: int) -> int:
     return result
 
 
+def _normalize_disabled(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _normalize(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError("规则必须是对象")
@@ -370,11 +376,6 @@ def _normalize(data: dict) -> dict:
             raise ValueError("电影规则不能设置季覆盖")
 
     priority = _integer(data.get("priority", 0), "优先级", minimum=-10_000, maximum=10_000)
-    disabled_raw = data.get("disabled", False)
-    if isinstance(disabled_raw, str):
-        disabled = disabled_raw.strip().lower() in {"1", "true", "yes", "on"}
-    else:
-        disabled = bool(disabled_raw)
     return {
         "name": name,
         "pattern": pattern,
@@ -383,8 +384,20 @@ def _normalize(data: dict) -> dict:
         "media_type": media_type,
         "season_override": season_override,
         "priority": priority,
-        "disabled": disabled,
+        "disabled": _normalize_disabled(data.get("disabled", False)),
     }
+
+
+def normalize_rule_update(data: dict, current: dict) -> dict:
+    """仅启停时保留业务行，整表单提交也使用同一状态更新。"""
+    if set(data) == {"disabled"}:
+        return {"disabled": _normalize_disabled(data["disabled"])}
+    rule = _normalize(data)
+    if "disabled" in data and all(
+        current[key] == value for key, value in rule.items() if key != "disabled"
+    ):
+        return {"disabled": rule["disabled"]}
+    return rule
 
 
 def _serialize(row: sqlite3.Row) -> dict:

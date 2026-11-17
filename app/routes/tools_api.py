@@ -648,22 +648,28 @@ def update_tmdb_regex_rule_api(
 ):
     require_api_login(request)
     try:
-        if tmdb_regex_rules.get_rule(rule_id) is None:
+        current = tmdb_regex_rules.get_rule(rule_id)
+        if current is None:
             return api_error("TMDB 强制匹配规则不存在", 404)
         payload = dict(data or {})
-        tmdb_regex_rules.preview_rule(payload, "", "", "movie")
         sample_filename = str(payload.pop("sample_filename", "") or "").strip()
         sample_parent_path = str(payload.pop("sample_parent_path", "") or "").strip()
+        changes = tmdb_regex_rules.normalize_rule_update(payload, current)
+        expected = {key: value for key, value in current.items() if key != "updated_at"}
+        if set(changes) == {"disabled"}:
+            return api_response(tmdb_regex_rules.update_rule(rule_id, changes, expected_snapshot=expected))
         verified = _validate_tmdb_regex_target(
-            payload, filename=sample_filename, parent_path=sample_parent_path,
+            changes, filename=sample_filename, parent_path=sample_parent_path,
         )
         if payload.get("media_type") == "any":
-            payload["media_type"] = verified["media_type"]
-        updated = tmdb_regex_rules.update_rule(rule_id, payload)
+            changes["media_type"] = verified["media_type"]
+        updated = tmdb_regex_rules.update_rule(rule_id, changes, expected_snapshot=expected)
         updated["verified_target"] = verified
         return api_response(updated)
     except TmdbRegexTargetUnavailable as exc:
         return api_error(str(exc), 503)
+    except tmdb_regex_rules.RuleConflict as exc:
+        return api_error(str(exc), 409)
     except ValueError as exc:
         status = 404 if "不存在" in str(exc) else 400
         return api_error(str(exc), status)

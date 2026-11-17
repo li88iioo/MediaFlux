@@ -506,6 +506,48 @@ class TmdbRegexRuleApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 404)
         validate.assert_not_called()
 
+    def test_existing_rule_can_change_status_offline_with_or_without_form_fields(self):
+        from app.modules import tmdb_regex_rules as rules
+        from app.routes import tools_api
+
+        form = self.payload(media_type="any", season_override=None)
+        rule = rules.create_rule(form)
+        with patch.object(tools_api, "require_api_login"), patch.object(
+            tools_api, "_validate_tmdb_regex_target",
+            side_effect=tools_api.TmdbRegexTargetUnavailable("TMDB 暂不可用"),
+        ) as validate:
+            response = tools_api.update_tmdb_regex_rule_api(
+                Mock(), rule["id"], {**form, "disabled": True, "sample_filename": "Api.Show.S01E01.mkv"},
+            )
+            self.assertEqual(response.status_code, 200)
+            saved = rules.get_rule(rule["id"])
+            assert saved is not None
+            self.assertTrue(saved["disabled"])
+            for key in form.keys() - {"disabled"}:
+                self.assertEqual(saved[key], rule[key])
+            response = tools_api.update_tmdb_regex_rule_api(Mock(), rule["id"], {"disabled": False})
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(rules.get_rule(rule["id"])["disabled"])
+            validate.assert_not_called()
+
+    def test_rule_content_and_target_changes_still_require_tmdb(self):
+        from app.modules import tmdb_regex_rules as rules
+        from app.routes import tools_api
+
+        rule = rules.create_rule(self.payload())
+        with patch.object(tools_api, "require_api_login"), patch.object(
+            tools_api, "_validate_tmdb_regex_target",
+            side_effect=tools_api.TmdbRegexTargetUnavailable("TMDB 暂不可用"),
+        ) as validate:
+            for change in ({"pattern": "New.Show"}, {"tmdb_id": "789"}):
+                with self.subTest(change=change):
+                    response = tools_api.update_tmdb_regex_rule_api(
+                        Mock(), rule["id"], self.payload(disabled=True, **change),
+                    )
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(rules.get_rule(rule["id"]), rule)
+            self.assertEqual(validate.call_count, 2)
+
     def test_create_any_rule_persists_the_sample_resolved_type(self):
         from app.routes import tools_api
 

@@ -459,11 +459,17 @@
         const state=document.getElementById('tmdbRegexRuleFormState');
         const button=document.getElementById('saveTmdbRegexRuleBtn');
         const id=document.getElementById('tmdbRegexRuleId').value;
+        const payload=regexRulePayload();
+        const original=regexRules.find(rule=>String(rule.id)===id);
+        const stateOnly=original&&payload.disabled!==original.disabled&&Object.entries(payload).every(
+            ([key,value])=>key==='disabled'||key.startsWith('sample_')||value===original[key],
+        );
         button.disabled=true;
-        state.textContent='正在校验并保存…';
+        state.textContent=stateOnly?'正在保存…':'正在校验并保存…';
         try{
-            if(document.getElementById('tmdbRegexSampleFilename').value.trim()&&!(await previewRegexRule()))throw new Error('样例校验未通过');
-            const response=await fetch(id?`/api/tools/tmdb-regex-rules/${id}`:'/api/tools/tmdb-regex-rules',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(regexRulePayload())});
+            if(!stateOnly&&payload.sample_filename&&!(await previewRegexRule()))throw new Error('样例校验未通过');
+            const body=stateOnly?{disabled:payload.disabled}:payload;
+            const response=await fetch(id?`/api/tools/tmdb-regex-rules/${id}`:'/api/tools/tmdb-regex-rules',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'规则保存失败');
             state.textContent=id?'规则已更新':'规则已创建';

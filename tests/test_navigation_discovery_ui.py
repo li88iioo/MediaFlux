@@ -404,6 +404,44 @@ class OrganizeRulesFirstPaintTests(unittest.TestCase):
         self.assertEqual(submissions[-1], {"expected_task_id": "task-b"})
         self.assertEqual(errors, [])
 
+    def test_forced_rule_status_saves_without_revalidating_the_filled_sample(self):
+        page, errors, _writes = self._page(width=390)
+        rule = {
+            "id": 7, "name": "Example rule", "pattern": "Example", "match_target": "filename",
+            "tmdb_id": "42", "media_type": "tv", "season_override": None, "priority": 40, "disabled": False,
+        }
+        updates = []
+        previews = []
+
+        def update(route):
+            updates.append(route.request.post_data_json)
+            rule.update(updates[-1])
+            route.fulfill(json=rule)
+
+        def preview(route):
+            previews.append(route.request.post_data_json)
+            route.fulfill(status=503, json={"error": "TMDB 暂不可用"})
+
+        page.route("**/api/tools/tmdb-regex-rules", lambda route: route.fulfill(json=[rule]))
+        page.route("**/api/tools/tmdb-regex-rules/7", update)
+        page.route("**/api/tools/tmdb-regex-rules/preview", preview)
+        page.goto("http://mediaflux.test/organize-rules")
+        page.locator("#openTmdbRegexRulesBtn").click()
+        page.get_by_role("button", name="编辑规则 Example rule").click()
+        page.locator("#tmdbRegexSampleFilename").fill("Example.S01E02.mkv")
+        page.locator("#tmdbRegexDisabled").select_option("1")
+        page.locator("#saveTmdbRegexRuleBtn").click()
+        page.locator('.tmdb-regex-rule-card[data-rule-id="7"].is-disabled').wait_for(state="attached")
+        self.assertEqual(updates, [{"disabled": True}])
+        self.assertEqual(previews, [])
+
+        page.locator("#tmdbRegexRulePattern").fill("Different")
+        page.locator("#saveTmdbRegexRuleBtn").click()
+        page.locator("#tmdbRegexSamplePreview").filter(has_text="TMDB 暂不可用").wait_for()
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(updates, [{"disabled": True}])
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()
