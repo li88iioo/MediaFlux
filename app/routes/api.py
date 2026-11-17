@@ -1466,9 +1466,6 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 "GY_ORGANIZE_NSFW_SOURCE_IDS",
                 media_workflow_updates["GY_ORGANIZE_NSFW_SOURCE_IDS"],
             )
-        from app.modules.local_media_service import LOCAL_MEDIA_RUNTIME_KEYS
-
-        local_media_keys = set(LOCAL_MEDIA_RUNTIME_KEYS) & updates.keys()
         previous_file_values = config.all_items()
         persisted_updates = {
             key: value
@@ -1547,7 +1544,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         changed_keys,
         background_services=bool(getattr(request.app.state, "background_services_enabled", False)),
         retired_source_ids=retired_source_ids,
-        retry_keys=local_media_keys,
+        retry_keys=updates.keys(),
     )
     logger.info(
         "配置保存完成 changed=%s persist_ms=%s total_ms=%s",

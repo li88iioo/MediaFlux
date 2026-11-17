@@ -829,6 +829,10 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
                 events.append("lock-exit")
 
         with patch.object(bot_handlers, "_lifecycle_control_lock", TrackingLock()), patch.object(
+            bot_handlers, "_bot_reload_pending", False,
+        ), patch.object(
+            bot_handlers, "_configuration_complete", return_value=True,
+        ), patch.object(
             bot_handlers,
             "_stop_bot_locked",
             side_effect=lambda **_kwargs: events.append("stop") or True,
@@ -845,7 +849,9 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         )
 
     def test_restart_does_not_start_new_generation_until_old_polling_exits(self):
-        with patch.object(bot_handlers, "_stop_bot_locked", return_value=False), patch(
+        with patch.object(bot_handlers, "_bot_reload_pending", False), patch.object(
+            bot_handlers, "_stop_bot_locked", return_value=False,
+        ), patch(
             "app.notifier.reset"
         ) as reset, patch.object(bot_handlers, "_start_bot_locked") as start:
             self.assertFalse(bot_handlers.restart_bot())

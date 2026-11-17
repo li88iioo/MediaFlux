@@ -61,6 +61,7 @@ _progress_recovery_thread: threading.Thread | None = None
 _progress_recovery_stop: threading.Event | None = None
 _lifecycle_lock = threading.RLock()
 _lifecycle_control_lock = threading.RLock()
+_bot_reload_pending = False
 # 整理与同步共用锁，保证串行
 _task_lock = threading.Lock()
 _sync_running = False
@@ -4153,8 +4154,6 @@ def _start_bot_locked() -> bool:
     with _lifecycle_lock:
         if _bot_thread and _bot_thread.is_alive():
             return False
-        if not _configuration_complete():
-            return False
         from app.bot.agent_adapter import AGENT_EXECUTOR
 
         if not AGENT_EXECUTOR.start():
@@ -4182,7 +4181,7 @@ def _start_bot_locked() -> bool:
 def start_bot() -> bool:
     """幂等启动 polling 线程，供 lifespan 和配置热更新调用。"""
     with _lifecycle_control_lock:
-        return _start_bot_locked()
+        return _configuration_complete() and _start_bot_locked()
 
 
 def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) -> bool:
@@ -4260,16 +4259,21 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
 
 def stop_bot(timeout: float = 5.0) -> bool:
     """停止 Telegram 长轮询，并汇总 polling、恢复与资源站 worker 的关停结果。"""
+    global _bot_reload_pending
     with _lifecycle_control_lock:
+        _bot_reload_pending = False
         return _stop_bot_locked(timeout=timeout)
 
 
-def restart_bot() -> bool:
-    """配置更新后原子地停止旧 polling、重置客户端并启动新代。"""
-    global _registered_bot_id, _command_menu_bot_id
+def restart_bot(*, only_if_pending: bool = False) -> bool:
+    """切换到最新设置。禁用时停止即完成，未完成的切换可再次保存重试。"""
+    global _registered_bot_id, _command_menu_bot_id, _bot_reload_pending
     from app.notifier import reset
 
     with _lifecycle_control_lock:
+        if only_if_pending and not _bot_reload_pending:
+            return True
+        _bot_reload_pending = True
         if not _stop_bot_locked(cancel_operations=False):
             logger.error("Telegram Bot 旧运行时尚未完全退出，已取消热重启")
             return False
@@ -4277,4 +4281,7 @@ def restart_bot() -> bool:
         with _lifecycle_lock:
             _registered_bot_id = None
             _command_menu_bot_id = None
-        return _start_bot_locked()
+        if _configuration_complete() and not _start_bot_locked():
+            return False
+        _bot_reload_pending = False
+        return True

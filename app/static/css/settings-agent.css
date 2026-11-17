@@ -2021,6 +2021,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     opacity: .72;
 }
 .settings-page .settings-savebar > span.is-success { color: var(--success); }
+.settings-page .settings-savebar > span.is-warning { color: var(--warning); }
 .settings-page .settings-savebar > span.is-error { color: var(--danger); }
 .settings-page .settings-savebar .btn {
     width: auto;

@@ -160,6 +160,7 @@ _RECOGNITION_WEB_RUNTIME_KEYS = ORGANIZE_TAVILY_KEYS | {
 _REVIEW_DISPATCHER_KEYS = AGENT_EPISODE_RESEARCH_KEYS | {
     "AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_NSFW_CLEAN_REVIEW_ENABLED",
 }
+_TELEGRAM_CONNECTION_KEYS = frozenset({"TG_BOT_TOKEN", "TG_CHAT_ID"})
 
 
 class _Reload:
@@ -178,14 +179,15 @@ def reload_runtime(
 ) -> tuple[list[str], bool]:
     """配置落盘后的唯一运行时刷新入口；Web 保存与 Agent 写入共用同一规则。
 
-    ``retry_keys`` 是值未变但已提交的键，只用于重试本地媒体运行时切换。
+    ``retry_keys`` 是页面提交的键，供支持原值重试的消费者使用。
     """
     keys = set(changed_keys) - config.RUNTIME_DISPLAY_ONLY_KEYS
+    submitted = set(retry_keys)
     outcome = _Reload()
     _refresh_recognition_caches(keys)
     _refresh_discovery_and_web(keys, outcome)
-    _refresh_local_media(keys | set(retry_keys), outcome)
-    _refresh_bot_and_agent(keys, outcome, background_services=background_services)
+    _refresh_local_media(keys | submitted, outcome)
+    _refresh_bot_and_agent(keys, outcome, background_services=background_services, submitted=submitted)
     _refresh_media_servers(keys, outcome, background_services=background_services)
     _refresh_schedulers(keys, outcome, background_services=background_services,
                         retired_source_ids=tuple(retired_source_ids))
@@ -269,26 +271,31 @@ def _refresh_local_media(keys: set[str], outcome: _Reload) -> None:
         outcome.warn("本地媒体配置已保存，但运行时切换失败；请重试或重启服务")
 
 
-def _refresh_bot_and_agent(keys: set[str], outcome: _Reload, *, background_services: bool) -> None:
-    if {"TG_BOT_TOKEN", "TG_CHAT_ID"} & keys:
+def _refresh_bot_and_agent(
+    keys: set[str], outcome: _Reload, *, background_services: bool, submitted: set[str],
+) -> None:
+    connection_changed = bool(_TELEGRAM_CONNECTION_KEYS & keys)
+    # 表单已保存的草稿会收起为掩码，同值再次保存可能提交空对象。
+    retry_connection = background_services and (not (keys or submitted) or bool(_TELEGRAM_CONNECTION_KEYS & submitted))
+    if connection_changed or retry_connection:
         started = time.perf_counter()
         try:
             if background_services:
                 from app.bot import restart_bot
 
-                if not restart_bot():
-                    outcome.warn("Telegram Bot 配置已保存，但旧连接未及时退出；请稍后重试或重启 MediaFlux 服务")
-                    logger.warning("Telegram Bot 配置热更新未完成：旧 polling 仍在退出")
+                if not restart_bot(only_if_pending=not connection_changed):
+                    outcome.warn("Telegram Bot 配置已保存，运行时切换尚未完成。请稍后再次保存或重启 MediaFlux。")
             else:
                 from app.notifier import reset
 
                 reset()
         except Exception as exc:
-            outcome.warn("Telegram Bot 配置已保存，但运行中实例热更新失败；请稍后重试或重启 MediaFlux 服务")
+            outcome.warn("Telegram Bot 配置已保存，但运行中实例热更新失败。请稍后再次保存或重启 MediaFlux。")
             logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
         finally:
-            logger.info("Telegram Bot 配置热更新 ms=%s", max(1, round((time.perf_counter() - started) * 1000)))
-    elif background_services and {"AGENT_LLM_ENABLED", "TG_AGENT_ENABLED"} & keys:
+            if connection_changed:
+                logger.info("Telegram Bot 配置热更新 ms=%s", max(1, round((time.perf_counter() - started) * 1000)))
+    if not connection_changed and background_services and {"AGENT_LLM_ENABLED", "TG_AGENT_ENABLED"} & keys:
         try:
             from app.bot.handlers import request_command_menu_refresh
 

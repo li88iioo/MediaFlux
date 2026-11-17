@@ -235,8 +235,10 @@
             if(panel.dataset.settingsPanel==='downloads')syncTelemetryWidgets();
             const hasPendingChanges=result?.__hasPendingConfigChanges===true
                 || Object.keys(collectConfigFields(panel)).length>0;
-            state.className=hasPendingChanges?'':'is-success';
-            state.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':'当前分区已保存';
+            const reloadPending=panel.dataset.settingsPanel==='telegram'&&result?.restart_required===true;
+            state.className=hasPendingChanges?'':reloadPending?'is-warning':'is-success';
+            state.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改'
+                :reloadPending?'配置已保存，等待生效':'当前分区已保存';
             if(isDoubanDiscoverySave&&saveGeneration===doubanDbcl2StatusGeneration&&isSavedDoubanDbcl2State())refreshDoubanDbcl2Status();
         }
         catch(error){state.className='is-error';state.textContent=error.message;}

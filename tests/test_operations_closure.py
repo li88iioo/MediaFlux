@@ -5,6 +5,7 @@ from starlette.requests import Request
 import os
 import threading
 from contextlib import ExitStack
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -50,8 +51,8 @@ def services():
             assert web.close()
 
 
-def save(values):
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(background_services_enabled=False)))
+def save(values, *, background_services=False):
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(background_services_enabled=background_services)))
     return api.save_config(cast(Request, request), values)
 
 
@@ -229,6 +230,7 @@ def bot_stopped():
     with ExitStack() as stack:
         for name in ("_bot", "_bot_thread", "_bot_thread_stop", "_progress_recovery_thread", "_progress_recovery_stop"):
             stack.enter_context(patch.object(handlers, name, None))
+        stack.enter_context(patch.object(handlers, "_bot_reload_pending", False))
         agent_stop = stack.enter_context(patch.object(AGENT_EXECUTOR, "stop", return_value=True))
         yield handlers, agent_stop
 
@@ -242,17 +244,65 @@ def test_bot_stop_includes_indexer_outcome_without_changing_agent_cancellation(b
     agent_stop.assert_called_once_with(timeout=0.1, cancel_queries=True)
 
 
-@pytest.mark.parametrize("finished", [False, True])
-def test_bot_restart_requires_indexer_shutdown_and_preserves_cancel_false(bot_stopped, finished):
+@pytest.mark.parametrize("finished, configured", [(False, True), (True, True), (True, False)])
+def test_bot_restart_requires_indexer_shutdown_and_preserves_cancel_false(bot_stopped, finished, configured):
     handlers, agent_stop = bot_stopped
     with (
         patch("app.modules.telegram_resource_search.shutdown_telegram_indexer_worker", return_value=finished),
+        patch.object(handlers, "_configuration_complete", return_value=configured),
         patch.object(handlers, "_start_bot_locked", return_value=True) as start,
         patch("app.notifier.reset") as reset,
     ):
         assert handlers.restart_bot() is finished
     agent_stop.assert_called_once_with(timeout=5.0, cancel_queries=False)
-    assert start.call_count == reset.call_count == int(finished)
+    assert reset.call_count == int(finished)
+    assert start.call_count == int(finished and configured)
+
+
+def test_bot_reload_retries_the_saved_config_after_old_polling_thread_exits(bot_stopped):
+    handlers, _agent_stop = bot_stopped
+    release = threading.Event()
+    stop_requested = threading.Event()
+    old_polling = threading.Thread(target=release.wait, daemon=True)
+    old_polling.start()
+    try:
+        with (
+            initialized_web_runtime(),
+            patch.object(api, "require_api_login"),
+            patch.object(handlers, "_bot_thread", old_polling),
+            patch.object(handlers, "_bot_thread_stop", stop_requested),
+            patch.object(handlers, "_stop_bot_locked", wraps=partial(handlers._stop_bot_locked, timeout=0.02)),
+            patch.object(handlers, "_start_bot_locked", side_effect=lambda: config.get("TG_BOT_TOKEN") == "123:replacement") as start,
+            patch("app.notifier.reset") as reset,
+            patch("app.modules.telegram_resource_search.shutdown_telegram_indexer_worker", return_value=True),
+        ):
+            config.set_and_save({"TG_BOT_TOKEN": "123:old", "TG_CHAT_ID": "456"})
+            update = {"TG_BOT_TOKEN": "123:replacement"}
+            first = save(update, background_services=True)
+            assert first["success"] and first["restart_required"] and first["warnings"]
+            assert config.get("TG_BOT_TOKEN") == update["TG_BOT_TOKEN"]
+            assert stop_requested.is_set() and old_polling.is_alive()
+
+            unchanged = save(update, background_services=True)
+            assert unchanged["restart_required"]
+            start.assert_not_called()
+            reset.assert_not_called()
+
+            release.set()
+            old_polling.join(timeout=2)
+            assert not old_polling.is_alive()
+            assert save({}, background_services=True) == {"success": True}
+            assert save({}, background_services=True) == {"success": True}
+            start.assert_called_once_with()
+            reset.assert_called_once_with()
+
+            assert save({"__clear_secrets": ["TG_BOT_TOKEN"]}, background_services=True) == {"success": True}
+            assert config.get("TG_BOT_TOKEN") == ""
+            start.assert_called_once_with()
+            assert reset.call_count == 2
+    finally:
+        release.set()
+        old_polling.join(timeout=2)
 
 
 def test_bot_stop_rejects_real_worker_until_retry_finishes(bot_stopped):
