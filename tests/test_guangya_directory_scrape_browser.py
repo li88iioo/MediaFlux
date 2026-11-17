@@ -6,6 +6,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from jinja2 import Environment, FileSystemLoader, nodes
+
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover - 由显式 system python3 门禁执行
@@ -20,6 +22,7 @@ APP_MODAL_SCRIPT = APP_SOURCE[
 ]
 POSITION_SCRIPT = (ROOT / "app/static/js/media-scrape-position.js").read_text("utf-8")
 SCRIPT = (ROOT / "app/static/js/guangya-directory-scrape.js").read_text("utf-8")
+MAIN_STYLES = (ROOT / "app/static/css/main.css").read_text("utf-8")
 STYLES = (ROOT / "app/static/css/guangya-directory-scrape.css").read_text("utf-8")
 HARNESS = textwrap.dedent(
     """
@@ -64,35 +67,7 @@ HARNESS = textwrap.dedent(
             <button type="button" role="menuitem" data-scrape-action="auto">auto</button>
             <button type="button" role="menuitem" data-browser-action="delete-item" hidden>delete</button>
         </div>
-        <div id="gyScrapeModal" hidden>
-            <button id="gyScrapeCloseBtn"></button>
-            <button id="gyScrapeCancelBtn"></button>
-            <button id="gyScrapeRunBtn"><span></span></button>
-            <button id="gyScrapeSearchBtn"><span></span></button>
-            <button id="gyScrapeExternalBtn"><span>豆瓣 / BGM 线索</span></button>
-            <input id="gyScrapeQuery">
-            <select id="gyScrapeType">
-                <option value="auto">auto</option>
-                <option value="movie">movie</option>
-                <option value="tv">tv</option>
-            </select>
-            <div id="gyScrapeEpisodeFields" hidden>
-                <label id="gyScrapeSeasonField"><input id="gyScrapeSeason" type="number"></label>
-                <label id="gyScrapeEpisodeField"><input id="gyScrapeEpisode" type="number"></label>
-            </div>
-            <div id="gyScrapeDirectory"></div>
-            <div id="gyScrapeInspection" data-state="ready">
-                <div id="gyScrapeInspectionSummary"></div>
-                <div id="gyScrapeInspectionHint"></div>
-            </div>
-            <div id="gyScrapeCandidates"></div>
-            <div id="gyScrapeExternalHints" hidden></div>
-            <div id="gyScrapeCandidateCount"></div>
-            <div id="gyScrapeDetail"></div>
-            <div id="gyScrapeStatus"></div>
-            <div id="gyScrapeArchiveTarget"></div>
-            <div id="gyScrapePlanSummary"></div>
-        </div>
+        __SCRAPE_MODAL__
     </main>
     """
 )
@@ -103,6 +78,14 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        env = Environment(loader=FileSystemLoader(str(ROOT / "app/templates")), autoescape=True)
+        template = env.parse((ROOT / "app/templates/guangya.html").read_text("utf-8"))
+        assignment = next(node for node in template.find_all(nodes.Assign)
+                          if getattr(node.target, "name", "") == "media_scrape")
+        assert isinstance(assignment.node, nodes.Expr)
+        cls.modal_markup = env.get_template("_media_scrape_modal.html").render(
+            media_scrape=assignment.node.as_const(),
+        )
         cls.browser_path = next(
             (
                 path
@@ -137,10 +120,12 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         super().tearDownClass()
 
     def setUp(self):
-        self.page = self.browser.new_page(viewport={"width": 800, "height": 600})
+        self.page = self.browser.new_page(viewport={"width": 1280, "height": 900})
         self.page_errors: list[str] = []
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
-        self.page.set_content(HARNESS)
+        self.page.set_content(HARNESS.replace("__SCRAPE_MODAL__", self.modal_markup))
+        self.page.add_style_tag(content=MAIN_STYLES)
+        self.page.add_style_tag(content=STYLES)
         self.page.evaluate(
             """
             () => {
@@ -343,6 +328,16 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self._hold_scrape_replies('/preview')
         self._open_manual_directory()
         candidate = self.page.locator('.gy-scrape-candidate').first
+        # 列表操作按钮即使恰好位于候选下方，也不能盖住弹窗。
+        self.assertTrue(candidate.evaluate("""node => {
+            const box = node.getBoundingClientRect();
+            const x = box.x + box.width / 2;
+            const y = box.y + box.height / 2;
+            const action = document.querySelector('.test-action');
+            action.style.left = `${x - 10}px`;
+            action.style.top = `${y - 10}px`;
+            return node.contains(document.elementFromPoint(x, y));
+        }"""))
         candidate.click()
         self.assertEqual(self.page.locator('#gyScrapeDetail').get_attribute('aria-busy'), 'true')
         self.assertEqual(self.page.locator('#gyScrapeDetail .is-spinning').count(), 1)
@@ -800,20 +795,12 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.assertEqual(self.page_errors, [])
 
     def test_directory_search_shares_control_row_at_mobile_and_desktop_widths(self):
-        from jinja2 import Environment, FileSystemLoader, nodes
-        env = Environment(loader=FileSystemLoader(str(ROOT / "app/templates")), autoescape=True)
-        template = env.parse((ROOT / "app/templates/guangya.html").read_text("utf-8"))
-        assignment = next(node for node in template.find_all(nodes.Assign)
-                          if getattr(node.target, "name", "") == "media_scrape")
-        assert isinstance(assignment.node, nodes.Expr)
-        options = assignment.node.as_const()
-        markup = env.get_template("_media_scrape_modal.html").render(media_scrape=options)
         for width in (320, 390, 650, 760, 1280):
             with self.subTest(width=width):
                 page = self.browser.new_page(viewport={"width": width, "height": 900})
                 try:
-                    page.set_content('<html data-theme="light"><body>' + markup + '</body></html>')
-                    page.add_style_tag(content=(ROOT / "app/static/css/main.css").read_text("utf-8"))
+                    page.set_content('<html data-theme="light"><body>' + self.modal_markup + '</body></html>')
+                    page.add_style_tag(content=MAIN_STYLES)
                     page.add_style_tag(content=STYLES)
                     page.add_style_tag(content="*, *::before, *::after { animation: none !important; transition: none !important; }")
                     page.add_script_tag(path=str(ROOT / "app/static/js/lucide.min.js"))
