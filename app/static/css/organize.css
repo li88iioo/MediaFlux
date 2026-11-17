@@ -887,6 +887,15 @@ html[data-organize-rules-initial-tab="delivery"] #organizeRulesNav [data-tab-tar
     grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+/* 同行卡片按最高者等高；说明紧跟标题，不被推到卡片底部。 */
+.organize-rules-page .organize-toggle-tile {
+    justify-content: flex-start;
+}
+
+.organize-rules-page .organize-field-card input[type="number"] {
+    max-width: 200px;
+}
+
 .organize-rules-page .organize-hint-switches {
     margin-bottom: 10px;
 }

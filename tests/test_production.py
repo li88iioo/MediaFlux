@@ -5763,7 +5763,7 @@ class SecurityTests(InitializedWebTestCase):
             stylesheet,
         )
         self.assertIn(
-            ".settings-section.offline-settings-section { min-width: 0; height: 100%; margin: 0; padding: 22px;",
+            ".settings-section.offline-settings-section { min-width: 0; height: auto; margin: 0; padding: 22px;",
             stylesheet,
         )
         self.assertIn('class="strm-section-head"', strm.text)
