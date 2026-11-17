@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unicodedata
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from datetime import datetime, timedelta
@@ -262,9 +263,14 @@ def get_media_subscription(subscription_id: int, *, include_deleted: bool = Fals
         ).fetchone()
 
 
+def _subscription_title_key(title: str | None) -> str:
+    return unicodedata.normalize("NFKC", title or "").casefold()
+
+
 def list_media_subscriptions(
     *, status: str = "", enabled: bool | None = None, limit: int = 200, offset: int = 0,
     before: tuple[str, int] | None = None,
+    title_query: str = "",
 ) -> list[sqlite3.Row]:
     clauses: list[str] = ["deleted_at IS NULL"]
     params: list[Any] = []
@@ -274,12 +280,20 @@ def list_media_subscriptions(
     if enabled is not None:
         clauses.append("enabled=?")
         params.append(int(enabled))
+    title_key = _subscription_title_key(title_query).strip()
+    if title_key:
+        clauses.append(
+            "(instr(mediaflux_title_key(title),?)>0 OR instr(mediaflux_title_key(original_title),?)>0)"
+        )
+        params.extend((title_key, title_key))
     if before is not None:
         clauses.append("(updated_at<? OR (updated_at=? AND id<?))")
         params.extend((before[0], before[0], before[1]))
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend((max(1, min((limit or 200), 500)), max(0, (offset or 0))))
     with get_conn() as conn:
+        if title_key:
+            conn.create_function("mediaflux_title_key", 1, _subscription_title_key, deterministic=True)
         return conn.execute(
             f"SELECT * FROM media_subscriptions{where} ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?",
             params,

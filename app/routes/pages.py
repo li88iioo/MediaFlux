@@ -317,6 +317,12 @@ def guangya_more(request: Request, view: str = "share"):
     )
 
 
+def _subscription_link_id(value: str) -> str:
+    if re.fullmatch(r"[1-9][0-9]{0,18}", value) and int(value) <= 2**63 - 1:
+        return value
+    return ""
+
+
 @router.get("/rss", name="pages.rss")
 def rss(request: Request):
     from app.modules.offline import OfflineRules
@@ -328,6 +334,8 @@ def rss(request: Request):
         "rss.html",
         "rss",
         resource_results_enabled=config.get_bool("INDEXER_SEARCH_ENABLED"),
+        media_subscription_id=_subscription_link_id(request.query_params.get("media_subscription_id", "")),
+        rss_subscription_id=_subscription_link_id(request.query_params.get("subscription_id", "")),
         rss_subscription_defaults=RSS_SUBSCRIPTION_DEFAULTS,
         rss_inherited_dir_id=offline.target_dir_id if config.get("OFFLINE_TARGET_DIR", config.get("RSS_GY_TARGET_DIR")).strip() else "",
         rss_inherited_dir_name="根目录" if offline.target_dir_id == "0" else offline.target_dir_name,

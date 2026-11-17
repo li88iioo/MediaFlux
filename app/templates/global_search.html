@@ -30,7 +30,7 @@
     {% if search_error %}
     <section class="media-hub-notice is-error"><i data-lucide="circle-alert"></i><div><strong>无法执行搜索</strong><span>{{ search_error }}</span></div></section>
     {% elif not result.query %}
-    <section class="media-hub-empty media-hub-search-empty"><span><i data-lucide="search"></i></span><strong>输入关键词开始搜索</strong><p>一次检索媒体库、探索结果、RSS 订阅、下载任务和整理记录。</p></section>
+    <section class="media-hub-empty media-hub-search-empty"><span><i data-lucide="search"></i></span><strong>输入关键词开始搜索</strong><p>一次检索媒体库、探索结果、媒体追更与 RSS 订阅、下载任务和整理记录。</p></section>
     {% else %}
     {% if top_match %}
     <section class="global-top-hit" data-global-search-section="media">
@@ -76,21 +76,22 @@
     </section>
 
     <div class="global-automation-grid">
-        {% set rss_section = section_map.get('rss', {}) %}
+        {% set subscriptions_section = section_map.get('rss', {}) %}
         <section class="global-automation-panel is-subscriptions" data-global-search-section="rss">
-            <header class="global-module-head"><div><i data-lucide="rss"></i><strong>订阅规则</strong><span>{{ counts.rss }}</span></div><a href="{{ rss_section.get('target_url', url_for('pages.rss')) }}">管理订阅<i data-lucide="chevron-right"></i></a></header>
+            <header class="global-module-head"><div><i data-lucide="rss"></i><strong>订阅</strong><span>{{ counts.rss }}</span></div><a href="{{ subscriptions_section.get('target_url', url_for('pages.rss')) }}">管理订阅<i data-lucide="chevron-right"></i></a></header>
             <div class="global-automation-body">
-                {% if rss_section.get('error') %}<div class="media-hub-section-state is-error"><i data-lucide="triangle-alert"></i><span>{{ rss_section.error }}</span></div>{% elif rss_section.get('items') %}
+                {% if subscriptions_section.get('error') %}<div class="media-hub-section-state is-error"><i data-lucide="triangle-alert"></i><span>{{ subscriptions_section.error }}</span></div>{% endif %}
+                {% if subscriptions_section.get('items') %}
                 <div class="global-subscription-list">
-                    {% for item in rss_section['items'] %}
+                    {% for item in subscriptions_section['items'] %}
                     <a class="global-subscription-card" href="{{ item.url }}">
-                        <span class="global-subscription-icon"><i data-lucide="rss"></i></span>
-                        <span class="global-subscription-copy"><strong>{{ item.title }}</strong><small>{{ item.parser }}</small><span>{% for rule in item.rules %}<em>{{ rule }}</em>{% endfor %}</span></span>
+                        <span class="global-subscription-icon"><i data-lucide="{{ 'clapperboard' if item.subscription_type == 'media' else 'rss' }}"></i></span>
+                        <span class="global-subscription-copy"><strong title="{{ item.title }}">{{ item.title }}</strong><small>{{ item.source_label }}</small><span>{% for rule in item.rules %}<em>{{ rule }}</em>{% endfor %}</span></span>
                         <b class="{{ 'is-running' if item.enabled else '' }}"><i></i>{{ '运行中' if item.enabled else '已停用' }}</b>
                     </a>
                     {% endfor %}
                 </div>
-                {% else %}<div class="media-hub-section-state"><span class="media-hub-state-icon"><i data-lucide="rss"></i></span><span><strong>订阅区安静待命</strong><small>当前关键词未命中订阅规则。</small></span></div>{% endif %}
+                {% elif not subscriptions_section.get('error') %}<div class="media-hub-section-state"><span class="media-hub-state-icon"><i data-lucide="rss"></i></span><strong>没有匹配的订阅</strong></div>{% endif %}
             </div>
         </section>
 

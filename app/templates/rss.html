@@ -60,7 +60,8 @@
                 <p>按 TMDB 身份核对 Jellyfin / Emby 库存，只搜索已播且缺失的内容。</p>
             </div>
             <div class="subscription-panel-actions">
-                <select class="form-select" id="mediaSubscriptionStatus" aria-label="媒体订阅状态筛选">
+                <select class="form-select" id="mediaSubscriptionStatus" aria-label="媒体订阅筛选">
+                    {% if media_subscription_id %}<option value="match" data-subscription-id="{{ media_subscription_id }}" selected>搜索命中</option>{% endif %}
                     <option value="">全部状态</option>
                     <option value="missing">发现缺失</option>
                     <option value="satisfied">已满足</option>
@@ -99,7 +100,10 @@
                 <div><span class="subscription-eyebrow">FEED ITEMS</span><h2>订阅抓取条目</h2></div>
                 <div class="rss-entry-filters" aria-label="订阅条目筛选">
                     <div class="rss-search-field"><i data-lucide="search"></i><input type="search" class="form-input" id="filterKeyword" placeholder="搜索标题、订阅源或 GUID" onkeydown="if(event.key==='Enter')loadEntries()"></div>
-                    <select class="form-select" id="filterSub" onchange="loadEntries()"><option value="">全部订阅源</option></select>
+                    <select class="form-select" id="filterSub" aria-label="订阅源筛选" data-initial-subscription-id="{{ rss_subscription_id }}" onchange="loadEntries()">
+                        <option value="">全部订阅源</option>
+                        {% if rss_subscription_id %}<option value="{{ rss_subscription_id }}" selected>选定的订阅源</option>{% endif %}
+                    </select>
                     <select class="form-select" id="filterStatus" onchange="loadEntries()"><option value="">全部状态</option><option value="pending">待处理</option><option value="submitting">提交中</option><option value="downloaded">已处理</option><option value="failed">失败</option><option value="skipped">手动已处理</option></select>
                     <button class="jump-btn subscription-refresh" id="refreshRssEntries" type="button" onclick="loadEntries()"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
                 </div>
@@ -435,6 +439,9 @@ async function loadSubs({preserve=true}={}){
         const selectedValue=sel.value;
         sel.replaceChildren(new Option('全部订阅源',''));
         rows.forEach(s=>sel.appendChild(new Option(s.name||`订阅源 #${s.id}`,String(s.id))));
+        if(selectedValue&&selectedValue===sel.dataset.initialSubscriptionId&&!rows.some(s=>String(s.id)===selectedValue)){
+            sel.appendChild(new Option('订阅源已不存在',selectedValue));
+        }
         if([...sel.options].some(option=>option.value===selectedValue))sel.value=selectedValue;
 
         if(!rows.length){

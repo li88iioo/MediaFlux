@@ -1,4 +1,4 @@
-"""全局搜索聚合：本地媒体、Discovery、RSS、下载与整理日志。"""
+"""全局搜索聚合：本地媒体、Discovery、订阅、下载与整理日志。"""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +8,7 @@ from urllib.parse import quote_plus, urlencode
 from app import config as app_config
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.repositories import rss as rss_repo
 from app.clients.base import MediaItem
 from app.discovery.search import discovery_provider_names, get_discovery_search_service
@@ -40,6 +41,7 @@ def _section(key: str, title: str, target_url: str, items: list[dict], error: st
 
 _MEDIA_SECTION_LIMIT = 16
 _LOCAL_MEDIA_SOURCE_FETCH_LIMIT = _MEDIA_SECTION_LIMIT * 2
+_SUBSCRIPTION_RESULT_LIMIT = 8
 
 
 def _series_id(item: MediaItem) -> str:
@@ -214,7 +216,7 @@ def _discovery_section(query: str) -> dict:
     )
 
 
-def _rss_section(query: str) -> dict:
+def _rss_matches(query: str) -> list[dict]:
     folded = query.casefold()
     items = []
     for row in rss_repo.list_rss_subscriptions():
@@ -237,19 +239,55 @@ def _rss_section(query: str) -> dict:
             "title": str(_present_value(row, "name", "未命名订阅")),
             "subtitle": "已启用" if enabled else "已停用",
             "meta": parser,
-            "url": "/rss",
+            "url": f"/rss?subscription_id={row['id']}#rss",
             "image_url": "",
             "external": False,
             "provider": parser.lower(),
-            "source_label": parser,
+            "source_label": f"RSS 订阅 · {parser}",
+            "subscription_type": "rss",
             "enabled": enabled,
             "parser": parser,
             "rules": rules,
             "last_refreshed_at": str(_present_value(row, "last_refreshed_at", "") or ""),
         })
-        if len(items) >= 8:
+        if len(items) >= _SUBSCRIPTION_RESULT_LIMIT:
             break
-    return _section("rss", "RSS 订阅", "/rss", items)
+    return items
+
+
+def _media_subscription_matches(query: str) -> list[dict]:
+    items = []
+    for row in media_subscriptions_repo.list_media_subscriptions(
+        title_query=query, limit=_SUBSCRIPTION_RESULT_LIMIT,
+    ):
+        enabled = bool(row["enabled"])
+        provider = str(row["provider"] or "tmdb")
+        items.append({
+            "title": row["title"] or row["original_title"] or "未命名媒体",
+            "subtitle": "已启用" if enabled else "已停用",
+            "url": f"/rss?media_subscription_id={row['id']}#media",
+            "image_url": "",
+            "external": False,
+            "provider": provider,
+            "source_label": f"媒体追更 · {provider.upper()}",
+            "subscription_type": "media",
+            "enabled": enabled,
+            "rules": [part for part in (_type_label(row["media_type"]), row["year"]) if part],
+        })
+    return items
+
+
+def _subscriptions_section(query: str) -> dict:
+    items = []
+    unavailable = []
+    for label, load in (("媒体追更", _media_subscription_matches), ("RSS 订阅", _rss_matches)):
+        try:
+            items.extend(load(query))
+        except Exception as exc:
+            logger.warning("全局搜索订阅来源失败 source=%s type=%s", label, type(exc).__name__)
+            unavailable.append(label)
+    error = f"{'、'.join(unavailable)}暂时不可用" if unavailable else ""
+    return _section("rss", "订阅", "/rss", items, error)
 
 
 def _progress_percent(value) -> int:
@@ -351,7 +389,7 @@ def build_global_search(value: str) -> dict:
     query = normalize_search_query(value)
     jobs = [
         ("local", lambda: _local_section(query)),
-        ("rss", lambda: _rss_section(query)),
+        ("rss", lambda: _subscriptions_section(query)),
         ("downloads", lambda: _downloads_section(query)),
         ("logs", lambda: _logs_section(query)),
     ]
@@ -369,7 +407,7 @@ def build_global_search(value: str) -> dict:
                 title = {
                     "local": "本地媒体",
                     "discovery": "影视探索",
-                    "rss": "RSS 订阅",
+                    "rss": "订阅",
                     "downloads": "下载任务",
                     "logs": "整理日志",
                 }[key]

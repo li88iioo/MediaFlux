@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi.testclient import TestClient
 
@@ -113,6 +113,40 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
             const alert = window.appAlert;
             window.appAlert = value => { window.receipts.push(value); return alert(value); };
         }""")
+
+    def test_search_links_open_the_matching_media_and_rss_filters(self):
+        from playwright.sync_api import expect
+        from app.repositories import rss as rss_repo
+
+        feed_id = rss_repo.add_rss_subscription("回执测试订阅源", "https://example.invalid/feed")
+        self.addCleanup(rss_repo.delete_rss_subscription, feed_id)
+        rss_repo.add_rss_entry_with_media(feed_id, "选定来源的条目", "search-link-guid")
+        media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="86035", tmdb_id="86035", media_type="movie", title="另一个订阅",
+        )
+        page = self.page
+        search_url = "http://app.test/search?" + urlencode({"q": "回执测试"})
+        cards = page.locator(".global-subscription-card")
+
+        with patch.dict("os.environ", {"DISCOVERY_ENABLED": "0"}):
+            page.goto(search_url)
+            expect(cards).to_have_count(2)
+            cards.filter(has_text="媒体追更").click()
+            expect(page.locator("#subscriptionTabMedia")).to_have_attribute("aria-selected", "true")
+            matches = page.locator("#mediaSubscriptionList .media-subscription-card")
+            expect(matches).to_have_count(1)
+            expect(matches).to_have_attribute("data-subscription-id", str(self.subscription_id))
+            expect(page.locator("#mediaSubscriptionStatus")).to_have_value("match")
+            page.locator("#mediaSubscriptionStatus").select_option("")
+            expect(matches).to_have_count(2)
+
+            page.goto(search_url)
+            with page.expect_request(lambda request: urlsplit(request.url).path == "/api/rss/entries") as entries:
+                cards.filter(has_text="RSS 订阅").click()
+            self.assertEqual(parse_qs(urlsplit(entries.value.url).query)["subscription_id"], [str(feed_id)])
+            expect(page.locator("#subscriptionTabRss")).to_have_attribute("aria-selected", "true")
+            expect(page.locator("#filterSub")).to_have_value(str(feed_id))
+            expect(page.locator("#entryList")).to_contain_text("选定来源的条目")
 
     def test_check_receipt_uses_nested_result_and_error_semantics(self):
         from app.modules.media_subscriptions import MediaSubscriptionError, MediaSubscriptionService

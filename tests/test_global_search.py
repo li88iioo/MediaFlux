@@ -9,7 +9,9 @@ from urllib.parse import parse_qs, urlsplit
 from app.clients.base import MediaItem
 from app.discovery.models import MediaCard
 from app.discovery.models import normalize_search_query
-from app.modules.global_search import _local_section, _rss_section, build_global_search
+from app.modules.global_search import _local_section, _rss_matches, _subscriptions_section, build_global_search
+from app.repositories import media_subscriptions, rss
+from tests.support import isolated_test_database
 
 
 class GlobalSearchTests(unittest.TestCase):
@@ -26,8 +28,36 @@ class GlobalSearchTests(unittest.TestCase):
         wanted = {"id": 2, "name": "One Piece", "urls": "https://example.invalid/rss", "parser": "mikan",
                   "exclude_keywords": "", "enabled": 1, "action": "subscribe", "download_method": ""}
         with patch("app.repositories.rss.list_rss_subscriptions", return_value=[legacy, wanted]):
-            section = _rss_section("one")
-        self.assertEqual([item["title"] for item in section["items"]], ["One Piece"])
+            items = _rss_matches("one")
+        self.assertEqual([item["title"] for item in items], ["One Piece"])
+
+    def test_subscription_results_include_paused_media_and_keep_exact_type_links(self):
+        query = "STRASSE X_%"
+        with isolated_test_database():
+            media_id = media_subscriptions.add_media_subscription(
+                provider="tmdb", external_id="1", tmdb_id="1", media_type="tv",
+                title="街道", original_title="Straße Ｘ_%", enabled=False,
+            )
+            deleted_id = media_subscriptions.add_media_subscription(
+                provider="tmdb", external_id="2", tmdb_id="2", media_type="movie", title=f"{query} 已删除",
+            )
+            self.assertTrue(media_subscriptions.delete_media_subscription(deleted_id))
+            media_subscriptions.add_media_subscription(
+                provider="tmdb", external_id="3", tmdb_id="3", media_type="movie", title="STRASSE XY",
+            )
+            rss_id = rss.add_rss_subscription(f"{query} RSS", "https://example.invalid/fixture")
+            section = _subscriptions_section(query)
+            with patch.object(rss, "list_rss_subscriptions", side_effect=RuntimeError("fixture unavailable")):
+                partial = _subscriptions_section(query)
+
+        self.assertEqual([(item["subscription_type"], item["title"]) for item in section["items"]],
+                         [("media", "街道"), ("rss", f"{query} RSS")])
+        media, feed = section["items"]
+        self.assertFalse(media["enabled"])
+        self.assertEqual(media["url"], f"/rss?media_subscription_id={media_id}#media")
+        self.assertEqual(feed["url"], f"/rss?subscription_id={rss_id}#rss")
+        self.assertEqual(partial["items"], [media])
+        self.assertIn("RSS 订阅", partial["error"])
 
     @patch("app.modules.global_search.search_media_servers")
     def test_local_media_prefers_one_real_series_over_episode_hits(self, media_search):
@@ -135,11 +165,12 @@ class GlobalSearchTests(unittest.TestCase):
     @patch("app.modules.global_search.db.list_organize_timeline")
     @patch("app.repositories.download_requests.list_download_logs")
     @patch("app.repositories.rss.list_rss_subscriptions")
+    @patch("app.repositories.media_subscriptions.list_media_subscriptions", return_value=[])
     @patch("app.modules.global_search.get_discovery_search_service")
     @patch("app.modules.global_search.app_config.get_bool", return_value=True)
     @patch("app.modules.global_search.search_media_servers")
     def test_search_groups_local_discovery_rss_downloads_and_logs(
-        self, media_search, _enabled, discovery_service, rss_rows, download_rows, log_rows,
+        self, media_search, _enabled, discovery_service, _media_subscriptions, rss_rows, download_rows, log_rows,
     ):
         media_search.return_value = [{
             "server_type": "jellyfin",
@@ -211,10 +242,11 @@ class GlobalSearchTests(unittest.TestCase):
     @patch("app.modules.global_search.db.list_organize_timeline", side_effect=RuntimeError("db down"))
     @patch("app.repositories.download_requests.list_download_logs", return_value=[])
     @patch("app.repositories.rss.list_rss_subscriptions", return_value=[])
+    @patch("app.repositories.media_subscriptions.list_media_subscriptions", return_value=[])
     @patch("app.modules.global_search.app_config.get_bool", return_value=False)
     @patch("app.modules.global_search.search_media_servers", return_value=[])
     def test_source_failure_is_isolated_and_discovery_can_be_hidden(
-        self, _media, _enabled, _rss, _downloads, _logs,
+        self, _media, _enabled, _media_subscriptions, _rss, _downloads, _logs,
     ):
         result = build_global_search("测试")
         sections = {section["key"]: section for section in result["sections"]}

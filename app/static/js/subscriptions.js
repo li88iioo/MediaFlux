@@ -309,11 +309,13 @@
         delete container.dataset.skeletonShownAt;
     }
 
-    function renderMediaList(rows) {
+    function renderMediaList(rows, matchedSubscription) {
         const list = elements.mediaList;
         list.replaceChildren();
         if (!rows.length) {
-            list.append(emptyState('radar', '暂无媒体订阅', '可从收藏清单创建追更，或使用 TMDB ID 新建订阅。'));
+            list.append(matchedSubscription
+                ? emptyState('radar', '媒体订阅已不存在', '可选择全部状态查看其他订阅。')
+                : emptyState('radar', '暂无媒体订阅', '可从收藏清单创建追更，或使用 TMDB ID 新建订阅。'));
             renderIcons(list);
             return;
         }
@@ -476,16 +478,27 @@
             }, 320);
         }
         const status = elements.mediaStatus.value;
+        const subscriptionId = elements.mediaStatus.selectedOptions[0]?.dataset.subscriptionId;
         try {
-            const query = status ? `?status=${encodeURIComponent(status)}` : '';
-            const rows = await collectPages(`/api/subscriptions/media${query}`, controller.signal);
+            let rows;
+            if (subscriptionId) {
+                const item = await apiJSON(`/api/subscriptions/media/${encodeURIComponent(subscriptionId)}`, {}, controller.signal)
+                    .catch((error) => {
+                        if (error.status === 404) return null;
+                        throw error;
+                    });
+                rows = item ? [item] : [];
+            } else {
+                const query = status ? `?status=${encodeURIComponent(status)}` : '';
+                rows = await collectPages(`/api/subscriptions/media${query}`, controller.signal);
+            }
             if (requestId !== state.mediaRequestId) return;
             await settleSkeleton(elements.mediaList);
             if (requestId !== state.mediaRequestId) return;
             state.media = rows;
             state.loaded.media = true;
             const releaseHeight = preserve && hadContent ? lockElementHeight(elements.mediaList) : () => {};
-            renderMediaList(state.media);
+            renderMediaList(state.media, Boolean(subscriptionId));
             releaseHeight();
             loadStats();
         } catch (error) {
