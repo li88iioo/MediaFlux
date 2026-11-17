@@ -1,211 +1,143 @@
-"""受控季集研究设置：源码隔离 API/内存配置与静态 UI 回归，不加载 DB 或模型。"""
+"""受控季集研究设置的真实配置 API、持久化与静态 UI 回归。"""
 from __future__ import annotations
 
-import ast
-import json
-import logging
-import re
-import sys
-import time
+import os
 import unittest
-from contextlib import nullcontext
 from html.parser import HTMLParser
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from app import config
+from app.agent.feature_gate import current_agent_runtime_generation
+from app.defaults import DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT, DEFAULT_BOOL_CONFIG_VALUES
+from app.main import create_app
+from tests.support import initialized_web_runtime
+from tests.test_config_empty_values_api import login
 
 ROOT = Path(__file__).resolve().parents[1]
 ENABLED = "AGENT_EPISODE_RESEARCH_ENABLED"
 LIMIT = "AGENT_EPISODE_RESEARCH_DAILY_LIMIT"
 PARENT = "AGENT_RECOGNITION_REVIEW_ENABLED"
-VALIDATOR = "_validate_agent_episode_research_updates"
-
-
-class MemoryConfig:
-    """只在内存发布；禁止依赖生产 ENV_FILE、密钥与数据库。"""
-
-    AtomicPublishError = OSError
-    runtime_config_read_guard = staticmethod(nullcontext)
-
-    def __init__(self):
-        self.values = {}
-        self.overrides = {}
-        self.set_and_save = Mock(side_effect=self.values.update)
-
-    def get(self, key, default=""):
-        return self.overrides.get(key, self.values.get(key, default))
-
-    def get_bool(self, key, default=False):
-        return str(self.get(key, default)).strip().lower() in {"1", "true", "yes", "on"}
-
-    def all_items(self):
-        return dict(self.values)
-
-    def has_external_override(self, key):
-        return key in self.overrides
-
-
-def _module(name, **attributes):
-    result = ModuleType(name)
-    result.__dict__.update(attributes)
-    return result
-
-
-def _load_settings_api(config) -> dict[str, Any]:
-    """执行真实路由/注册代码，剥离顶层导入和无关校验，防止启动业务服务。"""
-    namespace: dict[str, Any] = {
-        "config": config, "nullcontext": nullcontext, "time": time, "re": re,
-        "logger": logging.getLogger(__name__), "Body": lambda **_: None,
-        "require_api_login": Mock(), "redact_config": dict,
-        "api_error": lambda message, status=400: SimpleNamespace(
-            status_code=status, body=json.dumps({"error": message}).encode(),
-        ),
-    }
-    defaults_path = ROOT / "app/defaults.py"
-    exec(compile(defaults_path.read_text("utf-8"), str(defaults_path), "exec"), namespace)
-    path = ROOT / "app/routes/api.py"
-    tree = ast.parse(path.read_text("utf-8"), filename=str(path))
-    functions = {"_is_config_mask", "_ui_defaults", VALIDATOR, "get_config", "save_config"}
-    nodes: list[ast.stmt] = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
-    for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib", "app.modules.feature_config", "app.modules.policy_config", "app.modules.telegram_notification_policy"}:
-            nodes.append(node)
-        elif isinstance(node, ast.Assign) and all(
-            isinstance(target, ast.Name) and target.id.startswith("_") for target in node.targets
-        ):
-            nodes.append(node)
-        elif isinstance(node, ast.FunctionDef):
-            if node.name in functions:
-                node.decorator_list = []
-                nodes.append(node)
-            elif node.name.startswith("_validate_"):
-                namespace[node.name] = Mock(return_value={})
-    isolated = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
-    exec(compile(isolated, str(path), "exec"), namespace)
-    return namespace
 
 
 class EpisodeResearchSettingsTests(unittest.TestCase):
     def setUp(self):
-        self.config = MemoryConfig()
-        self.api = _load_settings_api(self.config)
-        self.invalidate = Mock()
-        self.wake = Mock()
-        modules = {
-            "app.services": _module("app.services", clear_dashboard_cache=Mock()),
-            "app.agent.feature_gate": _module(
-                "app.agent.feature_gate", agent_runtime_transition=nullcontext,
-                invalidate_agent_runtime_generation=self.invalidate,
-            ),
-            "app.modules.organize_confirmations": _module(
-                "app.modules.organize_confirmations", wake_recognition_review_dispatcher=self.wake,
-            ),
-            "app.modules.offline": _module(
-                "app.modules.offline", DEFAULT_VIDEO_EXTS_CSV="mkv,mp4",
-                normalize_video_extensions=lambda _: ("mkv", "mp4"),
-            ),
-            # 本组不修改本地媒体配置；显式隔离该依赖，不借用其它测试的导入缓存。
-            "app.modules.local_media_service": _module("app.modules.local_media_service", LOCAL_MEDIA_RUNTIME_KEYS=()),
-            # 任何意外加载这些运行时依赖都会立即失败，不会连接真实资源。
-            "app.database": None, "sqlite3": None, "requests": None,
-            "app.agent.kernel.bootstrap": None,
-        }
-        module_patch = patch.dict(sys.modules, modules)
-        module_patch.start()
-        self.addCleanup(module_patch.stop)
-        self.request = SimpleNamespace(
-            session={},
-            app=SimpleNamespace(state=SimpleNamespace(background_services_enabled=False, media_proxy_manager=None)),
-        )
+        # 真实发布会同步进程环境，用例退出时恢复之前的变量。
+        self.enterContext(patch.dict(os.environ))
+        for key in (ENABLED, LIMIT, PARENT, "AGENT_LLM_ENABLED", "TAVILY_DAILY_CREDIT_LIMIT", "WEB_SEARCH_ENABLED"):
+            os.environ.pop(key, None)
+        self.env_file = self.enterContext(initialized_web_runtime()).env_file
+        self.client = TestClient(create_app())
+        self.addCleanup(self.client.close)
+        self.headers = login(self.client)
+        self.wake = self.enterContext(patch("app.modules.organize_confirmations.wake_recognition_review_dispatcher"))
 
-    def save(self, payload):
-        return self.api["save_config"](self.request, payload)
+    def _post_config(self, payload: dict[str, object]):
+        return self.client.post("/api/config", json=payload, headers=self.headers)
 
-    def get(self):
-        return self.api["get_config"](self.request)
+    def _assert_saved(self, payload: dict[str, object]) -> None:
+        response = self._post_config(payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"success": True})
+
+    def _get_config(self) -> dict[str, Any]:
+        response = self.client.get("/api/config")
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _file_values(self) -> dict[str, str]:
+        return config.read_env_snapshot(self.env_file)[1]
+
+    def _publication_state(self) -> tuple[bytes, int]:
+        return self.env_file.read_bytes(), current_agent_runtime_generation()
 
     def test_shared_defaults_and_missing_config_are_independently_off(self):
-        self.assertIs(self.api["DEFAULT_BOOL_CONFIG_VALUES"].get(ENABLED), False)
-        self.assertEqual(self.api.get("DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT"), 10)
-        self.config.values.update({PARENT: "1", "AGENT_LLM_ENABLED": "1"})
-        self.assertEqual(self.get().get(ENABLED), "0")
-        self.assertEqual(self.get().get(LIMIT), "10")
-        self.assertNotIn(ENABLED, self.config.values)
-        self.assertNotIn(LIMIT, self.config.values)
-
-    def test_both_keys_are_registered_and_have_api_defaults(self):
-        for key, default in ((ENABLED, "0"), (LIMIT, "10")):
-            with self.subTest(key=key):
-                self.assertIn(key, self.api["_CONFIG_UI_SAVEABLE_KEYS"])
-                self.assertEqual(self.api["_UI_DEFAULTS"].get(key), default)
+        self.assertIs(DEFAULT_BOOL_CONFIG_VALUES[ENABLED], False)
+        self.assertEqual(DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT, 10)
+        config.set_and_save({PARENT: "1", "AGENT_LLM_ENABLED": "1"})
+        before = self._publication_state()
+        payload = self._get_config()
+        self.assertEqual(payload[ENABLED], "0")
+        self.assertEqual(payload[LIMIT], "10")
+        self.assertTrue({ENABLED, LIMIT}.isdisjoint(self._file_values()))
+        self.assertEqual(self._publication_state(), before)
 
     def test_boolean_normalization_roundtrips_without_enabling_dependencies(self):
+        config.set_and_save({"AGENT_LLM_ENABLED": None})
+        before = self._file_values()
+        initial_generation = current_agent_runtime_generation()
         for raw, expected in ((True, "1"), (False, "0"), (" on ", "1"), ("off", "0"), ("YES", "1"), ("n", "0")):
             with self.subTest(value=raw):
-                self.assertEqual(self.save({ENABLED: raw}), {"success": True})
-                self.assertEqual(self.get()[ENABLED], expected)
-                self.assertEqual(self.config.values, {ENABLED: expected})
-        self.assertEqual(self.invalidate.call_count, 6)
+                self._assert_saved({ENABLED: raw})
+                self.assertEqual(self._get_config()[ENABLED], expected)
+                self.assertEqual(self._file_values(), before | {ENABLED: expected})
+        self.assertEqual(current_agent_runtime_generation(), initial_generation + 6)
         self.assertEqual(self.wake.call_count, 6)
 
     def test_valid_daily_limits_roundtrip_as_canonical_integers(self):
+        before = self._file_values()
         for raw, expected in ((1, "1"), (100, "100"), (10, "10"), (" 07 ", "7")):
             with self.subTest(value=raw):
-                self.assertEqual(self.save({LIMIT: raw}), {"success": True})
-                self.assertEqual(self.get()[LIMIT], expected)
-                self.assertEqual(self.config.values, {LIMIT: expected})
+                self._assert_saved({LIMIT: raw})
+                self.assertEqual(self._get_config()[LIMIT], expected)
+                self.assertEqual(self._file_values(), before | {LIMIT: expected})
 
     def test_invalid_boolean_never_publishes(self):
+        before = self._publication_state()
         for raw in ("", "enabled", "2", 2, None, [], {}):
             with self.subTest(value=raw):
-                result = self.save({ENABLED: raw, LIMIT: 10})
-                self.assertEqual(result.status_code, 400)
-                self.assertIn(ENABLED, json.loads(result.body)["error"])
-                self.assertEqual(self.config.values, {})
-        self.config.set_and_save.assert_not_called()
-        self.invalidate.assert_not_called()
+                response = self._post_config({ENABLED: raw, LIMIT: 10})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(ENABLED, response.json()["error"])
+                self.assertEqual(self._publication_state(), before)
         self.wake.assert_not_called()
 
     def test_invalid_daily_limit_rejects_entire_update(self):
+        before = self._publication_state()
         for raw in (0, -1, 101, "", " ", None, False, True, 1.5, 10.0, "1.0", "NaN", "inf", "1e1", [], {}):
             with self.subTest(value=raw):
-                result = self.save({ENABLED: "1", LIMIT: raw})
-                self.assertEqual(result.status_code, 400)
-                self.assertIn(LIMIT, json.loads(result.body)["error"])
-                self.assertEqual(self.config.values, {})
-        self.config.set_and_save.assert_not_called()
-        self.invalidate.assert_not_called()
+                response = self._post_config({ENABLED: "1", LIMIT: raw})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(LIMIT, response.json()["error"])
+                self.assertEqual(self._publication_state(), before)
         self.wake.assert_not_called()
 
     def test_parent_toggle_and_existing_quota_do_not_grant_child_permission(self):
-        self.config.values.update({"TAVILY_DAILY_CREDIT_LIMIT": "23", "WEB_SEARCH_ENABLED": "0"})
-        self.assertEqual(self.save({PARENT: "1"}), {"success": True})
-        self.assertEqual(self.get().get(ENABLED), "0")
-        self.assertNotIn(ENABLED, self.config.values)
-        self.assertEqual(self.save({ENABLED: "1", LIMIT: "10"}), {"success": True})
-        self.assertEqual(self.config.values["TAVILY_DAILY_CREDIT_LIMIT"], "23")
-        self.assertEqual(self.config.values["WEB_SEARCH_ENABLED"], "0")
-        self.assertNotIn("AGENT_ENABLED", self.config.values)
-        self.assertNotIn("AGENT_LLM_ENABLED", self.config.values)
+        config.set_and_save({"TAVILY_DAILY_CREDIT_LIMIT": "23", "WEB_SEARCH_ENABLED": "0", "AGENT_LLM_ENABLED": None})
+        before = self._file_values()
+        self._assert_saved({PARENT: "1"})
+        self.assertEqual(self._get_config()[ENABLED], "0")
+        self.assertEqual(self._file_values(), before | {PARENT: "1"})
+        self._assert_saved({ENABLED: "1", LIMIT: "10"})
+        self.assertEqual(self._file_values(), before | {PARENT: "1", ENABLED: "1", LIMIT: "10"})
 
     def test_unchanged_normalized_values_do_not_publish_or_wake(self):
-        self.config.values.update({ENABLED: "0", LIMIT: "10"})
-        self.assertEqual(self.save({ENABLED: "false", LIMIT: " 10 "}), {"success": True})
-        self.config.set_and_save.assert_not_called()
-        self.invalidate.assert_not_called()
+        config.set_and_save({ENABLED: "0", LIMIT: "10"})
+        before = self._publication_state()
+        self._assert_saved({ENABLED: "false", LIMIT: " 10 "})
+        self.assertEqual(self._publication_state(), before)
         self.wake.assert_not_called()
 
     def test_environment_overrides_are_visible_and_locked_for_both_keys(self):
+        config.set_and_save({ENABLED: "0", LIMIT: "10"})
+        before = self._publication_state()
         for key, deployed, attempted in ((ENABLED, "1", "0"), (LIMIT, "25", "10")):
-            with self.subTest(key=key):
-                self.config.overrides = {key: deployed}
-                self.assertEqual(self.get().get(key), deployed)
-                self.assertIn(key, self.get()["__managed_fields"])
-                response = self.save({key: attempted})
-                self.assertEqual(response.status_code, 409)
-                self.assertIn(key, json.loads(response.body)["error"])
-        self.config.set_and_save.assert_not_called()
+            with (
+                self.subTest(key=key),
+                patch.dict(os.environ, {key: deployed}),
+                patch.object(config, "_STARTUP_ENV_OVERRIDES", config._STARTUP_ENV_OVERRIDES | {key}),
+            ):
+                payload = self._get_config()
+                self.assertEqual(payload[key], deployed)
+                self.assertIn(key, payload["__managed_fields"])
+                response = self._post_config({key: attempted})
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertIn(key, response.json()["error"])
+                self.assertEqual(self._publication_state(), before)
+        self.wake.assert_not_called()
 
 
 class InputParser(HTMLParser):
