@@ -332,7 +332,7 @@ def prepare_stop(run_id=None) -> tuple[dict, dict]:
     }, task
 
 
-def stop(*, expected_snapshot=None, run_id=None, check_cancelled=None) -> dict:
+def stop(*, expected_snapshot=None, run_id=None, expected_task_id="", check_cancelled=None) -> dict:
     if check_cancelled:
         check_cancelled()
     if expected_snapshot is not None:
@@ -370,4 +370,6 @@ def stop(*, expected_snapshot=None, run_id=None, check_cancelled=None) -> dict:
         if not preview_result["ok"]:
             return preview_result
         return stop(expected_snapshot=snapshot, check_cancelled=check_cancelled)
-    return get_organize_manager().stop()
+    return get_organize_manager().stop(
+        expected_task_id=expected_task_id, require_running=bool(expected_task_id),
+    )

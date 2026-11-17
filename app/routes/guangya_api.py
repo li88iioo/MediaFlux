@@ -442,11 +442,17 @@ def organize_status(request: Request, task_id: str = ""):
 
 
 @router.post("/organize/stop")
-def organize_stop(request: Request):
+def organize_stop(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
     from app.modules.organize_service import stop
 
-    result = stop()
+    expected_task_id = ""
+    if data and "expected_task_id" in data:
+        value = data["expected_task_id"]
+        if not isinstance(value, str) or not value.strip():
+            return JSONResponse({"error": "缺少有效的整理任务 ID"}, status_code=400)
+        expected_task_id = value.strip()
+    result = stop(expected_task_id=expected_task_id)
     return JSONResponse(result, status_code=202 if result.get("ok") else 409)
 
 

@@ -370,6 +370,40 @@ class OrganizeRulesFirstPaintTests(unittest.TestCase):
         self.assertNotIn("organize-rules-nav-card", html)
         self.assertIn('id="organizeSourceList"', html)
 
+    def test_stop_confirmation_keeps_the_task_visible_when_it_opened(self):
+        page, errors, _writes = self._page(execute=True)
+        active = {"id": "task-a", "status": "running", "stoppable": True}
+        submissions = []
+
+        def submit(route):
+            body = route.request.post_data_json
+            submissions.append(body)
+            if body == {"expected_task_id": active["id"]}:
+                active["status"] = "stopping"
+                route.fulfill(status=202, json={"ok": True})
+            else:
+                route.fulfill(status=409, json={"error": "整理任务状态已变化"})
+
+        page.route("**/api/guangya/organize/status", lambda route: route.fulfill(json=active))
+        page.route("**/api/guangya/organize/stop", submit)
+        page.goto("http://mediaflux.test/organize")
+        stop = page.locator("#stopOrganizeBtn")
+        confirm = page.locator("#appConfirmSubmit")
+        stop.click()
+        confirm.wait_for(state="visible")
+        with page.expect_response("**/api/guangya/organize/status"):
+            active["id"] = "task-b"
+        confirm.click()
+        page.locator("#appMessageText").filter(has_text="整理任务状态已变化").wait_for()
+        self.assertEqual(submissions, [{"expected_task_id": "task-a"}])
+        self.assertEqual(active["status"], "running")
+        page.locator("#appMessageClose").click()
+        stop.click()
+        confirm.click()
+        page.locator("#organizeStateTag").filter(has_text="停止中").wait_for()
+        self.assertEqual(submissions[-1], {"expected_task_id": "task-b"})
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -222,6 +222,7 @@ class OrganizeStatusPollingLifecycleTests(unittest.TestCase):
             let statusRequestSerial = 0;
             let organizeActionBusy = false;
             let organizeStatusRunning = false;
+            let organizeStoppableTaskId = '';
             let fetchImpl;
             const fetch = (...args) => fetchImpl(...args);
             {status_block}
@@ -229,7 +230,7 @@ class OrganizeStatusPollingLifecycleTests(unittest.TestCase):
               fetchImpl = async () => ({{
                 ok: true, status: 200,
                 json: async () => ({{
-                  status: 'running', message: '整理中', current_source: '下载',
+                  id: 'active-task', status: 'running', message: '整理中', current_source: '下载',
                   stats: {{moved: 1, skipped: 0, failed: 0}}, schedule: {{}},
                 }}),
               }});

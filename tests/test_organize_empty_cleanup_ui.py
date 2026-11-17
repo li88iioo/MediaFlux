@@ -52,6 +52,7 @@ class OrganizeEmptyCleanupUiTests(unittest.TestCase):
             async function runCase(config) {
                 let organizeActionBusy = config.initialBusy || false;
                 let organizeStatusRunning = config.running || false;
+                const organizeStoppableTaskId = organizeStatusRunning ? 'active-task' : '';
                 const isRules = false;
                 const sources = config.noSources ? [] : [{id: 'fixture-source', name: '测试来源'}];
                 const buttons = Object.fromEntries(

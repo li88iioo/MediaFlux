@@ -42,6 +42,7 @@
     let statusRequestSerial=0;
     let organizeActionBusy=false;
     let organizeStatusRunning=false;
+    let organizeStoppableTaskId='';
     const configFieldLocks=Array.from(workspace.querySelectorAll('[data-key]'),field=>({field,disabled:field.disabled}));
     const executeConfigActions=['addOrganizeSourceBtn','pickOrganizeTargetBtn']
         .map(id=>document.getElementById(id))
@@ -689,7 +690,7 @@
     }
     function setOrganizeActionBusy(busy){
         organizeActionBusy=busy;if(isRules)return;
-        document.getElementById('runOrganizeBtn').disabled=busy||organizeStatusRunning;document.getElementById('stopOrganizeBtn').disabled=busy||!organizeStatusRunning;document.getElementById('cleanEmptyBtn').disabled=busy||organizeStatusRunning;
+        document.getElementById('runOrganizeBtn').disabled=busy||organizeStatusRunning;document.getElementById('stopOrganizeBtn').disabled=busy||!organizeStoppableTaskId;document.getElementById('cleanEmptyBtn').disabled=busy||organizeStatusRunning;
     }
     async function run(){
         if(organizeActionBusy)return;
@@ -700,8 +701,17 @@
         catch(error){await appAlert({type:'error',title:'整理任务启动失败',message:error.message||'无法启动整理任务'});}finally{setOrganizeActionBusy(false);await loadStatus();}
     }
     async function stop(){
-        if(organizeActionBusy)return;const confirmed=await appConfirm({title:'停止整理任务',message:'停止后，已经完成的云盘移动不会自动回滚。',confirmText:'停止任务',danger:true});if(!confirmed)return;
-        setOrganizeActionBusy(true);try{const response=await fetch('/api/guangya/organize/stop',{method:'POST'});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'停止失败');}
+        const expectedTaskId=organizeStoppableTaskId;
+        if(organizeActionBusy||!expectedTaskId)return;
+        const confirmed=await appConfirm({title:'停止整理任务',message:'停止后，已经完成的云盘移动不会自动回滚。',confirmText:'停止任务',danger:true});if(!confirmed)return;
+        setOrganizeActionBusy(true);
+        try{
+            const response=await fetch('/api/guangya/organize/stop',{
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({expected_task_id:expectedTaskId}),
+            });
+            const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'停止失败');
+        }
         catch(error){await appAlert({type:'error',title:'停止任务失败',message:error.message||'无法停止整理任务'});}finally{setOrganizeActionBusy(false);await loadStatus();}
     }
     function emptyCleanupText(value,maxLength=80){
@@ -847,10 +857,11 @@
     }
     function renderStatus(data){
         clearStatusSyncError();
+        const stopTaskId=data.status==='running'&&data.stoppable!==false&&typeof data.id==='string'?data.id:'';
         const renderKey=JSON.stringify({
             status:data.status||'',message:data.message||'',error:data.error||'',
             current_source:data.current_source||'',stats:data.stats||{},schedule:data.schedule||{},
-            group_progress:data.group_progress||{}
+            group_progress:data.group_progress||{},stop_task_id:stopTaskId
         });
         if(renderKey===lastStatusRenderKey)return;
         lastStatusRenderKey=renderKey;
@@ -860,6 +871,7 @@
         renderGroupProgress(data);
         const tag=document.getElementById('organizeStateTag');
         const running=['running','stopping'].includes(data.status);organizeStatusRunning=running;
+        organizeStoppableTaskId=stopTaskId;
         tag.textContent={idle:'空闲',running:'整理中',stopping:'停止中',completed:'已完成',partial:'部分完成',stopped:'已停止',failed:'失败'}[data.status]||data.status;
         const tagTone=running?'is-active':data.status==='failed'?'is-danger':['completed','partial'].includes(data.status)?'is-success':'';
         tag.className=`organize-state-tag${tagTone?` ${tagTone}`:''}`;
@@ -881,7 +893,7 @@
         lastStatusDetailText=detail.textContent;
 
         document.getElementById('runOrganizeBtn').disabled=organizeActionBusy||running;
-        document.getElementById('stopOrganizeBtn').disabled=organizeActionBusy||!running;
+        document.getElementById('stopOrganizeBtn').disabled=organizeActionBusy||!organizeStoppableTaskId;
         document.getElementById('cleanEmptyBtn').disabled=organizeActionBusy||running;
     }
     async function loadStatus(){
