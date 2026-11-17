@@ -273,6 +273,7 @@
             memoryDrafts.clear();
             typed = '';
             if (promptInput) promptInput.value = '';
+            clearShareCards();
             transcript?.replaceChildren();
             lastUserAt = 0;
             followOutput = true;
@@ -386,6 +387,7 @@
         while (transcript.children.length > MAX_TRANSCRIPT_ITEMS) {
             transcript.firstElementChild?.remove();
         }
+        clearShareCards(true);
     }
 
     function appendMessage(role, {recovered = false, scroll = true} = {}) {
@@ -476,6 +478,168 @@
 
     const MAGNET_RE = /^magnet:\?\S*xt=urn:bt[im]h:/i;
     let downloadCardCount = 0;
+    const shareCards = new Set();
+
+    function guangyaShareLink(text) {
+        const match = String(text || '').match(/https?:\/\/[^\s<>]+/i);
+        if (!match) return '';
+        try {
+            const url = new URL(match[0].replace(/[.,，。;；)）\]]+$/, ''));
+            const host = url.hostname.toLowerCase().replace(/\.$/, '');
+            return (host === 'guangyapan.com' || host.endsWith('.guangyapan.com'))
+                && /\/(?:s|share)\/[A-Za-z0-9][A-Za-z0-9_-]*(?:\/|$)/i.test(decodeURIComponent(url.pathname))
+                ? url.href : '';
+        } catch (_) { return ''; }
+    }
+
+    function clearShareCards(detachedOnly = false) {
+        for (const entry of shareCards) if (!detachedOnly || !entry.node.isConnected) entry.dispose();
+    }
+
+    // 与 Telegram 共用分享快照及幂等转存接口；选择和确认由用户完成，不调用模型。
+    async function createShareCard(url) {
+        const view = appendMessage('download');
+        view.item.setAttribute('aria-label', '光鸭分享转存');
+        const card = element('section', 'agent-download-card agent-share-card');
+        const status = element('p', 'agent-download-meta', '正在解析分享…');
+        status.setAttribute('role', 'status');
+        const selection = element('p', 'agent-download-meta');
+        const files = element('div', 'agent-share-files');
+        const controls = element('div', 'agent-download-actions');
+        const actions = element('div', 'agent-download-actions');
+        const button = (parent, label, primary = false) => {
+            const node = element('button', primary ? 'agent-download-submit' : 'agent-download-cancel', label);
+            node.type = 'button'; parent.append(node); return node;
+        };
+        const previous = button(controls, '上一页'), next = button(controls, '下一页');
+        const all = button(controls, '全选'), none = button(controls, '全不选');
+        const targetButton = button(card, '选择目标目录');
+        targetButton.classList.add('agent-share-target');
+        const submit = button(actions, '确认转存', true), cancel = button(actions, '取消');
+        const retry = button(actions, '重新解析');
+        const review = element('a', 'jump-btn', '查看下载记录');
+        review.href = '/downloads';
+        actions.append(review);
+        card.prepend(element('strong', 'agent-download-title', '光鸭分享转存'), status, selection, files, controls);
+        card.append(actions);
+        view.body.append(card);
+        let preview = null, selected = new Set(), pageIndex = 0, target = null;
+        let pending = false, finished = false, mayRetry = false, expiresAt = 0, timer = null, picker = null;
+        let controller = null;
+        const alive = () => shareCards.has(entry) && view.item.isConnected;
+        const entry = {node: view.item, dispose: () => {
+            controller?.abort(); clearTimeout(timer); picker?.close({restoreFocus: false});
+            card.inert = true; shareCards.delete(entry);
+        }};
+        shareCards.add(entry);
+        function update() {
+            const items = preview?.files || [], available = Boolean(preview && !pending && !finished);
+            selection.textContent = preview ? `文件页：${pageIndex + 1}/${Math.max(1, Math.ceil(items.length / 8))} · 已选择 ${selected.size} / ${items.length}` : '';
+            targetButton.textContent = target ? `目标目录：${target.name}` : '选择目标目录';
+            targetButton.disabled = !available;
+            all.disabled = none.disabled = !available;
+            previous.hidden = next.hidden = items.length <= 8;
+            previous.disabled = !available || pageIndex === 0;
+            next.disabled = !available || (pageIndex + 1) * 8 >= items.length;
+            submit.disabled = !available || !selected.size || !target;
+            submit.textContent = pending && preview ? '正在转存…' : '确认转存';
+            cancel.disabled = pending && Boolean(preview);
+            cancel.textContent = finished ? '关闭' : '取消';
+            retry.hidden = pending || !mayRetry;
+            review.hidden = !finished;
+            files.querySelectorAll('input').forEach(input => { input.disabled = !available; input.checked = selected.has(input.value); });
+        }
+        function renderFiles() {
+            files.replaceChildren(...(preview?.files || []).slice(pageIndex * 8, (pageIndex + 1) * 8).map(file => {
+                const label = element('label', 'agent-share-file');
+                const check = element('input'); check.type = 'checkbox'; check.value = String(file.id);
+                const name = element('span', '', `${file.is_dir ? '目录' : '文件'}：${file.name}`);
+                name.title = String(file.name || '');
+                label.append(check, name);
+                check.addEventListener('change', () => { check.checked ? selected.add(check.value) : selected.delete(check.value); update(); });
+                return label;
+            }));
+            update();
+        }
+        async function inspect() {
+            pending = true; finished = false; mayRetry = false; preview = null; pageIndex = 0;
+            clearTimeout(timer); card.classList.remove('is-error', 'is-done');
+            status.textContent = '正在解析分享…'; renderFiles();
+            controller = new AbortController();
+            try {
+                const result = await fetchJSON('/api/share/inspect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}), signal: controller.signal});
+                if (!alive()) return;
+                if (!result.preview_id || !Array.isArray(result.files) || !result.files.length) throw new Error('分享中没有可转存文件');
+                preview = result; selected = new Set(result.files.map(file => String(file.id)));
+                target = result.target_id !== undefined ? {id: String(result.target_id), name: String(result.target_name || '根目录')} : null;
+                expiresAt = Date.now() + Number(result.expires_in || 0) * 1000;
+                status.textContent = '选择需要转存的文件或目录后确认。';
+                timer = setTimeout(() => { if (alive() && !pending && !finished) expire(); }, Math.max(0, expiresAt - Date.now()));
+            } catch (error) {
+                if (!alive()) return;
+                mayRetry = true; status.textContent = error?.message || '解析失败，请重试'; card.classList.add('is-error');
+            } finally { if (alive()) { pending = false; renderFiles(); } }
+        }
+        function expire() {
+            finished = true; mayRetry = true; picker?.close();
+            status.textContent = '预览已过期，请重新解析后转存。'; update();
+        }
+        async function followRequest(id, attempts = 0) {
+            if (!alive()) return;
+            try {
+                const result = await fetchJSON(`/api/share/requests/${encodeURIComponent(id)}`);
+                if (!alive()) return;
+                if (result.terminal) {
+                    status.textContent = result.success ? `转存成功 · 目标目录：${result.target_dir_name || target.name}` : (result.error || '转存未完成，请在下载记录中核对');
+                    card.classList.toggle('is-done', Boolean(result.success));
+                    card.classList.toggle('is-error', !result.success);
+                } else if (attempts < 44) timer = setTimeout(() => followRequest(id, attempts + 1), 2000);
+                else status.textContent = `请求 #${id} 仍在处理，请在下载记录中查看。`;
+            } catch (_) { if (alive()) status.textContent = `请求 #${id} 状态待确认，请在下载记录中核对，勿重复提交。`; }
+            if (alive()) update();
+        }
+        all.addEventListener('click', () => { selected = new Set(preview.files.map(file => String(file.id))); update(); });
+        none.addEventListener('click', () => { selected.clear(); update(); });
+        previous.addEventListener('click', () => { pageIndex -= 1; renderFiles(); });
+        next.addEventListener('click', () => { pageIndex += 1; renderFiles(); });
+        cancel.addEventListener('click', () => { entry.dispose(); view.item.remove(); setConsoleEmpty(!transcript?.childElementCount); });
+        retry.addEventListener('click', inspect);
+        targetButton.addEventListener('click', () => {
+            if (Date.now() >= expiresAt) { expire(); return; }
+            picker = window.openGuangYaDirectoryPicker({modalId: 'agentShareDirectory', title: '选择转存目标目录', trigger: targetButton, preserveWhileLoading: true,
+                onSelect: directory => { if (alive() && !finished && !pending) { target = {id: String(directory.id), name: String(directory.name)}; update(); } },
+            });
+        });
+        submit.addEventListener('click', async () => {
+            if (pending || finished || !selected.size || !target) return;
+            if (Date.now() >= expiresAt) { expire(); return; }
+            pending = true; clearTimeout(timer); picker?.close(); update();
+            const body = {preview_id: preview.preview_id, file_ids: [...selected], target_dir_id: target.id, target_dir_name: target.name};
+            try {
+                const result = await fetchJSON('/api/share/restore', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+                if (!alive()) return;
+                finished = true;
+                if (result.success === true) {
+                    status.textContent = `${result.duplicate ? '已转存，请勿重复提交' : `转存成功 · ${result.count} 项`} · 目标目录：${result.target_dir_name || target.name}`;
+                    card.classList.add('is-done');
+                } else if (result.accepted && result.request_id) {
+                    status.textContent = '转存请求已受理，正在核对结果…';
+                    void followRequest(result.request_id);
+                } else status.textContent = '提交状态待确认，请在下载记录中核对，勿重复提交。';
+            } catch (error) {
+                if (!alive()) return;
+                finished = true; card.classList.add('is-error');
+                mayRetry = error?.status === 410 || error?.status === 400;
+                status.textContent = error?.status === 410 || error?.status === 400 ? error.message : `提交状态待确认，请在下载记录中核对，勿重复提交。${error?.message || ''}`;
+                // 无法确定服务器是否已受理时只查询/核对，不提供再建请求的按钮。
+                if (error?.status !== 410 && error?.status !== 400) {
+                    if (error?.payload?.request_id) void followRequest(error.payload.request_id);
+                }
+            } finally { if (alive()) { pending = false; update(); } }
+        });
+        await inspect();
+        if (alive()) scrollToBottom(true);
+    }
 
     function formatBytes(value) {
         let size = Number(value) || 0;
@@ -490,7 +654,7 @@
         if (source.file) form.append('file', source.file, source.file.name);
         else form.append('url', source.url);
         if (option) form.append('target', option.target);
-        if (option?.nsfw_source_id) form.append('nsfw_source_id', option.nsfw_source_id);
+        if (option && 'nsfw_source_id' in option) form.append('nsfw_source_id', option.nsfw_source_id);
         return form;
     }
 
@@ -572,7 +736,8 @@
                 const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, option)});
                 const status = String(result.status || 'manual_review');
                 const succeeded = (result.succeeded || [])
-                    .map(target => target === 'guangya' && option.nsfw_source_id ? option.label : backendLabels[target])
+                    .map(target => status === 'duplicate' ? ({qb: 'qBittorrent', guangya: '光鸭云盘'})[target]
+                        : target === 'guangya' && option.nsfw_source_id ? option.label : backendLabels[target])
                     .filter(Boolean);
                 meta.textContent = [result.summary || `下载请求 #${result.request_id} 受理结果待核对`,
                     succeeded.length ? `已提交：${succeeded.join('、')}` : '', result.error || ''].filter(Boolean).join(' · ');
@@ -2465,6 +2630,12 @@
 
     async function sendQuery(text, actionKey = '') {
         if (busy || sessionStopOwners.has(sessionId) || initialRestore || !text.trim()) return;
+        const shareUrl = !actionKey && !replyDraft && guangyaShareLink(text);
+        if (shareUrl) {
+            promptInput.value = ''; saveDraft(); resizePrompt();
+            void createShareCard(shareUrl);
+            return;
+        }
         clearReceiptObserverForNewRequest();
         const message = text.trim();
         const replyTo = actionKey ? '' : replyDraft;
@@ -3020,6 +3191,7 @@
             });
         }
         expireCandidateCards();
+        clearShareCards();
         transcript?.replaceChildren();
         lastUserAt = 0;
         const candidateGroups = new Map();
@@ -3124,6 +3296,7 @@
         const switching = targetId !== sessionId;
         const previousSessionId = sessionId;
         if (switching) {
+            clearShareCards();
             setReply('');
             clearTaskSnapshot();
             saveDraft();
@@ -3365,6 +3538,7 @@
 
     async function openChannel(key) {
         if (!key) return;
+        clearShareCards();
         // 只读查看渠道会话：先像切换会话一样放下当前会话的请求与草稿，返回时由 loadSession 重新恢复。
         stopInitialRestore();
         saveDraft();
@@ -3378,6 +3552,7 @@
             const payload = await fetchJSON(`/api/agent/channels/${encodeURIComponent(key)}`);
             if (generation !== sessionLoadGeneration) return;
             setChannelMode(key);
+            clearShareCards();
             transcript?.replaceChildren();
             lastUserAt = 0;
             for (const message of payload?.messages || []) {
@@ -3406,6 +3581,7 @@
         restoreDraft();
         followOutput = true;
         if (newRepliesButton) newRepliesButton.hidden = true;
+        clearShareCards();
         transcript?.replaceChildren();
         lastUserAt = 0;
         setConsoleEmpty(true);
@@ -3804,6 +3980,7 @@
     newRepliesButton?.addEventListener('click', () => scrollToBottom(true));
     function handlePageHide() {
         saveDraft();
+        clearShareCards();
         if (activeRequest?.receiptOnly) receiptResumeNeeded = true;
         ++sessionLoadGeneration;
         invalidateActiveRequest();

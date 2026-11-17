@@ -596,6 +596,112 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
         self.assertEqual(card.locator('.agent-download-submit').count(), 0)
 
+    def share_page(self, *, width=1280, count=10, expires_in=900):
+        page = self.page(viewport={'width': width, 'height': 900})
+        page.evaluate("""({count, expires_in}) => {
+            window.__shareCalls = [];
+            window.__shareReplies = {};
+            const original = window.fetch;
+            window.fetch = async (url, options = {}) => {
+                const path = String(url);
+                if (!path.startsWith('/api/share/') && !path.startsWith('/api/guangya/dirs')) return original(url, options);
+                window.__shareCalls.push({path, body: options.body ? JSON.parse(options.body) : null});
+                if (window.__holdShare === path) await new Promise(resolve => { window.__releaseShare = resolve; });
+                let data = path === '/api/share/inspect' ? {
+                    preview_id: 'share-preview', target_id: 'offline', target_name: '离线', expires_in,
+                    files: Array.from({length: count}, (_, i) => ({id: `file-${i}`, name: i ? `Episode ${i}.mkv` : 'The Silent Storm <img src=x onerror=window.__shareXss=1>', is_dir: i === 0})),
+                } : path === '/api/share/restore' ? {success: true, count: 1, target_dir_name: '电影', request_id: 19}
+                  : path.startsWith('/api/guangya/dirs') ? [{file_id: 'movies', name: '电影', is_dir: true}]
+                  : {success: true, terminal: true, target_dir_name: '电影'};
+                const reply = window.__shareReplies[path] || {data, status: 200};
+                return new Response(JSON.stringify(reply.data), {status: reply.status, headers: {'Content-Type': 'application/json'}});
+            };
+        }""", {'count': count, 'expires_in': expires_in})
+        # 使用生产公共脚本中的目录弹窗与请求处理，不伪造目录选择回调。
+        page.add_script_tag(path=str(harness.ROOT / 'app/static/js/app.js'))
+        page.locator('#agentPrompt').fill('https://www.guangyapan.com/s/demo123?code=2468#/share')
+        page.locator('#agentComposer').evaluate('node => node.requestSubmit()')
+        page.locator('.agent-share-card input[type=checkbox]').first.wait_for()
+        return page
+
+    def test_share_card_selects_files_across_pages_and_uses_shared_directory_picker(self):
+        page = self.share_page()
+        card = page.locator('.agent-share-card')
+        self.assertIn('目标目录：离线', card.inner_text())
+        card.get_by_role('button', name='全不选', exact=True).click()
+        self.assertTrue(card.get_by_role('button', name='确认转存').is_disabled())
+        card.locator('input[value="file-0"]').check()
+        card.get_by_role('button', name='下一页').click()
+        card.locator('input[value="file-9"]').check()
+        card.get_by_role('button', name='上一页').click()
+        self.assertTrue(card.locator('input[value="file-0"]').is_checked())
+        self.assertIn('已选择 2 / 10', card.inner_text())
+        card.get_by_role('button', name='目标目录：离线').click()
+        page.locator('#agentShareDirectory [data-dir-list] button').last.click()
+        self.assertIn('目标目录：电影', card.inner_text())
+        self.assertEqual(page.evaluate("__shareCalls.filter(c => c.path === '/api/share/restore').length"), 0)
+        page.evaluate("window.__holdShare = '/api/share/restore'")
+        card.get_by_role('button', name='确认转存').click()
+        self.assertTrue(card.get_by_role('button', name='正在转存…').is_disabled())
+        page.evaluate('window.__releaseShare()')
+        card.locator('.agent-download-meta', has_text='转存成功').wait_for()
+        request = page.evaluate("__shareCalls.find(c => c.path === '/api/share/restore').body")
+        self.assertEqual(request, {'preview_id': 'share-preview', 'file_ids': ['file-0', 'file-9'], 'target_dir_id': 'movies', 'target_dir_name': '电影'})
+        self.assertEqual(page.evaluate("__kernelCalls.filter(c => c.url === '/api/agent/query').length"), 0)
+        self.assertIsNone(page.evaluate('window.__shareXss'))
+        self.assertTrue(card.get_by_role('button', name='重新解析').is_hidden())
+
+    def test_share_card_mobile_cancel_and_session_switch_close_directory_picker(self):
+        page = self.share_page(width=390, count=1)
+        card = page.locator('.agent-share-card')
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+        card.get_by_role('button', name='目标目录：离线').click()
+        page.locator('#agentShareDirectory [data-dir-close]').click()
+        self.assertIn('目标目录：离线', card.inner_text())
+        card.get_by_role('button', name='目标目录：离线').click()
+        page.locator('#agentNewSession').evaluate('node => node.click()')
+        self.assertEqual(page.locator('#agentShareDirectory').count(), 0)
+        self.assertEqual(page.locator('.agent-share-card').count(), 0)
+        self.assertEqual(page.evaluate("__shareCalls.filter(c => c.path === '/api/share/restore').length"), 0)
+
+    def test_share_card_expiry_can_reparse_but_unknown_submission_cannot_resubmit(self):
+        page = self.share_page(count=1)
+        card = page.locator('.agent-share-card')
+        page.evaluate("window.__shareReplies['/api/share/restore'] = {data: {error: '预览已过期，请重新解析'}, status: 410}")
+        card.get_by_role('button', name='确认转存').click()
+        card.get_by_role('button', name='重新解析').click()
+        page.wait_for_function("__shareCalls.filter(c => c.path === '/api/share/inspect').length === 2")
+        page.evaluate("window.__shareReplies['/api/share/restore'] = {data: {error: '网络中断'}, status: 502}")
+        card.get_by_role('button', name='确认转存').click()
+        card.locator('.agent-download-meta', has_text='提交状态待确认').wait_for()
+        self.assertTrue(card.get_by_role('button', name='确认转存').is_disabled())
+        self.assertTrue(card.get_by_role('button', name='重新解析').is_hidden())
+        self.assertTrue(card.get_by_role('link', name='查看下载记录').is_visible())
+
+    def test_share_card_accepted_request_waits_for_confirmed_result(self):
+        page = self.share_page(count=1)
+        page.evaluate("""() => {
+            window.__shareReplies['/api/share/restore'] = {data: {accepted: true, duplicate: true, request_id: 19}, status: 202};
+            window.__holdShare = '/api/share/requests/19';
+        }""")
+        card = page.locator('.agent-share-card')
+        card.get_by_role('button', name='确认转存').click()
+        card.locator('.agent-download-meta', has_text='正在核对结果').wait_for()
+        self.assertNotIn('转存成功', card.inner_text())
+        self.assertTrue(card.get_by_role('button', name='重新解析').is_hidden())
+        page.evaluate('window.__releaseShare()')
+        card.locator('.agent-download-meta', has_text='转存成功').wait_for()
+
+    def test_share_card_expires_and_cancel_keeps_cloud_untouched(self):
+        page = self.share_page(count=1, expires_in=1)
+        card = page.locator('.agent-share-card')
+        card.locator('.agent-download-meta', has_text='预览已过期').wait_for()
+        self.assertTrue(card.get_by_role('button', name='确认转存').is_disabled())
+        card.get_by_role('button', name='重新解析').click()
+        card.get_by_role('button', name='取消', exact=True).click()
+        self.assertEqual(page.locator('.agent-share-card').count(), 0)
+        self.assertEqual(page.evaluate("__shareCalls.filter(c => c.path === '/api/share/restore').length"), 0)
+
     def test_download_card_offers_telegram_targets_and_submits_nsfw_source(self):
         page = self.page({'directPreview': _direct_preview({'qb': True, 'guangya': True}, kind='magnet', title='HNMG-002',
                                                            nsfw=(('adult-1', 'NewNsfw'),)),
@@ -658,14 +764,16 @@ class AgentUXBrowserTests(unittest.TestCase):
         for status, receipt in (
             ('partial', {'ok': True, 'succeeded': ['qb'], 'failed': ['guangya'], 'error': '光鸭提交失败'}),
             ('manual_review', {'ok': False, 'error': '受理结果待核对，请勿重复提交'}),
-            ('duplicate', {'ok': False, 'duplicate': True, 'error': '已有下载请求正在处理'}),
+            ('duplicate', {'ok': False, 'duplicate': True, 'succeeded': ['guangya'], 'error': '已有下载请求正在处理'}),
         ):
             with self.subTest(status=status):
-                page = self.page({'directPreview': _direct_preview({'qb': True, 'guangya': True}, kind='torrent', title='Film', file_count=1),
+                page = self.page({'directPreview': _direct_preview({'qb': True, 'guangya': True}, nsfw=(('adult-new', '新选择的来源'),), kind='torrent', title='Film', file_count=1),
                                   'directSubmit': {**receipt, 'status': status, 'request_id': 9, 'summary': f'下载请求 #9 {status}'}})
                 page.locator('#agentAttachFile').set_input_files(files=[{
                     'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
                 card = page.locator('.agent-download-card')
+                if status == 'duplicate':
+                    _target(card, '光鸭·NSFW · 新选择的来源').check()
                 card.locator('.agent-download-submit').click()
                 error = receipt['error']
                 assert isinstance(error, str)
@@ -677,6 +785,9 @@ class AgentUXBrowserTests(unittest.TestCase):
                 self.assertTrue(card.get_by_role('link', name='查看下载记录').is_visible())
                 if status == 'partial':
                     self.assertIn('已提交：qBittorrent', card.inner_text())
+                elif status == 'duplicate':
+                    self.assertIn('已提交：光鸭云盘', card.inner_text())
+                    self.assertNotIn('新选择的来源', card.locator('.agent-download-meta').inner_text())
                 self.assertEqual(page.evaluate('window.__directForms.length'), 2)
                 page.close()
 

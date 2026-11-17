@@ -835,9 +835,31 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
         self.assertNotIn(SHARE_URL, response.text)
         self.assertNotIn("2468", response.text)
 
-    def test_web_share_api_keeps_auth_csrf_session_isolation_and_secret_redaction(self):
+    def test_first_previews_from_the_same_browser_cookie_keep_the_same_owner(self):
+        # 两个请求从同一份初始 cookie 发出，第二个响应最后写回浏览器。
+        sibling = TestClient(self.client.app, raise_server_exceptions=False)
+        self.addCleanup(sibling.close)
+        sibling.cookies.update(self.client.cookies)
         fake = FakeShareClient()
         with patch("app.routes.share_api.GuangYaClient", return_value=fake):
+            first = self.client.post('/api/share/inspect', headers=self.headers, json={'url': SHARE_URL})
+            second = sibling.post('/api/share/inspect', headers=self.headers, json={'url': SHARE_URL})
+            self.assertEqual((first.status_code, second.status_code), (200, 200))
+            restored = sibling.post('/api/share/restore', headers=self.headers, json={
+                'preview_id': first.json()['preview_id'], 'file_ids': ['file-1'],
+                'target_dir_id': 'dir-target', 'target_dir_name': '电影',
+            })
+        self.assertEqual(restored.status_code, 200)
+        self.assertTrue(restored.json()['success'])
+        self.assertEqual(len(fake.restore_calls), 1)
+
+    def test_web_share_api_keeps_auth_csrf_session_isolation_and_secret_redaction(self):
+        fake = FakeShareClient()
+        with patch("app.routes.share_api.GuangYaClient", return_value=fake), patch(
+            "app.modules.share_transfer.get", side_effect=lambda key, default="": {
+                "GY_SHARE_TARGET_DIR": "saved-share-dir", "GY_SHARE_TARGET_DIR_NAME": "分享默认目录",
+            }.get(key, default),
+        ):
             no_csrf = self.client.post("/api/share/inspect", json={"url": SHARE_URL})
             inspected = self.client.post(
                 "/api/share/inspect",
@@ -848,6 +870,7 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
         self.assertEqual(no_csrf.status_code, 403)
         self.assertEqual(inspected.status_code, 200)
         payload = inspected.json()
+        self.assertEqual((payload["target_id"], payload["target_name"]), ("saved-share-dir", "分享默认目录"))
         self.assertNotIn(SECRET_TOKEN, repr(payload))
         self.assertNotIn(SIGNED_URL, repr(payload))
         self.assertNotIn(SHARE_URL, repr(payload))

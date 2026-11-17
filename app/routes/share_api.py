@@ -1,7 +1,7 @@
 """光鸭分享链接解析预览与选择转存 API。"""
 from __future__ import annotations
 
-import secrets
+import hashlib
 from typing import Any
 
 from fastapi import APIRouter, Body, Request
@@ -15,7 +15,7 @@ from app.modules.share_transfer import (
     get_share_transfer_store,
     inspect_share_for_transfer,
 )
-from app.web import require_api_login
+from app.web import csrf_token, require_api_login
 
 router = APIRouter(prefix="/api/share")
 logger = get_logger(__name__)
@@ -24,7 +24,9 @@ logger = get_logger(__name__)
 def _web_owner(request: Request) -> str:
     owner_id = str(request.session.get("share_transfer_owner") or "").strip()
     if not owner_id:
-        owner_id = secrets.token_urlsafe(18)
+        # 同一浏览器同时解析首批链接时，各请求携带相同的会话快照。
+        # 从已有会话令牌确定归属，避免随机 owner 被后返回的 Cookie 覆盖。
+        owner_id = hashlib.sha256(f"share:{csrf_token(request)}".encode()).hexdigest()
         request.session["share_transfer_owner"] = owner_id
     return f"web:{owner_id}"
 
@@ -71,6 +73,8 @@ def inspect_share(request: Request, data: dict | None = Body(default=None)):
             "expires_in": preview["expires_in"],
             "count": len(preview["files"]),
             "files": preview["files"],
+            "target_id": preview["target_id"],
+            "target_name": preview["target_name"],
         }
     except ValueError:
         return JSONResponse({"error": "分享链接无效，请检查链接或提取码"}, status_code=400)

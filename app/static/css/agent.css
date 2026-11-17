@@ -2015,6 +2015,14 @@ body.agent-page-body::after { display: none; }
 .agent-download-card { display: grid; gap: 6px; max-width: 560px; padding: 14px 16px; background: var(--bg-card); border: 1px solid var(--agent-line); border-radius: 16px; }
 .agent-download-title { color: var(--text-primary); font-size: 14px; font-weight: 650; overflow-wrap: anywhere; }
 .agent-download-meta { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.agent-share-card { width: min(560px, 100%); min-width: 0; }
+.agent-share-card .agent-download-meta { min-height: 1.5em; line-height: 1.5; }
+.agent-share-files { display: grid; gap: 6px; min-height: 44px; }
+.agent-share-file { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 10px; border: 1px solid var(--agent-line); border-radius: 9px; cursor: pointer; }
+.agent-share-file input { flex-shrink: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+.agent-share-file span { min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
+.agent-share-target { height: auto; min-height: 44px; padding-block: 8px; text-align: left; overflow-wrap: anywhere; }
+.agent-share-card [hidden] { display: none; }
 .agent-download-card.is-error .agent-download-meta { color: var(--danger); }
 .agent-download-card.is-done .agent-download-meta { color: var(--accent); }
 .agent-download-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
