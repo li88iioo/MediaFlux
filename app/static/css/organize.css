@@ -1021,10 +1021,13 @@ html[data-organize-rules-initial-tab="delivery"] #organizeRulesNav [data-tab-tar
     color: var(--text-secondary);
 }
 
+/* 行高等于弹窗可用高度：台账列表与编辑区各自滚动，左侧不再在列表下方留白。 */
 .tmdb-regex-body {
     grid-template-columns: minmax(340px, 0.84fr) minmax(0, 1.16fr);
+    grid-template-rows: minmax(0, 1fr);
     gap: 14px;
     min-height: 0;
+    overflow: hidden;
     padding: 14px 18px 16px;
     background: var(--surface-subtle, var(--bg-card));
 }
@@ -1074,8 +1077,8 @@ html[data-organize-rules-initial-tab="delivery"] #organizeRulesNav [data-tab-tar
 .tmdb-regex-table-frame {
     height: auto;
     flex: 1 1 auto;
-    min-height: 280px;
-    max-height: 580px;
+    min-height: 0;
+    max-height: none;
     background: var(--bg-card);
 }
 
@@ -1089,6 +1092,12 @@ html[data-organize-rules-initial-tab="delivery"] #organizeRulesNav [data-tab-tar
     border-radius: 10px;
     font-size: 12.5px;
     background: var(--control-tint, var(--bg-input));
+}
+
+/* 空台账撑满列表框，与有数据时同高，不在下方留白。 */
+.tmdb-regex-rule-list:has(> .tmdb-regex-rule-empty) {
+    grid-template-rows: minmax(240px, 1fr);
+    align-content: stretch;
 }
 
 .tmdb-regex-rule-card {
