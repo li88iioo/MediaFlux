@@ -13,15 +13,23 @@
     #MediaFluxConfigPage .mfSection > .fieldDescription { margin:0 0 1em; }
     #MediaFluxConfigPage .mfActions { display:flex; flex-wrap:wrap; gap:.75em; margin-top:.5em; }
     #MediaFluxConfigPage .mfActions .emby-button { margin:0; }
-    #MediaFluxConfigPage #mfStatus { min-height:1.5em; margin:1em 0 2em; overflow-wrap:anywhere; }
+    /* 读取、保存与同步前后文字长短不同：预留高度并固定范围区，避免按钮和下方内容跳动。 */
+    #MediaFluxConfigPage #mfPasswordInfo, #MediaFluxConfigPage #mfCacheInfo { min-height:3em; }
+    /* 窄屏同步说明按三行占位，保持异步读取前后布局一致。 */
+    @media (max-width:359px) {
+      #MediaFluxConfigPage #mfCacheInfo { min-height:4.5em; line-height:1.5; }
+    }
+    #MediaFluxConfigPage #mfStatus { min-height:3em; margin:1em 0 2em; overflow-wrap:anywhere; }
+    #MediaFluxConfigPage .mfScope { height:22em; overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; padding-right:.5em; }
     #MediaFluxConfigPage .mfScope h4 { margin:1.25em 0 .5em; font-weight:600; }
+    #MediaFluxConfigPage .mfScope h4:first-child { margin-top:0; }
     #MediaFluxConfigPage .mfScope ul { list-style:none; margin:0; padding:0; }
     #MediaFluxConfigPage .mfScope li { padding:.6em 0; border-top:1px solid rgba(128,128,128,.25); overflow-wrap:anywhere; }
     #MediaFluxConfigPage .mfScope li:last-child { border-bottom:1px solid rgba(128,128,128,.25); }
     #MediaFluxConfigPage .mfScope code { font-size:.9em; }
     #MediaFluxConfigPage .mfScope .mfSub { display:block; margin-top:.2em; opacity:.7; }
     #MediaFluxConfigPage .mfEmpty { opacity:.7; padding:.6em 0; }
-    #MediaFluxConfigPage #mfVersion { margin-top:1.25em; }
+    #MediaFluxConfigPage #mfVersion { margin-top:1.25em; min-height:3em; }
     #MediaFluxConfigPage #mfLastError { margin-top:1em; padding:.6em .9em; border-left:3px solid rgba(128,128,128,.5); overflow-wrap:anywhere; }
     #MediaFluxConfigPage #mfLastError.mfHasError { border-left-color:#e05252; }
   </style>

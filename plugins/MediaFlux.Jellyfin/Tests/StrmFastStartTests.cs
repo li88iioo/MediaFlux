@@ -35,6 +35,7 @@ public sealed class StrmFastStartTests
         public Mock<IMediaSourceManager> Inner { get; } = new();
         public List<bool> Probes { get; } = [];
         public IReadOnlyList<MediaStream> Streams { get; set; } = [];
+        public bool ProbeFails { get; set; }
         public StrmProbeLedger Ledger { get; }
         public StrmProbeMediaSourceManager Manager { get; }
 
@@ -42,16 +43,22 @@ public sealed class StrmFastStartTests
         {
             Ledger = NewLedger();
             Inner.Setup(m => m.GetMediaStreams(It.IsAny<Guid>())).Returns(() => Streams);
-            // Jellyfin 的远程探测成功后会把音视频流写回库；不探测时库内流保持不变。
+            // 与 Jellyfin 一致：探测成功才写回媒体流并推进刷新时间；失败或不探测时两者都保持原样。
             Inner.Setup(m => m.GetPlaybackMediaSources(It.IsAny<BaseItem>(), It.IsAny<User>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                .Callback((BaseItem _, User _, bool probe, bool _, CancellationToken _) =>
+                .Callback((BaseItem item, User _, bool probe, bool _, CancellationToken _) =>
                 {
                     Probes.Add(probe);
-                    if (probe) Streams = PlayableStreams;
+                    if (probe && !ProbeFails) Completed(item);
                 })
                 .ReturnsAsync(Array.Empty<MediaSourceInfo>());
             Manager = new StrmProbeMediaSourceManager(Inner.Object, Ledger, NullLogger<StrmProbeMediaSourceManager>.Instance);
             SetFastStart(fastStart);
+        }
+
+        public void Completed(BaseItem item)
+        {
+            Streams = PlayableStreams;
+            item.DateLastRefreshed = (item.DateLastRefreshed > DateTime.UtcNow ? item.DateLastRefreshed : DateTime.UtcNow).AddSeconds(1);
         }
 
         public StrmProbeLedger NewLedger()
@@ -107,12 +114,13 @@ public sealed class StrmFastStartTests
         var id = Guid.NewGuid();
         var file = Path.Combine(h.F.Root, "config", "MediaFlux.Jellyfin.strm-probe.tsv");
         Directory.CreateDirectory(Path.GetDirectoryName(file)!);
-        File.WriteAllLines(file, Enumerable.Range(0, 1500).Select(i => $"{id:N}\tOLD{i}")
-            .Append("not-a-guid\tX").Append("broken line").Append($"{id:N}\tNEW"));
+        File.WriteAllLines(file, Enumerable.Range(0, 1500).Select(i => $"2\t{id:N}\tOLD{i}")
+            .Append("2\tnot-a-guid\tX").Append("broken line").Append($"2\t{id:N}\tNEW")
+            .Append($"{id:N}\tLEGACY").Append($"{id:N}\t"));
 
         var ledger = h.NewLedger();
         Assert.True(ledger.Matches(id, "NEW"));
-        Assert.Equal([$"{id:N}\tNEW"], File.ReadAllLines(file));
+        Assert.Equal([$"2\t{id:N}\tNEW"], File.ReadAllLines(file));
     }
 
     [Fact]
@@ -127,6 +135,34 @@ public sealed class StrmFastStartTests
 
         Assert.Equal([true, false, false], h.Probes);
         Assert.True(h.NewLedger().Matches(item.Id, StrmProbeLedger.Fingerprint(item.Path)!));
+    }
+
+    [Fact]
+    public async Task LegacyUnverifiedRecordsRequireASuccessfulProbeAndThenSurviveReload()
+    {
+        using var h = new Harness();
+        var item = h.Strm();
+        var untouched = h.Strm("untouched.strm");
+        var file = Path.Combine(h.F.Root, "config", "MediaFlux.Jellyfin.strm-probe.tsv");
+        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+        File.WriteAllLines(file, new[] { item, untouched }
+            .Select(i => $"{i.Id:N}\t{StrmProbeLedger.Fingerprint(i.Path)}"));
+        h.Streams = PlayableStreams;
+        h.ProbeFails = true;
+        await h.Play(item);
+        Assert.Equal([true], h.Probes);
+        Assert.False(h.Ledger.Contains(item.Id));
+        Assert.False(h.Ledger.Contains(untouched.Id));
+
+        h.ProbeFails = false;
+        await h.Play(item);
+        var reloaded = h.NewLedger();
+        var manager = new StrmProbeMediaSourceManager(h.Inner.Object, reloaded, NullLogger<StrmProbeMediaSourceManager>.Instance);
+        await manager.GetPlaybackMediaSources(item, null!, true, true, CancellationToken.None);
+        Assert.Equal([true, true, false], h.Probes);
+        Assert.False(reloaded.Contains(untouched.Id));
+        reloaded.Forget(item.Id);
+        Assert.False(h.NewLedger().Contains(item.Id));
     }
 
     [Fact]
@@ -146,6 +182,32 @@ public sealed class StrmFastStartTests
         await h.Play(item);
 
         Assert.Equal([true, true, false, true], h.Probes);
+    }
+
+    [Fact]
+    public async Task FailedProbeLeavingOldStreamsIsNeverRecorded()
+    {
+        using var h = new Harness();
+        var item = h.Strm();
+        await h.Play(item);
+
+        // 洗版后探测失败：库内仍是旧片源的音视频流，不能登记新指纹，否则会长期沿用错误信息。
+        h.WriteStrm("S01E01.strm", "http://mf.invalid/playgy/replacement");
+        h.ProbeFails = true;
+        await h.Play(item);
+        await h.Play(item);
+        Assert.False(h.Ledger.Matches(item.Id, StrmProbeLedger.Fingerprint(item.Path)!));
+
+        // 装插件前已探测过的存量条目，首次探测失败同样不登记。
+        var existing = h.Strm("existing.strm");
+        h.Streams = PlayableStreams;
+        await h.Play(existing);
+        Assert.False(h.Ledger.Contains(existing.Id));
+
+        h.ProbeFails = false;
+        await h.Play(item);
+        await h.Play(item);
+        Assert.Equal([true, true, true, true, true, false], h.Probes);
     }
 
     [Fact]
@@ -248,7 +310,7 @@ public sealed class StrmFastStartTests
                 .Callback((BaseItem item, MetadataRefreshOptions options, CancellationToken _) =>
                 {
                     lock (Refreshes) Refreshes.Add((item.Id, options));
-                    H.Streams = PlayableStreams;
+                    H.Completed(item);
                     _refreshed.Release();
                 })
                 .ReturnsAsync(ItemUpdateType.MetadataImport);
@@ -365,17 +427,104 @@ public sealed class StrmFastStartTests
         Assert.Equal([true], p.H.Probes);
     }
 
+    [Theory]
+    [InlineData("partial")]
+    [InlineData("exception")]
+    [InlineData("cancelled")]
+    public async Task FailedPreProbeIgnoresItsOwnUpdateButAllowsALaterRetry(string failure)
+    {
+        using var p = new PreProbeHarness();
+        var item = p.Add(p.H.Strm("changed.strm"));
+        p.H.Ledger.Record(item.Id, StrmProbeLedger.Fingerprint(item.Path)!);
+        p.H.WriteStrm("changed.strm", "http://mf.invalid/playgy/replacement");
+        p.H.Streams = PlayableStreams;
+        var barriers = new[] { p.Add(p.H.Strm("after-failure.strm")), p.Add(p.H.Strm("after-retry.strm")) };
+        var completed = barriers.Select(_ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).ToArray();
+        var attempts = 0;
+        var recover = false;
+        p.Providers.Setup(m => m.RefreshSingleItem(It.IsAny<BaseItem>(), It.IsAny<MetadataRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Callback((BaseItem refreshed, MetadataRefreshOptions _, CancellationToken _) =>
+            {
+                if (refreshed.Id != item.Id)
+                {
+                    p.H.Completed(refreshed);
+                    completed[Array.FindIndex(barriers, b => b.Id == refreshed.Id)].TrySetResult();
+                    return;
+                }
+                var attempt = Interlocked.Increment(ref attempts);
+                if (recover) p.H.Completed(refreshed);
+                // 宿主即使部分提供方失败，仍会保存其它结果并发出 ItemUpdated。
+                if (attempt == 1) p.Raise("updated", refreshed);
+                p.Raise("added", barriers[Math.Min(attempt - 1, 1)]);
+                if (!recover && failure == "exception") throw new IOException("probe failed");
+                if (!recover && failure == "cancelled") throw new OperationCanceledException("provider timeout");
+            })
+            .ReturnsAsync(ItemUpdateType.MetadataImport);
+
+        p.Raise("updated", item);
+        // 哨兵在自身更新事件之后入队，无需依赖睡眠来判断是否重复探测。
+        await completed[0].Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, attempts);
+        Assert.False(p.H.Ledger.Matches(item.Id, StrmProbeLedger.Fingerprint(item.Path)!));
+
+        recover = true;
+        p.Raise("updated", item);
+        await completed[1].Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(2, attempts);
+        await p.H.Play(item);
+        Assert.Equal([false], p.H.Probes);
+    }
+
     [Fact]
-    public async Task PreProbeWithoutPlayableStreamsIsNotRecorded()
+    public async Task StoppingTheServiceCancelsTheProbeWithoutRecordingItOrDrainingMoreItems()
     {
         using var p = new PreProbeHarness();
         var item = p.Add(p.H.Strm());
+        var later = p.Add(p.H.Strm("later.strm"));
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        CancellationToken probeToken = default;
+        p.Providers.Setup(m => m.RefreshSingleItem(It.IsAny<BaseItem>(), It.IsAny<MetadataRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Returns(async (BaseItem _, MetadataRefreshOptions _, CancellationToken token) =>
+            {
+                Interlocked.Increment(ref calls);
+                probeToken = token;
+                entered.TrySetResult();
+                await Task.Delay(Timeout.Infinite, token);
+                return ItemUpdateType.None;
+            });
+        p.Raise("added", item);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        p.Raise("added", later);
+        await p.Service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(probeToken.IsCancellationRequested);
+        Assert.Equal(1, calls);
+        Assert.False(p.H.Ledger.Contains(item.Id));
+        Assert.False(p.H.Ledger.Contains(later.Id));
+    }
+
+    [Fact]
+    public async Task PreProbeIsRecordedOnlyWhenTheRefreshCompletesWithStreams()
+    {
+        using var p = new PreProbeHarness();
+        var stale = p.Add(p.H.Strm("stale.strm"));
+        var empty = p.Add(p.H.Strm("empty.strm"));
+        // 刷新报告失败（刷新时间未推进）时即使库内残留旧音视频流也不登记。
         p.Providers.Setup(m => m.RefreshSingleItem(It.IsAny<BaseItem>(), It.IsAny<MetadataRefreshOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(ItemUpdateType.MetadataImport);
+        p.H.Streams = PlayableStreams;
+        Assert.True(await p.Service.ProbeAsync(stale.Id, CancellationToken.None));
+        Assert.False(p.H.Ledger.Contains(stale.Id));
 
-        Assert.True(await p.Service.ProbeAsync(item.Id, CancellationToken.None));
-        Assert.False(p.H.Ledger.Contains(item.Id));
-        await p.H.Play(item);
+        // 刷新完成但未取得音视频流同样不登记。
+        p.Providers.Setup(m => m.RefreshSingleItem(It.IsAny<BaseItem>(), It.IsAny<MetadataRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Callback((BaseItem item, MetadataRefreshOptions _, CancellationToken _) => item.DateLastRefreshed = DateTime.UtcNow.AddMinutes(1))
+            .ReturnsAsync(ItemUpdateType.MetadataImport);
+        p.H.Streams = [];
+        Assert.True(await p.Service.ProbeAsync(empty.Id, CancellationToken.None));
+        Assert.False(p.H.Ledger.Contains(empty.Id));
+
+        await p.H.Play(stale);
         Assert.Equal([true], p.H.Probes);
     }
 

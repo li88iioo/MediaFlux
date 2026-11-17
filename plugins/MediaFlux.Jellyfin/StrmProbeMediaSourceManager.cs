@@ -42,6 +42,13 @@ public sealed class StrmProbeMediaSourceManager(
     public static bool HasVideoAndAudio(IReadOnlyList<MediaStream> streams) =>
         streams.Any(s => s.Type == MediaStreamType.Video) && streams.Any(s => s.Type == MediaStreamType.Audio);
 
+    /// <summary>
+    /// 远程探测失败时库内仍保留旧片源的媒体流，不能据此登记新指纹。Jellyfin 只在本次刷新的
+    /// 全部提供方都成功时才更新 DateLastRefreshed，以此确认探测确实完成。
+    /// </summary>
+    public static bool ProbeCompleted(BaseItem item, DateTime refreshedBefore, IReadOnlyList<MediaStream> streams) =>
+        item.DateLastRefreshed > refreshedBefore && HasVideoAndAudio(streams);
+
     public async Task<IReadOnlyList<MediaSourceInfo>> GetPlaybackMediaSources(
         BaseItem item, User user, bool allowMediaProbe, bool enablePathSubstitution, CancellationToken cancellationToken)
     {
@@ -52,8 +59,9 @@ public sealed class StrmProbeMediaSourceManager(
         if (fingerprint is not null && ledger.Matches(item.Id, fingerprint) && HasVideoAndAudio(inner.GetMediaStreams(item.Id)))
             return await inner.GetPlaybackMediaSources(item, user, false, enablePathSubstitution, cancellationToken).ConfigureAwait(false);
 
+        var refreshedBefore = item.DateLastRefreshed;
         var sources = await inner.GetPlaybackMediaSources(item, user, true, enablePathSubstitution, cancellationToken).ConfigureAwait(false);
-        if (fingerprint is not null && HasVideoAndAudio(inner.GetMediaStreams(item.Id)))
+        if (fingerprint is not null && ProbeCompleted(item, refreshedBefore, inner.GetMediaStreams(item.Id)))
         {
             ledger.Record(item.Id, fingerprint);
             logger.LogDebug("STRM 起播加速：已记录探测结果 {Item}", item.Id);

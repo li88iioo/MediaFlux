@@ -79,9 +79,17 @@ public sealed class StrmPreProbeService(
             {
                 await Task.Delay(SettleDelay, token).ConfigureAwait(false);
                 while (library.IsScanRunning) await Task.Delay(SettleDelay, token).ConfigureAwait(false);
-                _pending.TryRemove(id, out _);
-                if (!StrmProbeMediaSourceManager.Enabled) continue;
-                if (await ProbeAsync(id, token).ConfigureAwait(false)) await Task.Delay(Gap, token).ConfigureAwait(false);
+                bool probed;
+                try
+                {
+                    // 自身刷新也会触发 ItemUpdated，探测结束前保持占位，避免失败后循环入队。
+                    probed = StrmProbeMediaSourceManager.Enabled && await ProbeAsync(id, token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _pending.TryRemove(id, out _);
+                }
+                if (probed) await Task.Delay(Gap, token).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -97,6 +105,7 @@ public sealed class StrmPreProbeService(
             return false;
         if (ledger.Matches(id, fingerprint) && StrmProbeMediaSourceManager.HasVideoAndAudio(mediaSources.GetMediaStreams(id)))
             return false;
+        var refreshedBefore = item.DateLastRefreshed;
         try
         {
             await item.RefreshMetadata(
@@ -106,11 +115,12 @@ public sealed class StrmPreProbeService(
                     MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
                 },
                 token).ConfigureAwait(false);
-            if (StrmProbeMediaSourceManager.HasVideoAndAudio(mediaSources.GetMediaStreams(id))) ledger.Record(id, fingerprint);
-            else logger.LogWarning("STRM 起播加速：预探测未取得音视频流 {Item}", id);
+            if (StrmProbeMediaSourceManager.ProbeCompleted(item, refreshedBefore, mediaSources.GetMediaStreams(id))) ledger.Record(id, fingerprint);
+            else logger.LogWarning("STRM 起播加速：预探测未完成（刷新报告失败或未取得音视频流）{Item}", id);
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e) when (e is not OperationCanceledException || !token.IsCancellationRequested)
         {
+            // 提供方自身超时只结束当前条目；服务停机取消才终止整个 worker。
             logger.LogWarning(e, "STRM 起播加速：预探测失败 {Item}", id);
         }
         return true;

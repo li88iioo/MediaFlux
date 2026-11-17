@@ -1,6 +1,6 @@
 # MediaFlux Jellyfin 插件
 
-版本 **0.1.5**（程序集 / manifest：**0.1.5.0**）。验证 **Jellyfin 12.2 / 12.3 / 12.4，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
+版本 **0.1.6**（程序集 / manifest：**0.1.6.0**）。验证 **Jellyfin 12.2 / 12.3 / 12.4，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
 
 插件默认关闭，仅拦截用户明确发起的 Jellyfin `DELETE /Items/{itemId}`、`DELETE /Items?ids=...`。扫描发现 STRM 消失、清库或定时任务不会触发 MF 云端删除；插件关闭或请求完全不涉及映射内 STRM 时，继续原生删除行为。
 
@@ -73,7 +73,7 @@ Jellyfin 12.2–12.4 的 `MediaSourceManager.GetPlaybackMediaSources` 对 `.strm
 - 开关 `StrmFastStart` 默认关闭，在调用时读取（`IMediaSourceManager` 在插件实例创建前已被解析）。
 - 仅当条目是视频 `.strm`、`StrmProbeLedger` 中的指纹与当前 `.strm` 原始字节 SHA256 一致、且库内同时有音视频流时，以 `allowMediaProbe=false` 调用官方实现；否则照常探测，成功取得音视频流后记录指纹。
 - `StrmPreProbeService` 处理 `ItemAdded` 的视频 `.strm`，以及已记录但内容变化的 `ItemUpdated`；等待入库扫描结束后串行执行与播放前相同的 `RefreshMetadata(FullRefresh, EnableRemoteContentProbe)`。待预探测最多 200 个，超出部分留到首次播放；`ItemRemoved` 删除记录，不批量补探存量。
-- 指纹记录为插件配置目录下的追加式 TSV，重复和墓碑行过多时启动加载时重写；写盘失败只影响重启后的命中。
+- 指纹记录为插件配置目录下的追加式 TSV，当前每行格式为 `2<TAB>条目ID<TAB>指纹`（空指纹表示删除）。旧版无版本的两列记录不可信，不再导入；下次播放成功探测后重建，不批量补探。重复和墓碑行过多时加载时重写；写盘失败只影响重启后的命中。
 
 ## 本地构建与官方 TestServer 测试
 
@@ -108,4 +108,4 @@ DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 
 发版前在 `changelog.json` 写入新版本的真实更新说明（以上一插件标签到本次提交的变更为准）；缺少当前版本说明时打包直接失败，不再以简介代替。发布清单同时用该文件修正已发布版本的说明文字，资产地址与校验值不变。
 
-脚本校验版本、框架 / ABI、插件 ID、更新说明，生成 `artifacts/MediaFlux.Jellyfin-0.1.5.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。
+脚本校验版本、框架 / ABI、插件 ID、更新说明，生成 `artifacts/MediaFlux.Jellyfin-0.1.6.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。

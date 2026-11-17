@@ -78,7 +78,7 @@ class JellyfinPluginBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator("#mfVersion").inner_text(), "编译 API 基线 12.2.0 · 已验证 Jellyfin 12.2 / 12.3 / 12.4")
         self.assertNotIn("T12:00:00Z", self.page.locator("#mfCacheInfo").inner_text())
         self.assertFalse(self.page.locator("#mfEnabled").is_checked())
-        for width in (1100, 360):
+        for width in (1100, 360, 320):
             self.page.set_viewport_size({"width": width, "height": 1100})
             logo = self.page.get_by_role("img", name="MediaFlux").bounding_box()
             self.assertIsNotNone(logo)
@@ -143,6 +143,76 @@ class JellyfinPluginBrowserTests(unittest.TestCase):
         self.page.evaluate("settings.strm_fast_start_available = true")
         self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")
         self.page.wait_for_function("document.querySelector('#mfStrmFastStartInfo').textContent === %r" % info)
+
+    def test_loading_and_syncing_scope_do_not_shift_the_layout(self):
+        ids = ["mfEnabled", "mfStrmFastStart", "mfSync", "mfStatus", "mfCacheInfo", "mfScope", "mfVersion", "mfLastError"]
+        # 点击可能滚动页面；比较文档坐标和尺寸，避免把滚动误判成布局位移。
+        geometry = """ids => ids.map(id => {
+            const r = document.getElementById(id).getBoundingClientRect();
+            return [r.top + scrollY, r.width, r.height];
+        })"""
+        for width in (1100, 360, 320):
+            for cache in ("matched", "stale", "never"):
+                with self.subTest(width=width, cache=cache):
+                    self.page.set_viewport_size({"width": width, "height": 1100})
+                    self.page.evaluate(API)
+                    if cache != "matched":
+                        self.page.evaluate("settings.cache_current = false")
+                    if cache == "never":
+                        self.page.evaluate("Object.assign(settings, {synced_at_utc: '', active_mappings: [], libraries: []})")
+                    self.page.set_content(PAGE.read_text(encoding="utf-8"))
+                    before = self.page.evaluate(geometry, ids)
+                    self.page.evaluate("window.hold = true; delete window.release")
+                    self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")
+                    self.page.wait_for_function("typeof window.release === 'function'")
+                    self.assertEqual(self.page.evaluate(geometry, ids), before)
+                    self.page.evaluate("release(); window.hold = false")
+                    self.page.wait_for_function("!document.querySelector('#mfFields').disabled")
+                    self.assertEqual(self.page.evaluate(geometry, ids), before)
+                    scope = self.page.locator("#mfScope").inner_text()
+                    # 首次同步也写入时间：覆盖“未同步”的两行变成三行。
+                    self.page.evaluate("""() => {
+                        settings.active_mappings = Array.from({length: 7}, (_, i) => ({local: '/data/strm/c' + i, server: '/media/strm/c' + i}));
+                        settings.libraries = Array.from({length: 5}, (_, i) => ({Name: '库' + i, Locations: ['/media/strm/c' + i]}));
+                        settings.synced_at_utc = '2026-11-17T23:59:59Z'; settings.cache_current = true;
+                        window.hold = true; delete window.release;
+                    }""")
+                    self.page.locator("#mfSync").click()
+                    self.page.wait_for_function("typeof window.release === 'function'")
+                    self.assertEqual(self.page.evaluate(geometry, ids), before)
+                    self.assertEqual(self.page.locator("#mfScope").inner_text(), scope)
+                    self.page.evaluate("release(); window.hold = false")
+                    self.page.wait_for_function("document.querySelector('#mfStatus').textContent.startsWith('MF 范围同步成功')")
+                    self.assertEqual(self.page.evaluate(geometry, ids), before)
+                    self.assertEqual(self.page.locator("#mfScope li").count(), 12)
+                    self.assertGreater(self.page.evaluate("document.querySelector('#mfScope').scrollHeight"),
+                                       self.page.evaluate("document.querySelector('#mfScope').clientHeight"))
+                    self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
+                    self.assertTrue(self.page.evaluate("""() => {
+                        const info = document.querySelector('#mfCacheInfo');
+                        const scope = document.querySelector('#mfScope');
+                        return info.scrollHeight <= info.clientHeight && info.scrollWidth <= info.clientWidth &&
+                            scope.scrollWidth <= scope.clientWidth;
+                    }"""))
+                    self.assertTrue(self.page.locator("#mfCacheInfo").inner_text().endswith("MediaFlux 离线时保留已同步范围。"))
+                    scope = self.page.locator("#mfScope").inner_text()
+                    # 同步失败和重新读取失败均保留范围，等待/失败时几何均稳定。
+                    for action in ("sync", "refresh"):
+                        with self.subTest(action=action):
+                            self.page.evaluate("window.fail = true; window.hold = true; delete window.release")
+                            if action == "sync":
+                                self.page.locator("#mfSync").click()
+                            else:
+                                self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")
+                            self.page.wait_for_function("typeof window.release === 'function'")
+                            self.assertTrue(self.page.locator("#mfSync").is_disabled())
+                            self.assertEqual(self.page.evaluate(geometry, ids), before)
+                            self.assertEqual(self.page.locator("#mfScope").inner_text(), scope)
+                            self.page.evaluate("release(); window.hold = false")
+                            self.page.wait_for_function("!document.querySelector('#mfFields').disabled")
+                            self.assertEqual(self.page.locator("#mfStatus").inner_text(), "MF 暂时无法连接")
+                            self.assertEqual(self.page.evaluate(geometry, ids), before)
+                            self.assertEqual(self.page.locator("#mfScope").inner_text(), scope)
 
     def test_refresh_does_not_accumulate_event_handlers(self):
         self.page.locator("#MediaFluxConfigPage").dispatch_event("pageshow")

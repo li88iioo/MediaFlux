@@ -9,6 +9,8 @@ namespace MediaFlux.Jellyfin;
 /// </summary>
 public sealed class StrmProbeLedger(IApplicationPaths paths)
 {
+    // 旧版两列记录可能来自失败探测；只信任通过刷新完成校验的新版记录。
+    private const string Version = "2";
     private readonly string _path = Path.Combine(paths.PluginConfigurationsPath, "MediaFlux.Jellyfin.strm-probe.tsv");
     private readonly object _gate = new();
     private Dictionary<Guid, string>? _entries;
@@ -39,7 +41,7 @@ public sealed class StrmProbeLedger(IApplicationPaths paths)
         {
             if (Entries().TryGetValue(id, out var known) && known == fingerprint) return;
             _entries![id] = fingerprint;
-            Append($"{id:N}\t{fingerprint}");
+            Append($"{Version}\t{id:N}\t{fingerprint}");
         }
     }
 
@@ -47,7 +49,7 @@ public sealed class StrmProbeLedger(IApplicationPaths paths)
     {
         lock (_gate)
         {
-            if (Entries().Remove(id)) Append($"{id:N}\t");
+            if (Entries().Remove(id)) Append($"{Version}\t{id:N}\t");
         }
     }
 
@@ -60,9 +62,9 @@ public sealed class StrmProbeLedger(IApplicationPaths paths)
         {
             _lines++;
             var parts = line.Split('\t');
-            if (parts.Length != 2 || !Guid.TryParseExact(parts[0], "N", out var id)) continue;
-            if (parts[1].Length == 0) _entries.Remove(id);
-            else _entries[id] = parts[1];
+            if (parts.Length != 3 || parts[0] != Version || !Guid.TryParseExact(parts[1], "N", out var id)) continue;
+            if (parts[2].Length == 0) _entries.Remove(id);
+            else _entries[id] = parts[2];
         }
         // 墓碑和覆盖行过多时整体重写，避免文件随播放与删除无限增长。
         if (_lines > _entries.Count * 2 + 1024) Rewrite();
@@ -88,7 +90,7 @@ public sealed class StrmProbeLedger(IApplicationPaths paths)
         var temp = _path + ".tmp";
         try
         {
-            File.WriteAllLines(temp, _entries!.Select(e => $"{e.Key:N}\t{e.Value}"));
+            File.WriteAllLines(temp, _entries!.Select(e => $"{Version}\t{e.Key:N}\t{e.Value}"));
             File.Move(temp, _path, overwrite: true);
             _lines = _entries!.Count;
         }
