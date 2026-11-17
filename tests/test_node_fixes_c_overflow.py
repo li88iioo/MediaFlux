@@ -19,7 +19,7 @@ from app.modules import strm
 from app.modules.media_refresh import plan_refresh_targets
 from app.modules.scheduler import STRMScheduler
 from app.modules.strm_metadata_worker import STRMMetadataWorker
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, media_refresh_providers
 from tests.test_media_precise_refresh import _RefreshRecorder
 from tests.test_strm_hardening import _TreeClient
 
@@ -137,7 +137,7 @@ def test_C02_exact_spill_survives_real_refresh_queue_and_consumers(tmp_path, all
         media_refresh_queue_status,
     )
 
-    with isolated_test_database(), ExitStack() as stack:
+    with isolated_test_database(), media_refresh_providers("jellyfin", "emby"), ExitStack() as stack:
         scheduler = STRMScheduler()
         stack.enter_context(patch("app.modules.scheduler.get", side_effect=lambda k, d="": str(tmp_path) if k == "STRM_ROOT" else d))
         policy = replace(scheduler._refresh_overflow_sink(), allow_emby=allow_emby)
@@ -154,8 +154,6 @@ def test_C02_exact_spill_survives_real_refresh_queue_and_consumers(tmp_path, all
         worker = coordinator.MediaRefreshCoordinator()
         stack.enter_context(patch.object(coordinator, "get_media_refresh_coordinator", return_value=worker))
         stack.enter_context(patch.object(worker, "wake"))
-        stack.enter_context(patch.object(coordinator, "_configured_provider_names",
-            side_effect=lambda *, allow_emby: ("jellyfin", "emby") if allow_emby else ("jellyfin",)))
         # 不替换 enqueue：outbox -> 统一 SQLite 队列 -> 条件 ACK。
         STRMMetadataWorker()._flush_media_refresh(force=True)
         assert strm_repo.count_strm_refresh_paths() == 0

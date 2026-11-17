@@ -9,6 +9,7 @@ from unittest.mock import patch
 from typing import TypedDict, cast
 from app.clients.guangya import GuangYaClient
 
+import os
 import sqlite3
 import tempfile
 import time
@@ -20,7 +21,7 @@ from app.modules.process_lock import CrossProcessLock
 from app.repositories.media_refresh_queue import media_refresh_queue_status
 from tests.support import IsolatedDatabaseTestCase
 from tests.support import PagedDirectoryTestMixin
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, media_refresh_providers
 
 
 def _job(**updates) -> dict:
@@ -288,6 +289,31 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
             1,
         )
         self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_unchanged_metadata_job_keeps_its_original_refresh_target(self):
+        from app.modules import media_refresh_coordinator as refresh
+        from app.repositories import media_refresh_queue
+
+        job = _job()
+        with media_refresh_providers("jellyfin"):
+            strm_repo.enqueue_strm_metadata_jobs([job])
+            claimed = strm_repo.claim_due_strm_metadata_jobs(owner="original")[0]
+            with patch.dict(os.environ, {"JELLYFIN_URL": "http://replacement.invalid"}):
+                repeated = strm_repo.enqueue_strm_metadata_jobs([job])
+                self.assertEqual(repeated["deduped"], 1)
+                completed = strm_repo.settle_strm_metadata_job(
+                    claimed["id"], expected_owner="original", expected_revision=claimed["revision"],
+                    expected_lease_generation=claimed["lease_generation"], refresh_paths=["/strm/Movie.nfo"],
+                )
+                self.assertEqual(completed, "completed")
+                metadata.STRMMetadataWorker()._flush_media_refresh(force=True)
+                worker = refresh.MediaRefreshCoordinator()
+                group = media_refresh_queue.claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+                with patch("app.clients.jellyfin.JellyfinClient") as client:
+                    worker._process_group(group)
+                    client.assert_not_called()
+                self.assertEqual(worker.status()["failed_session"], 1)
+                self.assertEqual(worker.status()["paths"], 0)
 
     def test_failures_use_exponential_retry_and_end_in_failed(self):
         strm_repo.enqueue_strm_metadata_jobs([_job()], max_attempts=2)
@@ -796,9 +822,7 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             "STRM_ROOT": str(self.root), "STRM_METADATA_EXTS": "nfo",
         }.get(key, default)))
         self.download = self.enterContext(patch("app.modules.strm.requests.get", return_value=_Response()))
-        self.enterContext(patch(
-            "app.modules.media_refresh_coordinator._configured_provider_names", return_value=("jellyfin",),
-        ))
+        self.enterContext(media_refresh_providers("jellyfin"))
         self.enterContext(patch("threading.excepthook", side_effect=lambda args: self.thread_errors.append(args.exc_value)))
         acknowledge = strm_repo.acknowledge_strm_refresh_paths
         wait = self.worker._wake_event.wait

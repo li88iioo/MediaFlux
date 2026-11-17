@@ -12,7 +12,7 @@ from app import database as db
 from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, media_refresh_providers
 from tests.test_strm_hardening import _TreeClient
 
 
@@ -172,7 +172,7 @@ def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
     from app.modules import media_refresh_coordinator as refresh
     from app.modules.strm_metadata_worker import STRMMetadataWorker
     from app.repositories import media_refresh_queue as queue
-    with isolated_test_database(), patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
+    with isolated_test_database(), media_refresh_providers("jellyfin"), patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
         plans = strm.plan_strm_sources([{"id": "s1", "name": "Films"}, {"id": "s2", "name": "Films"}])
         files = [GuangYaFile(f"v{i}", "Same.mkv", False, 100, f"e{i}", f"s{i}") for i in (1, 2)]
         client = _TreeClient({file.parent_id: [file] for file in files})
@@ -190,7 +190,7 @@ def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
         coordinator = refresh.MediaRefreshCoordinator()
         provider = Mock(display_name="Jellyfin")
         provider.refresh_for_paths.return_value = {"ok": True, "succeeded_target_ids": ["library"], "deduplicated": 0}
-        with patch.object(refresh, "_configured_provider_names", return_value=("jellyfin",)), patch.object(refresh, "get_media_refresh_coordinator", return_value=coordinator), patch.object(coordinator, "wake"):
+        with patch.object(refresh, "get_media_refresh_coordinator", return_value=coordinator), patch.object(coordinator, "wake"):
             STRMMetadataWorker()._flush_media_refresh(force=True)
         groups = queue.claim_due_media_refreshes(owner=coordinator._owner, limit=8)
         assert len(groups) == 1

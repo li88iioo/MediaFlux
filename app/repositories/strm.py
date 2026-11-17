@@ -6,10 +6,13 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 from app import database as db
+
+if TYPE_CHECKING:
+    from app.modules.media_server_profiles import MediaRefreshIntent
 
 
 def strm_failure_selection(ids: list[int], *, status: str = "all") -> list[dict]:
@@ -36,6 +39,12 @@ class StrmRefreshPolicy:
     allow_emby: bool = True
     request_owners: Iterable[dict[str, Any]] | None = None
     enabled: bool = True
+    refresh_targets: dict[str, MediaRefreshIntent] | None = None
+
+    def with_current_targets(self) -> StrmRefreshPolicy:
+        from app.modules.media_server_profiles import capture_media_refresh_intents
+
+        return replace(self, refresh_targets=capture_media_refresh_intents(allow_emby=self.allow_emby) if self.enabled else {})
 
     def __call__(self, targets: list[str]) -> None:
         """溢出统计和旧路径凭据共用本策略，只持久化，不唤醒消费者。"""
@@ -44,9 +53,7 @@ class StrmRefreshPolicy:
         from app.modules.media_refresh import plan_refresh_targets
 
         planned = plan_refresh_targets(changed_dirs=targets, media_roots=[self.media_root])
-        enqueue_strm_refresh_paths(
-            planned.targets, allow_emby=self.allow_emby, request_owners=self.request_owners,
-        )
+        enqueue_strm_refresh_paths(planned.targets, policy=self)
 
     def record(self, conn: sqlite3.Connection, paths: Iterable[object] | None) -> None:
         if not self.enabled:
@@ -64,7 +71,7 @@ class StrmRefreshPolicy:
             raise ValueError("STRM 刷新目标超出冻结媒体根，拒绝丢弃刷新交接")
         if targets:
             _enqueue_strm_refresh_paths(
-                conn, targets, stamp=db.now(), allow_emby=self.allow_emby,
+                conn, targets, stamp=db.now(), allow_emby=self.allow_emby, refresh_targets=self.refresh_targets,
                 request_owners=self.request_owners,
             )
 
@@ -431,10 +438,12 @@ DEFAULT_STRM_METADATA_LEASE_SECONDS = 900
 DEFAULT_STRM_METADATA_MAX_ATTEMPTS = 6
 
 
-def _metadata_snapshot(item: dict[str, Any]) -> tuple[str, ...]:
+def _metadata_snapshot(item: dict[str, Any], *, enqueue: bool = False) -> tuple[str, ...]:
     policy = StrmRefreshPolicy(**(
         item.get("refresh_policy") or json.loads(item.get("refresh_policy_json") or "{}")
     ))
+    if enqueue and policy.refresh_targets is None:
+        policy = policy.with_current_targets()
     return (
         str(item.get("source_name") or ""),
         str(item.get("parent_id") or ""),
@@ -473,7 +482,7 @@ def enqueue_strm_metadata_jobs(
             filename = str(item.get("filename") or "").strip()
             if not source_id or not file_id or not filename:
                 continue
-            snapshot = _metadata_snapshot(item)
+            snapshot = _metadata_snapshot(item, enqueue=True)
             row = conn.execute(
                 "SELECT * FROM strm_metadata_queue WHERE provider=? AND source_id=? AND file_id=?",
                 ((provider or "guangya"), source_id, file_id),
@@ -494,8 +503,17 @@ def enqueue_strm_metadata_jobs(
                 result["created"] += 1
                 continue
 
-            changed = _metadata_snapshot(dict(row)) != snapshot
+            previous = _metadata_snapshot(dict(row))
+            previous_policy = json.loads(previous[7])
+            new_policy = json.loads(snapshot[7])
+            previous_policy.pop("refresh_targets", None)
+            new_policy.pop("refresh_targets", None)
+            changed = previous[:7] != snapshot[:7] or previous_policy != new_policy
             status = str(row["status"] or "queued")
+            force = bool(item.get("force"))
+            if not changed and not (force and status == "completed"):
+                # 路径映射变化不触发重新下载，也不改写已登记的原刷新目标。
+                values = (*values[:7], previous[7], safe_max_attempts)
             if status == "running":
                 conn.execute(
                     "UPDATE strm_metadata_queue SET source_name=?,parent_id=?,filename=?,etag=?,"
@@ -506,7 +524,6 @@ def enqueue_strm_metadata_jobs(
                 )
                 result["dirty" if changed else "deduped"] += 1
                 continue
-            force = bool(item.get("force"))
             if not changed and status == "failed" and not force:
                 result.setdefault("failed", 0)
                 result["failed"] += 1
@@ -666,44 +683,55 @@ def _enqueue_strm_refresh_paths(
     *,
     stamp: str,
     allow_emby: bool,
+    refresh_targets: dict[str, MediaRefreshIntent] | None,
     request_owners: Iterable[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     from app.repositories.strm_request_ownership import (
         _attach_request_work,
         refresh_work_key,
     )
+    if refresh_targets is not None and not allow_emby:
+        refresh_targets = {key: value for key, value in refresh_targets.items() if key != "emby"}
+    intent_json = json.dumps(refresh_targets, separators=(",", ":")) if refresh_targets is not None else None
     entries: list[dict[str, Any]] = []
     for path in _normalize_refresh_paths(paths):
         token = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO strm_refresh_outbox("
-            "path,allow_emby,event_token,created_at,updated_at) VALUES(?,?,?,?,?) "
+            "path,allow_emby,event_token,created_at,updated_at,refresh_intent_json) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(path,allow_emby) DO UPDATE SET "
-            "event_token=excluded.event_token,updated_at=excluded.updated_at",
-            (path, 1 if allow_emby else 0, token, stamp, stamp),
+            "event_token=excluded.event_token,updated_at=excluded.updated_at,refresh_intent_json=excluded.refresh_intent_json",
+            (path, int(allow_emby), token, stamp, stamp, intent_json),
         )
         _attach_request_work(conn, request_owners, "refresh", refresh_work_key(path, allow_emby))
-        entries.append({"path": path, "allow_emby": allow_emby, "event_token": token})
+        entries.append({"path": path, "allow_emby": allow_emby, "event_token": token, "refresh_targets": refresh_targets})
     return entries
 
 
 def enqueue_strm_refresh_paths(
     paths: Iterable[object] | None, *, allow_emby: bool = True, request_owners: Iterable[dict[str, Any]] | None = None,
+    policy: StrmRefreshPolicy | None = None,
 ) -> list[dict[str, Any]]:
     """持久登记变化，返回本次写入的事件快照；交接只允许确认该快照。"""
+    policy = policy if policy is not None else StrmRefreshPolicy(
+        allow_emby=allow_emby, request_owners=request_owners,
+    ).with_current_targets()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         return _enqueue_strm_refresh_paths(
-            conn, paths, stamp=db.now(), allow_emby=allow_emby,
-            request_owners=request_owners,
+            conn, paths, stamp=db.now(), allow_emby=policy.allow_emby,
+            refresh_targets=policy.refresh_targets, request_owners=policy.request_owners,
         )
 
 
 def resolve_strm_failure_with_refresh(
     failure_id: int, paths: Iterable[object] | None, *, allow_emby: bool = True,
     expected_status: str = "retrying", metadata_job: dict[str, Any] | None = None,
+    refresh_targets: dict[str, MediaRefreshIntent] | None = None,
 ) -> bool:
     """失败恢复、同快照后台队列 ACK 与刷新意图同事务；不重新排队已安装文件。"""
+    if refresh_targets is None:
+        refresh_targets = StrmRefreshPolicy(allow_emby=allow_emby).with_current_targets().refresh_targets
     stamp = db.now()
     with db.get_conn() as conn:
         cur = conn.execute(
@@ -734,7 +762,7 @@ def resolve_strm_failure_with_refresh(
                     )
                     # 原后台任务的刷新范围及下载归属继续履约，不借人工重试扩大其权限。
                     policy.record(conn, [metadata_job["installed_path"]])
-        _enqueue_strm_refresh_paths(conn, paths, stamp=stamp, allow_emby=allow_emby)
+        _enqueue_strm_refresh_paths(conn, paths, stamp=stamp, allow_emby=allow_emby, refresh_targets=refresh_targets)
         return True
 
 
@@ -743,11 +771,15 @@ def list_strm_refresh_entries(*, limit: int = 5000) -> list[dict[str, Any]]:
     safe_limit = max(1, min((limit or 5000), 20000))
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT path,allow_emby,event_token FROM strm_refresh_outbox "
+            "SELECT path,allow_emby,event_token,refresh_intent_json FROM strm_refresh_outbox "
             "ORDER BY updated_at,path,allow_emby LIMIT ?",
             (safe_limit,),
         ).fetchall()
-    return [dict(row, allow_emby=bool(row["allow_emby"])) for row in rows]
+    return [
+        {"path": row["path"], "allow_emby": bool(row["allow_emby"]), "event_token": row["event_token"],
+         "refresh_targets": json.loads(row["refresh_intent_json"]) if row["refresh_intent_json"] is not None else None}
+        for row in rows
+    ]
 
 
 def count_strm_refresh_paths() -> int:

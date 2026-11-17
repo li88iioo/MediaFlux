@@ -153,6 +153,7 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             expected = {}
             for key, status in groups:
                 group = state["groups"][key]
+                group.pop("intent")
                 group.update(status=status, attempts=10_000, last_error="历史刷新失败", due_at=10_000)
                 group["waiting_paths"] = {f"{root}/{status}/waiting.strm": {
                     "reason": "缺少路径映射", "configuration_revision": "dc938c40",
@@ -178,11 +179,12 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             self.assertEqual(sum(len(item["paths"]) for item in claimed), 6)
             endpoint = MediaEndpoint(root)
             endpoint.fail = True
-            with patch.object(worker, "_client_for", side_effect=endpoint.client), patch(
+            with patch.object(worker, "_client_for") as legacy_client, patch(
                 "app.repositories.media_refresh_queue.time.time", return_value=101,
             ):
                 for item in claimed:
                     worker._process_group(item)
+            legacy_client.assert_not_called()
             self.assertEqual(worker.status()["failed_session"], 3)
             self.assertEqual(queue.media_refresh_queue_status(now_epoch=102)["paths"], 0)
             db.init_db()

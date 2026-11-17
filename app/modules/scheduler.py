@@ -73,10 +73,6 @@ class _ChangeOwnerOptions(TypedDict, total=False):
     request_owners: list[dict[str, Any]]
 
 
-class _RefreshOwnerOptions(TypedDict, total=False):
-    request_owners: Iterable[dict[str, Any]]
-
-
 def _source_local_dir(strm_root: str, source: dict[str, str]) -> str:
     """返回与 STRM 目标生成规则一致的来源本地根目录。"""
     target = Path(strm_root).expanduser() / STRM_SUBDIR
@@ -329,7 +325,7 @@ def _media_refresh_summary(events: dict[str, Any], baseline: dict[str, str] | No
 
     return {"status": status(statuses), "pending": pending,
             "providers": {{"jellyfin": "Jellyfin", "emby": "Emby"}.get(name, name): status(values)
-                          for name, values in providers.items() if name != "媒体库"}, "events": events}
+                          for name, values in providers.items() if name != "媒体库" or "failed" in values}, "events": events}
 
 
 def reconcile_strm_media_refresh_results() -> None:
@@ -1464,7 +1460,7 @@ class STRMScheduler:
             media_root=str((Path(root).expanduser() / STRM_SUBDIR).resolve()),
             enabled=True if enabled is None else bool(enabled),
             request_owners=request_owners,
-        )
+        ).with_current_targets()
 
     def _run_incremental_sources(
         self,
@@ -1476,6 +1472,7 @@ class STRMScheduler:
         exts: set[str],
         metadata_exts: set[str],
         threshold: int,
+        refresh_policy: strm_repo.StrmRefreshPolicy,
     ) -> tuple[dict, list[dict], bool, str]:
         """运行可信整理清单；返回 aggregate/source_results/stopped/fallback_reason。"""
         prepared_changes: list[dict[str, Any]] = []
@@ -1508,7 +1505,6 @@ class STRMScheduler:
         grouped: dict[str, list[dict]] = {}
         for item in changes:
             grouped.setdefault(str(item.get("source_id") or ""), []).append(dict(item))
-        refresh_policy = self._refresh_overflow_sink(strm_root)
         aggregate = self._empty_stats()
         source_results: list[dict] = []
         stopped = False
@@ -1590,9 +1586,10 @@ class STRMScheduler:
         metadata_exts: set[str],
         threshold: int,
         active_ids_complete: bool = True,
+        refresh_policy: strm_repo.StrmRefreshPolicy | None = None,
     ) -> tuple[dict, list[dict], bool]:
         """执行全量来源扫描；局部来源模式禁止把未选来源判为退役。"""
-        refresh_policy = self._refresh_overflow_sink(strm_root)
+        refresh_policy = refresh_policy or self._refresh_overflow_sink(strm_root)
         aggregate = self._empty_stats()
         source_results: list[dict] = []
         _configured, source_error = configured_strm_source_plans()
@@ -1940,6 +1937,7 @@ class STRMScheduler:
                 organize_changes = _merge_organize_changes(
                     organize_changes, claimed_changes,
                 )
+            refresh_policy = self._refresh_overflow_sink(strm_root)
             use_incremental = bool(
                 (trigger_type == "organize" or requested_mode == "fast")
                 and organize_changes
@@ -1962,6 +1960,7 @@ class STRMScheduler:
                         exts=exts,
                         metadata_exts=metadata_exts,
                         threshold=threshold,
+                        refresh_policy=refresh_policy,
                     )
                 )
                 mode = "fast" if requested_mode == "fast" else "incremental"
@@ -2007,6 +2006,7 @@ class STRMScheduler:
                             metadata_exts=metadata_exts,
                             threshold=threshold,
                             active_ids_complete=not scoped_sources,
+                            refresh_policy=refresh_policy,
                         )
                         # 两阶段实际发出的云端读取都纳入观测；文件扫描结果仍以全量阶段为准。
                         for key in (
@@ -2055,6 +2055,7 @@ class STRMScheduler:
                     metadata_exts=metadata_exts,
                     threshold=threshold,
                     active_ids_complete=not scoped_sources,
+                    refresh_policy=refresh_policy,
                 )
 
             has_changes = bool(
@@ -2064,7 +2065,7 @@ class STRMScheduler:
                 media_refresh = {}
                 if has_changes:
                     media_refresh = self._refresh_media_servers(
-                        refresh_policy=self._refresh_overflow_sink(strm_root),
+                        refresh_policy=refresh_policy,
                         changed_paths=list(aggregate.get("changed_strm_paths") or []),
                         changed_dirs=list(aggregate.get("changed_dirs") or []),
                         persist_only=True,
@@ -2127,7 +2128,7 @@ class STRMScheduler:
             refresh_started = monotonic()
             refresh_entries: list[dict[str, Any]] = []
             media_refresh = self._refresh_media_servers(
-                refresh_policy=self._refresh_overflow_sink(strm_root),
+                refresh_policy=refresh_policy,
                 has_changes=has_changes,
                 changed_paths=list(stats.get("changed_strm_paths") or []),
                 changed_dirs=list(stats.get("changed_dirs") or []),
@@ -2319,7 +2320,7 @@ class STRMScheduler:
             strm_root = get("STRM_ROOT", "")
             refresh_policy = strm_repo.StrmRefreshPolicy(
                 media_root=str(Path(strm_root) / STRM_SUBDIR) if strm_root else "",
-            )
+            ).with_current_targets()
         if not refresh_policy.enabled:
             logger.info("整理联动已关闭媒体服务器刷新，跳过 Jellyfin/Emby")
             return {}
@@ -2342,8 +2343,7 @@ class STRMScheduler:
         targets = list(plan.targets)
         # STRM 已经落盘，媒体库刷新必须独立交接。先写 durable outbox，再尝试
         # 投递统一刷新队列；投递失败只重试刷新，绝不重新生成 STRM。
-        owner_kwargs: _RefreshOwnerOptions = {"request_owners": refresh_policy.request_owners} if refresh_policy.request_owners else {}
-        entries = strm_repo.enqueue_strm_refresh_paths(targets, allow_emby=refresh_policy.allow_emby, **owner_kwargs)
+        entries = strm_repo.enqueue_strm_refresh_paths(targets, policy=refresh_policy)
         from app.repositories.media_refresh_queue import register_media_refresh_handoff
 
         options = notification_options or {}

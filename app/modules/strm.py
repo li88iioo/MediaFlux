@@ -1495,7 +1495,7 @@ def cleanup_deleted_cloud_files(file_ids: set[str], *, refresh_enabled: bool) ->
             raise ValueError("未配置 STRM 本地根目录，已保留清理凭据")
         policy = StrmRefreshPolicy(
             media_root=str(Path(strm_root) / STRM_SUBDIR), enabled=refresh_enabled,
-        )
+        ).with_current_targets()
         for source in sources:
             recover_pending_paths(
                 source, strm_root, stats, valid_ids=set(), only_file_ids=file_ids,
@@ -3604,7 +3604,7 @@ def _process_claimed_strm_failures(
         media_root=str((Path(strm_root).expanduser() / STRM_SUBDIR).resolve()),
         enabled=bool(runtime.get("media_server_refresh", True)),
         allow_emby=bool(runtime.get("allow_emby", True)),
-    )
+    ).with_current_targets()
     video_exts = set(runtime["video_exts"])
     metadata_exts = set(runtime["metadata_exts"])
     threshold_bytes = runtime["skip_threshold_mb"] * 1024 * 1024
@@ -3732,6 +3732,7 @@ def _process_claimed_strm_failures(
                     failure_id,
                     refresh_paths if refresh_policy.enabled else [],
                     allow_emby=refresh_policy.allow_emby,
+                    refresh_targets=refresh_policy.refresh_targets,
                     expected_status="retrying", metadata_job=metadata_job,
                 ):
                     raise RuntimeError("STRM 失败项状态已变化，拒绝覆盖")

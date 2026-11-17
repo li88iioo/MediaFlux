@@ -1811,6 +1811,12 @@ def _migrate_share_retry_count_v41(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_strm_refresh_intent_v42(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(strm_refresh_outbox)")}
+    if columns and "refresh_intent_json" not in columns:
+        conn.execute("ALTER TABLE strm_refresh_outbox ADD COLUMN refresh_intent_json TEXT")
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1853,4 +1859,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     38: _migrate_agent_compensation_payload_v39,
     39: _migrate_missing_resource_source_v40,
     40: _migrate_share_retry_count_v41,
+    41: _migrate_strm_refresh_intent_v42,
 }

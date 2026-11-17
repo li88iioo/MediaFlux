@@ -20,7 +20,6 @@ from app.clients.emby import EmbyClient
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.clients.jellyfin import JellyfinClient
 from app.modules import media_probe, strm
-from app.modules import media_refresh_coordinator as refresh
 from app.modules import strm_metadata_worker as metadata
 from app.modules.local_media_service import LocalMediaService, LocalMediaServiceError
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
@@ -171,7 +170,7 @@ class MediaEndpoint:
     def close(self):
         pass
 
-    def client(self, provider):
+    def client(self, provider, _intent=None):
         client = {"jellyfin": JellyfinClient, "emby": EmbyClient}[provider](
             f"http://{provider}.invalid", "offline-test-key",
         )
@@ -410,8 +409,8 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
         # 逐文件交接（单集精度），同季多集由客户端收敛为整剧/整季刷新。
         videos = [season / f"Audit.Series.S01E0{n}.strm" for n in range(1, 5)] if enabled else []
         nfos = [season / f"Audit.Series.S01E0{n}.nfo" for n in range(1, 5)] if enabled else []
-        policy = StrmRefreshPolicy(str(media_root), enabled=enabled, allow_emby=allow_emby)
         with cloud_runtime(cloud, root, providers=("jellyfin", "emby")):
+            policy = StrmRefreshPolicy(str(media_root), enabled=enabled, allow_emby=allow_emby).with_current_targets()
             result = generate_batch(cloud, root, refresh_policy=policy)
             assert result["generated"] == 4 and result["metadata_queued"] == 4, result
             assert cloud.list_calls == 1 and cloud.info_calls == 0
@@ -460,8 +459,8 @@ def test_batch_metadata_path_migration_keeps_both_refresh_intents(tmp_path, allo
         worker._client = cast(GuangYaClient, cloud)
         worker._last_refresh_at = metadata.time.monotonic()
         file = cloud.files["nfo-1"]
-        policy = StrmRefreshPolicy(str(root / strm.STRM_SUBDIR), allow_emby=allow_emby)
         with cloud_runtime(cloud, root, providers=("jellyfin", "emby")):
+            policy = StrmRefreshPolicy(str(root / strm.STRM_SUBDIR), allow_emby=allow_emby).with_current_targets()
             old = None
             for directory in ("Old Series/Season 01", "New Series/Season 01"):
                 strm_repo.enqueue_strm_metadata_jobs(
@@ -568,7 +567,7 @@ def test_interrupt_cancel_restart_finishes_only_uncommitted_files(tmp_path):
 
 
 def test_interrupt_refresh_outbox_ack_recovery_and_media_failure_finishes(tmp_path):
-    with isolated_test_database():
+    with isolated_test_database(), _providers("jellyfin"):
         endpoint = MediaEndpoint(tmp_path)
         paths = [str(tmp_path / f"Series {n}" / "episode.strm") for n in range(3)]
         for path in paths:
@@ -578,20 +577,17 @@ def test_interrupt_refresh_outbox_ack_recovery_and_media_failure_finishes(tmp_pa
         strm_repo.enqueue_strm_refresh_paths(paths)
         worker = metadata.STRMMetadataWorker()
         with patch.object(
-            refresh, "_configured_provider_names", return_value=("jellyfin",)
+            strm_repo,
+            "acknowledge_strm_refresh_paths",
+            side_effect=OSError("ACK unavailable"),
         ):
-            with patch.object(
-                strm_repo,
-                "acknowledge_strm_refresh_paths",
-                side_effect=OSError("ACK unavailable"),
-            ):
-                worker._flush_media_refresh(force=True)
-            assert strm_repo.count_strm_refresh_paths() == 3
-            assert queue.media_refresh_queue_status()["paths"] == 3
-            restarted = metadata.STRMMetadataWorker()
-            restarted._flush_media_refresh(force=True)
-            assert strm_repo.count_strm_refresh_paths() == 0
-            assert queue.media_refresh_queue_status()["paths"] == 3
+            worker._flush_media_refresh(force=True)
+        assert strm_repo.count_strm_refresh_paths() == 3
+        assert queue.media_refresh_queue_status()["paths"] == 3
+        restarted = metadata.STRMMetadataWorker()
+        restarted._flush_media_refresh(force=True)
+        assert strm_repo.count_strm_refresh_paths() == 0
+        assert queue.media_refresh_queue_status()["paths"] == 3
         claimed = queue.claim_due_media_refreshes(owner="dead-consumer", force=True)
         assert len(claimed) == 1
         assert queue.recover_media_refresh_leases() == 1
@@ -609,8 +605,7 @@ def test_interrupt_refresh_outbox_ack_recovery_and_media_failure_finishes(tmp_pa
         changed = Path(paths[0])
         changed.write_text("http://play.invalid/new-change")
         strm_repo.enqueue_strm_refresh_paths([str(changed)])
-        with patch.object(refresh, "_configured_provider_names", return_value=("jellyfin",)):
-            restarted._flush_media_refresh(force=True)
+        restarted._flush_media_refresh(force=True)
         assert strm_repo.count_strm_refresh_paths() == 0
         assert queue.media_refresh_queue_status()["paths"] == 1
         complete, claimed = drain_refresh(endpoint, owner="restart-2")
@@ -824,7 +819,7 @@ def test_normal_cloud_organize_write_to_strm_and_refresh(tmp_path, allow_emby):
                 metadata_exts={"nfo"},
                 refresh_policy=StrmRefreshPolicy(
                     str(root / strm.STRM_SUBDIR), allow_emby=allow_emby,
-                ),
+                ).with_current_targets(),
             )
             assert result["generated"] == 2 and result["metadata_queued"] == 2, result
             worker = metadata.STRMMetadataWorker()

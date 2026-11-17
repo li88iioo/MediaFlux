@@ -12,8 +12,7 @@ from typing import Any
 from app import config
 from app.clients.base import close_media_server_client
 from app.logger import get_logger, redact_sensitive_text
-from app.modules.media_server_path_mapping import configured_media_server_refresh_options
-from app.modules.media_server_profiles import list_configured_profiles
+from app.modules.media_server_profiles import MediaRefreshIntent, configured_media_refresh_targets
 from app.modules.process_lock import CrossProcessLock
 from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
@@ -44,24 +43,6 @@ def _recent_ttl_seconds() -> int:
     ), 1800))
 
 
-def _configured_provider_names(*, allow_emby: bool = True) -> tuple[str, ...]:
-    providers: list[str] = []
-    if (
-        config.get_bool("JELLYFIN_ENABLED")
-        and config.get("JELLYFIN_URL")
-        and config.get("JELLYFIN_API_KEY")
-    ):
-        providers.append("jellyfin")
-    if (
-        allow_emby
-        and config.get_bool("EMBY_ENABLED")
-        and config.get("EMBY_URL")
-        and config.get("EMBY_TOKEN")
-    ):
-        providers.append("emby")
-    return tuple(providers)
-
-
 def enqueue_media_refresh_paths(
     paths: list[str] | tuple[str, ...] | set[str],
     *,
@@ -73,32 +54,41 @@ def enqueue_media_refresh_paths(
     source_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     """持久登记刷新；无可用自动目标时明确返回全局 skipped，不创建待办。"""
-    selected = tuple(dict.fromkeys(
-        (item or "").strip().lower()
-        for item in (
-            providers if providers is not None
-            else _configured_provider_names(allow_emby=allow_emby)
+    if source_entries is None:
+        targets = configured_media_refresh_targets()
+        selected = dict.fromkeys(item.strip().lower() for item in providers if item.strip()) if providers is not None else (
+            provider for provider, target in targets.items()
+            if target.profile.enabled and target.profile.configured and (allow_emby or provider != "emby")
         )
-        if (item or "").strip()
-    ))
-    if source_entries is not None:
-        register_media_refresh_handoff(source_entries, providers=selected or ("媒体库",))
-    if not selected:
-        return {"媒体库": "skipped"}
+        batches = [
+            (provider, targets[provider].intent() if provider in targets else None, paths, None)
+            for provider in selected
+        ]
+    else:
+        register_media_refresh_handoff(source_entries)
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for entry in source_entries:
+            for provider, intent in (entry.get("refresh_targets") or {}).items():
+                grouped.setdefault((provider, intent["upstream"], intent["mappings"]), []).append(entry)
+        batches = [
+            (provider, {"upstream": upstream, "mappings": mappings}, [entry["path"] for entry in batch], batch)
+            for (provider, upstream, mappings), batch in grouped.items()
+        ]
     results: dict[str, str] = {}
     delay = 0 if immediate else _debounce_seconds()
-    for provider in selected:
+    for provider, intent, batch_paths, batch in batches:
         label = {"jellyfin": "Jellyfin", "emby": "Emby"}.get(
             provider, provider or "unknown",
         )
         try:
             queued = enqueue_media_refresh(
                 provider,
-                paths,
+                batch_paths,
                 allowed_library_ids=allowed_library_ids,
                 library_binding=library_binding,
                 debounce_seconds=delay,
-                source_entries=source_entries,
+                source_entries=batch,
+                intent=intent,
             )
         except Exception as exc:
             logger.warning(
@@ -106,13 +96,11 @@ def enqueue_media_refresh_paths(
             )
             results[label] = "failed"
             continue
-        if queued.get("group_key"):
-            results[label] = "queued"
-        else:
-            results[label] = "skipped"
+        if results.get(label) != "failed":
+            results[label] = "queued" if queued.get("group_key") else "skipped"
     if any(value == "queued" for value in results.values()):
         get_media_refresh_coordinator().wake()
-    return results
+    return results or {"媒体库": "skipped"}
 
 
 class MediaRefreshCoordinator:
@@ -243,17 +231,13 @@ class MediaRefreshCoordinator:
         collect_media_refresh_results()
 
     @staticmethod
-    def _client_for(provider: str):
-        profiles = {
-            item.server_type: item for item in list_configured_profiles()
-            if item.enabled and item.configured
-        }
-        profile = profiles.get(provider)
-        if profile is None:
+    def _client_for(provider: str, intent: MediaRefreshIntent):
+        target = configured_media_refresh_targets().get(provider)
+        if target is None or not target.profile.enabled or not target.profile.configured:
             return None
-        return profile.create_client(
-            path_mappings=configured_media_server_refresh_options(provider)["path_mappings"],
-        )
+        if target.intent() != intent:
+            raise ValueError("媒体服务器或路径映射已变更，请核对原刷新目标")
+        return target.profile.create_client(path_mappings=target.path_mappings)
 
     @staticmethod
     def _resolve_library_binding(client, group: dict[str, Any]) -> tuple[str, ...]:
@@ -295,11 +279,14 @@ class MediaRefreshCoordinator:
         paths = list(group.get("paths") or [])
         label = {"jellyfin": "Jellyfin", "emby": "Emby"}.get(provider, provider)
         # 本地存储故障不算一次上游刷新尝试，保留租约供消费者恢复。
-        recent_ids = recent_media_refresh_target_ids(provider)
+        intent = group.get("intent")
+        recent_ids = recent_media_refresh_target_ids(provider, upstream=intent["upstream"]) if intent else ()
         client = None
         outcome: dict[str, Any]
         try:
-            client = self._client_for(provider)
+            if not intent:
+                raise ValueError("历史刷新未记录原媒体服务器，请手动刷新")
+            client = self._client_for(provider, intent)
             if client is None:
                 raise ValueError("媒体服务器已停用或配置不完整")
             allowed_ids = self._resolve_library_binding(client, group)

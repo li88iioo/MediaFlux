@@ -30,7 +30,7 @@ from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
     media_refresh_queue_status,
 )
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, media_refresh_providers
 from tests.test_strm_hardening import _TreeClient
 
 
@@ -85,14 +85,7 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
 
 @contextmanager
 def _providers(*names):
-    values = {"JELLYFIN_URL": "http://jellyfin.invalid", "JELLYFIN_API_KEY": "synthetic",
-              "EMBY_URL": "http://emby.invalid", "EMBY_TOKEN": "synthetic"}
-    get, get_bool = refresh.config.get, refresh.config.get_bool
-    with patch.object(refresh.config, "get_bool", side_effect=lambda k, d=False: (
-             k.removesuffix("_ENABLED").lower() in names
-             if k in {"JELLYFIN_ENABLED", "EMBY_ENABLED"} else get_bool(k, d)
-         )), patch.object(refresh.config, "get", side_effect=lambda k, d="": values[k] if k in values else get(k, d)), \
-         patch.object(refresh, "get_media_refresh_coordinator", return_value=Mock()):
+    with media_refresh_providers(*names), patch.object(refresh, "get_media_refresh_coordinator", return_value=Mock()):
         yield
 
 
@@ -291,22 +284,23 @@ def test_provider_disabled_before_failed_enqueue_recovery_reaches_terminal(tmp_p
         with _providers("jellyfin", "emby"), patch.object(refresh, "enqueue_media_refresh", side_effect=unavailable):
             _run(tmp_path)
         assert repository.count_strm_refresh_paths() == 1
-        with _providers(*remaining):
-            STRMMetadataWorker()._flush_media_refresh(force=True)
-        assert repository.count_strm_refresh_paths() == 0
-        worker = refresh.MediaRefreshCoordinator()
-        groups = claim_due_media_refreshes(owner=worker._owner, force=True)
-        assert len(groups) == 1 and groups[0]["provider"] == "jellyfin"
         client = Mock(display_name="fixture")
         client.refresh_for_paths.return_value = {"ok": True}
-        with patch.object(worker, "_client_for", return_value=client):
-            worker._process_group(groups[0])
+        with _providers(*remaining), patch("app.clients.jellyfin.JellyfinClient", return_value=client):
+            STRMMetadataWorker()._flush_media_refresh(force=True)
+            assert repository.count_strm_refresh_paths() == 0
+            worker = refresh.MediaRefreshCoordinator()
+            groups = claim_due_media_refreshes(owner=worker._owner, force=True)
+            assert {group["provider"] for group in groups} == {"jellyfin", "emby"}
+            for group in groups:
+                worker._process_group(group)
+        assert client.refresh_for_paths.call_count == int("jellyfin" in remaining)
         db.init_db()
         worker._reconcile_results()
         row = db.get_last_task_run("strm_sync")
         assert row is not None
         result = json.loads(row["result"])
-        assert result["media_refresh"] == {"Jellyfin": "success", "Emby": "skipped"}
+        assert result["media_refresh"] == {"Jellyfin": "success" if remaining else "failed", "Emby": "failed"}
         assert row["status"] == "success" and result["strm_partial"] is False
         assert not result["refresh_pending"]
         state = json.loads(db.kv_get("media_refresh_queue:v1"))
@@ -480,7 +474,7 @@ def crash_after_commit(*args, **kwargs):
     original(*args, **kwargs)
     os._exit(73)
 
-with _providers(), patch.object(repository, 'upsert_strm_index', side_effect=crash_after_commit):
+with _providers('jellyfin', 'emby'), patch.object(repository, 'upsert_strm_index', side_effect=crash_after_commit):
     _run(Path(sys.argv[2]), mode=sys.argv[3], enabled=sys.argv[4]=='1', allow_emby=sys.argv[5]=='1')
 os._exit(74)
 '''

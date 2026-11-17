@@ -539,7 +539,7 @@ class ShareRetryCountMigrationTests(unittest.TestCase):
                 assert ordinary is not None
                 self.assertEqual((ordinary["status"], ordinary["share_retry_count"]), ("pending", 0))
                 with db.get_conn() as conn:
-                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 41)
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
                     self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                     self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
                 download_requests_repo.delete_download_logs([row["id"] for row in original_logs])

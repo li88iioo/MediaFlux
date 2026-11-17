@@ -26,7 +26,7 @@ from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes, media_refresh_queue_status,
 )
 from app.repositories.telegram_notifications import get_notification
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, media_refresh_providers
 from tests.test_strm_hardening import _TreeClient
 
 
@@ -46,7 +46,7 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
     monkeypatch.setattr(socket.socket, "connect", Mock(side_effect=AssertionError("network forbidden")))
     monkeypatch.setattr(socket.socket, "connect_ex", Mock(side_effect=AssertionError("network forbidden")))
     monkeypatch.setattr(socket, "create_connection", Mock(side_effect=AssertionError("network forbidden")))
-    with isolated_test_database():
+    with isolated_test_database(), media_refresh_providers("jellyfin"):
         scheduler = STRMScheduler()
         manager = organize_tasks.OrganizeTaskManager()
         ready = threading.Event()
@@ -99,7 +99,6 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
         monkeypatch.setattr(center, "edit_event_result", editor)
         # 只调度明确的一轮，以免后台常驻消费者改变实验时序。
         monkeypatch.setattr("app.modules.strm_metadata_worker._worker.wake", lambda: None)
-        monkeypatch.setattr(refresh, "_configured_provider_names", lambda **_k: ("jellyfin",))
         monkeypatch.setattr(refresh, "get_media_refresh_coordinator", lambda: Mock())
 
         def sync(**kwargs):

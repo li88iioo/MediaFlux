@@ -1393,9 +1393,9 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(results, {"Jellyfin": "queued"})
-        self.enqueue_outbox.assert_called_once_with(
-            [f"{ROOT}/剧集/作品 A/Season 01/E01.strm"], allow_emby=True
-        )
+        self.enqueue_outbox.assert_called_once()
+        self.assertEqual(self.enqueue_outbox.call_args.args[0], [f"{ROOT}/剧集/作品 A/Season 01/E01.strm"])
+        self.assertTrue(self.enqueue_outbox.call_args.kwargs["policy"].allow_emby)
         self.register_handoff.assert_called_once()
         self.assertEqual(self.register_handoff.call_args.args, (entries,))
         self.assertIsNone(self.register_handoff.call_args.kwargs["run_id"])
@@ -1444,9 +1444,9 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(results, {"Jellyfin": "queued"})
-        self.enqueue_outbox.assert_called_once_with(
-            [f"{ROOT}/剧集/作品 A"], allow_emby=False
-        )
+        self.enqueue_outbox.assert_called_once()
+        self.assertEqual(self.enqueue_outbox.call_args.args[0], [f"{ROOT}/剧集/作品 A"])
+        self.assertFalse(self.enqueue_outbox.call_args.kwargs["policy"].allow_emby)
         self.ack_outbox.assert_called_once_with(self.enqueue_outbox.return_value)
         self.assertFalse(enqueue.call_args.kwargs["allow_emby"])
 

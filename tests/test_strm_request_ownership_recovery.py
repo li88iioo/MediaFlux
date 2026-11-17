@@ -24,7 +24,7 @@ from app.modules import strm
 from app.modules.scheduler import STRMScheduler
 from app.modules.strm_metadata_worker import STRMMetadataWorker
 from app.repositories.organize_history import settle_organize_task_run
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, media_refresh_providers
 from tests.test_strm_hardening import _TreeClient
 
 
@@ -581,6 +581,7 @@ class STRMRequestOwnershipRecoveryTests(unittest.TestCase):
     @patch("app.modules.scheduler.threading.Thread", _ParkedThread)
     def test_overflow_refresh_waits_for_all_paths_after_cold_recovery(self):
         """溢出目录同样归属于恢复请求；只补投刷新，不重复生成 STRM。"""
+        self.enterContext(media_refresh_providers("jellyfin"))
         request, admission, _ = self.seed()
         self.cloud.tree["source"] = []
         changes = []

@@ -54,6 +54,16 @@ def preserve_web_auth_config(getter: Callable[[str, str], str]) -> Callable[[str
     return get
 
 
+def media_refresh_providers(*names: str):
+    """配置合成上游，供生产者在 outbox 交接前冻结刷新目标。"""
+    return patch.dict(os.environ, {
+        "JELLYFIN_ENABLED": "1" if "jellyfin" in names else "0",
+        "JELLYFIN_URL": "http://jellyfin.invalid", "JELLYFIN_API_KEY": "synthetic",
+        "EMBY_ENABLED": "1" if "emby" in names else "0",
+        "EMBY_URL": "http://emby.invalid", "EMBY_TOKEN": "synthetic",
+    })
+
+
 class FakeTelegramBot:
     """记录Telegram注册与回复，不导入Web应用或触发运行态初始化。"""
 

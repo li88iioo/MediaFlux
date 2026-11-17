@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -21,7 +22,7 @@ from app.repositories.media_refresh_queue import (
     next_media_refresh_due_in,
     register_media_refresh_handoff,
 )
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, media_refresh_providers
 
 
 def _remember_targets(**expiries):
@@ -338,7 +339,33 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         clear_media_refresh_queue()
 
+    def test_recovered_lease_keeps_upstream_and_equal_item_ids_dedupe_per_server(self):
+        path = "/media/Film.strm"
+        client = Mock()
+        client.refresh_for_paths.return_value = {"ok": True, "succeeded_target_ids": ["same-item"]}
+        worker = MediaRefreshCoordinator()
+        with media_refresh_providers("jellyfin"), patch("app.clients.jellyfin.JellyfinClient", return_value=client) as factory:
+            enqueue_media_refresh_paths([path], immediate=True)
+            self.assertEqual(len(claim_due_media_refreshes(owner="old-worker")), 1)
+            with patch.dict(os.environ, {"JELLYFIN_URL": "http://replacement.invalid"}):
+                self.assertEqual(recover_media_refresh_leases(), 1)
+                stale = claim_due_media_refreshes(owner=worker._owner)[0]
+                worker._process_group(stale)
+                factory.assert_not_called()
+                self.assertEqual(worker.status()["failed_session"], 1)
+                enqueue_media_refresh_paths([path], immediate=True)
+                worker._process_group(claim_due_media_refreshes(owner=worker._owner)[0])
+                client.refresh_for_paths.assert_called_once_with([path], allowed_library_ids=(), skip_item_ids=())
+            client.refresh_for_paths.reset_mock()
+            enqueue_media_refresh_paths([path], immediate=True)
+            worker._process_group(claim_due_media_refreshes(owner=worker._owner)[0])
+            client.refresh_for_paths.assert_called_once_with([path], allowed_library_ids=(), skip_item_ids=())
+            enqueue_media_refresh_paths([path], immediate=True)
+            worker._process_group(claim_due_media_refreshes(owner=worker._owner)[0])
+            self.assertEqual(client.refresh_for_paths.call_args.kwargs["skip_item_ids"], ("same-item",))
+
     def test_finished_large_batches_are_collected_after_projection_and_restart(self):
+        self.enterContext(media_refresh_providers("jellyfin"))
         from app.repositories import strm as strm_repo
 
         worker = MediaRefreshCoordinator()
@@ -390,6 +417,7 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
         self.assertTrue(settle_media_refresh(new["group_key"], owner="same-worker", lease_generation=new["lease_generation"]))
 
     def test_real_request_work_registration_scales_by_batch_and_collects(self):
+        self.enterContext(media_refresh_providers("jellyfin"))
         from app.repositories import download_requests, strm as strm_repo
         from app.repositories.strm_request_ownership import refresh_work_key
 
@@ -428,7 +456,7 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                     yield conn
 
             with patch.object(db, "get_conn", measured):
-                register_media_refresh_handoff(entries, providers=("jellyfin",), run_id=run_id)
+                register_media_refresh_handoff(entries, run_id=run_id)
             vm_steps.append(steps)
             self.assertEqual(len(queries), 1)
             with original() as conn:
@@ -458,8 +486,8 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
     def test_no_eligible_automatic_provider_skips_without_queue_or_worker(self):
         cases = (
             ({}, True),
-            ({"JELLYFIN_ENABLED": True, "JELLYFIN_URL": "http://fixture.invalid"}, True),
-            ({"EMBY_ENABLED": True, "EMBY_URL": "http://fixture.invalid", "EMBY_TOKEN": "synthetic"}, False),
+            ({"JELLYFIN_ENABLED": "1", "JELLYFIN_URL": "http://fixture.invalid"}, True),
+            ({"EMBY_ENABLED": "1", "EMBY_URL": "http://fixture.invalid", "EMBY_TOKEN": "synthetic"}, False),
         )
         for settings, allow_emby in cases:
             with self.subTest(settings=settings, allow_emby=allow_emby), patch(

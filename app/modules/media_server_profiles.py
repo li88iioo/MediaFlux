@@ -1,6 +1,8 @@
 """Jellyfin / Emby 配置快照、固定目标连接与身份诊断。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import threading
 import time
@@ -10,9 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from sqlite3 import Row
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 from urllib.parse import urlsplit
 
+import httpx
 import requests
 
 from app import config
@@ -101,12 +104,12 @@ class MediaServerProfile:
         }
 
 
-def _profile(source: str) -> MediaServerProfile:
+def _profile(source: str, settings: Mapping[str, str] | None = None) -> MediaServerProfile:
     try:
         server_type, label, url_key, credential_key, enabled_key, user_key = _PROFILE_KEYS[source]
     except KeyError as exc:
         raise ValueError("媒体服务器来源无效") from exc
-    values = config.get_many((url_key, credential_key, enabled_key, user_key))
+    values = settings if settings is not None else config.get_many((url_key, credential_key, enabled_key, user_key))
     return MediaServerProfile(
         source=source,
         server_type=server_type,
@@ -121,6 +124,58 @@ def _profile(source: str) -> MediaServerProfile:
 def list_configured_profiles() -> list[MediaServerProfile]:
     """返回看板中可供反代选择的 Jellyfin / Emby 配置。"""
     return [_profile(source) for source in _PROFILE_KEYS]
+
+
+def media_server_upstream_identity(server_type: str, url: str) -> str:
+    """持久身份不含凭据，保留协议、端口和部署子路径的差异。"""
+    endpoint = url.strip().rstrip("/")
+    try:
+        endpoint = str(httpx.URL(endpoint))
+    except httpx.InvalidURL:
+        # 历史配置允许从部署环境载入无效地址，仍可登记并按原目标结算失败。
+        pass
+    return hashlib.sha256(json.dumps([server_type, endpoint]).encode()).hexdigest()
+
+
+class MediaRefreshIntent(TypedDict):
+    upstream: str
+    mappings: str
+
+
+@dataclass(frozen=True)
+class MediaRefreshTarget:
+    profile: MediaServerProfile
+    path_mappings: tuple[MediaServerPathMapping, ...]
+
+    def intent(self) -> MediaRefreshIntent:
+        pairs = sorted((item.local_prefix, item.server_prefix) for item in self.path_mappings)
+        return {
+            "upstream": media_server_upstream_identity(self.profile.server_type, self.profile.url),
+            "mappings": hashlib.sha256(json.dumps(pairs).encode()).hexdigest(),
+        }
+
+
+def configured_media_refresh_targets() -> dict[str, MediaRefreshTarget]:
+    from app.modules.media_server_path_mapping import MAPPING_CONFIG, configured_media_server_refresh_options
+
+    keys = [key for profile in _PROFILE_KEYS.values() for key in profile[2:]]
+    keys.extend(key for mapping in MAPPING_CONFIG.values() for key in mapping)
+    snapshot = config.get_many(keys)
+    profiles = [_profile(source, snapshot) for source in _PROFILE_KEYS]
+    return {
+        profile.server_type: MediaRefreshTarget(
+            profile, configured_media_server_refresh_options(profile.server_type, settings=snapshot)["path_mappings"],
+        )
+        for profile in profiles
+    }
+
+
+def capture_media_refresh_intents(*, allow_emby: bool = True) -> dict[str, MediaRefreshIntent]:
+    return {
+        provider: target.intent()
+        for provider, target in configured_media_refresh_targets().items()
+        if target.profile.enabled and target.profile.configured and (allow_emby or provider != "emby")
+    }
 
 
 _SLOT_LABELS = {"jellyfin": "Jellyfin 12", "emby": "Emby / Jellyfin 10.x"}

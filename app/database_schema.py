@@ -1022,6 +1022,7 @@ CREATE TABLE IF NOT EXISTS strm_refresh_outbox (
     path TEXT NOT NULL,
     event_token TEXT NOT NULL DEFAULT '',
     allow_emby INTEGER NOT NULL DEFAULT 1 CHECK(allow_emby IN (0,1)),
+    refresh_intent_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(path, allow_emby)

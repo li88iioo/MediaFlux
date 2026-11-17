@@ -407,22 +407,25 @@ class MediaServerRefreshOptions(TypedDict):
     allow_global_refresh_fallback: bool
 
 
-def configured_media_server_refresh_options(server_type: str) -> MediaServerRefreshOptions:
+def configured_media_server_refresh_options(
+    server_type: str, *, settings: Mapping[str, str] | None = None,
+) -> MediaServerRefreshOptions:
     """读取指定媒体服务器的路径映射；历史全库回退开关只作配置摘要元数据，不参与刷新。"""
     normalized = (server_type or "").strip().lower()
     try:
         mapping_key, fallback_key = MAPPING_CONFIG[normalized]
     except KeyError as exc:
         raise ValueError("媒体服务器类型无效") from exc
+    values = settings if settings is not None else config.get_many((mapping_key, fallback_key))
     try:
-        mappings = parse_media_server_path_mappings(config.get(mapping_key, ""))
+        mappings = parse_media_server_path_mappings(values[mapping_key])
     except MediaServerPathMappingError as exc:
         # 配置损坏时 fail closed：不带映射继续匹配，历史开关摘要值保持 false。
         logger.error("%s 路径映射配置无效，已安全忽略: %s", normalized, exc)
         mappings = ()
         allow_global_refresh_fallback = False
     else:
-        allow_global_refresh_fallback = config.get_bool(fallback_key, False)
+        allow_global_refresh_fallback = values[fallback_key].strip().lower() in {"1", "true", "yes", "on", "y"}
     return {
         "path_mappings": mappings,
         "allow_global_refresh_fallback": allow_global_refresh_fallback,
