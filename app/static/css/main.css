@@ -6427,7 +6427,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .indexer-site-option strong { color: inherit; font-size: 12px; font-weight: 600; }
 .indexer-site-option small { color: inherit; font-size: 9px; opacity: .78; }
 .indexer-site-option small::before { content: "·"; margin-right: 7px; }
-.indexer-site-option:hover [data-indexer-site-chip] { background: var(--accent-soft); border-color: var(--accent); }
+.indexer-site-option:hover :where(input:enabled) + [data-indexer-site-chip] { background: var(--accent-soft); border-color: var(--accent); }
 .indexer-site-option input:checked + [data-indexer-site-chip] { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
 .indexer-site-option input:indeterminate + [data-indexer-site-chip] { background: var(--accent-soft); border-style: dashed; }
 .indexer-site-option.is-sensitive input:checked + [data-indexer-site-chip] { color: var(--on-warning); background: var(--warning); border-color: var(--warning); }

@@ -63,7 +63,7 @@
     }
 
     function syncIndexerSiteSelection(){
-        if(!indexerSiteField)return;
+        if(!indexerSiteField||indexerSiteField.disabled)return;
         const selected=new Set(indexerSiteField.value.split(','));
         indexerSiteInputs.forEach(input=>{
             const site=input.dataset.indexerSite;
@@ -73,10 +73,20 @@
         indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
     }
     function loadIndexerSiteSelection(config){
+        if(!indexerSiteField)return;
         const selected=new Set(String(config.INDEXER_ENABLED_SITES||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean));
-        if(indexerSiteField)indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
+        indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
+        const managed=indexerSiteField.dataset.managedByEnvironment==='true';
+        indexerSiteBox.classList.toggle('is-disabled',managed);
+        if(managed){
+            const source=indexerSiteBox.querySelector('#indexerSiteSource');
+            source.textContent='环境托管';
+            source.title=indexerSiteField.title;
+            indexerSiteBox.querySelector('[data-indexer-site-selector]').setAttribute('aria-describedby',source.id);
+        }
         indexerSiteInputs.forEach(input=>{
             input.checked=selected.has(input.dataset.indexerSite);
+            input.disabled=managed;
         });
     }
     indexerSiteInputs.forEach(input=>input.addEventListener('change',syncIndexerSiteSelection));

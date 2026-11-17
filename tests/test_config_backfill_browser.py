@@ -7,6 +7,7 @@ user.env、路由、模板与 JS）；进程内对外 socket 连接被禁止。�
 """
 from __future__ import annotations
 
+import os
 import socket
 import unittest
 from types import SimpleNamespace
@@ -499,6 +500,30 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         )
         self.assertEqual(self.config_posts, [(200, {"AGENT_LLM_ENABLED": "1"})])
         self.assertEqual(config.get("AGENT_LIBRARY_PATROL_ENABLED"), "1")
+
+    def test_environment_managed_indexer_sites_are_read_only(self):
+        from playwright.sync_api import expect
+
+        key = "INDEXER_ENABLED_SITES"
+        self._write(INDEXER_ENABLED_SITES="btbtla", INDEXER_BTBTLA_MIN_INTERVAL_SECONDS="5")
+        with patch.dict(os.environ, {key: "nyaa"}), patch.object(
+            config, "_STARTUP_ENV_OVERRIDES", config._STARTUP_ENV_OVERRIDES | {key},
+        ):
+            page = self._open("/settings#discovery")
+            options = page.locator("[data-indexer-site]")
+            for option in options.all():
+                expect(option).to_be_disabled()
+            expect(page.locator("#indexerSiteSource")).to_have_text("环境托管")
+            expect(page.locator('[data-indexer-site="nyaa"]')).to_be_checked()
+            mikan = page.locator('[data-indexer-site="mikan"]')
+            mikan.locator("..").click(force=True)
+            expect(mikan).not_to_be_checked()
+            page.locator('[data-key="INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"]').fill("8")
+            page.locator('[data-settings-panel="discovery"] [data-save-settings]').click()
+            expect(page.locator('[data-settings-panel="discovery"] [data-settings-state]')).to_have_text("当前分区已保存")
+            self.assertEqual(self.config_posts, [(200, {"INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": "8"})])
+            self.assertEqual(config.all_items()[key], "btbtla")
+            self.assertEqual(config.get(key), "nyaa")
 
     def test_shared_telegram_allowlist_can_be_saved_and_revoked_with_agent_off(self):
         from app.bot.handlers import _reject_unauthorized_group_write, _reject_unauthorized_resource_search

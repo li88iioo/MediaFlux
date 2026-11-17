@@ -1323,7 +1323,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 }
 .settings-page .indexer-site-option strong { font-size: 11px; font-weight: 680; }
 .settings-page .indexer-site-option small { font-size: 8px; }
-.settings-page .indexer-site-option:hover [data-indexer-site-chip] {
+.settings-page .indexer-site-option:hover :where(input:enabled) + [data-indexer-site-chip] {
     color: var(--accent);
     background: var(--accent-soft);
     border-color: var(--accent-border);
