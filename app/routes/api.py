@@ -1291,7 +1291,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         old_strm_sources: list[dict[str, str]] = []
         new_strm_sources: list[dict[str, str]] | None = None
         old_strm_root = config.get("STRM_ROOT", "").strip()
-        strm_source_config_changed = "GY_STRM_SOURCE_DIRS" in data
+        strm_scope_keys = {"GY_STRM_SOURCE_DIRS", "STRM_ROOT"}
         if "GY_ORGANIZE_SOURCE_DIRS" in data:
             from app.modules.organize_sources import (
                 encode_organize_source_ids,
@@ -1315,26 +1315,25 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 canonical_scope = encode_organize_source_ids(pruned_scope)
                 if canonical_scope != config.get("GY_ORGANIZE_NSFW_SOURCE_IDS", ""):
                     media_workflow_updates["GY_ORGANIZE_NSFW_SOURCE_IDS"] = canonical_scope
-        if strm_source_config_changed:
+        if strm_scope_keys & data.keys():
             import json
 
             from app.modules.strm import parse_strm_sources
 
-            current_canonical = config.get("GY_STRM_SOURCE_DIRS", "")
-            old_strm_sources, _ = parse_strm_sources(
-                current_canonical, require_nonempty=False,
+            old_strm_sources, source_error = parse_strm_sources(
+                config.get("GY_STRM_SOURCE_DIRS", ""), require_nonempty=False,
             )
-            prospective_canonical = data.get("GY_STRM_SOURCE_DIRS", current_canonical)
-            sources, error = parse_strm_sources(
-                prospective_canonical, require_nonempty=False
-            )
-            if error:
-                return api_error(error, 400)
-            new_strm_sources = sources
             if "GY_STRM_SOURCE_DIRS" in data:
-                media_workflow_updates["GY_STRM_SOURCE_DIRS"] = json.dumps(
-                    sources, ensure_ascii=False, separators=(",", ":")
+                new_strm_sources, error = parse_strm_sources(
+                    data["GY_STRM_SOURCE_DIRS"], require_nonempty=False,
                 )
+                if error:
+                    return api_error(error, 400)
+                media_workflow_updates["GY_STRM_SOURCE_DIRS"] = json.dumps(
+                    new_strm_sources, ensure_ascii=False, separators=(",", ":")
+                )
+            elif not source_error:
+                new_strm_sources = old_strm_sources
         if "GY_STRM_BASE_URL" in data:
             raw_base_url = str(data.get("GY_STRM_BASE_URL") or "").strip()
             if raw_base_url:
@@ -1475,7 +1474,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         if persisted_updates:
             previous_values = {key: previous_file_values.get(key) for key in changed_keys}
             persist_started = time.perf_counter()
-            strm_reconcile_required = new_strm_sources is not None and "GY_STRM_SOURCE_DIRS" in changed_keys
+            strm_reconcile_required = new_strm_sources is not None and bool(strm_scope_keys & changed_keys)
             retirement = nullcontext([])
             publication = nullcontext()
             if strm_reconcile_required:
@@ -1491,12 +1490,13 @@ def save_config(request: Request, data: Any = Body(default=None)):
                     configured_sources=new_strm_sources or [],
                     configured_strm_root=persisted_updates.get("STRM_ROOT", old_strm_root) or "",
                     previous_sources=old_strm_sources,
+                    previous_strm_root=old_strm_root,
                 )
                 publication = config.runtime_config_publication(persisted_updates)
             config_persisted = False
             try:
                 with ExitStack() as write_scope:
-                    if changed_keys & {"GY_STRM_SOURCE_DIRS", "STRM_ROOT"}:
+                    if strm_scope_keys & changed_keys:
                         from app.modules.strm import STRM_OPERATION_LOCK
 
                         # 来源发布与清理共用文件锁；持配置锁时只能非阻塞获取，

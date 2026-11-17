@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.config import PATHS
 from app.logger import get_logger
@@ -1940,6 +1940,18 @@ def purge_agent_subject_data(
 _STRM_SOURCE_SNAPSHOT_KEY = "strm.configured_sources.snapshot.v1"
 
 
+class _StrmSourceSnapshot(NamedTuple):
+    sources: dict[str, str]
+    root: str
+    prefixes: dict[str, str]
+    output_roots: dict[str, list[str]]
+
+
+def _absolute_strm_root(root: str) -> str:
+    root = root.strip()
+    return os.path.abspath(os.path.expanduser(root)) if root else ""
+
+
 def _normalize_strm_source_snapshot(
     sources: Iterable[object],
 ) -> dict[str, str]:
@@ -1962,13 +1974,41 @@ def _write_strm_source_snapshot(
     sources: dict[str, str],
     strm_root: str,
     previous_sources: dict[str, str] | None = None,
+    previous_root: str = "",
 ) -> None:
     from app.modules.strm import STRM_SUBDIR, plan_strm_sources
 
+    strm_root = strm_root.strip()
+    current_root = _absolute_strm_root(strm_root)
+    if current_root:
+        try:
+            current_root = str(Path(current_root).resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            pass
     previous = _read_strm_source_snapshot(conn)
-    prefixes = previous[2] if previous is not None else _strm_source_prefixes(
+    prefixes = previous.prefixes if previous is not None else _strm_source_prefixes(
         sources if previous_sources is None else previous_sources
     )
+    output_roots = previous.output_roots if previous is not None else {}
+
+    def remember_root(source_ids: Iterable[str], root: str) -> None:
+        # 冻结配置的绝对路径，链接变化时不能将旧授权转向另一个目录。
+        if not (absolute := _absolute_strm_root(root)):
+            return
+        for source_id in source_ids:
+            roots = output_roots.setdefault(source_id, [])
+            if absolute not in roots:
+                roots.append(absolute)
+
+    if previous is not None:
+        remember_root(previous.sources, previous.root)
+    if previous_sources is not None:
+        remember_root(previous_sources, previous_root)
+    # 重新启用来源时会撤销退役；先保留旧版退役记录中唯一的根凭据。
+    for retired in conn.execute("SELECT source_id, strm_root FROM strm_retired_sources"):
+        if retired["source_id"] in sources:
+            remember_root((retired["source_id"],), retired["strm_root"])
+    remember_root(sources, current_root)
     occupied: set[str] = set()
     if strm_root and sources.keys() - prefixes.keys():
         try:
@@ -1983,8 +2023,9 @@ def _write_strm_source_snapshot(
     payload = json.dumps(
         {
             "version": 1,
-            "strm_root": (strm_root or ""),
+            "strm_root": current_root,
             "local_prefixes": prefixes,
+            "output_roots": output_roots,
             "sources": [
                 {"id": source_id, "name": source_name}
                 for source_id, source_name in sources.items()
@@ -1998,7 +2039,7 @@ def _write_strm_source_snapshot(
 
 def _read_strm_source_snapshot(
     conn: sqlite3.Connection,
-) -> tuple[dict[str, str], str, dict[str, str]] | None:
+) -> _StrmSourceSnapshot | None:
     row = conn.execute(
         "SELECT value FROM settings_kv WHERE key=?", (_STRM_SOURCE_SNAPSHOT_KEY,)
     ).fetchone()
@@ -2020,7 +2061,18 @@ def _read_strm_source_snapshot(
             for key, value in prefixes.items()
         ) or not sources.keys() <= prefixes.keys():
             raise RuntimeError("STRM 来源路径快照不完整，已停止重新分配目录")
-        return sources, str(payload.get("strm_root") or ""), _strm_source_prefixes(sources, prefixes)
+        raw_roots = payload.get("output_roots", {})
+        if not isinstance(raw_roots, dict):
+            raw_roots = {}
+        output_roots = {
+            source_id: [root for root in roots if isinstance(root, str) and Path(root).is_absolute()]
+            for source_id, roots in raw_roots.items()
+            if source_id in prefixes and isinstance(roots, list)
+        }
+        return _StrmSourceSnapshot(
+            sources, str(payload.get("strm_root") or ""),
+            _strm_source_prefixes(sources, prefixes), output_roots,
+        )
     except (TypeError, ValueError):
         logger.warning("STRM 来源快照损坏，已按当前配置重建")
         return None
@@ -2042,9 +2094,21 @@ def _strm_source_prefixes(sources: dict[str, str], prefixes: dict[str, str] | No
 def get_strm_source_prefixes(configured_sources: Iterable[object]) -> dict[str, str]:
     with get_conn() as conn:
         snapshot = _read_strm_source_snapshot(conn)
-    return snapshot[2] if snapshot is not None else _strm_source_prefixes(
+    return snapshot.prefixes if snapshot is not None else _strm_source_prefixes(
         _normalize_strm_source_snapshot(configured_sources)
     )
+
+
+def get_strm_source_output_roots(source_id: str) -> list[str]:
+    with get_conn() as conn:
+        snapshot = _read_strm_source_snapshot(conn)
+        retired = conn.execute(
+            "SELECT strm_root FROM strm_retired_sources WHERE source_id=?", (source_id,),
+        ).fetchone()
+    roots = snapshot.output_roots.get(source_id, []) if snapshot is not None else []
+    if retired is not None and (root := _absolute_strm_root(retired["strm_root"])):
+        return [root, *(item for item in roots if item != root)]
+    return roots
 
 
 def _apply_strm_source_reconciliation(
@@ -2073,6 +2137,7 @@ def reconcile_strm_retired_sources_transaction(
     configured_sources: Iterable[object] | None = None,
     configured_strm_root: str = "",
     previous_sources: Iterable[object] | None = None,
+    previous_strm_root: str = "",
 ):
     """在配置发布事务内同步 STRM 退役队列、元数据待办和来源快照。
 
@@ -2096,7 +2161,6 @@ def reconcile_strm_retired_sources_transaction(
         )
 
     with get_conn() as conn:
-        _apply_strm_source_reconciliation(conn, active_ids, normalized_retired)
         if configured_sources is not None:
             _write_strm_source_snapshot(
                 conn,
@@ -2104,7 +2168,9 @@ def reconcile_strm_retired_sources_transaction(
                 configured_strm_root,
                 _normalize_strm_source_snapshot(previous_sources)
                 if previous_sources is not None else None,
+                previous_strm_root,
             )
+        _apply_strm_source_reconciliation(conn, active_ids, normalized_retired)
         yield list(normalized_retired)
 
 
@@ -2119,14 +2185,13 @@ def reconcile_configured_strm_sources(
         previous = _read_strm_source_snapshot(conn)
         retired: dict[str, tuple[str, str]] = {}
         if previous is not None:
-            previous_sources, previous_root, _prefixes = previous
             retired = {
-                source_id: (source_name, previous_root)
-                for source_id, source_name in previous_sources.items()
+                source_id: (source_name, previous.root)
+                for source_id, source_name in previous.sources.items()
                 if source_id not in current
             }
-        _apply_strm_source_reconciliation(conn, active_ids, retired)
         _write_strm_source_snapshot(conn, current, strm_root)
+        _apply_strm_source_reconciliation(conn, active_ids, retired)
         return list(retired)
 
 
@@ -2139,7 +2204,7 @@ def _queue_strm_retired_source(
         "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
         "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
         "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
-        (source_id, source_name, strm_root, timestamp, timestamp),
+        (source_id, source_name, _absolute_strm_root(strm_root), timestamp, timestamp),
     )
 
 

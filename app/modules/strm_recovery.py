@@ -8,8 +8,10 @@ import sqlite3
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
+from app import database as db
 from app.repositories import strm as strm_repo
 from app.modules.media_refresh import plan_refresh_targets
 
@@ -53,6 +55,49 @@ def _managed_path(value: object, strm_root: str) -> Path | None:
         return None
 
 
+def _cleanup_roots(source_key: str, strm_root: str) -> tuple[Path, ...]:
+    provider, _, source_id = source_key.partition(":")
+    recorded = (
+        db.get_strm_source_output_roots(source_id)
+        if provider in {"guangya", "guangya-meta"} and source_id else []
+    )
+    roots = [Path(root) for root in recorded]
+    if strm_root:
+        configured = Path(os.path.abspath(os.path.expanduser(strm_root)))
+        # 当前配置可以显式使用挂载别名。旧凭据只使用当时冻结的绝对路径。
+        try:
+            primary = configured.resolve()
+        except (OSError, RuntimeError, ValueError):
+            primary = configured
+        roots = [primary, *(root for root in roots if root != configured)]
+    return tuple(dict.fromkeys(roots))
+
+
+def _cleanup_location(value: object, roots: tuple[Path, ...]) -> tuple[Path, Path] | None:
+    """从已登记的根定位记录；多个根下的旧版相对路径无从确认归属。"""
+    from app.modules.strm import STRM_SUBDIR
+
+    if not value:
+        return None
+    try:
+        raw = Path(str(value).strip()).expanduser()
+    except RuntimeError:
+        return None
+    if raw.is_absolute():
+        root = max(
+            (root for root in roots if raw.is_relative_to(root / STRM_SUBDIR)),
+            key=lambda root: len(root.parts), default=None,
+        )
+    else:
+        root = roots[0] if len(roots) == 1 else None
+    if root is not None:
+        subtree = root / STRM_SUBDIR
+        path = _managed_path(value, str(root))
+        if path is not None and path != subtree and path.is_relative_to(subtree):
+            return root, path
+    return None
+
+
 def recover_pending_paths(
     source_key: str,
     strm_root: str,
@@ -71,8 +116,7 @@ def recover_pending_paths(
     """
     from app.modules import strm
 
-    # 所有权校验、删除和刷新规划必须使用同一个已展开的绝对根。
-    strm_root = str(Path(strm_root).expanduser().resolve(strict=False))
+    roots: tuple[Path, ...] | None = None
     current = None
     reported_paths = set(stats.get("changed_strm_paths") or [])
     after_id = 0
@@ -83,89 +127,79 @@ def recover_pending_paths(
         if not batch:
             return
         after_id = int(batch[-1]["id"])
-        paths = {int(row["id"]): _managed_path(row["strm_path"], strm_root) for row in batch}
-        retained = strm._retained_indexed_paths((str(path) for path in paths.values() if path), strm_root)
-        completed: list[int] = []
-        changed_paths: list[str] = []
+        if roots is None:
+            roots = _cleanup_roots(source_key, strm_root)
+        by_root: dict[Path, list[tuple[Path, sqlite3.Row]]] = {}
         for row in batch:
-            if _stopped(stats, should_stop):
-                break
-            file_id = str(row["file_id"])
-            path = paths[int(row["id"])]
-            if path is None:
+            location = _cleanup_location(row["strm_path"], roots)
+            if location is None:
                 _blocked(
-                    stats, row["strm_path"], "旧路径不在当前 STRM 根内，已保留清理凭据"
+                    stats, row["strm_path"], "无法核实旧路径的 STRM 输出根或路径经过链接，已保留清理凭据"
                 )
                 continue
-            try:
-                if str(path) in retained:
-                    # 普通异常已回滚，或路径已被其他活跃对象复用；凭据不再适用。
-                    completed.append(int(row["id"]))
-                    continue
-                if path.exists() and file_id in valid_ids:
-                    if current is None:
-                        current = {
-                            str(item["file_id"]): item
-                            for item in strm_repo.list_strm_index(
-                                source_key, only_file_ids=only_file_ids,
-                            )
-                        }
-                    active = current.get(file_id)
-                    replacement = (
-                        _managed_path(active["strm_path"], strm_root)
-                        if active
-                        else None
-                    )
-                    if active is None or not replacement or not strm._fingerprint_matches(
-                        replacement, active["content_fingerprint"]
-                    ):
-                        _blocked(
-                            stats, path, "新文件尚未验证，已保留旧 STRM 和清理凭据"
-                        )
-                        continue
-                if path.is_symlink() or (path.exists() and not path.is_file()):
-                    _blocked(stats, path, "旧路径已变为链接或非普通文件，需人工核对")
-                    continue
-                deleted = strm._delete_owned_file(path, [row], "恢复旧 STRM 清理")
-                stats[
-                    "metadata_cleaned"
-                    if source_key.startswith("guangya-meta:")
-                    else "cleaned"
-                ] += int(deleted)
-                # 已删但未确认的凭据同样重放路径变化，防止中断后媒体库漏刷新。
-                if deleted or str(path) not in reported_paths:
-                    strm._track_change(
-                        stats,
-                        "removed",
-                        path,
-                        strm_root,
-                        on_refresh_paths=on_refresh_paths,
-                    )
-                    if len(reported_paths) < strm._MAX_TRACKED_CHANGED_PATHS:
-                        reported_paths.add(str(path))
-                changed_paths.append(str(path))
+            root, path = location
+            by_root.setdefault(root, []).append((path, row))
+        for root in roots:
+            items = by_root.get(root)
+            if not items:
+                continue
+            media_root = root / strm.STRM_SUBDIR
+            sink = on_refresh_paths
+            if isinstance(sink, strm_repo.StrmRefreshPolicy) and sink.media_root != str(media_root):
+                sink = replace(sink, media_root=str(media_root))
+            retained = strm._retained_indexed_paths((str(path) for path, _row in items), str(root))
+            completed: list[int] = []
+            changed_paths: list[str] = []
+            for path, row in items:
                 if _stopped(stats, should_stop):
                     break
-                completed.append(int(row["id"]))
-            except (OSError, RuntimeError, ValueError) as exc:
-                _blocked(stats, path, str(exc))
-        # 生产调用使用已固定刷新策略的 sink；持久化失败时不确认凭据。
-        if completed:
-            changed_targets = plan_refresh_targets(
-                changed_paths, media_roots=[str(Path(strm_root) / strm.STRM_SUBDIR)],
-            ).targets
-            if changed_targets and on_refresh_paths:
+                file_id = str(row["file_id"])
                 try:
-                    on_refresh_paths(list(changed_targets))
-                except Exception as exc:
-                    _blocked(
-                        stats,
-                        source_key,
-                        f"旧目录刷新交接失败（{type(exc).__name__}），保留清理凭据",
-                    )
-                    stats.update(stopped=True, stop_stage="refresh-persist")
-                    return
-            strm_repo.delete_strm_path_cleanup(completed)
+                    if str(path) in retained:
+                        # 普通异常已回滚，或路径已被其他活跃对象复用；凭据不再适用。
+                        completed.append(int(row["id"]))
+                        continue
+                    if path.exists() and file_id in valid_ids:
+                        if current is None:
+                            current = {
+                                str(item["file_id"]): item
+                                for item in strm_repo.list_strm_index(source_key, only_file_ids=only_file_ids)
+                            }
+                        active = current.get(file_id)
+                        replacement = _cleanup_location(active["strm_path"], roots) if active else None
+                        if active is None or not replacement or not strm._fingerprint_matches(
+                            replacement[1], active["content_fingerprint"]
+                        ):
+                            _blocked(stats, path, "新文件尚未验证，已保留旧 STRM 和清理凭据")
+                            continue
+                    if (not media_root.is_dir() or _managed_path(path, str(root)) != path
+                            or (path.exists() and not path.is_file())):
+                        _blocked(stats, path, "旧输出根无法访问，或旧路径已变为链接或非普通文件，需人工核对")
+                        continue
+                    deleted = strm._delete_owned_file(path, [row], "恢复旧 STRM 清理")
+                    stats["metadata_cleaned" if source_key.startswith("guangya-meta:") else "cleaned"] += int(deleted)
+                    # 已删但未确认的凭据同样重放路径变化，防止中断后媒体库漏刷新。
+                    if deleted or str(path) not in reported_paths:
+                        strm._track_change(stats, "removed", path, root, on_refresh_paths=sink)
+                        if len(reported_paths) < strm._MAX_TRACKED_CHANGED_PATHS:
+                            reported_paths.add(str(path))
+                    changed_paths.append(str(path))
+                    if _stopped(stats, should_stop):
+                        break
+                    completed.append(int(row["id"]))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    _blocked(stats, path, str(exc))
+            # 生产调用使用已固定刷新策略的 sink；持久化失败时不确认凭据。
+            if completed:
+                changed_targets = plan_refresh_targets(changed_paths, media_roots=[str(media_root)]).targets
+                if changed_targets and sink:
+                    try:
+                        sink(list(changed_targets))
+                    except Exception as exc:
+                        _blocked(stats, source_key, f"旧目录刷新交接失败（{type(exc).__name__}），保留清理凭据")
+                        stats.update(stopped=True, stop_stage="refresh-persist")
+                        return
+                strm_repo.delete_strm_path_cleanup(completed)
 
 
 def _pointer(path: Path) -> bytes:

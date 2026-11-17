@@ -49,7 +49,13 @@ from app.defaults import DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
-from app.modules.strm_recovery import _managed_path, reconcile_historical_strm, recover_pending_paths
+from app.modules.strm_recovery import (
+    _cleanup_location,
+    _cleanup_roots,
+    _managed_path,
+    reconcile_historical_strm,
+    recover_pending_paths,
+)
 from app.repositories.strm import (
     StrmRefreshPolicy,
     list_strm_path_cleanup_sources,
@@ -1410,16 +1416,55 @@ def _remove_indexed_rows(
     refresh_policy: StrmRefreshPolicy | None = None,
 ) -> dict:
     """三类索引清理共用批量归属、删除前校验及文件/索引/刷新提交边界。"""
-    result: dict[str, Any] = {"cleaned": 0, "removed_ids": [], "removed_paths": [], "errors": [], "stopped": False}
+    result: dict[str, Any] = {
+        "cleaned": 0, "removed_ids": [], "removed_paths": [], "errors": [],
+        "unsafe_paths_count": 0, "stopped": False,
+    }
+    if not rows:
+        return result
+    roots = _cleanup_roots(source_key, strm_root)
+    available = set()
+    for root in roots:
+        try:
+            if (root / STRM_SUBDIR).is_dir():
+                available.add(root)
+        except OSError:
+            continue
+    by_root: dict[Path, list[tuple[Path | None, Any]]] = {}
+    for row in rows:
+        text = str(row["strm_path"] or "")
+        location = _cleanup_location(text, roots) if text else ((roots[0], None) if roots else None)
+        if location is None or location[0] not in available:
+            result["unsafe_paths_count"] += 1
+            result["errors"].append((text, ValueError("STRM 输出根无法核实或访问，或路径经过链接，已保留索引")))
+            continue
+        root, path = location
+        by_root.setdefault(root, []).append((path, row))
+    for root in roots:
+        scoped = by_root.get(root)
+        if not scoped:
+            continue
+        policy = refresh_policy
+        if policy is not None and (not strm_root or root != roots[0]):
+            policy = replace(policy, media_root=str(root / STRM_SUBDIR))
+        _remove_indexed_rows_at_root(source_key, scoped, str(root), should_stop, policy, result)
+        if result["stopped"]:
+            break
+    return result
+
+
+def _remove_indexed_rows_at_root(
+    source_key: str,
+    rows: list[tuple[Path | None, Any]],
+    strm_root: str,
+    should_stop: Callable[[], bool] | None,
+    refresh_policy: StrmRefreshPolicy | None,
+    result: dict,
+) -> None:
     for start in range(0, len(rows), 500):
         groups: dict[Path | None, list[Any]] = {}
-        for row in rows[start:start + 500]:
-            text = str(row["strm_path"] or "")
-            path = _managed_path(text, strm_root) if text else None
-            if text and path is None:
-                result["errors"].append((text, ValueError("索引路径越界或经过符号链接")))
-            else:
-                groups.setdefault(path, []).append(row)
+        for path, row in rows[start:start + 500]:
+            groups.setdefault(path, []).append(row)
         removing = {(source_key, str(row["file_id"])) for owners in groups.values() for row in owners}
         retained = _retained_indexed_paths((str(path) for path in groups if path), strm_root, removing=removing)
         removed: list[Any] = []
@@ -1433,8 +1478,9 @@ def _remove_indexed_rows(
                 backup = None
                 try:
                     if path and str(path) not in retained:
-                        if path.exists() and not path.is_file():
-                            raise _STRMOwnershipError("目标不是普通文件，已保留原索引")
+                        if (_managed_path(path, strm_root) != path
+                                or (path.exists() and not path.is_file())):
+                            raise _STRMOwnershipError("目标路径已变化或不是普通文件，已保留原索引")
                         backup = _copy_backup(path)
                         deleted = _delete_owned_file(path, owners, "清理失效 STRM")
                         backups.append((path, backup, deleted))
@@ -1443,10 +1489,11 @@ def _remove_indexed_rows(
                 except (OSError, RuntimeError, ValueError) as exc:
                     _discard_backup(backup)
                     result["errors"].extend((str(row["strm_path"] or ""), exc) for row in owners)
-            strm_repo.delete_strm_index_ids(
-                source_key, [str(row["file_id"]) for row in removed],
-                refresh_policy=refresh_policy, refresh_paths=paths,
-            )
+            if removed:
+                strm_repo.delete_strm_index_ids(
+                    source_key, [str(row["file_id"]) for row in removed],
+                    refresh_policy=refresh_policy, refresh_paths=paths,
+                )
         except Exception as commit_error:
             rollback_errors: list[Exception] = []
             for path, backup, deleted in backups:
@@ -1475,7 +1522,6 @@ def _remove_indexed_rows(
         result["removed_paths"].extend(paths)
         if result["stopped"]:
             break
-    return result
 
 
 def cleanup_deleted_cloud_files(file_ids: set[str], *, refresh_enabled: bool) -> dict:
@@ -1483,18 +1529,17 @@ def cleanup_deleted_cloud_files(file_ids: set[str], *, refresh_enabled: bool) ->
     stats: dict = {"cleaned": 0, "metadata_cleaned": 0}
     if not file_ids:
         return stats
-    strm_root = get("STRM_ROOT", "").strip()
     if not STRM_OPERATION_LOCK.acquire():
         raise RuntimeError("STRM 写锁不可用")
     try:
+        strm_root = get("STRM_ROOT", "").strip()
         stats.update(retire_deleted_strm_files(
             {"file_id": file_id} for file_id in sorted(file_ids)
         ))
         sources = list_strm_path_cleanup_sources(file_ids)
-        if sources and not strm_root:
-            raise ValueError("未配置 STRM 本地根目录，已保留清理凭据")
         policy = StrmRefreshPolicy(
-            media_root=str(Path(strm_root) / STRM_SUBDIR), enabled=refresh_enabled,
+            media_root=str(Path(strm_root).expanduser() / STRM_SUBDIR) if strm_root else "",
+            enabled=refresh_enabled,
         ).with_current_targets()
         for source in sources:
             recover_pending_paths(
@@ -2943,11 +2988,8 @@ def _sync_strm_impl(
                 stats["clean_skipped"] = bool(stats["clean_skipped"]) or bool(
                     cleanup.get("skipped")
                 )
-                for blocked_path in cleanup.get("blocked_paths", [])[:3]:
-                    _append_error_sample(
-                        stats, "清理旧 STRM", blocked_path,
-                        RuntimeError("文件归属校验或删除失败，已保留文件和索引；请核对内容及目录写入权限"),
-                    )
+                for blocked_path, error in cleanup.get("errors", [])[:3]:
+                    _append_error_sample(stats, "清理旧 STRM", blocked_path, error)
                 stats["cleaned"] += cleanup["cleaned"]
                 stats["empty_dirs_cleaned"] += cleanup["empty_dirs_cleaned"]
                 for removed_path in cleanup.get("removed_paths", []):
@@ -2975,22 +3017,19 @@ def _sync_strm_impl(
                         stats["clean_skipped"]
                         or bool(metadata_cleanup.get("skipped"))
                     )
-                    for blocked_path in metadata_cleanup.get("blocked_paths", [])[:3]:
-                        _append_error_sample(
-                            stats, "清理旧元数据", blocked_path,
-                            RuntimeError("文件归属校验或删除失败，已保留文件和索引；请核对内容及目录写入权限"),
-                        )
+                    for blocked_path, error in metadata_cleanup.get("errors", [])[:3]:
+                        _append_error_sample(stats, "清理旧元数据", blocked_path, error)
                     stats["metadata_cleaned"] += metadata_cleanup["cleaned"]
                     stats["empty_dirs_cleaned"] += metadata_cleanup["empty_dirs_cleaned"]
                     for removed_path in metadata_cleanup.get("removed_paths", []):
                         _track_change(stats, "removed", removed_path, strm_root, on_refresh_paths=on_refresh_paths)
                     removed_dir_paths.update(metadata_cleanup.get("removed_dir_paths", []))
-                if not stats["clean_skipped"]:
+                if not stats["stopped"]:
                     recover_pending_paths(
                         source_key, strm_root, stats, valid_ids=seen_ids,
                         should_stop=should_stop, on_refresh_paths=on_refresh_paths,
                     )
-                    if metadata and metadata_queue_cleanup_ready and not stats["clean_skipped"]:
+                    if metadata and metadata_queue_cleanup_ready and not stats["stopped"]:
                         recover_pending_paths(
                             metadata_source_key, strm_root, stats, valid_ids=metadata_seen_ids,
                             should_stop=should_stop, on_refresh_paths=on_refresh_paths,
@@ -3932,23 +3971,19 @@ def clean_retired_strm_sources(
             continue
         result["sources"] += 1
         root_text = str(retired["strm_root"] or "").strip()
-        if not root_text:
+        if not root_text and not db.get_strm_source_output_roots(source_id):
             error = "退役来源缺少原 STRM_ROOT，已安全保留"
             db.update_strm_retired_source_error(source_id, error)
             result["blocked"] += 1
             result["errors"].append(f"{source_id}: {error}")
             continue
-        owned_root = (Path(root_text).expanduser() / STRM_SUBDIR).resolve(strict=False)
-        retired_refresh = (
-            replace(refresh_policy, media_root=str(owned_root))
-            if refresh_policy is not None else None
-        )
+        owned_root = Path(os.path.abspath(os.path.expanduser(root_text))) / STRM_SUBDIR if root_text else None
         namespaces = (f"guangya:{source_id}", f"guangya-meta:{source_id}")
         blocked = 0
         for namespace in namespaces:
             cleanup = _remove_indexed_rows(
-                namespace, strm_repo.list_strm_index(namespace), root_text,
-                should_stop=should_stop, refresh_policy=retired_refresh,
+                namespace, strm_repo.list_strm_index(namespace), "",
+                should_stop=should_stop, refresh_policy=refresh_policy,
             )
             result["cleaned"] += cleanup["cleaned"]
             result["index_cleaned"] += len(cleanup["removed_ids"])
@@ -3965,8 +4000,8 @@ def clean_retired_strm_sources(
                 # 来源已退役，不再要求新副本存活；只消费原根内的可信旧路径，
                 # 继续复用全局归属、删除前指纹复核及刷新持久化后 ACK。
                 recover_pending_paths(
-                    namespace, root_text, recovery, valid_ids=set(),
-                    should_stop=should_stop, on_refresh_paths=retired_refresh,
+                    namespace, "", recovery, valid_ids=set(),
+                    should_stop=should_stop, on_refresh_paths=refresh_policy,
                 )
                 if recovery.get("stopped"):
                     result["stopped"] = True
@@ -3992,6 +4027,8 @@ def clean_retired_strm_sources(
             db.update_strm_retired_source_error(source_id, error)
             continue
         db.delete_strm_retired_source(source_id)
+        if owned_root is None:
+            continue
         if clean_empty_dirs:
             empty_cleanup = clean_empty_strm_dirs(
                 root_text, should_stop=should_stop, owned_root=owned_root,
@@ -4017,8 +4054,8 @@ def clean_empty_strm_dirs(
     owned_root: Path | None = None,
 ) -> dict:
     """整轮任务结束后自底向上清理一次共享 STRM 空目录。"""
-    root = owned_root or (Path(strm_root) / STRM_SUBDIR)
-    if not root.exists():
+    root = owned_root or (Path(strm_root).expanduser().resolve(strict=False) / STRM_SUBDIR)
+    if not root.is_dir() or root.absolute() != root.resolve(strict=False):
         return {"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False}
     empty_dirs = 0
     removed_dir_paths: list[str] = []
@@ -4058,12 +4095,6 @@ def clean_invalid_strm(
     refresh_policy: StrmRefreshPolicy | None = None,
 ) -> dict:
     """基于持久化索引批量清理，不逐文件请求播放直链。"""
-    root = Path(strm_root) / STRM_SUBDIR
-    if not root.exists():
-        return {
-            "cleaned": 0, "checked": 0, "empty_dirs_cleaned": 0,
-            "skipped": False, "removed_paths": [], "removed_dir_paths": [],
-        }
     if not source_key or valid_ids is None:
         logger.warning("STRM 清理缺少完整扫描上下文，已安全跳过")
         return {
@@ -4079,27 +4110,6 @@ def clean_invalid_strm(
         ]
     stale = [row for row in rows if row["file_id"] not in valid_ids]
 
-    # 索引属于持久化外部状态，STRM_ROOT 可能在部署后发生变化。任何陈旧
-    # 索引只要指向当前光鸭 STRM 根之外，就整批跳过该命名空间的清理，
-    # 既不删除文件也不删除索引，避免配置漂移或数据库污染造成越界误删。
-    unsafe_rows = []
-    for row in stale:
-        path_text = str(row["strm_path"] or "").strip()
-        if not path_text:
-            continue
-        if _managed_path(path_text, strm_root) is None:
-            unsafe_rows.append(row)
-    if unsafe_rows:
-        logger.error(
-            "STRM 清理检测到越界索引，已跳过命名空间 source=%s unsafe=%s",
-            source_key, len(unsafe_rows),
-        )
-        return {
-            "cleaned": 0, "checked": len(rows), "empty_dirs_cleaned": 0,
-            "skipped": True, "unsafe_paths_count": len(unsafe_rows),
-            "removed_paths": [], "removed_dir_paths": [],
-        }
-
     cleanup = _remove_indexed_rows(
         source_key, stale, strm_root, should_stop=should_stop, refresh_policy=refresh_policy,
     )
@@ -4108,7 +4118,7 @@ def clean_invalid_strm(
 
     empty_dirs = 0
     removed_dir_paths: list[str] = []
-    if clean_empty_dirs and not stopped:
+    if clean_empty_dirs and strm_root and not stopped and not blocked_paths:
         empty_cleanup = clean_empty_strm_dirs(strm_root, should_stop=should_stop)
         empty_dirs = int(empty_cleanup.get("empty_dirs_cleaned", 0) or 0)
         removed_dir_paths = list(empty_cleanup.get("removed_dir_paths") or [])
@@ -4122,8 +4132,10 @@ def clean_invalid_strm(
         "empty_dirs_cleaned": empty_dirs,
         "skipped": bool(blocked_paths) or stopped,
         "stopped": stopped,
+        "unsafe_paths_count": cleanup["unsafe_paths_count"],
         "ownership_blocked": len(blocked_paths),
         "blocked_paths": blocked_paths,
+        "errors": cleanup["errors"],
         "removed_paths": cleanup["removed_paths"],
         "removed_dir_paths": removed_dir_paths,
     }

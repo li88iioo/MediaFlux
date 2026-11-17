@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import cast
 from app.clients.guangya import GuangYaClient
 
+import json
 import os
 import subprocess
 import sqlite3
@@ -854,6 +855,84 @@ class StrmRetiredPathRecoveryTests(unittest.TestCase):
         run = db.get_last_task_run("strm_sync")
         assert run is not None
         self.assertEqual(run["status"], status)
+
+    def test_retirement_recovers_v1_snapshot_root_and_current_root_with_fingerprinted_receipt(self):
+        former, current = self.root / "Former", self.root / "Current"
+        sources = [{"id": "source", "name": "S"}]
+        # 老版仅保存最后一次来源发布的配置根，根目录单独保存后可与它失配。
+        db.kv_set(db._STRM_SOURCE_SNAPSHOT_KEY, json.dumps({
+            "version": 1, "strm_root": str(former), "sources": sources,
+        }))
+        sync(former, clean_invalid=False)
+        previous = next(former.rglob("*.strm"))
+        self.assertEqual(db.reconcile_configured_strm_sources(sources, str(current)), [])
+        sync(current, clean_invalid=False)
+        latest = next(current.rglob("*.strm"))
+        self.assertEqual(db.reconcile_configured_strm_sources([], str(self.root / "Third")), ["source"])
+        db.init_db()
+
+        result = self._retire()
+        self.assertEqual(result["blocked"], 0, result)
+        self.assertEqual(result["cleaned"], 2)
+        self.assertFalse(previous.exists())
+        self.assertFalse(latest.exists())
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(
+            {(row["path"], row["allow_emby"]) for row in strm_repo.list_strm_refresh_entries()},
+            {(str(previous), False), (str(latest), False)},
+        )
+
+    def test_reactivated_source_keeps_its_legacy_retirement_root(self):
+        former, current = self.root / "Former", self.root / "Current"
+        sync(former, clean_invalid=False)
+        stale = next(former.rglob("*.strm"))
+        db.enqueue_strm_retired_source("source", "S", str(former))
+
+        db.reconcile_configured_strm_sources([{"id": "source", "name": "S"}], str(current))
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        result = strm.clean_invalid_strm(str(current), source_key="guangya:source", valid_ids=set())
+        self.assertFalse(result["skipped"], result)
+        self.assertEqual(result["removed_paths"], [str(stale)])
+        self.assertFalse(stale.exists())
+
+    def test_confirmed_delete_retains_unproven_or_linked_paths_without_blocking_registered_root(self):
+        old, linked, current, foreign = (self.root / root for root in ("A", "Link", "B", "Foreign"))
+        sources = [{"id": "source", "name": "S"}]
+        old.mkdir()
+        linked.symlink_to(old, target_is_directory=True)
+        for root in (linked, current):
+            db.reconcile_configured_strm_sources(sources, str(root))
+        db.reconcile_configured_strm_sources([{"id": "other", "name": "O"}], str(foreign))
+        db.reconcile_configured_strm_sources(sources, str(current))
+        namespace = "guangya:source"
+        paths = {}
+        for root in (old, current, foreign):
+            path = root / strm.STRM_SUBDIR / f"{root.name}.strm"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"identical bytes")
+            paths[root] = path
+        linked.unlink()
+        linked.symlink_to(foreign, target_is_directory=True)
+        paths[linked] = linked / strm.STRM_SUBDIR / paths[foreign].name
+        for root, path in paths.items():
+            strm_repo.upsert_strm_index(
+                namespace, root.name, "etag", 100, path.name, str(path), strm._content_fingerprint(path),
+            )
+
+        with patch.object(strm, "get", return_value=str(current)):
+            result = strm.cleanup_deleted_cloud_files(
+                {root.name for root in paths}, refresh_enabled=False,
+            )
+        self.assertEqual(result["cleaned"], 2)
+        self.assertEqual(result["recovery_pending"], 2)
+        self.assertFalse(paths[old].exists())
+        self.assertFalse(paths[current].exists())
+        self.assertEqual(paths[foreign].read_bytes(), b"identical bytes")
+        self.assertEqual(
+            {row["strm_path"] for row in strm_repo.list_strm_path_cleanup(namespace)},
+            {str(paths[foreign]), str(paths[linked])},
+        )
 
     def _fail_old_refresh(self, old):
         old_directory = str(old).replace("'", "''")

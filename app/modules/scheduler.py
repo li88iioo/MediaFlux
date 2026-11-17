@@ -12,6 +12,7 @@ import json
 import secrets
 import logging
 import math
+import os
 import threading
 from copy import deepcopy
 from datetime import datetime
@@ -1681,6 +1682,7 @@ class STRMScheduler:
             stopped = True
             round_cleanup_safe = False
 
+        scans_safe = round_cleanup_safe
         retirement: dict[str, Any] = {
             "sources": 0, "blocked": 0, "cleaned": 0,
             "empty_dirs_cleaned": 0, "removed_paths": [],
@@ -1738,8 +1740,9 @@ class STRMScheduler:
             self._set_progress("retirement", 1, 1, "清理已移除的 STRM 来源")
 
         if not round_cleanup_safe:
-            cleanup_reason = ROUND_CLEANUP_BLOCKED_REASON
             aggregate["clean_skipped"] = True
+        if not scans_safe:
+            cleanup_reason = ROUND_CLEANUP_BLOCKED_REASON
             if cleanup_reason not in aggregate["error_samples"]:
                 aggregate["error_samples"].append(cleanup_reason)
             for result in source_results:
@@ -1783,11 +1786,12 @@ class STRMScheduler:
 
         cleanup_roots: list[Path] = []
         if round_cleanup_safe and strm_root:
+            current_root = Path(strm_root).expanduser().resolve(strict=False)
             if active_ids_complete:
-                cleanup_roots.append(Path(strm_root) / STRM_SUBDIR)
+                cleanup_roots.append(current_root / STRM_SUBDIR)
             else:
                 cleanup_roots.extend(
-                    Path(_source_local_dir(strm_root, source)) for source in sources
+                    Path(_source_local_dir(str(current_root), source)) for source in sources
                 )
         if round_cleanup_safe and active_ids_complete:
             cleanup_roots.extend(
@@ -1796,7 +1800,7 @@ class STRMScheduler:
         unique_cleanup_roots: list[Path] = []
         seen_cleanup_roots: set[str] = set()
         for root in cleanup_roots:
-            normalized = str(root.expanduser().resolve(strict=False))
+            normalized = os.path.abspath(root.expanduser())
             if normalized in seen_cleanup_roots:
                 continue
             seen_cleanup_roots.add(normalized)

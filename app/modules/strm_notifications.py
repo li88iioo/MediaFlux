@@ -22,9 +22,12 @@ def cleanup_notice_lines(stats: Mapping[str, object]) -> tuple[str, ...]:
     """说明本轮清理保护；只陈述已观测到的后续排队，不承诺自动重试。"""
     if not stats.get("clean_skipped"):
         return ()
-    lines = (
-        "本轮扫描未完整或目录状态存在异常；为避免误删，已暂停本轮删除型清理（失效 STRM、来源退役及空目录）。",
-    )
+    if any(stats.get(key) for key in ("cleaned", "metadata_cleaned", "empty_dirs_cleaned")):
+        lines = ("为避免误删，本轮删除型清理有项目已保留。请查看运行记录中的原因。",)
+    else:
+        lines = (
+            "本轮扫描未完整或目录状态存在异常；为避免误删，已暂停本轮删除型清理（失效 STRM、来源退役及空目录）。",
+        )
     if stats.get("organize_followup_queued"):
         lines += ("截至本轮结束，另有整理联动已排队，将在当前任务结束后再次同步。",)
     return lines
