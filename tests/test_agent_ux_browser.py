@@ -598,8 +598,8 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
         self.assertEqual(card.locator('.agent-download-submit').count(), 0)
 
-    def share_page(self, *, width=1280, count=10, expires_in=900):
-        page = self.page(viewport={'width': width, 'height': 900})
+    def share_page(self, config=None, *, width=1280, count=10, expires_in=900):
+        page = self.page(config, viewport={'width': width, 'height': 900})
         page.evaluate("""({count, expires_in}) => {
             window.__shareCalls = [];
             window.__shareReplies = {};
@@ -665,6 +665,66 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator('#agentShareDirectory').count(), 0)
         self.assertEqual(page.locator('.agent-share-card').count(), 0)
         self.assertEqual(page.evaluate("__shareCalls.filter(c => c.path === '/api/share/restore').length"), 0)
+
+    def test_receipt_refresh_and_failed_navigation_keep_both_download_drafts_actionable(self):
+        waiting = session_snapshot(
+            SESSION_A, pending_effect_count=1,
+            last_turn={'request_id': 'receipt-request', 'turn_id': 'receipt-turn', 'status': 'waiting'},
+        )
+        page = self.share_page({
+            'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+                {'session_id': SESSION_B, 'title': '另一个会话'}]},
+            'sessionDetails': {SESSION_A: waiting, SESSION_B: session_snapshot(
+                SESSION_B, messages=[{'role': 'assistant', 'content': '另一个会话的历史'}],
+            )},
+            'directPreview': _direct_preview({'qb': True, 'guangya': True}, title='Film', kind='torrent'),
+            'directSubmit': {'ok': True, 'status': 'submitted', 'request_id': 20, 'succeeded': ['qb']},
+        }, count=2)
+        share = page.locator('.agent-share-card')
+        first_file = share.locator('input[type=checkbox]').first
+        first_file.uncheck()
+        page.locator('#agentAttachFile').set_input_files(files=[{
+            'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+        direct = page.locator('.agent-download-card').filter(has_text='Film')
+        _target(direct, 'qBittorrent').check()
+        page.evaluate("""session => {
+            const fetch = window.fetch;
+            window.failSwitch = true;
+            window.draftCards = Array.from(document.querySelectorAll('.agent-download-card'));
+            window.fetch = (url, options) => window.failSwitch && url === '/api/agent/sessions/' + session
+                ? Promise.resolve(new Response(JSON.stringify({error: '会话暂不可用'}), {status: 503}))
+                : fetch(url, options);
+        }""", SESSION_B)
+        open_session = page.locator(f'[data-session-open="{SESSION_B}"]')
+        open_session.click()
+        page.get_by_text('会话暂不可用', exact=True).wait_for()
+        self.assertTrue(share.get_by_role('button', name='确认转存').is_enabled())
+        self.assertTrue(_target(direct, 'qBittorrent').is_checked())
+
+        first_file.focus()
+        page.evaluate("""id => {
+            const current = window.__kernelConfig.sessionDetails[id];
+            window.__kernelConfig.sessionDetails[id] = {
+                ...current, pending_effect_count: 0, last_turn: {...current.last_turn, status: 'completed'},
+                messages: [{role: 'assistant', content: '后台回执已保存'}],
+            };
+        }""", SESSION_A)
+        page.get_by_text('后台回执已保存', exact=True).wait_for(timeout=15000)
+        self.assertTrue(first_file.evaluate('node => node === document.activeElement'))
+        self.assertFalse(first_file.is_checked())
+        self.assertTrue(page.evaluate("""() => window.draftCards.every((node, index) =>
+            node === document.querySelectorAll('.agent-download-card')[index])"""))
+        share.get_by_role('button', name='确认转存').click()
+        share.get_by_text('转存成功', exact=False).wait_for()
+        self.assertEqual(page.evaluate("__shareCalls.find(call => call.path === '/api/share/restore').body.file_ids"), ['file-1'])
+        direct.get_by_role('button', name='提交下载').click()
+        direct.get_by_text('下载请求 #20', exact=False).wait_for()
+        self.assertEqual(page.evaluate('window.__directForms[1]')[-1], ['target', 'qb'])
+
+        page.evaluate('window.failSwitch = false')
+        open_session.click()
+        page.get_by_text('另一个会话的历史', exact=True).wait_for()
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
 
     def test_share_card_expiry_can_reparse_but_unknown_submission_cannot_resubmit(self):
         page = self.share_page(count=1)

@@ -88,6 +88,7 @@
     let receiptResumeRequested = false;
     let historyController = null;
     let sessionLoadGeneration = 0;
+    let sessionNavigationGeneration = 0;
     let busy = false;
     const sessionStopOwners = new Map();
     let initialRestore = consoleNode?.dataset.initialRestore === 'true';
@@ -267,13 +268,14 @@
             stopInitialRestore();
             // 同一页面的登录主体改变时，不把旧主体的请求、内存或输入传给新主体。
             ++sessionLoadGeneration;
+            ++sessionNavigationGeneration;
             invalidateActiveRequest();
             setBusy(false);
             expireCandidateCards();
             memoryDrafts.clear();
             typed = '';
             if (promptInput) promptInput.value = '';
-            clearShareCards();
+            clearDownloadCards();
             transcript?.replaceChildren();
             lastUserAt = 0;
             followOutput = true;
@@ -385,12 +387,11 @@
     function pruneTranscript() {
         if (!transcript) return;
         while (transcript.children.length > MAX_TRANSCRIPT_ITEMS) {
-            transcript.firstElementChild?.remove();
+            removeTranscriptItem(transcript.firstElementChild);
         }
-        clearShareCards(true);
     }
 
-    function appendMessage(role, {recovered = false, scroll = true} = {}) {
+    function appendMessage(role, {recovered = false, scroll = true, before = null} = {}) {
         const item = element('article', `agent-message agent-message-${role}`);
         if (recovered) item.classList.add('is-recovered');
         item.setAttribute('aria-label', role === 'user' ? '你的消息' : role === 'download' ? '下载提交' : '助手回复');
@@ -407,7 +408,7 @@
             item.append(reply);
             renderIcons(reply);
         }
-        transcript?.append(item);
+        transcript?.insertBefore(item, before);
         pruneTranscript();
         setConsoleEmpty(false);
         if (scroll) scrollToBottom(true);
@@ -429,7 +430,7 @@
     }
 
     // 与上一条用户消息相隔半小时以上（或跨天）时插入居中的时间分隔；无时间的旧消息不分隔。
-    function appendTimeSeparator(seconds) {
+    function appendTimeSeparator(seconds, before) {
         if (!Number.isFinite(seconds) || seconds <= 0) return;
         const previous = lastUserAt;
         lastUserAt = seconds;
@@ -437,11 +438,11 @@
             && new Date(previous * 1000).toDateString() === new Date(seconds * 1000).toDateString()) return;
         const separator = element('div', 'agent-time-separator', timeLabel(seconds));
         separator.setAttribute('role', 'separator');
-        transcript?.append(separator);
+        transcript?.insertBefore(separator, before ?? null);
     }
 
     function appendUser(text, {replyTo = '', at = 0, ...options} = {}) {
-        appendTimeSeparator(Number(at));
+        appendTimeSeparator(Number(at), options.before);
         const view = appendMessage('user', options);
         if (replyTo) {
             const quote = element('button', 'agent-message-quote');
@@ -478,7 +479,7 @@
 
     const MAGNET_RE = /^magnet:\?\S*xt=urn:bt[im]h:/i;
     let downloadCardCount = 0;
-    const shareCards = new Set();
+    const downloadCards = new Map();
 
     function guangyaShareLink(text) {
         const match = String(text || '').match(/https?:\/\/[^\s<>]+/i);
@@ -492,8 +493,25 @@
         } catch (_) { return ''; }
     }
 
-    function clearShareCards(detachedOnly = false) {
-        for (const entry of shareCards) if (!detachedOnly || !entry.node.isConnected) entry.dispose();
+    function registerDownloadCard(node, lifecycle) {
+        downloadCards.set(node, lifecycle);
+        return () => downloadCards.has(node) && node.isConnected;
+    }
+
+    function removeTranscriptItem(node) {
+        const card = downloadCards.get(node);
+        downloadCards.delete(node);
+        card?.dispose?.();
+        node.remove();
+    }
+
+    function clearDownloadCards() {
+        for (const node of downloadCards.keys()) removeTranscriptItem(node);
+    }
+
+    function dismissDownloadCard(node) {
+        removeTranscriptItem(node);
+        setConsoleEmpty(!transcript?.childElementCount);
     }
 
     // 与 Telegram 共用分享快照及幂等转存接口；选择和确认由用户完成，不调用模型。
@@ -526,12 +544,14 @@
         let preview = null, selected = new Set(), pageIndex = 0, target = null;
         let pending = false, finished = false, mayRetry = false, expiresAt = 0, timer = null, picker = null;
         let controller = null;
-        const alive = () => shareCards.has(entry) && view.item.isConnected;
-        const entry = {node: view.item, dispose: () => {
-            controller?.abort(); clearTimeout(timer); picker?.close({restoreFocus: false});
-            card.inert = true; shareCards.delete(entry);
-        }};
-        shareCards.add(entry);
+        const alive = registerDownloadCard(view.item, {
+            dispose() {
+                controller?.abort(); clearTimeout(timer); picker?.close({restoreFocus: false});
+            },
+            resume() {
+                if (preview && !pending && !finished && Date.now() >= expiresAt) expire();
+            },
+        });
         function update() {
             const items = preview?.files || [], available = Boolean(preview && !pending && !finished);
             selection.textContent = preview ? `文件页：${pageIndex + 1}/${Math.max(1, Math.ceil(items.length / 8))} · 已选择 ${selected.size} / ${items.length}` : '';
@@ -602,7 +622,7 @@
         none.addEventListener('click', () => { selected.clear(); update(); });
         previous.addEventListener('click', () => { pageIndex -= 1; renderFiles(); });
         next.addEventListener('click', () => { pageIndex += 1; renderFiles(); });
-        cancel.addEventListener('click', () => { entry.dispose(); view.item.remove(); setConsoleEmpty(!transcript?.childElementCount); });
+        cancel.addEventListener('click', () => dismissDownloadCard(view.item));
         retry.addEventListener('click', inspect);
         targetButton.addEventListener('click', () => {
             if (Date.now() >= expiresAt) { expire(); return; }
@@ -663,6 +683,8 @@
     // 目标顺序与名称由服务端统一给出，与 Telegram 选择卡一致（含 NSFW 专用来源）。
     async function createDownloadCard(source) {
         const view = appendMessage('download');
+        const controller = new AbortController();
+        const alive = registerDownloadCard(view.item, {dispose: () => controller.abort()});
         const card = element('section', 'agent-download-card');
         const heading = element('strong', 'agent-download-title', source.file ? source.file.name : '磁力链接');
         const meta = element('p', 'agent-download-meta', '正在解析…');
@@ -670,8 +692,12 @@
         view.body.append(card);
         let preview;
         try {
-            preview = await fetchJSON('/api/downloads/direct/preview', {method: 'POST', body: directDownloadForm(source)});
+            preview = await fetchJSON('/api/downloads/direct/preview', {
+                method: 'POST', body: directDownloadForm(source), signal: controller.signal,
+            });
+            if (!alive()) return;
         } catch (error) {
+            if (!alive()) return;
             meta.textContent = error?.message || '无法解析，请确认种子或链接完整';
             card.classList.add('is-error');
             return;
@@ -731,7 +757,7 @@
             review.hidden = false;
             card.classList.add('is-error');
         };
-        cancel.addEventListener('click', () => view.item.remove());
+        cancel.addEventListener('click', () => dismissDownloadCard(view.item));
         submit.addEventListener('click', async () => {
             const option = chosen();
             if (!option) return;
@@ -741,6 +767,7 @@
             card.classList.remove('is-error');
             try {
                 const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, option)});
+                if (!alive()) return;
                 const status = String(result.status || 'manual_review');
                 const cloudLabel = option.nsfw_source_id ? option.label
                     : targets.find(item => item.target === 'guangya' && !('nsfw_source_id' in item))?.label;
@@ -759,6 +786,7 @@
                     showRecovery(status === 'failed' && result.ok === false && !succeeded.length);
                 }
             } catch (error) {
+                if (!alive()) return;
                 const notSubmitted = error?.status === 400 && error?.payload?.code === 'download_not_submitted';
                 if (notSubmitted && Array.isArray(error.payload.targets)) {
                     renderTargets(error.payload.targets);
@@ -1350,8 +1378,8 @@
         });
     }
 
-    function createAssistantTurn({recovered = false, scroll = true} = {}) {
-        const view = appendMessage('assistant', {recovered, scroll});
+    function createAssistantTurn({recovered = false, scroll = true, before = null} = {}) {
+        const view = appendMessage('assistant', {recovered, scroll, before});
         const stream = createStreamingCard();
         view.body.append(stream.card);
         renderIcons(stream.card);
@@ -2433,7 +2461,7 @@
     }
 
     function resumeReceiptObservation() {
-        if (document.hidden || !receiptResumeNeeded) return;
+        if (document.hidden || viewingChannel || !receiptResumeNeeded) return;
         if (receiptResumeInFlight) {
             receiptResumeRequested = true;
             return;
@@ -3179,9 +3207,9 @@
         }
     }
 
-    function renderRecoveredApproval(approval, {scroll = true} = {}) {
+    function renderRecoveredApproval(approval, {scroll = true, before = null} = {}) {
         if (!approval?.plan_id) return null;
-        const view = appendMessage('assistant', {recovered: true, scroll});
+        const view = appendMessage('assistant', {recovered: true, scroll, before});
         const card = buildApproval(approval);
         view.body.append(card);
         const turn = approvalTurnForCard(card);
@@ -3196,6 +3224,10 @@
         renderTaskSnapshot(payload.task);
         const previousFollow = followOutput;
         const previousScrollTop = transcript?.scrollTop || 0;
+        const focusedDraft = preserveScroll
+            ? [...downloadCards.keys()].find(node => node.contains(document.activeElement))
+            : null;
+        const draftTop = focusedDraft?.getBoundingClientRect().top;
         const processStates = new Map();
         if (preserveScroll) {
             transcript?.querySelectorAll('.agent-process-view').forEach(view => {
@@ -3207,17 +3239,19 @@
             });
         }
         expireCandidateCards();
-        clearShareCards();
-        transcript?.replaceChildren();
+        for (const node of [...(transcript?.children || [])]) {
+            if (!downloadCards.has(node)) node.remove();
+        }
+        const placement = {recovered: true, scroll: !preserveScroll, before: transcript?.firstElementChild ?? null};
         lastUserAt = 0;
         const candidateGroups = new Map();
         for (const message of payload.messages || []) {
-            if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, scroll: !preserveScroll, replyTo: String(message.reply_to || ''), at: Number(message.at) || 0});
+            if (message.role === 'user') appendUser(String(message.content || ''), {...placement, replyTo: String(message.reply_to || ''), at: Number(message.at) || 0});
             else if (message.role === 'assistant') {
                 const folded = message.candidate_result_ref === payload.candidate_view?.ref && payload.candidate_view?.last_result;
                 const content = folded ? String(message.candidate_followup || '') : String(message.content || '');
                 if (folded && !content) continue;
-                const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
+                const turn = createAssistantTurn(placement);
                 if (Array.isArray(message.activities)) message.activities.slice(-MAX_TURN_ACTIVITIES).forEach(activity => updateTurnActivity(turn, activity));
                 finalizeAnswer(turn, content);
                 if (message.candidate_view) {
@@ -3237,7 +3271,7 @@
             if (candidateGroup && data?.source_type === 'resource_candidates') {
                 pendingCard = buildApproval(payload.pending_approval);
                 candidateGroup._candidateState.output.append(pendingCard);
-            } else pendingCard = renderRecoveredApproval(payload.pending_approval, {scroll: !preserveScroll});
+            } else pendingCard = renderRecoveredApproval(payload.pending_approval, placement);
         }
 
         if (active && isCurrentActiveRequest(active) && payload.active_turn && sameActiveTurn(payload.active_turn, active)) {
@@ -3258,7 +3292,7 @@
                 prepareActiveStatus(active, activeProgressText(payload.active_turn, active));
             } else {
                 active.kind = active.kind || 'query';
-                const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
+                const turn = createAssistantTurn(placement);
                 turn.boundSelection = false;
                 const userMessage = [...(payload.messages || [])].reverse().find(message => message.role === 'user');
                 turn.requestMessage = userMessage?.content || '';
@@ -3274,7 +3308,7 @@
             const message = String(terminalTurn.message || (terminalTurn.status === 'cancelled'
                 ? '本轮处理已停止。' : '任务未能完成，请核对会话状态。'));
             if (!existingAnswer || String(existingAnswer).trim() !== message.trim()) {
-                const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
+                const turn = createAssistantTurn(placement);
                 turn.boundSelection = active?.kind === 'candidate_preview';
                 turn.requestMessage = active?.turn?.requestMessage || '';
                 turn.requestReplyTo = active?.turn?.requestReplyTo || '';
@@ -3297,7 +3331,10 @@
             if (state.focused) view.querySelector('.agent-process-toggle').focus({preventScroll: true});
         });
         followOutput = preserveScroll ? previousFollow : true;
-        if (followOutput && ![...processStates.values()].some(state => state.expanded)) scrollToBottom(true);
+        if (focusedDraft?.isConnected) {
+            transcript.scrollTop += focusedDraft.getBoundingClientRect().top - draftTop;
+            syncScrollPill();
+        } else if (followOutput && ![...processStates.values()].some(state => state.expanded)) scrollToBottom(true);
         else if (transcript) {
             transcript.scrollTop = previousScrollTop;
             syncScrollPill(true);
@@ -3306,32 +3343,36 @@
         return {candidateGroup, pendingCard};
     }
 
+    function leaveSessionView() {
+        saveDraft();
+        setReply('');
+        clearTaskSnapshot();
+        invalidateActiveRequest();
+        clearDownloadCards();
+        return ++sessionLoadGeneration;
+    }
+
     async function loadSession(targetId, {closeHistory = true, startup = false, signal = null, preserveScroll = false} = {}) {
         if (!SESSION_RE.test(targetId)) return false;
         if (!startup) stopInitialRestore();
-        const switching = targetId !== sessionId;
-        const previousSessionId = sessionId;
-        if (switching) {
-            clearShareCards();
-            setReply('');
-            clearTaskSnapshot();
-            saveDraft();
-            ++sessionLoadGeneration;
-            invalidateActiveRequest();
-            rememberSession(targetId);
-            restoreDraft();
-            setBusy(true);
-        } else if (activeRequest?.receiptOnly && activeRequest.sessionId === targetId) {
+        const switching = targetId !== sessionId || Boolean(viewingChannel);
+        const navigation = closeHistory || switching ? ++sessionNavigationGeneration : null;
+        if (!switching && activeRequest?.receiptOnly && activeRequest.sessionId === targetId) {
             invalidateActiveRequest();
         }
         const active = !switching && activeRequest?.sessionId === targetId ? activeRequest : null;
-        const generation = active ? sessionLoadGeneration : ++sessionLoadGeneration;
+        let generation = active || switching ? sessionLoadGeneration : ++sessionLoadGeneration;
+        const latest = () => (navigation === null || navigation === sessionNavigationGeneration)
+            && (switching || (generation === sessionLoadGeneration && (!active || isCurrentActiveRequest(active))));
         try {
             const payload = await fetchJSON(`/api/agent/sessions/${encodeURIComponent(targetId)}`, {signal});
             if (payload?.session_id !== targetId || !Array.isArray(payload?.messages)) throw new Error('会话内容响应无效');
-            if (generation !== sessionLoadGeneration || (active && !isCurrentActiveRequest(active))) return false;
-            if (configureDraftScope(payload.draft_scope) || generation !== sessionLoadGeneration
-                || (active && !isCurrentActiveRequest(active))) return false;
+            if (!latest() || configureDraftScope(payload.draft_scope) || !latest()) return false;
+            if (switching) {
+                generation = leaveSessionView();
+                rememberSession(targetId);
+                restoreDraft();
+            }
             if (viewingChannel) setChannelMode('');
             if (!(Number(payload.pending_effect_count) > 0)) receiptObservationWindows.delete(targetId);
             if (active) {
@@ -3385,14 +3426,7 @@
             if (!startup) refreshSessions({quiet: true});
             return true;
         } catch (error) {
-            if (generation === sessionLoadGeneration) {
-                if (switching && sessionId === targetId) {
-                    rememberSession(previousSessionId);
-                    restoreDraft();
-                    setBusy(false);
-                }
-                announce(sessionStatus, error?.message || '会话加载失败');
-            }
+            if (latest()) announce(sessionStatus, error?.message || '会话加载失败');
             return false;
         }
     }
@@ -3429,6 +3463,7 @@
             return;
         }
         if (mainSessionId === sessionId && !viewingChannel && activeRequest) {
+            ++sessionNavigationGeneration;
             closeHistoryRail();
             return;
         }
@@ -3554,21 +3589,15 @@
 
     async function openChannel(key) {
         if (!key) return;
-        clearShareCards();
-        // 只读查看渠道会话：先像切换会话一样放下当前会话的请求与草稿，返回时由 loadSession 重新恢复。
         stopInitialRestore();
-        saveDraft();
-        setReply('');
-        const generation = ++sessionLoadGeneration;
-        invalidateActiveRequest();
-        setBusy(false);
-        clearTaskSnapshot();
-        expireCandidateCards();
+        const navigation = ++sessionNavigationGeneration;
         try {
             const payload = await fetchJSON(`/api/agent/channels/${encodeURIComponent(key)}`);
-            if (generation !== sessionLoadGeneration) return;
+            if (navigation !== sessionNavigationGeneration) return;
+            leaveSessionView();
+            setBusy(false);
+            expireCandidateCards();
             setChannelMode(key);
-            clearShareCards();
             transcript?.replaceChildren();
             lastUserAt = 0;
             for (const message of payload?.messages || []) {
@@ -3579,25 +3608,21 @@
             scrollToBottom(true);
             closeHistoryRail();
         } catch (error) {
-            if (generation === sessionLoadGeneration) announce(sessionStatus, error?.message || '渠道会话加载失败');
+            if (navigation === sessionNavigationGeneration) announce(sessionStatus, error?.message || '渠道会话加载失败');
         }
     }
 
     function startNewSession() {
-        setReply('');
         if (viewingChannel) setChannelMode('');
-        clearTaskSnapshot();
         stopInitialRestore();
-        saveDraft();
-        ++sessionLoadGeneration;
-        invalidateActiveRequest();
+        ++sessionNavigationGeneration;
+        leaveSessionView();
         setBusy(false);
         expireCandidateCards();
         rememberSession(createId('session'));
         restoreDraft();
         followOutput = true;
         if (newRepliesButton) newRepliesButton.hidden = true;
-        clearShareCards();
         transcript?.replaceChildren();
         lastUserAt = 0;
         setConsoleEmpty(true);
@@ -3994,11 +4019,12 @@
         scrollPillFrame = requestAnimationFrame(() => { scrollPillFrame = 0; syncScrollPill(); });
     }, {passive: true});
     newRepliesButton?.addEventListener('click', () => scrollToBottom(true));
-    function handlePageHide() {
+    function handlePageHide(event) {
         saveDraft();
-        clearShareCards();
+        if (!event.persisted) clearDownloadCards();
         if (activeRequest?.receiptOnly) receiptResumeNeeded = true;
         ++sessionLoadGeneration;
+        ++sessionNavigationGeneration;
         invalidateActiveRequest();
         startupController?.abort();
         historyController?.abort();
@@ -4008,6 +4034,7 @@
 
     function handlePageShow(event) {
         if (event.persisted) {
+            for (const card of downloadCards.values()) card.resume?.();
             receiptResumeNeeded = true;
             resumeReceiptObservation();
         }
