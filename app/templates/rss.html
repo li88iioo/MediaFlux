@@ -440,7 +440,11 @@ async function loadSubs({preserve=true}={}){
             const en=Boolean(s.enabled);
             const targetText=s.download_method==='guangya'?'光鸭云盘':'qBittorrent';
             const intervalText=s.refresh_interval_minutes?`每 ${s.refresh_interval_minutes} 分钟`:'手动刷新';
-            const actionText=s.action==='download'?'自动离线':'仅订阅';
+            const automatic=s.action==='download';
+            const autoReady=en&&automatic;
+            const actionText=automatic?'自动离线':'仅订阅';
+            const autoHint=en?'编辑订阅，将下载策略设为「自动触发离线下载」。'
+                :automatic?'启用订阅后可自动下载。':'启用订阅，并将下载策略设为「自动触发离线下载」。';
             return `<div class="rss-sub-card">
                 <div class="rss-sub-header-row">
                     <div class="rss-sub-left">
@@ -449,7 +453,7 @@ async function loadSubs({preserve=true}={}){
                     </div>
                     <div class="rss-sub-actions">
                         <button type="button" class="rss-btn" onclick="refreshSub(${s.id},this)" title="刷新订阅"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
-                        <button type="button" class="rss-btn" onclick="autoDl(${s.id},this)" title="刷新并自动下载"><i data-lucide="zap"></i><span>自动下载</span></button>
+                        <button type="button" class="rss-btn" aria-label="自动下载" ${autoReady?`onclick="autoDl(${s.id},this)" title="刷新并自动下载"`:`disabled aria-describedby="rssAutoHint-${s.id}"`}><i data-lucide="zap"></i><span>自动下载</span></button>
                         <button type="button" class="rss-btn rss-sub-toggle ${en?'':'is-enable'}" onclick="toggleSub(${s.id},${en},this)" title="${en?'暂停定时刷新':'启用定时刷新'}" aria-label="${en?'暂停定时刷新':'启用定时刷新'}"><i data-lucide="${en?'pause':'play'}"></i><span>${en?'暂停':'启用'}</span></button>
                         <button type="button" class="rss-btn" onclick="editSub(${s.id},this)" title="编辑订阅"><i data-lucide="edit"></i><span>编辑</span></button>
                         <button type="button" class="rss-btn is-danger" onclick="delSub(${s.id},this)" title="删除订阅" aria-label="删除订阅"><i data-lucide="trash-2"></i></button>
@@ -465,6 +469,7 @@ async function loadSubs({preserve=true}={}){
                         ${s.skip_existing_episodes&&s.media_tmdb_id?`<span class="rss-meta-pill is-library" title="按 TMDB 精确过滤已有剧集"><i data-lucide="library-big"></i> TMDB ${escapeHtml(s.media_tmdb_id)} · S${String(s.media_default_season??1).padStart(2,'0')}</span>`:''}
                     </div>
                 </div>
+                ${autoReady?'':`<p class="rss-sub-auto-hint" id="rssAutoHint-${s.id}">${autoHint}</p>`}
             </div>`;
         }).join('');
         window.renderLucideIcons?.(list);
@@ -612,8 +617,10 @@ async function refreshSub(id,trigger){
 }
 
 async function autoDl(id,trigger){
-    const confirmed=await appConfirm({title:'自动下载待处理条目',message:'将刷新订阅，并按时间倒序提交本轮最多 100 条待处理内容；剩余条目保留到下一轮。',confirmText:'刷新并下载'});if(!confirmed)return;
-    if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'处理中');
+    if(trigger?.disabled)return;
+    const confirmed=await appConfirm({title:'自动下载待处理条目',message:'将刷新订阅，并按时间倒序提交本轮最多 100 条待处理内容；剩余条目保留到下一轮。',confirmText:'刷新并下载',trigger});
+    if(!confirmed||trigger?.disabled)return;
+    setRssButtonBusy(trigger,true,'处理中');
     try{
         const d=await rssApiJSON('/api/rss/subscriptions/'+id+'/auto',{method:'POST'});
         const r=d.result;

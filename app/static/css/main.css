@@ -3490,6 +3490,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     padding-top: 8px;
     border-top: 1px dashed var(--border-soft);
 }
+.rss-sub-auto-hint { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
 .rss-sub-url-inline {
     display: flex;
     align-items: center;

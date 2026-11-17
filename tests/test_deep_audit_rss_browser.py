@@ -103,6 +103,29 @@ class RssFilterRefreshBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("#filterSub option").count(), 2)
         self.assertEqual(page.locator(".rss-sub-card").count(), 1)
 
+    def test_auto_download_control_matches_subscription_policy_and_enabled_state(self):
+        page = self.page(375)
+        page.evaluate("""async()=>{
+            const task=loadSubs();
+            finish([
+                {id:1,name:'Manual',enabled:true,action:'subscribe'},
+                {id:2,name:'Paused',enabled:false,action:'download'},
+                {id:3,name:'Ready',enabled:true,action:'download'},
+            ]);
+            await task;
+        }""")
+        cards = page.locator(".rss-sub-card")
+        for name, instruction in (
+            ("Manual", "自动触发离线下载"),
+            ("Paused", "启用订阅"),
+        ):
+            card = cards.filter(has_text=name)
+            self.assertTrue(card.get_by_role("button", name="自动下载").is_disabled())
+            self.assertIn(instruction, card.locator(".rss-sub-auto-hint").inner_text())
+        ready = cards.filter(has_text="Ready")
+        self.assertTrue(ready.get_by_role("button", name="自动下载").is_enabled())
+        self.assertEqual(ready.locator(".rss-sub-auto-hint").count(), 0)
+
     def test_single_pending_is_neither_success_nor_failure(self):
         page = self.feedback_page()
         page.evaluate("""async()=>{
