@@ -546,10 +546,10 @@
         view.body.append(card);
         let preview = null, selected = new Set(), pageIndex = 0, target = null;
         let pending = false, finished = false, mayRetry = false, expiresAt = 0, timer = null, picker = null;
-        let controller = null;
+        const readController = new AbortController();
         const alive = registerDownloadCard(view.item, {
             dispose() {
-                controller?.abort(); clearTimeout(timer); picker?.close({restoreFocus: false});
+                readController.abort(); clearTimeout(timer); picker?.close({restoreFocus: false});
             },
             resume() {
                 if (preview && !pending && !finished && Date.now() >= expiresAt) expire();
@@ -588,9 +588,8 @@
             pending = true; finished = false; mayRetry = false; preview = null; pageIndex = 0;
             clearTimeout(timer); card.classList.remove('is-error', 'is-done');
             status.textContent = '正在解析分享…'; renderFiles();
-            controller = new AbortController();
             try {
-                const result = await fetchJSON('/api/share/inspect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}), signal: controller.signal});
+                const result = await fetchJSON('/api/share/inspect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}), signal: readController.signal});
                 if (!alive()) return;
                 if (!result.preview_id || !Array.isArray(result.files) || !result.files.length) throw new Error('分享中没有可转存文件');
                 preview = result; selected = new Set(result.files.map(file => String(file.id)));
@@ -610,7 +609,7 @@
         async function followRequest(id, attempts = 0) {
             if (!alive()) return;
             try {
-                const result = await fetchJSON(`/api/share/requests/${encodeURIComponent(id)}`);
+                const result = await fetchJSON(`/api/share/requests/${encodeURIComponent(id)}`, {signal: readController.signal});
                 if (!alive()) return;
                 if (result.terminal) {
                     status.textContent = result.success ? `转存成功 · 目标目录：${result.target_dir_name || target.name}` : (result.error || '转存未完成，请在下载记录中核对');
@@ -640,6 +639,7 @@
             pending = true; clearTimeout(timer); picker?.close(); update();
             const body = {preview_id: preview.preview_id, file_ids: [...selected], target_dir_id: target.id, target_dir_name: target.name};
             try {
+                // 已确认的转存继续由服务端结算。卡片释放后通过 alive() 丢弃回包。
                 const result = await fetchJSON('/api/share/restore', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
                 if (!alive()) return;
                 finished = true;

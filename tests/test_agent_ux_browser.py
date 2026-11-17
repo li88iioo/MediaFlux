@@ -598,7 +598,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
         self.assertEqual(card.locator('.agent-download-submit').count(), 0)
 
-    def share_page(self, config=None, *, width=1280, count=10, expires_in=900):
+    def share_page(self, config=None, *, width=1280, count=10, expires_in=900, open_card=True):
         page = self.page(config, viewport={'width': width, 'height': 900})
         page.evaluate("""({count, expires_in}) => {
             window.__shareCalls = [];
@@ -608,8 +608,17 @@ class AgentUXBrowserTests(unittest.TestCase):
                 const path = String(url);
                 if (!path.startsWith('/api/share/') && !path.startsWith('/api/guangya/dirs')) return original(url, options);
                 const body = options.body ? JSON.parse(options.body) : null;
-                window.__shareCalls.push({path, body});
-                if (window.__holdShare === path) await new Promise(resolve => { window.__releaseShare = resolve; });
+                const call = {path, body, aborted: false, responseStatus: null};
+                window.__shareCalls.push(call);
+                if (window.__holdShare === path) await new Promise((resolve, reject) => {
+                    const abort = () => { call.aborted = true; reject(options.signal.reason); };
+                    if (options.signal?.aborted) { abort(); return; }
+                    options.signal?.addEventListener('abort', abort, {once: true});
+                    window.__releaseShare = () => {
+                        options.signal?.removeEventListener('abort', abort);
+                        resolve();
+                    };
+                });
                 let data = path === '/api/share/inspect' ? {
                     preview_id: 'share-preview', target_id: 'offline', target_name: '离线', expires_in,
                     files: Array.from({length: count}, (_, i) => ({id: `file-${i}`, name: i ? `Episode ${i}.mkv` : 'The Silent Storm <img src=x onerror=window.__shareXss=1>', is_dir: i === 0})),
@@ -617,15 +626,149 @@ class AgentUXBrowserTests(unittest.TestCase):
                   : path.startsWith('/api/guangya/dirs') ? [{file_id: 'movies', name: '电影', is_dir: true}]
                   : {success: true, terminal: true, target_dir_name: '电影'};
                 const reply = window.__shareReplies[path] || {data, status: 200};
+                call.responseStatus = reply.status;
                 return new Response(JSON.stringify(reply.data), {status: reply.status, headers: {'Content-Type': 'application/json'}});
             };
         }""", {'count': count, 'expires_in': expires_in})
         # 使用生产公共脚本中的目录弹窗与请求处理，不伪造目录选择回调。
         page.add_script_tag(path=str(harness.ROOT / 'app/static/js/app.js'))
-        page.locator('#agentPrompt').fill('https://www.guangyapan.com/s/demo123?code=2468#/share')
-        page.locator('#agentComposer').evaluate('node => node.requestSubmit()')
-        page.locator('.agent-share-card input[type=checkbox]').first.wait_for()
+        if open_card:
+            page.locator('#agentPrompt').fill('https://www.guangyapan.com/s/demo123?code=2468#/share')
+            page.locator('#agentComposer').evaluate('node => node.requestSubmit()')
+            page.locator('.agent-share-card input[type=checkbox]').first.wait_for()
         return page
+
+    def test_transcript_pruning_keeps_the_latest_bounded_history(self):
+        from playwright.sync_api import expect
+
+        expires_in = 900
+        questions = [f'历史问题 {index:02d}' for index in range(60)]
+        page = self.share_page({
+            'queryEvents': [harness._event(1, 'turn.completed', {'status': 'success'})],
+        }, count=2, expires_in=expires_in, open_card=False)
+        page.clock.install()
+        prompt = page.locator('#agentPrompt')
+        transcript = page.locator('#agentTranscript')
+        cards = transcript.locator('.agent-share-card')
+
+        def submit(text: str) -> None:
+            prompt.evaluate("""(input, text) => {
+                __kernelConfig.queryEvents[0].payload.answer = `回复：${text}`;
+                input.value = text;
+                input.form.requestSubmit();
+            }""", text)
+            expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        def share(suffix: str, index: int) -> None:
+            submit(f'https://www.guangyapan.com/s/{suffix}')
+            cards.nth(index).get_by_role('checkbox').first.wait_for()
+
+        submit(questions[0])
+        share('polling', 0)
+        page.evaluate("""() => {
+            __shareReplies['/api/share/restore'] = {data: {accepted: true, request_id: 19}, status: 202};
+            window.__holdShare = '/api/share/requests/19';
+        }""")
+        cards.first.get_by_role('button', name='确认转存').click()
+        page.wait_for_function("__shareCalls.some(call => call.path === '/api/share/requests/19')")
+
+        write_body = {
+            'preview_id': 'confirmed-preview', 'file_ids': ['confirmed-file'],
+            'target_dir_id': 'offline', 'target_dir_name': '离线',
+        }
+        page.evaluate("""([body, expiresIn]) => {
+            __shareReplies['/api/share/inspect'] = {status: 200, data: {
+                preview_id: body.preview_id, target_id: body.target_dir_id, target_name: body.target_dir_name,
+                expires_in: expiresIn, files: [{id: body.file_ids[0], name: '已确认.mkv'}],
+            }};
+            window.__holdShare = '/api/share/restore';
+        }""", [write_body, expires_in])
+        share('confirmed', 1)
+        cards.nth(1).get_by_role('button', name='确认转存').click()
+        expect(cards.nth(1).get_by_role('button', name='正在转存…')).to_be_disabled()
+        cards.nth(1).get_by_role('status').evaluate("""status => {
+            window.__confirmedWrite = {
+                call: __shareCalls.findLast(call => call.path === '/api/share/restore'),
+                release: __releaseShare, status, previousText: status.textContent,
+            };
+            delete __shareReplies['/api/share/inspect'];
+        }""")
+
+        # 记录实际到期回调是否执行。仅检查已移除卡片的 DOM 无法识别遗留计时器。
+        page.evaluate("""expiryMs => {
+            const schedule = window.setTimeout;
+            window.__expiryRuns = [];
+            window.setTimeout = (callback, delay, ...args) => {
+                if (delay <= expiryMs - 1000 || delay > expiryMs) return schedule(callback, delay, ...args);
+                const index = __expiryRuns.push(0) - 1;
+                return schedule((...values) => {
+                    __expiryRuns[index] += 1;
+                    callback(...values);
+                }, delay, ...args);
+            };
+        }""", expires_in * 1000)
+        share('picker', 2)
+        share('retained', 3)
+        cards.nth(3).get_by_role('checkbox').first.uncheck()
+        page.evaluate("window.__originalCards = [...document.querySelectorAll('.agent-share-card')]")
+        for question in questions[1:-3]:
+            submit(question)
+        expect(transcript.locator(':scope > *')).to_have_count(119)
+        expect(cards).to_have_count(4)
+
+        page.evaluate("window.__holdShare = '/api/guangya/dirs?parent_id=0'")
+        cards.nth(2).get_by_role('button', name='目标目录：离线').click()
+        picker = page.locator('#agentShareDirectory')
+        expect(picker.get_by_text('加载中...', exact=True)).to_be_visible()
+        # 让目录选择器保持打开，从实际表单入口继续添加转录项。
+        for question in questions[-3:]:
+            submit(question)
+        expect(cards).to_have_count(2)
+        expect(picker).to_be_visible()
+        aborted_paths = "__shareCalls.filter(call => call.aborted).map(call => call.path)"
+        self.assertEqual(page.evaluate(aborted_paths), ['/api/share/requests/19'])
+        pending_write = {'path': '/api/share/restore', 'body': write_body, 'aborted': False, 'responseStatus': None}
+        self.assertEqual(page.evaluate('__confirmedWrite.call'), pending_write)
+
+        page.evaluate("window.__holdShare = '/api/share/inspect'")
+        submit('https://www.guangyapan.com/s/pending-preview')
+        expect(cards.last.get_by_text('正在解析分享…', exact=True)).to_be_visible()
+        expect(picker).to_have_count(0)
+        self.assertEqual(page.evaluate('__originalCards.map(card => card.isConnected)'), [False, False, False, True])
+        self.assertEqual(page.evaluate(aborted_paths), [
+            '/api/share/requests/19', '/api/guangya/dirs?parent_id=0',
+        ])
+        expect(transcript.locator(':scope > *')).to_have_count(120)
+        expect(transcript.locator('.agent-message-user .agent-message-body, .agent-narrative')).to_have_text([
+            text for question in questions[1:] for text in (question, f'回复：{question}')
+        ])
+
+        retained = cards.first
+        expect(retained.get_by_role('checkbox').first).not_to_be_checked()
+        expect(retained.get_by_role('checkbox').last).to_be_checked()
+        retained.get_by_role('button', name='目标目录：离线').click()
+        picker.locator('[data-dir-list] button').last.click()
+        expect(retained.get_by_role('button', name='目标目录：电影')).to_be_enabled()
+        self.assertEqual(page.evaluate('__expiryRuns'), [0, 0])
+        page.clock.fast_forward((expires_in + 1) * 1000)
+        expect(retained.get_by_text('预览已过期，请重新解析后转存。')).to_be_visible()
+        self.assertEqual(page.evaluate('__expiryRuns'), [0, 1])
+
+        page.locator('#agentNewSession').evaluate('button => button.click()')
+        expect(transcript.locator(':scope > *')).to_have_count(0)
+        self.assertEqual(page.evaluate(aborted_paths), [
+            '/api/share/requests/19', '/api/guangya/dirs?parent_id=0', '/api/share/inspect',
+        ])
+        self.assertEqual(page.evaluate('__confirmedWrite.call'), pending_write)
+        page.evaluate("""() => {
+            __shareReplies['/api/share/restore'] = {status: 200, data: {success: true, count: 1, request_id: 20}};
+            __confirmedWrite.release();
+        }""")
+        page.wait_for_function('__confirmedWrite.call.responseStatus === 200')
+        self.assertEqual(page.evaluate('__confirmedWrite.call'), {**pending_write, 'responseStatus': 200})
+        self.assertTrue(page.evaluate('__confirmedWrite.status.textContent === __confirmedWrite.previousText'))
+        expect(transcript.locator(':scope > *')).to_have_count(0)
+        self.assertEqual(page.evaluate("__shareCalls.filter(call => call.path === '/api/share/restore').length"), 2)
 
     def test_share_card_selects_files_across_pages_and_uses_shared_directory_picker(self):
         page = self.share_page()
