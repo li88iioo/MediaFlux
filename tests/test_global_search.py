@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from app.clients.base import MediaItem
 from app.discovery.models import MediaCard
@@ -131,7 +132,7 @@ class GlobalSearchTests(unittest.TestCase):
             [("同名剧集", "2001"), ("同名剧集", "2026")],
         )
 
-    @patch("app.modules.global_search.db.list_organize_logs")
+    @patch("app.modules.global_search.db.list_organize_timeline")
     @patch("app.repositories.download_requests.list_download_logs")
     @patch("app.repositories.rss.list_rss_subscriptions")
     @patch("app.modules.global_search.get_discovery_search_service")
@@ -197,8 +198,17 @@ class GlobalSearchTests(unittest.TestCase):
         self.assertEqual(sections["rss"]["items"][0]["title"], "沙丘订阅")
         self.assertEqual(sections["downloads"]["items"][0]["title"], "沙丘2 2160p")
         self.assertEqual(sections["logs"]["items"][0]["title"], "沙丘2.mkv")
+        for key, path, params in (
+            ("downloads", "/downloads", {"view": ["logs"], "keyword": ["沙丘"]}),
+            ("logs", "/logs", {"q": ["沙丘"]}),
+        ):
+            section = sections[key]
+            self.assertEqual(section["target_url"], section["items"][0]["url"])
+            url = urlsplit(section["target_url"])
+            self.assertEqual(url.path, path)
+            self.assertEqual(parse_qs(url.query), params)
 
-    @patch("app.modules.global_search.db.list_organize_logs", side_effect=RuntimeError("db down"))
+    @patch("app.modules.global_search.db.list_organize_timeline", side_effect=RuntimeError("db down"))
     @patch("app.repositories.download_requests.list_download_logs", return_value=[])
     @patch("app.repositories.rss.list_rss_subscriptions", return_value=[])
     @patch("app.modules.global_search.app_config.get_bool", return_value=False)

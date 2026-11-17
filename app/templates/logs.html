@@ -64,7 +64,7 @@
         <div class="logs-search-row">
             <div class="logs-searchbox">
                 <i data-lucide="search"></i>
-                <input type="search" class="form-input" id="orgKeyword" placeholder="搜索路径、标题、来源或错误" onkeydown="if(event.key==='Enter')loadOrganize(1)">
+                <input type="search" class="form-input" id="orgKeyword" value="{{ organize_keyword }}" placeholder="搜索路径、标题、来源或错误" onkeydown="if(event.key==='Enter')loadOrganize(1)">
             </div>
             <button class="btn btn-primary logs-search-btn" onclick="loadOrganize(1)"><i data-lucide="search"></i><span>搜索</span></button>
         </div>

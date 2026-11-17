@@ -262,8 +262,17 @@ def _progress_percent(value) -> int:
     return round(max(0.0, min(progress, 1.0)) * 100)
 
 
+def _download_logs_url(query: str) -> str:
+    return f"/downloads?view=logs&keyword={quote_plus(query)}"
+
+
+def _organize_logs_url(query: str) -> str:
+    return f"/logs?q={quote_plus(query)}"
+
+
 def _downloads_section(query: str) -> dict:
     rows = download_requests_repo.list_download_logs(keyword=query, limit=8, offset=0)
+    target_url = _download_logs_url(query)
     items = []
     status_labels = {
         "submitting": "提交中", "submitted": "已提交", "downloading": "下载中",
@@ -278,7 +287,7 @@ def _downloads_section(query: str) -> dict:
             "title": str(_present_value(row, "title", "未命名任务") or "未命名任务"),
             "subtitle": source_labels.get(source, source.upper()),
             "meta": status_labels.get(status, status),
-            "url": f"/downloads?keyword={quote_plus(query)}",
+            "url": target_url,
             "image_url": "",
             "external": False,
             "provider": source,
@@ -290,22 +299,23 @@ def _downloads_section(query: str) -> dict:
             "created_at": str(_present_value(row, "created_at", "") or ""),
             "error": str(_present_value(row, "error", "") or ""),
         })
-    return _section(
-        "downloads", "下载任务", f"/downloads?keyword={quote_plus(query)}", items
-    )
+    return _section("downloads", "下载任务", target_url, items)
 
 
 def _logs_section(query: str) -> dict:
-    rows = db.list_organize_logs(keyword=query, limit=8, offset=0)
+    rows = db.list_organize_timeline(keyword=query, limit=8, offset=0)
+    target_url = _organize_logs_url(query)
     items = []
     for row in rows:
         title = str(
             _present_value(row, "current_name", "")
             or _present_value(row, "original_name", "")
+            or _present_value(row, "title", "")
             or _present_value(row, "new_path", "")
+            or _present_value(row, "original_path", "")
             or "整理记录"
         )
-        status = str(_present_value(row, "status", "unknown") or "unknown").lower()
+        status = str(_present_value(row, "raw_status") or _present_value(row, "status") or "unknown").lower()
         status_label = {
             "success": "成功", "failed": "失败", "running": "处理中",
             "pending": "等待中", "interrupted": "已中断", "rolled_back": "已回滚",
@@ -323,7 +333,7 @@ def _logs_section(query: str) -> dict:
             "title": title,
             "subtitle": path,
             "meta": status_label,
-            "url": f"/logs?q={quote_plus(query)}",
+            "url": target_url,
             "image_url": "",
             "external": False,
             "provider": "organize",
@@ -334,7 +344,7 @@ def _logs_section(query: str) -> dict:
             "path": path,
             "created_at": str(_present_value(row, "created_at", "") or ""),
         })
-    return _section("logs", "整理日志", f"/logs?q={quote_plus(query)}", items)
+    return _section("logs", "整理日志", target_url, items)
 
 
 def build_global_search(value: str) -> dict:
@@ -367,8 +377,8 @@ def build_global_search(value: str) -> dict:
                     "local": f"/media/recent?q={quote_plus(query)}",
                     "discovery": f"/discovery?q={quote_plus(query)}",
                     "rss": "/rss",
-                    "downloads": f"/downloads?keyword={quote_plus(query)}",
-                    "logs": f"/logs?q={quote_plus(query)}",
+                    "downloads": _download_logs_url(query),
+                    "logs": _organize_logs_url(query),
                 }[key]
                 sections_by_key[key] = _section(key, title, target, [], "该来源暂时不可用")
 

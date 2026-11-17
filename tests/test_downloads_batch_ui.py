@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
+from jinja2 import Template
+
 
 class DownloadRetryTargetFixture(TypedDict):
     enabled: bool
@@ -265,6 +267,7 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
 
         template = TEMPLATE.read_text(encoding="utf-8")
         content = template.split("{% block content %}", 1)[1].split("{% endblock %}", 1)[0]
+        content = Template(content, autoescape=True).render(download_view="tasks", download_keyword="")
         html = '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
         html += "<style>" + STYLES.read_text(encoding="utf-8") + "</style>" + content
         script = (ROOT / "app/static/js/downloads.js").read_text(encoding="utf-8")

@@ -336,7 +336,11 @@ def rss(request: Request):
 
 @router.get("/downloads", name="pages.downloads")
 def downloads(request: Request):
-    return _page(request, "downloads.html", "downloads")
+    keyword = request.query_params.get("keyword", "").strip()
+    view = request.query_params.get("view", "")
+    if view not in {"tasks", "issues", "logs"}:
+        view = "logs" if keyword else "tasks"
+    return _page(request, "downloads.html", "downloads", download_view=view, download_keyword=keyword)
 
 @router.get("/local-media", name="pages.local_media")
 def local_media(request: Request):
@@ -385,7 +389,7 @@ def tools(request: Request):
 
 @router.get("/logs", name="pages.logs")
 def logs(request: Request):
-    return _page(request, "logs.html", "logs")
+    return _page(request, "logs.html", "logs", organize_keyword=request.query_params.get("q", "").strip())
 
 
 @router.get("/settings", name="pages.settings")

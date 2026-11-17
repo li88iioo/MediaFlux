@@ -1024,7 +1024,6 @@ class DownloadAttentionUiContractTests(unittest.TestCase):
             "download-attention-operation",
             '<th style="width:42%;">问题</th>',
             'colspan="4"',
-            "new URLSearchParams(window.location.search).get('view')",
         ):
             self.assertIn(contract, downloads)
         self.assertNotIn(">异常阶段</th>", downloads)

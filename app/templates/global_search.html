@@ -96,7 +96,7 @@
 
         {% set task_section = section_map.get('downloads', {}) %}
         <section class="global-automation-panel is-downloads" data-global-search-section="downloads">
-            <header class="global-module-head"><div><i data-lucide="download"></i><strong>下载与转存</strong><span>{{ counts.downloads }}</span></div><a href="{{ task_section.get('target_url', url_for('pages.downloads')) }}">打开任务<i data-lucide="chevron-right"></i></a></header>
+            <header class="global-module-head"><div><i data-lucide="download"></i><strong>下载与转存</strong><span>{{ counts.downloads }}</span></div><a href="{{ task_section.get('target_url', url_for('pages.downloads')) }}">查看下载日志<i data-lucide="chevron-right"></i></a></header>
             <div class="global-automation-body">
                 {% if task_section.get('error') %}<div class="media-hub-section-state is-error"><i data-lucide="triangle-alert"></i><span>{{ task_section.error }}</span></div>{% elif task_section.get('items') %}
                 <div class="global-task-list">

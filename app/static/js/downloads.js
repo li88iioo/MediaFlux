@@ -38,7 +38,7 @@ function qbTaskControl(state) {
     return {action:'',label:'不可操作',icon:'circle-slash-2',disabled:true};
 }
 
-function switchDlTab(tabName, syncUrl=true) {
+function switchDlTab(tabName) {
     const isTasks = tabName === 'tasks';
     const isIssues = tabName === 'issues';
     const isLogs = tabName === 'logs';
@@ -59,11 +59,10 @@ function switchDlTab(tabName, syncUrl=true) {
         announceDownloadTab('正在加载下载日志');
         loadLogs(downloadLogRequestedPage).then(ok=>announceDownloadTab(ok?'下载日志已加载':'下载日志加载失败'));
     }
-    if(syncUrl){
-        const url=new URL(window.location.href);
-        if(isTasks)url.searchParams.delete('view');else url.searchParams.set('view',tabName);
-        window.history.replaceState({},'',url);
-    }
+    const url=new URL(window.location.href);
+    if(isTasks&&!url.searchParams.get('keyword')?.trim())url.searchParams.delete('view');
+    else url.searchParams.set('view',tabName);
+    window.history.replaceState({},'',url);
 }
 
 document.querySelector('.dl-tab-bar')?.addEventListener('keydown',event=>{
@@ -1072,6 +1071,3 @@ function syncOverviewPolling(){
 }
 document.addEventListener('visibilitychange',syncOverviewPolling);
 syncOverviewPolling();
-const initialDownloadView=new URLSearchParams(window.location.search).get('view');
-const normalizedDownloadView=['tasks','issues','logs'].includes(initialDownloadView)?initialDownloadView:'tasks';
-switchDlTab(normalizedDownloadView,false);

@@ -400,6 +400,28 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertIn('form.requestSubmit()', response.text)
         self.assertNotIn('media-hub-filter-submit', response.text)
 
+    def test_log_deep_links_render_the_requested_view_and_filter(self):
+        self._login()
+        keyword = "沙丘 & 预言 #1"
+        for params, tab in (
+            ({}, "Tasks"),
+            ({"view": "issues", "keyword": keyword}, "Issues"),
+            ({"view": "logs", "keyword": keyword}, "Logs"),
+            ({"keyword": keyword}, "Logs"),
+            ({"view": "tasks", "keyword": keyword}, "Tasks"),
+        ):
+            with self.subTest(params=params):
+                page = self.client.get("/downloads", params=params)
+                self.assertEqual(page.status_code, 200)
+                self.assertRegex(page.text, rf'id="tab{tab}Btn"[^>]+aria-selected="true"')
+                self.assertIn(f'id="view{tab}" role="tabpanel" aria-labelledby="tab{tab}Btn">', page.text)
+                expected = keyword.replace("&", "&amp;") if "keyword" in params else ""
+                self.assertIn(f'id="logKeyword" type="search" value="{expected}"', page.text)
+
+        page = self.client.get("/logs", params={"q": keyword})
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('id="orgKeyword" value="沙丘 &amp; 预言 #1"', page.text)
+
     def test_global_search_page_renders_grouped_real_sources(self):
         self._login()
         result: dict = {
