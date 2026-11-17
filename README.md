@@ -107,9 +107,15 @@ MediaFlux 起源于将本地下载、光鸭云盘和 Jellyfin / Emby 串联使�
 - **一键回退**：如归档错误，可在日志页一键重新匹配、送回源目录或撤销重命名。
 - **Telegram Bot**：支持在 Telegram 中触发同步、整理网盘、管理订阅、接收整理通知与异常告警。
 
+### 8. 配套设施（Jellyfin）
+- **媒体删除同步云盘**：在媒体库中删除不喜欢的媒体时同步删除云盘内容，需要安装 [Jellyfin 插件](docs/jellyfin-plugin.md)
+- **STRM 播放加速**：提升二次播放的起播速度，安装同⬆️
+- **直连云盘&画质切换**：媒体播放直连云盘，可切换媒体画质。安装 [Pathfin（Jellyfin 第三方客户端）](https://github.com/li88iioo/Pathfin/releases)
+- **电视直播直连**：安装同⬆️
+
 ---
 
-## 快速开始
+## [快速开始](docs/快速开始.md)
 
 MediaFlux 提供开箱即用的 Docker 容器化部署与 Python 源码运行方式：
 
@@ -203,6 +209,7 @@ python mediaflux.py support-bundle
 
 ## 文档索引
 
+- 🚀 [**快速开始**](docs/快速开始.md)：从部署到光鸭整理、STRM、媒体反代与 Jellyfin 插件的最短配置路径。
 - 📖 [**部署指南**](docs/部署指南.md)：包含 Docker、源码运行、Nginx/Caddy 反代配置及升级说明。
 - 🖼️ [**配置教程（带截图）**](docs/配置教程.md)：TMDB、qBittorrent、Emby/Jellyfin、光鸭云盘、STRM 和本地整理分步图文教程。
 - ❓ [**常见问题 (FAQ)**](docs/常见问题.md)：整理移动、局域网访问、STRM 播放、刮削排错常见疑问。
