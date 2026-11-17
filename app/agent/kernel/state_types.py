@@ -9,9 +9,12 @@ import threading
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .conversation_codec import PendingText, json_text, pending_content
+
+if TYPE_CHECKING:
+    from app.agent.feature_gate import RuntimeFence
 
 
 class KernelStateError(RuntimeError):
@@ -92,6 +95,7 @@ class PublicationLease:
     continuation_id: str = ""
     continuation_claim_id: str = ""
     continuation_kind: str = "read_quota"
+    continuation_fence: RuntimeFence | None = None
 
 
 @dataclass(frozen=True, slots=True)

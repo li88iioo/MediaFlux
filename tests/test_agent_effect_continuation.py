@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -34,6 +35,7 @@ from tests.test_agent_effect_admission import (
     _run_real_worker,
     _spec,
 )
+from tests.test_agent_runtime_fence import legacy_runtime_fence
 from tests.test_agent_task_first_slice import NativeScript
 
 OWNER, SID = 'effect-follow-owner', 'effect-follow-session'
@@ -158,6 +160,97 @@ def test_native_effect_wait_resumes_original_cloud_goal_without_a_synthetic_user
             with db.get_conn() as conn:
                 assert conn.execute('SELECT COUNT(*) FROM organize_operation_jobs').fetchone()[0] == 1
     asyncio.run(run())
+
+
+async def resume_after_display_saves(tmp_path, channel, *, legacy, revoke=""):
+    from fastapi.testclient import TestClient
+
+    from app.agent.kernel.ports.mediaflux_policy import MediaFluxTurnAdmission
+    from app.agent.owner_routes import web_kernel_owner
+    from app.main import create_app
+    from app.modules.agent_jobs_scheduler import AgentJobsScheduler
+    from tests.test_config_empty_values_api import login
+
+    switches = ("DISCOVERY_DOUBAN_ENABLED", "DISCOVERY_ENABLED", "INDEXER_SEARCH_ENABLED")
+    values = {"AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "7",
+              **dict.fromkeys(switches, "1")}
+    owner = "tg:v1:-100\x1f7" if channel == "telegram" else web_kernel_owner("admin")
+    route = {"chat_id": "-100", "message_thread_id": 42} if channel == "telegram" else None
+    with ExitStack() as upgrade, patch(__name__ + ".OWNER", owner):
+        if legacy:
+            upgrade.enter_context(legacy_runtime_fence())
+        async with _ready_case(tmp_path, channel=channel, route=route, runtime_settings=values) as (
+            store, candidate, client, reads, stack, users,
+        ):
+            wait_id = candidate["wait_id"]
+            assert candidate["state"] == "pending"
+            old = (await store.load(owner=owner, session_id=SID)).metadata["effect_waits"][wait_id]
+            assert candidate["admission_fence"]["v"] == (1 if legacy else 2)
+            if revoke == "epoch":
+                # 真实授权变更后改回原值，epoch 仍然区分先前的候选。
+                original_model = config.all_items().get("AGENT_LLM_MODEL")
+                config.set_and_save({"AGENT_LLM_MODEL": "other-model"})
+                config.set_and_save({"AGENT_LLM_MODEL": original_model})
+            upgrade.close()
+            if revoke == "effective":
+                stack.enter_context(patch.dict(config._SYSTEM_ENV_SNAPSHOT, {"AGENT_LLM_TIMEOUT_SECONDS": "55"}))
+            with TestClient(create_app(start_background=False)) as web:
+                headers = login(web)
+                before = _capture_creation_binding()
+                for key in switches:
+                    response = web.post("/api/config", headers=headers, json={key: "0"})
+                    assert response.status_code == 200 and not config.get_bool(key)
+                assert _capture_creation_binding() == before
+
+            model = FollowScript(resume=True)
+            claims = []
+
+            def factory(record, binding, cold_store):
+                claims.append(record["wait_id"])
+                session = _session(cold_store, model, client, reads, stack=stack)
+                session.turn_admission = MediaFluxTurnAdmission()
+                return SimpleNamespace(session=session, creation_binding=binding)
+
+            scheduler = AgentJobsScheduler(continuation_runtime_factory=factory)
+            resumed = await asyncio.to_thread(scheduler._run_due_continuation_once)
+            final = await store.load(owner=owner, session_id=SID)
+            row = final.metadata["effect_waits"][wait_id]
+            record = row["continuation"]
+            assert row["sealed"] == old["sealed"]
+            assert record["admission_fence"] == candidate["admission_fence"]
+            if revoke:
+                assert resumed == 0 and reads == [] and claims == [] and not model.requests
+                assert record["terminal_reason"] == "expired_or_runtime_changed"
+            else:
+                assert resumed == 1 and reads == ["admitted.mp4"] and claims == [wait_id]
+                assert not model.steps and record["terminal_reason"] == "success"
+                assert [item for item in final.conversation if item["role"] == "user"] == users
+                if channel == "telegram":
+                    delivery, = (await store.due_continuations())
+                    assert delivery["kind"] == "delivery" and delivery["delivery_route"] == route
+                    with patch("app.modules.telegram_notification_center.wake_telegram_notification_dispatcher"):
+                        assert await asyncio.to_thread(scheduler._run_due_continuation_once) == 1
+                    with db.get_conn() as conn:
+                        rows = conn.execute(
+                            "SELECT json_extract(event_json,'$._agent_continuation_delivery') FROM telegram_notification_outbox "
+                            "WHERE json_extract(event_json,'$._agent_continuation_delivery') IS NOT NULL",
+                        ).fetchall()
+                    saved, = [json.loads(row[0]) for row in rows]
+                    assert saved["delivery_route"] == route and "admitted.mp4" in saved["html"]
+                    assert await store.due_continuations() == []
+            assert record["state"] == "terminal"
+            with db.get_conn() as conn:
+                assert conn.execute("SELECT COUNT(*) FROM organize_operation_jobs").fetchone()[0] == 1
+            return record["terminal_reason"]
+
+
+@pytest.mark.parametrize(("channel", "legacy", "revoke"), [
+    ("web", False, ""), ("telegram", False, ""),
+    ("web", True, ""), ("telegram", True, ""),
+    ("web", True, "epoch"), ("telegram", True, "effective"),
+])
+def test_display_saves_preserve_only_current_queued_effect_authority(agent_llm_enabled, tmp_path, channel, legacy, revoke):
+    asyncio.run(resume_after_display_saves(tmp_path, channel, legacy=legacy, revoke=revoke))
 
 
 class NextWriteScript(FollowScript):

@@ -209,7 +209,11 @@ def get_bool(key: str, default: bool | None = None) -> bool:
 _SYSTEM_ENV_SNAPSHOT = dict(os.environ)
 _runtime_snapshot: ContextVar[RuntimeConfigSnapshot | None] = ContextVar("runtime_config_snapshot", default=None)
 _runtime_guard = threading.local()
-_DISPLAY_ONLY_KEY = "AGENT_STREAM_DISPLAY_ENABLED"
+_STREAM_DISPLAY_KEY = "AGENT_STREAM_DISPLAY_ENABLED"
+RUNTIME_DISPLAY_ONLY_KEYS = frozenset({
+    _STREAM_DISPLAY_KEY,
+    "DISCOVERY_ENABLED", "DISCOVERY_DOUBAN_ENABLED", "INDEXER_SEARCH_ENABLED",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,8 +224,9 @@ class RuntimeConfigSnapshot:
     effective_digest: str
 
 
-def _runtime_digest(values: Mapping[str, str]) -> str:
-    canonical = {key: value for key, value in values.items() if key != _DISPLAY_ONLY_KEY}
+def _runtime_digest(values: Mapping[str, str], *, legacy: bool = False) -> str:
+    display_keys = {_STREAM_DISPLAY_KEY} if legacy else RUNTIME_DISPLAY_ONLY_KEYS
+    canonical = {key: value for key, value in values.items() if key not in display_keys}
     return hashlib.sha256(json.dumps(canonical, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -279,9 +284,10 @@ def runtime_config_publication(updates: Mapping[str, str | None]):
         read_runtime_fence,
     )
     with runtime_config_read_guard():
+        authorizing = bool(set(updates) - RUNTIME_DISPLAY_ONLY_KEYS)
         active = _runtime_guard.scope["publication"]
         if active is not None:
-            if not active["authorizing"] and set(updates) - {_DISPLAY_ONLY_KEY}:
+            if not active["authorizing"] and authorizing:
                 raise RuntimeFenceError("runtime_publication_scope_changed")
             try:
                 yield
@@ -289,7 +295,6 @@ def runtime_config_publication(updates: Mapping[str, str | None]):
                 active["failed"] = True
                 raise
             return
-        authorizing = bool(set(updates) - {_DISPLAY_ONLY_KEY})
         changing = None
         if authorizing:
             snapshot = capture_runtime_config_snapshot()

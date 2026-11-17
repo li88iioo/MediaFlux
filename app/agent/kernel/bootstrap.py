@@ -21,6 +21,7 @@ from app.agent.feature_gate import (
     RuntimeFenceError,
     read_runtime_fence,
     require_runtime_fence,
+    verified_legacy_continuation_binding,
 )
 from app.repositories.agent_provider_plans import invalidate_provider_plans_for_session
 from app.agent.session_context import SQLiteAgentSessionContextRepository
@@ -50,6 +51,7 @@ class RuntimeCreationBinding:
     fence: RuntimeFence
     effective_digest: str
     snapshot: config.RuntimeConfigSnapshot = field(repr=False, compare=False)
+    legacy_continuation: tuple[RuntimeFence, str] | None = field(default=None, repr=False)
 
 
 def _capture_creation_binding() -> RuntimeCreationBinding:
@@ -59,9 +61,10 @@ def _capture_creation_binding() -> RuntimeCreationBinding:
     with db.get_conn() as conn:
         fence = read_runtime_fence(conn)
         require_runtime_fence(conn, fence)
-    if fence.config_digest != snapshot.config_digest:
-        raise RuntimeFenceError("runtime_snapshot_mismatch")
-    return RuntimeCreationBinding(fence, snapshot.effective_digest, snapshot)
+        if fence.config_digest != snapshot.config_digest:
+            raise RuntimeFenceError("runtime_snapshot_mismatch")
+        legacy = verified_legacy_continuation_binding(conn, fence, snapshot.effective_digest)
+    return RuntimeCreationBinding(fence, snapshot.effective_digest, snapshot, legacy)
 
 
 def _recheck_creation_binding(binding: RuntimeCreationBinding) -> None:

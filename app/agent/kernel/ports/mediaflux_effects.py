@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -46,8 +44,7 @@ class MediaFluxEffectLifecycle:
     @staticmethod
     def _configuration_fingerprint() -> str:
         # 只保存摘要，不把配置值写进计划；文件操作不能打断其他会话的只读查询。
-        payload = json.dumps(config.all_items(), sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return config._runtime_digest(config.all_items())
 
     @staticmethod
     def _risk(plan: EffectPlan) -> RiskLevel:

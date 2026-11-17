@@ -14,7 +14,10 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 持久键沿用旧名，记录的 v 字段标识摘要版本。
 RUNTIME_FENCE_KEY = "agent.runtime_fence.v1"
+RUNTIME_FENCE_VERSION = 2
+_LEGACY_CONTINUATION_KEY = "agent.runtime_fence.legacy_continuation"
 
 
 class RuntimeFenceError(RuntimeError):
@@ -30,21 +33,24 @@ class RuntimeFence:
     config_digest: str
 
 
+def _is_lower_hex(value: object, size: int) -> bool:
+    return isinstance(value, str) and len(value) == size and all(c in "0123456789abcdef" for c in value)
+
+
 def read_runtime_fence(conn: sqlite3.Connection) -> RuntimeFence:
     row = conn.execute("SELECT value FROM settings_kv WHERE key=?", (RUNTIME_FENCE_KEY,)).fetchone()
     try:
         data = json.loads(row[0]) if row else None
         if not isinstance(data, dict) or set(data) != {"v", "incarnation", "epoch", "phase", "config_digest"}:
             raise ValueError
-        if type(data["v"]) is not int or data["v"] != 1:
+        if type(data["v"]) is not int or data["v"] not in (1, RUNTIME_FENCE_VERSION):
             raise ValueError
         if type(data["epoch"]) is not int or not 0 < data["epoch"] < 2**63:
             raise ValueError
         if data["phase"] not in ("stable", "changing"):
             raise ValueError
         for key, size in (("incarnation", 32), ("config_digest", 64)):
-            value = data[key]
-            if not isinstance(value, str) or len(value) != size or any(c not in "0123456789abcdef" for c in value):
+            if not _is_lower_hex(data[key], size):
                 raise ValueError
         return RuntimeFence(**data)
     except (ValueError, TypeError, KeyError) as exc:
@@ -58,6 +64,7 @@ def require_runtime_fence(conn: sqlite3.Connection, expected: RuntimeFence) -> N
         not isinstance(expected, RuntimeFence)
         or type(expected.epoch) is not int
         or type(expected.v) is not int
+        or current.v != RUNTIME_FENCE_VERSION
         or current.phase != "stable"
         or current != expected
     ):
@@ -79,6 +86,7 @@ def begin_runtime_change(conn: sqlite3.Connection, expected: RuntimeFence) -> Ru
         raise RuntimeFenceError("runtime_fence_exhausted")
     changing = replace(expected, epoch=expected.epoch + 1, phase="changing")
     _write_fence(conn, changing)
+    conn.execute("DELETE FROM settings_kv WHERE key=?", (_LEGACY_CONTINUATION_KEY,))
     return changing
 
 
@@ -96,11 +104,61 @@ def begin_installation_fence(conn: sqlite3.Connection, config_digest: str) -> Ru
     """INSERT-only, caller-owned transaction; never reset existing authority."""
     if not conn.in_transaction:
         raise RuntimeFenceError("runtime_fence_transaction_required")
-    if len(config_digest) != 64 or any(c not in "0123456789abcdef" for c in config_digest):
+    if not _is_lower_hex(config_digest, 64):
         raise RuntimeFenceError("runtime_snapshot_invalid")
-    fence = RuntimeFence(1, secrets.token_hex(16), 1, "changing", config_digest)
+    fence = RuntimeFence(RUNTIME_FENCE_VERSION, secrets.token_hex(16), 1, "changing", config_digest)
     conn.execute("INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)", (RUNTIME_FENCE_KEY, json.dumps(asdict(fence), sort_keys=True)))
     return fence
+
+
+def verify_startup_runtime_fence(fence: RuntimeFence, snapshot: config.RuntimeConfigSnapshot) -> None:
+    """只读启动检查与事务内升级按记录原版本核验配置。"""
+    if fence.phase != "stable":
+        raise RuntimeFenceError("runtime_fence_changing")
+    expected = (snapshot.config_digest if fence.v == RUNTIME_FENCE_VERSION
+                else config._runtime_digest(snapshot.file_values, legacy=True))
+    if fence.config_digest != expected:
+        raise RuntimeFenceError("runtime_snapshot_mismatch")
+
+
+def _upgrade_runtime_fence(
+    conn: sqlite3.Connection, old: RuntimeFence, snapshot: config.RuntimeConfigSnapshot,
+) -> RuntimeFence:
+    fence = replace(old, v=RUNTIME_FENCE_VERSION, config_digest=snapshot.config_digest)
+    effective = {**snapshot.file_values, **snapshot.startup_overrides}
+    proof = {
+        "fence": asdict(fence),
+        "effective_digest": snapshot.effective_digest,
+        "legacy_file_digest": old.config_digest,
+        "legacy_effective_digest": config._runtime_digest(effective, legacy=True),
+    }
+    _write_fence(conn, fence)
+    conn.execute(
+        "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
+        (_LEGACY_CONTINUATION_KEY, json.dumps(proof, sort_keys=True)),
+    )
+    return fence
+
+
+def verified_legacy_continuation_binding(
+    conn: sqlite3.Connection, fence: RuntimeFence, effective_digest: str,
+) -> tuple[RuntimeFence, str] | None:
+    """仅给本代已签名的旧续行提供升级前的精确绑定。"""
+    row = conn.execute("SELECT value FROM settings_kv WHERE key=?", (_LEGACY_CONTINUATION_KEY,)).fetchone()
+    if row is None:
+        return None
+    try:
+        proof = json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+    if (not isinstance(proof, dict) or proof.get("fence") != asdict(fence)
+            or proof.get("effective_digest") != effective_digest):
+        return None
+    file_digest = proof.get("legacy_file_digest")
+    legacy_effective = proof.get("legacy_effective_digest")
+    if not _is_lower_hex(file_digest, 64) or not _is_lower_hex(legacy_effective, 64):
+        return None
+    return replace(fence, v=1, config_digest=file_digest), legacy_effective
 
 
 def initialize_runtime_fence(*, defer_initial_setup: bool = False) -> RuntimeFence | None:
@@ -117,15 +175,17 @@ def initialize_runtime_fence(*, defer_initial_setup: bool = False) -> RuntimeFen
                     raise RuntimeFenceError("existing_runtime_requires_controlled_config_recovery")
                 fence = read_runtime_fence(conn)
                 snapshot = config.capture_runtime_config_snapshot()
-                if fence.phase != "stable":
-                    raise RuntimeFenceError("runtime_fence_changing")
-                if fence.config_digest != snapshot.config_digest:
-                    raise RuntimeFenceError("runtime_snapshot_mismatch")
+                verify_startup_runtime_fence(fence, snapshot)
+                if fence.v != RUNTIME_FENCE_VERSION:
+                    return _upgrade_runtime_fence(conn, fence, snapshot)
+                if verified_legacy_continuation_binding(conn, fence, snapshot.effective_digest) is None:
+                    # 启动时发现部署配置漂移，撤销旧续行映射，避免部署值回切后复活。
+                    conn.execute("DELETE FROM settings_kv WHERE key=?", (_LEGACY_CONTINUATION_KEY,))
                 return fence
             if defer_initial_setup:
                 raise RuntimeFenceError("explicit_installation_required")
             snapshot = config.capture_runtime_config_snapshot()
-            fence = RuntimeFence(1, secrets.token_hex(16), 1, "stable", snapshot.config_digest)
+            fence = RuntimeFence(RUNTIME_FENCE_VERSION, secrets.token_hex(16), 1, "stable", snapshot.config_digest)
             conn.execute(
                 "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
                 (RUNTIME_FENCE_KEY, json.dumps(asdict(fence), sort_keys=True)),
@@ -176,9 +236,9 @@ def current_agent_runtime_generation(*, channel: str = "") -> int:
 def invalidate_agent_runtime_generation(*, changed_keys: Iterable[str] | None = None) -> int:
     """配置发布只撤销受影响渠道；不带配置范围的撤销仍作用于整个 Agent。"""
     global _runtime_generation, _telegram_runtime_generation
-    keys = set(changed_keys) if changed_keys is not None else None
+    keys = set(changed_keys) - config.RUNTIME_DISPLAY_ONLY_KEYS if changed_keys is not None else None
     with _runtime_generation_lock:
-        if keys is None or keys - {"AGENT_STREAM_DISPLAY_ENABLED", "TG_AGENT_ENABLED"}:
+        if keys is None or keys - {"TG_AGENT_ENABLED"}:
             _runtime_generation += 1
         elif "TG_AGENT_ENABLED" in keys:
             _telegram_runtime_generation += 1

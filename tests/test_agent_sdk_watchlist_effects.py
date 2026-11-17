@@ -210,8 +210,9 @@ def test_confirmation_runtime_rejects_configuration_aba(backend):
         prepared = await effects.prepare("watchlist.add", ADD, context=context)
         assert prepared.effect_plan is not None
         assert prepared.effect_plan.snapshot_fingerprint.startswith("mfkr2:")
-        config.set_and_save({"DISCOVERY_ENABLED": "0"})
-        config.set_and_save({"DISCOVERY_ENABLED": "1"})
+        original = config.all_items().get("TMDB_API_URL")
+        config.set_and_save({"TMDB_API_URL": "https://different-provider.invalid/3"})
+        config.set_and_save({"TMDB_API_URL": original})
         with pytest.raises(ToolPipelineError) as error:
             await effects.execute_confirmed(prepared.effect_plan.plan_id, context=context)
         assert error.value.code == "confirmation_stale"

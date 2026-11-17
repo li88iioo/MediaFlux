@@ -892,7 +892,7 @@ def restore_backup(paths: RuntimePaths, archive_path: Path) -> BackupManifest:
             # one recoverable transaction; ordinary startup never promotes a
             # changing fence. Legacy databases without a fence stay unchanged.
             from app import config
-            from app.agent.feature_gate import RUNTIME_FENCE_KEY, read_runtime_fence
+            from app.agent.feature_gate import RUNTIME_FENCE_KEY, RUNTIME_FENCE_VERSION, read_runtime_fence
             from app.env_file import read_env_bytes
 
             with closing(sqlite3.connect(database_payload)) as restored, restored:
@@ -929,7 +929,7 @@ def restore_backup(paths: RuntimePaths, archive_path: Path) -> BackupManifest:
                         raise BackupError("无法安全读取恢复后的 user.env，已拒绝恢复") from exc
 
                     rebound = {
-                        "v": 1,
+                        "v": RUNTIME_FENCE_VERSION,
                         "incarnation": uuid.uuid4().hex,
                         "epoch": 1,
                         "phase": "stable",

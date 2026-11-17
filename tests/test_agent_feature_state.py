@@ -120,28 +120,31 @@ def test_reload_releases_confirmation_and_config_guards_before_waiting_for_old_w
     from app.routes.api import save_config
 
     with ThreadPoolExecutor(max_workers=1) as pool:
+        refreshed = []
+
         def read_on_old_worker():
             with config.runtime_config_read_guard():
-                return config.get_bool("DISCOVERY_ENABLED")
-        def shutdown():
+                return config.get_bool("STRM_METADATA_ENABLED")
+
+        def refresh():
             # 若提交者仍持有配置 guard，本反例两秒内失败，外层退出释放后 worker 可收尾。
-            assert pool.submit(read_on_old_worker).result(timeout=2)
-            return True
-        monkeypatch.setattr("app.discovery.service.shutdown_discovery_service", shutdown)
+            refreshed.append(pool.submit(read_on_old_worker).result(timeout=2))
+
+        monkeypatch.setattr("app.modules.scheduler.get_scheduler", lambda: SimpleNamespace(reload=refresh))
         if writer == "web":
             request = Request({"type": "http", "session": authenticated_session(),
                 "app": SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))})
-            assert save_config(request, {"DISCOVERY_ENABLED": "1"}) == {"success": True}
+            assert save_config(request, {"STRM_METADATA_ENABLED": "1"}) == {"success": True}
         else:
             async def check():
                 effects = executor()
                 context = await context_for(effects.state_store, owner=OWNER)
-                plan = (await effects.prepare(WRITE, {"feature": "discovery", "enabled": True}, context=context)).effect_plan
+                plan = (await effects.prepare(WRITE, {"feature": "strm_metadata", "enabled": True}, context=context)).effect_plan
                 assert plan is not None
                 done = await effects.execute_confirmed(plan.plan_id, context=context)
                 assert done.outcome.public_content["ok"]
             asyncio.run(check())
-        assert item("discovery")["enabled"]
+        assert refreshed == [True] and item("strm_metadata")["enabled"]
 
 
 @pytest.mark.parametrize("writer", ["sdk", "web"])
@@ -226,12 +229,12 @@ def test_configuration_drift_after_card_is_rejected_without_overwrite(backend):
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("failure", ["reload_false", "reload_error", "readback"])
+@pytest.mark.parametrize("failure", ["reload_error", "readback"])
 def test_persisted_but_unverified_or_unreloaded_is_unknown_not_success(backend, monkeypatch, failure):
     async def check():
         effects = executor()
         context = await context_for(effects.state_store, owner=OWNER)
-        plan = (await effects.prepare(WRITE, {"feature": "discovery", "enabled": True}, context=context)).effect_plan
+        plan = (await effects.prepare(WRITE, {"feature": "strm_metadata", "enabled": True}, context=context)).effect_plan
         assert plan is not None
         with monkeypatch.context() as changes:
             if failure == "readback":
@@ -241,16 +244,16 @@ def test_persisted_but_unverified_or_unreloaded_is_unknown_not_success(backend, 
                     changes.setattr(config, "read_env_snapshot", lambda *a, **k: (_ for _ in ()).throw(OSError(SECRET)))
                     return result
                 changes.setattr(config, "update_runtime_env_file", published)
-            elif failure == "reload_error":
-                changes.setattr("app.discovery.service.shutdown_discovery_service", lambda: (_ for _ in ()).throw(OSError(SECRET)))
             else:
-                changes.setattr("app.discovery.service.shutdown_discovery_service", lambda: False)
+                def fail_reload():
+                    raise OSError(SECRET)
+                changes.setattr("app.modules.scheduler.get_scheduler", lambda: SimpleNamespace(reload=fail_reload))
             result = (await executor().execute_confirmed(plan.plan_id, context=context)).outcome.public_content
             assert not result["ok"] and result["status"] == "outcome_unknown"
             assert SECRET not in json.dumps(result, ensure_ascii=False)
             if failure != "readback":
                 assert result["data"]["saved"] and not result["data"]["runtime_refreshed"]
-        assert item("discovery")["enabled"]
+        assert item("strm_metadata")["enabled"]
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)
     asyncio.run(check())

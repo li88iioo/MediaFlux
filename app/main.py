@@ -292,6 +292,7 @@ def _initialize_runtime_storage() -> None:
         RuntimeFenceError,
         initialize_runtime_fence,
         read_runtime_fence,
+        verify_startup_runtime_fence,
     )
 
     with config.runtime_config_read_guard():
@@ -310,11 +311,7 @@ def _initialize_runtime_storage() -> None:
             tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settings_kv'").fetchone()
             established = bool(tables and conn.execute("SELECT 1 FROM settings_kv WHERE key=?", (RUNTIME_FENCE_KEY,)).fetchone())
             if established:
-                fence = read_runtime_fence(conn)
-                if fence.phase != "stable":
-                    raise RuntimeFenceError("runtime_fence_changing")
-                if fence.config_digest != config.capture_runtime_config_snapshot().config_digest:
-                    raise RuntimeFenceError("runtime_snapshot_mismatch")
+                verify_startup_runtime_fence(read_runtime_fence(conn), config.capture_runtime_config_snapshot())
         database.init_db()
         if not established:
             # 旧版允许只用部署环境变量。首次建立 fence 前补齐空文件，

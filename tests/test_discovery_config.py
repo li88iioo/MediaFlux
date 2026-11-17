@@ -80,10 +80,8 @@ class DiscoveryConfigTests(unittest.TestCase):
 
     def test_discovery_runtime_config_save_shuts_down_cached_service(self):
         values = {
-            "DISCOVERY_ENABLED": "0",
             "DISCOVERY_CACHE_TTL_SECONDS": "3600",
             "DISCOVERY_STALE_TTL_SECONDS": "604800",
-            "DISCOVERY_DOUBAN_ENABLED": "0",
             "ORGANIZE_DOUBAN_HINTS_ENABLED": "0",
             "ORGANIZE_BANGUMI_HINTS_ENABLED": "0",
             "DOUBAN_DBCL2": "123456789:test-dbcl2-value",
@@ -159,6 +157,28 @@ class DiscoveryConfigTests(unittest.TestCase):
         self.assertEqual(response, {"success": True})
         persist.assert_called_once_with({"QB_CATEGORY": "shared"})
         shutdown.assert_not_called()
+
+    def test_web_display_switches_save_without_shutting_down_shared_workers(self):
+        values = {"DISCOVERY_ENABLED": "0", "DISCOVERY_DOUBAN_ENABLED": "0", "INDEXER_SEARCH_ENABLED": "0"}
+        with (
+            patch("app.discovery.search.shutdown_discovery_search_service") as shutdown_search,
+            patch("app.indexers.runtime.refresh_indexer_configuration", return_value={"web": True, "telegram": True}) as refresh_indexers,
+        ):
+            response, persist, shutdown = self._save(values)
+        self.assertEqual(response, {"success": True})
+        persist.assert_called_once_with(values)
+        shutdown.assert_not_called()
+        shutdown_search.assert_not_called()
+        refresh_indexers.assert_not_called()
+
+    def test_discovery_provider_change_reports_shared_worker_shutdown_failure(self):
+        with patch("app.discovery.search.shutdown_discovery_search_service", return_value=False):
+            response, persist, shutdown = self._save({"DISCOVERY_CACHE_TTL_SECONDS": "3600"})
+        self.assertIsInstance(response, dict)
+        self.assertTrue(response["success"] and response["restart_required"])
+        self.assertIn("运行中实例未能热更新", response["warnings"][0])
+        persist.assert_called_once_with({"DISCOVERY_CACHE_TTL_SECONDS": "3600"})
+        shutdown.assert_called_once_with()
 
     def test_unknown_configuration_key_remains_rejected(self):
         response, persist, _shutdown = self._save({"DISCOVERY_UNKNOWN_OPTION": "1"})
@@ -309,7 +329,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         self.assertIn("DISCOVERY_STALE_TTL_SECONDS", self._payload(response)["error"])
         persist.assert_not_called()
 
-    def test_public_douban_config_save_restarts_discovery_service(self):
+    def test_public_douban_save_restarts_discovery_service_when_provider_config_changes(self):
         for existing in ({}, {"DOUBAN_DBCL2": ""}):
             with self.subTest(existing=existing):
                 values = {"DISCOVERY_DOUBAN_ENABLED": "1", "DOUBAN_DBCL2": ""}
@@ -318,7 +338,7 @@ class DiscoveryConfigTests(unittest.TestCase):
                 # 已存空值无需重写；缺失键显式提交为空则与统一保存语义一致。
                 expected = {"DISCOVERY_DOUBAN_ENABLED": "1"} if existing else values
                 persist.assert_called_once_with(expected)
-                shutdown.assert_called_once_with()
+                self.assertEqual(shutdown.call_count, int(not existing))
 
     def test_bangumi_user_agent_rejects_blank_or_header_injection(self):
         for value in ("   ", "MediaFlux/1.0\r\nX-Test: injected"):

@@ -5,7 +5,8 @@ from starlette.requests import Request
 from app.agent.kernel.model import ModelAdapter
 from typing import cast
 import json
-from contextlib import closing
+import hashlib
+from contextlib import ExitStack, closing, contextmanager
 import os
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import pytest
 from app import config, database as db
 from app.agent import feature_gate as gate
 from app.agent.kernel import bootstrap
-from tests.support import isolated_test_database
+from tests.support import initialized_web_runtime, isolated_test_database
 from tests.test_backup import make_paths
 
 
@@ -41,6 +42,95 @@ def read_record():
     with db.get_conn() as conn:
         row = conn.execute('SELECT value FROM settings_kv WHERE key=?', ('agent.runtime_fence.v1',)).fetchone()
     return json.loads(row['value']) if row else None
+
+
+@contextmanager
+def legacy_runtime_fence():
+    """用基线序列化规则通过真实安装与发布器创建 v1 状态。"""
+    def v1_digest(values, **_kwargs):
+        canonical = {key: value for key, value in values.items() if key != "AGENT_STREAM_DISPLAY_ENABLED"}
+        return hashlib.sha256(json.dumps(canonical, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+
+    with (
+        patch.object(gate, "RUNTIME_FENCE_VERSION", 1),
+        patch.object(config, "_runtime_digest", v1_digest),
+        patch.object(config, "RUNTIME_DISPLAY_ONLY_KEYS", frozenset({"AGENT_STREAM_DISPLAY_ENABLED"})),
+    ):
+        yield
+
+
+@pytest.fixture
+def installed_v1():
+    with ExitStack() as upgrade:
+        upgrade.enter_context(legacy_runtime_fence())
+        with initialized_web_runtime():
+            config.set_and_save({"DISCOVERY_ENABLED": "1", "DISCOVERY_DOUBAN_ENABLED": "1", "INDEXER_SEARCH_ENABLED": "1"})
+            before = bootstrap._capture_creation_binding()
+            upgrade.close()
+            assert before.fence.v == 1
+            yield before
+
+
+def test_verified_v1_upgrade_survives_display_writes_and_restart(installed_v1):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    old = installed_v1
+    raw = config.ENV_FILE.read_bytes()
+    with TestClient(create_app(start_background=False)) as web:
+        assert web.get("/readyz").status_code == 200
+    upgraded = bootstrap._capture_creation_binding()
+    assert upgraded.fence.v == 2
+    assert (upgraded.fence.incarnation, upgraded.fence.epoch) == (old.fence.incarnation, old.fence.epoch)
+    assert upgraded.fence.config_digest != old.fence.config_digest
+    assert upgraded.legacy_continuation == (old.fence, old.effective_digest)
+    assert config.ENV_FILE.read_bytes() == raw
+    with db.get_conn() as conn, pytest.raises(gate.RuntimeFenceError):
+        gate.require_runtime_fence(conn, old.fence)
+
+    config.set_and_save({"DISCOVERY_ENABLED": "0", "DISCOVERY_DOUBAN_ENABLED": "0", "INDEXER_SEARCH_ENABLED": "0"})
+    with patch.dict(config._SYSTEM_ENV_SNAPSHOT, {"DISCOVERY_ENABLED": "1"}):
+        with TestClient(create_app(start_background=False)) as web:
+            assert web.get("/readyz").status_code == 200
+        assert bootstrap._capture_creation_binding() == upgraded
+
+    config.set_and_save({"AGENT_LLM_MODEL": "temporary", "DISCOVERY_ENABLED": "1"})
+    config.set_and_save({"AGENT_LLM_MODEL": upgraded.snapshot.file_values.get("AGENT_LLM_MODEL")})
+    current = bootstrap._capture_creation_binding()
+    assert current.fence.config_digest == upgraded.fence.config_digest
+    assert current.fence.epoch == upgraded.fence.epoch + 2
+    assert current.legacy_continuation is None
+
+
+@pytest.mark.parametrize("fault", ["changing", "unrelated_file_change", "v2_digest_under_v1_version"])
+def test_startup_rejects_unverified_v1_before_schema_initialization(installed_v1, fault):
+    from app.main import create_app
+
+    data = read_record()
+    assert data is not None
+    if fault == "changing":
+        data["phase"] = "changing"
+    elif fault == "unrelated_file_change":
+        config.write_env_file(config.ENV_FILE, {**config.all_items(), "AGENT_LLM_MODEL": "external"}, replace=True)
+    else:
+        data["config_digest"] = config.capture_runtime_config_snapshot().config_digest
+    with db.get_conn() as conn:
+        conn.execute("UPDATE settings_kv SET value=? WHERE key=?", (json.dumps(data), gate.RUNTIME_FENCE_KEY))
+
+    reason = "runtime_fence_changing" if fault == "changing" else "runtime_snapshot_mismatch"
+    with patch.object(db, "init_db") as initialize, pytest.raises(gate.RuntimeFenceError, match=reason):
+        create_app(start_background=False)
+    initialize.assert_not_called()
+    assert read_record() == data
+
+
+def test_legacy_effective_binding_is_revoked_on_observed_deployment_drift(installed_v1):
+    assert gate.initialize_runtime_fence() is not None
+    assert bootstrap._capture_creation_binding().legacy_continuation is not None
+    with patch.dict(config._SYSTEM_ENV_SNAPSHOT, {"AGENT_LLM_MODEL": "other-deployment"}):
+        assert gate.initialize_runtime_fence() is not None
+        assert bootstrap._capture_creation_binding().legacy_continuation is None
+    assert bootstrap._capture_creation_binding().legacy_continuation is None
 
 
 def test_publication_commits_changing_before_file_and_stable_after(runtime_env):

@@ -443,8 +443,6 @@ class AgentJobsScheduler:
 
     def _run_due_continuation_once(self) -> int:
         """一个有界的原任务续行；读取等待与后台终态共用执行器。"""
-        from dataclasses import asdict
-
         from app import config
         from app.agent.feature_gate import is_agent_enabled
         from app.agent.kernel.bootstrap import (
@@ -452,6 +450,7 @@ class AgentJobsScheduler:
             _recheck_creation_binding,
             build_agent_kernel_runtime,
         )
+        from app.agent.kernel.continuation import matches_runtime_binding
         from app.agent.kernel.persistence import SQLiteKernelStore
         from app.agent.kernel.ports.mediaflux_policy import MediaFluxTurnAdmission
         from app.agent.kernel.state_types import AgentInput
@@ -480,8 +479,7 @@ class AgentJobsScheduler:
                     continue
                 with config.runtime_config_read_guard():
                     binding = _capture_creation_binding()
-                if (candidate['admission_fence'] != asdict(binding.fence)
-                        or candidate['effective_digest'] != binding.effective_digest):
+                if not matches_runtime_binding(candidate, binding):
                     # The same claim transaction retires only this exact old wait.
                     await store.claim_continuation(candidate, binding)
                     continue

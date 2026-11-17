@@ -306,7 +306,9 @@ class EffectLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_only_actual_configuration_changes_invalidate_other_sessions(self):
         lifecycle = MediaFluxEffectLifecycle()
-        with patch("app.agent.kernel.ports.mediaflux_effects.config.all_items", return_value={"MODE": "old"}):
+        display = dict.fromkeys(("AGENT_STREAM_DISPLAY_ENABLED", "DISCOVERY_ENABLED", "DISCOVERY_DOUBAN_ENABLED", "INDEXER_SEARCH_ENABLED"), "1")
+        previous = {"MODE": "old", **display}
+        with patch("app.agent.kernel.ports.mediaflux_effects.config.all_items", return_value=previous):
             fingerprint = lifecycle._configuration_fingerprint()
         plan = EffectPlan(
             plan_id="config-bound-job", owner="job-owner", session_id="session-1",
@@ -319,11 +321,13 @@ class EffectLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ("partial", False, {"background_job": {"status": "partial"}}),
             ("outcome_unknown", False, {"background_job": {"status": "running"}}),
         ):
-            for changed in (False, True):
+            for current, changed in (
+                (previous, False), ({"MODE": "old", **dict.fromkeys(display, "0")}, False),
+                ({**previous, "MODE": "new"}, True),
+            ):
                 with (
-                    self.subTest(status=status, changed=changed),
-                    patch("app.agent.kernel.ports.mediaflux_effects.config.all_items",
-                          return_value={"MODE": "new" if changed else "old"}),
+                    self.subTest(status=status, current=current),
+                    patch("app.agent.kernel.ports.mediaflux_effects.config.all_items", return_value=current),
                     patch("app.agent.kernel.ports.mediaflux_effects.invalidate_agent_runtime_generation") as invalidate,
                 ):
                     lifecycle.completed(plan=plan, value=ToolResult(ok, status, "结果", data=data), elapsed_ms=1)

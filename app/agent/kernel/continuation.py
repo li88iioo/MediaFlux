@@ -173,7 +173,18 @@ def check_claim(state, lease, now, conn=None, *, publication=False):
             or now >= record.get("expires_at", 0)):
         raise StalePublicationError("read wait claim revoked")
     if conn is not None:
-        require_runtime_fence(conn, RuntimeFence(**record["admission_fence"]))
+        origin = RuntimeFence(**record["admission_fence"])
+        # 旧来源仍用于密封回执核验。只有已成功领取的租约持有升级后的 fence。
+        expected = (lease.continuation_fence or origin) if origin.v == 1 else origin
+        require_runtime_fence(conn, expected)
+
+
+def matches_runtime_binding(record, binding):
+    recorded = (record["admission_fence"], record["effective_digest"])
+    if recorded == (asdict(binding.fence), binding.effective_digest):
+        return True
+    legacy = getattr(binding, "legacy_continuation", None)
+    return legacy is not None and recorded == (asdict(legacy[0]), legacy[1])
 
 
 def revoke(state, reason):
@@ -379,7 +390,7 @@ def claim(state: SessionState, candidate, now, binding, conn=None):
         if same_candidate:
             revoke(state, "effect_conflict")
         return None
-    if record["admission_fence"] != asdict(binding.fence) or record["effective_digest"] != binding.effective_digest:
+    if not matches_runtime_binding(record, binding):
         if same_candidate:
             revoke(state, "runtime_changed")
         return None
@@ -406,7 +417,8 @@ def claim(state: SessionState, candidate, now, binding, conn=None):
     state.metadata["active_publication"] = {"generation": state.generation,
         "turn_id": record["resume_turn_id"], "request_id": record["source_request_id"], "status": "running"}
     return PublicationLease(state.owner, state.session_id, state.generation, record["resume_turn_id"],
-                            record["source_request_id"], record["wait_id"], record["claim_id"])
+                            record["source_request_id"], record["wait_id"], record["claim_id"],
+                            continuation_fence=binding.fence)
 
 
 # Accepted writes are never resubmitted. A frozen batch may finish its approved
@@ -536,7 +548,7 @@ def claim_effect(state, candidate, now, binding, conn=None):
     if type(stopped_generation) is int and record["origin_generation"] <= stopped_generation <= state.generation:
         record.update(state="cancelled", terminal_reason="cancelled")
         return None
-    if (record["admission_fence"] != asdict(binding.fence) or record["effective_digest"] != binding.effective_digest
+    if (not matches_runtime_binding(record, binding)
             or now < record["last_checked_at"] or now >= record["expires_at"]):
         record.update(state="terminal", terminal_reason="expired_or_runtime_changed")
         return None
@@ -573,7 +585,8 @@ def claim_effect(state, candidate, now, binding, conn=None):
     if payload["origin"].get("batch_plan"):
         state.metadata["active_publication"]["protected"] = True
     return PublicationLease(state.owner, state.session_id, state.generation, record["resume_turn_id"],
-        record["source_request_id"], record["wait_id"], record["claim_id"], "effect")
+        record["source_request_id"], record["wait_id"], record["claim_id"], "effect",
+        continuation_fence=binding.fence)
 
 
 def apply_effect_action(state, lease, update, now):

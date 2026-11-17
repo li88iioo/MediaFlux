@@ -2,6 +2,7 @@
 from tests.agent_task_native_helpers import task_call
 import asyncio
 import json
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
 from unittest.mock import patch
@@ -9,7 +10,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app import database as db
+from app import config, database as db
 from app.agent.errors import ToolRateLimitError
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import (
@@ -20,6 +21,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.rate_limit import RateLimitDecision
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
+from tests.test_agent_runtime_fence import legacy_runtime_fence
 from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
@@ -123,7 +125,8 @@ def test_native_quota_park_and_cold_cancel(agent_llm_enabled, cancel_entry):
     asyncio.run(run())
 
 
-def test_scheduler_cold_native_resume_uses_new_id_and_one_read(agent_llm_enabled):
+@pytest.mark.parametrize("upgrade", [False, True], ids=["current", "v1-upgrade"])
+def test_scheduler_cold_native_resume_uses_new_id_and_one_read(agent_llm_enabled, upgrade):
     from app.modules.agent_jobs_scheduler import AgentJobsScheduler
     timer = [100]
     async def park():
@@ -136,7 +139,11 @@ def test_scheduler_cold_native_resume_uses_new_id_and_one_read(agent_llm_enabled
         events = [e async for e in runtime.session.run(AgentInput(message=GOAL, owner=OWNER,
                           session_id='wait-resume', request_id='resume-source'))]
         assert events[-1].payload.get('status') == 'waiting'
-    asyncio.run(park())
+    with patch.dict(config._SYSTEM_ENV_SNAPSHOT, {"DISCOVERY_ENABLED": "1"}):
+        with legacy_runtime_fence() if upgrade else nullcontext():
+            asyncio.run(park())
+        if upgrade:
+            initialize_runtime_fence()
     timer[0] = 110
     resumed = WaitScript(True)
     handlers = []
@@ -151,7 +158,8 @@ def test_scheduler_cold_native_resume_uses_new_id_and_one_read(agent_llm_enabled
         return replace(runtime, creation_binding=binding)
     scheduler = AgentJobsScheduler(clock=lambda: datetime.fromtimestamp(timer[0]))
     scheduler._continuation_runtime_factory = factory
-    assert getattr(scheduler, '_run_due_continuation_once', lambda: 0)() == 1
+    with patch.dict(config._SYSTEM_ENV_SNAPSHOT, {"DISCOVERY_ENABLED": "0"}):
+        assert scheduler._run_due_continuation_once() == 1
     assert len(handlers) == 1
     assert len(resumed.requests) == 1
     assert any('fixture READ complete' in str(row.get('content', '')) for row in resumed.requests[0]['messages'])

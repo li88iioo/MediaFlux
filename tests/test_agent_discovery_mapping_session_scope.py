@@ -311,16 +311,23 @@ def test_cancellation_at_each_mapping_boundary_never_writes(backend, phase):
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("change", ["config_aba", "agent_disabled"])
+@pytest.mark.parametrize("change", ["display", "config_aba", "agent_disabled"])
 def test_runtime_and_authority_are_rechecked_before_mapping_write(backend, change):
     async def exercise():
         store = SQLiteKernelStore()
         context = await context_for(store, owner=OWNER)
         effects = executor(store)
         plan = await prepare(effects, context)
+        if change == "display":
+            config.set_and_save({"DISCOVERY_ENABLED": "0", "DISCOVERY_DOUBAN_ENABLED": "0"})
+            completed = await effects.execute_confirmed(plan.plan_id, context=context)
+            assert completed.outcome.public_content["ok"]
+            assert discovery_repo.get_media_external_id("douban", "101", "movie") is not None
+            return
         if change == "config_aba":
-            config.set_and_save({"DISCOVERY_ENABLED": "0"})
-            config.set_and_save({"DISCOVERY_ENABLED": "1"})
+            original = config.all_items().get("TMDB_API_URL")
+            config.set_and_save({"TMDB_API_URL": "https://different-provider.invalid/3"})
+            config.set_and_save({"TMDB_API_URL": original})
         else:
             config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         with pytest.raises(ToolPipelineError) as error:

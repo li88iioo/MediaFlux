@@ -30,8 +30,7 @@ FEATURES = {
 BOOLEAN_VALUES = {**dict.fromkeys(("1", "true", "yes", "on", "y"), "1"),
                   **dict.fromkeys(("0", "false", "no", "off", "n"), "0")}
 DISCOVERY_RUNTIME_KEYS = frozenset({
-    "DISCOVERY_ENABLED", "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS",
-    "DISCOVERY_DOUBAN_ENABLED", "DOUBAN_DBCL2",
+    "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS", "DOUBAN_DBCL2",
     "DOUBAN_CACHE_TTL_SECONDS", "BANGUMI_USER_AGENT", "ORGANIZE_DOUBAN_HINTS_ENABLED",
     "ORGANIZE_BANGUMI_HINTS_ENABLED", "TMDB_API_KEY", "TMDB_API_URL", "TMDB_MATCH_MODE", "PROXY_URL",
 })
@@ -181,7 +180,7 @@ def reload_runtime(
 
     ``retry_keys`` 是值未变但已提交的键，只用于重试本地媒体运行时切换。
     """
-    keys = set(changed_keys)
+    keys = set(changed_keys) - config.RUNTIME_DISPLAY_ONLY_KEYS
     outcome = _Reload()
     _refresh_recognition_caches(keys)
     _refresh_discovery_and_web(keys, outcome)
