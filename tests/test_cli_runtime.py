@@ -459,7 +459,7 @@ sys.addaudithook(audit)
         open_browser.assert_called_once_with("http://127.0.0.1:1258/", new=2)
         self.assertEqual(output.getvalue().strip(), "http://127.0.0.1:1258/")
 
-    def test_status_uses_configured_runtime_port(self) -> None:
+    def test_status_uses_source_config_port_or_container_internal_port(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             paths = RuntimePaths(
@@ -473,17 +473,18 @@ sys.addaudithook(audit)
             )
             paths.config_dir.mkdir(parents=True)
             paths.env_file.write_text("WEB_PORT=24567\n", encoding="utf-8")
-            output = io.StringIO()
-            with (
-                patch("app.runtime_paths.get_runtime_paths", return_value=paths),
-                patch("app.cli.urlopen", return_value=_Response(b'{"status":"ok"}')) as request,
-                redirect_stdout(output),
-            ):
-                exit_code = main(["status"])
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(request.call_args.args[0], "http://127.0.0.1:24567/healthz")
-        self.assertEqual(output.getvalue().strip(), "MediaFlux is healthy")
+            for container, expected_port in (("0", 24567), ("1", 1258)):
+                output = io.StringIO()
+                with (
+                    self.subTest(container=container),
+                    patch.dict(os.environ, {"MEDIAFLUX_CONTAINER": container}, clear=True),
+                    patch("app.runtime_paths.get_runtime_paths", return_value=paths),
+                    patch("app.cli.urlopen", return_value=_Response(b'{"status":"ok"}')) as request,
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(main(["status"]), 0)
+                    self.assertEqual(request.call_args.args[0], f"http://127.0.0.1:{expected_port}/healthz")
+                    self.assertEqual(output.getvalue().strip(), "MediaFlux is healthy")
 
     def test_status_rejects_non_object_and_malformed_responses_uniformly(self) -> None:
         for body in (b"[]", b"not-json"):
@@ -586,7 +587,7 @@ sys.addaudithook(audit)
         )
         self.assertNotIn("runtime_config", {check["key"] for check in json.loads(output.getvalue())})
 
-    def test_doctor_environment_endpoint_overrides_existing_env_file(self) -> None:
+    def test_doctor_resolves_source_environment_and_container_ports(self) -> None:
         from app.modules.runtime_diagnostics import DiagnosticCheck, DiagnosticReport
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -603,19 +604,23 @@ sys.addaudithook(audit)
             paths.config_dir.mkdir()
             paths.env_file.write_text("WEB_HOST=127.0.0.9\nWEB_PORT=24678\n")
             report = DiagnosticReport((DiagnosticCheck("ffprobe", "warning", "未找到 ffprobe"),))
-            output = io.StringIO()
-            with (
-                patch.dict(os.environ, {"WEB_HOST": "127.0.0.7", "WEB_PORT": "24567"}, clear=True),
-                patch("app.runtime_paths.get_runtime_paths", return_value=paths),
-                patch("app.modules.runtime_diagnostics.run_diagnostics", return_value=report) as diagnostics,
-                redirect_stdout(output),
+            for container, args, expected_port in (
+                ("0", [], 24567),
+                ("1", [], 1258),
+                ("1", ["--port", "24568"], 24568),
             ):
-                exit_code = main(["doctor"])
-
-        self.assertEqual(exit_code, 0)
-        diagnostics.assert_called_once_with(
-            paths, source_paths=(), target_paths=(), host="127.0.0.7", port=24567
-        )
+                environment = {"MEDIAFLUX_CONTAINER": container, "WEB_HOST": "127.0.0.7", "WEB_PORT": "24567"}
+                with (
+                    self.subTest(container=container, args=args),
+                    patch.dict(os.environ, environment, clear=True),
+                    patch("app.runtime_paths.get_runtime_paths", return_value=paths),
+                    patch("app.modules.runtime_diagnostics.run_diagnostics", return_value=report) as diagnostics,
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(main(["doctor", *args]), 0)
+                    diagnostics.assert_called_once_with(
+                        paths, source_paths=(), target_paths=(), host="127.0.0.7", port=expected_port
+                    )
 
     def test_doctor_invalid_env_file_returns_runtime_config_error_as_json(self) -> None:
         from app.modules.runtime_diagnostics import DiagnosticCheck, DiagnosticReport

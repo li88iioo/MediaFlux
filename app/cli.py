@@ -77,10 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _enforce_packaged_production_mode() -> None:
-    """容器运行模式下强制使用 production，不能被开发环境文件降级。"""
-    if os.getenv("MEDIAFLUX_CONTAINER", "").strip().lower() in {"1", "true", "yes", "on"}:
-        os.environ["APP_ENV"] = "production"
+def _is_official_container() -> bool:
+    return os.getenv("MEDIAFLUX_CONTAINER", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _configure_start_paths(data_dir: str | None) -> None:
@@ -101,7 +99,8 @@ def _configure_start_paths(data_dir: str | None) -> None:
 
 
 def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
-    _enforce_packaged_production_mode()
+    if _is_official_container():
+        os.environ["APP_ENV"] = "production"
     _configure_start_paths(data_dir)
 
     # 启动、pending restore 与整个 Uvicorn 生命周期共享同一把独占锁。
@@ -236,12 +235,15 @@ def _resolve_doctor_endpoint(
     host: str | None,
     port: int | None,
 ) -> tuple[str, int, DiagnosticCheck | None]:
-    """只读解析 doctor 端点：CLI、环境、已有 user.env、默认值。"""
+    """只读解析运维命令使用的服务端点。"""
     from app.modules.runtime_diagnostics import DiagnosticCheck
 
     resolved_host = host if host is not None else os.environ.get("WEB_HOST") or None
     resolved_port = port
-    raw_environment_port = None if port is not None else os.environ.get("WEB_PORT")
+    if resolved_port is None and _is_official_container():
+        # docker exec 不经过入口脚本，仍使用镜像约定的内部端口。
+        resolved_port = DEFAULT_WEB_PORT
+    raw_environment_port = os.environ.get("WEB_PORT") if resolved_port is None else None
     if raw_environment_port:
         try:
             resolved_port = int(raw_environment_port)
