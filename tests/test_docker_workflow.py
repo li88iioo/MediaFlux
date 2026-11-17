@@ -255,8 +255,8 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('PYTHONUNBUFFERED: "1"', test_job)
         self.assertNotIn("| tail", test_job)
         self.assertIn("actions/setup-node@v6", test_job)
-        self.assertIn('node-version: "24.22.2"', test_job)
-        self.assertIn("npm install --global npm@12.2.1 --ignore-scripts", test_job)
+        self.assertIn('node-version: "24.22.3"', test_job)
+        self.assertIn("npm install --global npm@12.2.2 --ignore-scripts", test_job)
 
     def test_candidate_manifest_and_arm64_runtime_are_verified_before_promotion(
         self,

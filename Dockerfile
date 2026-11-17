@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS static-builder
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS static-builder
 
 # 固定镜像仍需更新同发行版安全补丁（CA bundle、zlib），再执行 npm。
 RUN apk upgrade --no-cache
@@ -6,14 +6,14 @@ RUN apk upgrade --no-cache
 WORKDIR /src
 
 COPY package.json package-lock.json .npmrc ./
-RUN npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+RUN npm install --global npm@12.2.2 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
 RUN npm ci --ignore-scripts --no-audit --no-fund
 
 COPY packaging/scripts/minify_static.mjs /src/packaging/scripts/minify_static.mjs
 COPY app/static /src/app/static
 RUN npm run build:static -- --input /src/app/static --output /out
 
-FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

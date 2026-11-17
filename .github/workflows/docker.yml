@@ -29,7 +29,7 @@ jobs:
           ref: ${{ github.sha }}
 
       - uses: actions/setup-node@v6
-        with: {node-version: "24.22.2", package-manager-cache: false}
+        with: {node-version: "24.22.3", package-manager-cache: false}
 
       - uses: actions/setup-python@v6
         with:
@@ -39,7 +39,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          npm install --global npm@12.2.2 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
           npm ci --ignore-scripts --no-audit --no-fund
           python -m pip install --require-hashes -r requirements-release-runtime.lock
           python -m pip install "pytest==9.2.0"

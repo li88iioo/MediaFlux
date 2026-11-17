@@ -80,7 +80,7 @@ class StaticAssetBuildTests(unittest.TestCase):
 
     def test_package_manifest_pins_minifier_versions(self) -> None:
         package = json.loads((self.ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(package["packageManager"], "npm@12.2.1")
+        self.assertEqual(package["packageManager"], "npm@12.2.2")
         self.assertEqual(package["devDependencies"]["terser"], "5.51.2")
         self.assertEqual(package["devDependencies"]["lightningcss"], "1.33.0")
         self.assertEqual(package["devDependencies"]["lucide"], "1.74.0")
@@ -197,12 +197,12 @@ class StaticAssetDockerContractTests(unittest.TestCase):
         dockerfile = (self.ROOT / "Dockerfile").read_text(encoding="utf-8")
         builder = (
             "FROM --platform=$BUILDPLATFORM "
-            "node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 "
+            "node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 "
             "AS static-builder"
         )
         runtime = (
             "FROM python:3.13-slim@sha256:"
-            "2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb"
+            "e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90"
         )
         self.assertIn(builder, dockerfile)
         self.assertIn("COPY package.json package-lock.json .npmrc ./", dockerfile)
