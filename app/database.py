@@ -55,7 +55,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -589,6 +589,8 @@ def init_db() -> None:
                 needs_rss_delivery_migration = previous_schema_version == 0 or bool(
                     rss_columns and not {"download_request_id", "download_request_key", "download_backend"} <= rss_columns
                 )
+                if previous_schema_version == 0:
+                    database_migrations._migrate_media_proxy_binding_upstream_v43(connection)
                 _sync_missing_schema_columns(connection)
                 database_migrations._migrate_agent_session_context_v2(connection)
                 # 未打版本的早期数据库不会进入正式迁移链；仍需同步清除

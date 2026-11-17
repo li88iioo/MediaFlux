@@ -56,7 +56,7 @@ from app.logger import get_logger, log_throttled
 from app.modules.media_proxy_forwarding import media_proxy_forwarding_config
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
 from app.modules.media_proxy_safety import safe_media_name as _safe_media_name
-from app.modules.media_server_profiles import resolve_proxy_instance
+from app.modules.media_server_profiles import media_server_upstream_identity, resolve_proxy_instance
 
 logger = get_logger(__name__)
 _MEDIA_MIME_OVERRIDES = {
@@ -471,11 +471,9 @@ def signed_url_cache_metrics(instance_id: int | None = None) -> dict:
         }
 
 
-def _proxy_upstream_identity(instance: dict[str, Any]) -> tuple[httpx.URL, str]:
-    return (
-        _parse_upstream_url(instance["upstream_url"])[1],
-        str(instance.get("server_type") or "").strip().casefold(),
-    )
+def _proxy_upstream_identity(instance: dict[str, Any]) -> str:
+    url, _ = _parse_upstream_url(instance["upstream_url"])
+    return media_server_upstream_identity(str(instance.get("server_type") or ""), url)
 
 
 class _ProxyAppRetired(ValueError):
@@ -3985,6 +3983,7 @@ def _media_proxy_binding(
     item_id: str,
     source_id: str,
     *,
+    upstream_identity: str,
     item_level_scopes: ItemLevelBindingScopes,
     allow_item_level: bool = False,
     auth_scope: str = "",
@@ -3996,7 +3995,7 @@ def _media_proxy_binding(
     for item_variant in _media_identifier_variants(item_id):
         for source_variant in _media_identifier_variants(requested_source):
             candidate = media_proxy_repo.get_media_proxy_binding(
-                instance_id, item_variant, source_variant
+                instance_id, item_variant, source_variant, upstream_identity=upstream_identity,
             )
             if not candidate:
                 continue
@@ -4049,6 +4048,7 @@ def rewrite_playback_info(
     instance_id: int,
     item_id: str,
     *,
+    upstream_identity: str,
     route_prefix: str = "",
     dynamic_mappings: DynamicGuangYaMappings,
     item_level_scopes: ItemLevelBindingScopes,
@@ -4116,6 +4116,7 @@ def rewrite_playback_info(
             instance_id,
             item_id,
             source_id,
+            upstream_identity=upstream_identity,
             item_level_scopes=item_level_scopes,
             allow_item_level=allow_item_level,
             auth_scope=auth_scope,
@@ -5454,6 +5455,7 @@ def create_proxy_app(
                 instance_id,
                 item_id,
                 source_id,
+                upstream_identity=app.state.upstream_identity,
                 item_level_scopes=item_level_scopes,
                 auth_scope=auth_scope,
             )
@@ -5846,6 +5848,7 @@ def create_proxy_app(
                     payload,
                     instance_id,
                     playback_match.group(1),
+                    upstream_identity=app.state.upstream_identity,
                     dynamic_mappings=dynamic_mappings,
                     item_level_scopes=item_level_scopes,
                     playback_grants=playback_grants,

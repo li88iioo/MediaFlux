@@ -165,7 +165,7 @@ class PlayGyQualityTests(unittest.TestCase):
                 "id": 7, "enabled": enabled, "upstream_url": "http://127.0.0.1:8096", "local_root": "",
             }))
             stack.enter_context(patch("app.repositories.media_proxy.get_media_proxy_binding",
-                side_effect=lambda _instance, _item, source: binding if source == "cloud" else None))
+                side_effect=lambda _instance, _item, source, **_: binding if source == "cloud" else None))
             stack.enter_context(patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kwargs:
                 async_client(transport=httpx.MockTransport(upstream), **kwargs)))
             stack.enter_context(patch.object(media_proxy, "GuangYaClient", return_value=self.client))
@@ -394,6 +394,7 @@ class PlayGyQualityTests(unittest.TestCase):
                         payload,
                         7,
                         "quality-item",
+                        upstream_identity="fixture-upstream",
                         dynamic_mappings=media_proxy.DynamicGuangYaMappings(),
                         item_level_scopes=media_proxy.ItemLevelBindingScopes(),
                         playback_grants=media_proxy.PlaybackGrantRegistry(),

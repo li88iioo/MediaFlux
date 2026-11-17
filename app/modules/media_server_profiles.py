@@ -134,7 +134,7 @@ def media_server_upstream_identity(server_type: str, url: str) -> str:
     except httpx.InvalidURL:
         # 历史配置允许从部署环境载入无效地址，仍可登记并按原目标结算失败。
         pass
-    return hashlib.sha256(json.dumps([server_type, endpoint]).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([server_type.strip().casefold(), endpoint]).encode()).hexdigest()
 
 
 class MediaRefreshIntent(TypedDict):
@@ -361,7 +361,7 @@ def connection(server: str = "all") -> dict:
             "error": "" if ok else summary}
 
 
-def resolve_proxy_instance(row: Mapping[str, Any] | Row) -> dict[str, Any]:
+def resolve_proxy_instance(row: Mapping[str, Any] | Row, *, require_available: bool = True) -> dict[str, Any]:
     """解析当前上游；配置凭据仅供管理探测，不替代下游用户令牌。"""
     resolved = dict(row)
     source = str(row_value(row, "config_source", "custom") or "custom").strip()
@@ -370,12 +370,13 @@ def resolve_proxy_instance(row: Mapping[str, Any] | Row) -> dict[str, Any]:
         return resolved
 
     profile = _profile(source)
-    if not profile.enabled:
-        raise ValueError(f"{profile.label} 已在看板停用，请先启用")
-    if not profile.url:
-        raise ValueError(f"{profile.label} 上游地址未配置")
-    if not profile.credential:
-        raise ValueError(f"{profile.label} API 凭据未配置")
+    if require_available:
+        if not profile.enabled:
+            raise ValueError(f"{profile.label} 已在看板停用，请先启用")
+        if not profile.url:
+            raise ValueError(f"{profile.label} 上游地址未配置")
+        if not profile.credential:
+            raise ValueError(f"{profile.label} API 凭据未配置")
     resolved.update(
         server_type=profile.server_type,
         upstream_url=profile.url,
@@ -383,3 +384,11 @@ def resolve_proxy_instance(row: Mapping[str, Any] | Row) -> dict[str, Any]:
         source_label=profile.label,
     )
     return resolved
+
+
+def media_proxy_binding_identity(row: Mapping[str, Any] | Row) -> str:
+    instance = resolve_proxy_instance(row, require_available=False)
+    upstream_url = str(instance["upstream_url"] or "").strip()
+    if not upstream_url:
+        return ""
+    return media_server_upstream_identity(instance["server_type"], upstream_url)

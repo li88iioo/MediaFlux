@@ -532,7 +532,7 @@
         try{
             const rows=(await request(`/api/media-proxy/${session.instanceId}/bindings`)).filter(row=>row.source_type==='guangya');
             if(!isCurrent())return;
-            root.innerHTML=rows.length?rows.map(row=>`<article class="proxy-binding-card"><div class="proxy-binding-icon"><i data-lucide="cloud"></i></div><div><strong>${esc(row.media_item_id)}</strong><p>${row.media_source_id?`Source ${esc(row.media_source_id)} · `:''}光鸭文件 ${esc(row.guangya_file_id)}</p></div><button type="button" class="icon-action danger" data-delete-binding="${row.id}" title="删除映射"><i data-lucide="trash-2"></i></button></article>`).join(''):'<div class="empty-state compact"><i data-lucide="link-2-off"></i><p>没有手动播放映射</p><span class="hint">标准 STRM 会自动识别，无需手工配置</span></div>';
+            root.innerHTML=rows.length?rows.map(row=>`<article class="proxy-binding-card"><div class="proxy-binding-icon"><i data-lucide="cloud"></i></div><div><strong>${esc(row.media_item_id)}</strong>${row.needs_review?' <span class="status-pill paused">待核对上游</span>':''}<p>${row.media_source_id?`Source ${esc(row.media_source_id)} · `:''}光鸭文件 ${esc(row.guangya_file_id)}</p></div><button type="button" class="icon-action danger" data-delete-binding="${row.id}" title="删除映射"><i data-lucide="trash-2"></i></button></article>`).join(''):'<div class="empty-state compact"><i data-lucide="link-2-off"></i><p>没有手动播放映射</p><span class="hint">标准 STRM 会自动识别，无需手工配置</span></div>';
             root.querySelectorAll('[data-delete-binding]').forEach(btn=>btn.addEventListener('click',()=>removeBinding(Number(btn.dataset.deleteBinding),session)));
             session.loaded=true;state.textContent=`共 ${rows.length} 条映射`;
             renderLucideIcons(root);

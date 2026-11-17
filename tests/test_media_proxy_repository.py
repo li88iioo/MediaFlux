@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.database_schema import MEDIA_PROXY_BINDINGS_TABLE
+from app.modules.media_server_profiles import media_proxy_binding_identity
 from app.repositories import media_proxy as repository
 from tests.support import isolated_test_database
 
@@ -44,14 +46,16 @@ class MediaProxyRepositoryTests(unittest.TestCase):
                 instance["trusted_proxy_cidrs_json"],
                 '["192.168.88.110/32"]',
             )
-            repository.create_media_proxy_binding(
+            binding = repository.create_media_proxy_binding(
                 instance_id=instance_id,
                 media_item_id="item-1",
                 media_source_id="source-1",
                 source_type="local",
                 local_relative_path="Movie.mkv",
             )
-            row = repository.get_media_proxy_binding(instance_id, "item-1", "missing-source")
+            row = repository.get_media_proxy_binding(
+                instance_id, "item-1", "missing-source", upstream_identity=binding["upstream_identity"],
+            )
             assert (row) is not None
             self.assertEqual(row["media_source_id"], "source-1")
             repository.record_media_proxy_playback_attempt(
@@ -95,6 +99,43 @@ class MediaProxyRepositoryTests(unittest.TestCase):
             self.assertEqual(int(row["instance_id"]), instance_id)
             self.assertEqual(row["media_item_id"], "item-atomic")
             self.assertEqual(row["guangya_file_id"], "file-atomic")
+
+    def test_migration_preserves_unverified_binding_and_allows_scoped_recreation(self):
+        with isolated_test_database():
+            instance_id = repository.add_media_proxy_instance(
+                name="Historical", server_type="jellyfin", upstream_url="http://fixture.invalid",
+                api_key="fixture", listen_host="127.0.0.1", listen_port=18096,
+            )
+            binding = dict(
+                instance_id=instance_id, media_item_id="item", media_source_id="",
+                source_type="guangya", guangya_file_id="old-file",
+            )
+            with db.get_conn() as conn:
+                conn.execute("DROP TABLE media_proxy_bindings")
+                conn.execute(MEDIA_PROXY_BINDINGS_TABLE
+                             .replace("    upstream_identity TEXT NOT NULL DEFAULT '',\n", "")
+                             .replace("instance_id, upstream_identity, media_item_id", "instance_id, media_item_id"))
+                conn.execute(
+                    "INSERT INTO media_proxy_bindings(id,instance_id,media_item_id,source_type,guangya_file_id,created_at,updated_at) "
+                    "VALUES(7,?,'item','guangya','old-file','original','original')",
+                    (instance_id,),
+                )
+                conn.execute("UPDATE sqlite_sequence SET seq=99 WHERE name='media_proxy_bindings'")
+                conn.execute("PRAGMA user_version=42")
+            db.init_db()
+            historic = repository.list_media_proxy_bindings(instance_id)[0]
+            self.assertEqual((historic["id"], historic["guangya_file_id"], historic["created_at"]), (7, "old-file", "original"))
+            first = repository.create_media_proxy_binding(**binding)
+            self.assertGreater(first["id"], 99)
+            repository.update_media_proxy_instance(instance_id, {"upstream_url": "http://replacement.invalid"})
+            instance = repository.get_media_proxy_instance(instance_id)
+            assert instance is not None
+            identity = media_proxy_binding_identity(instance)
+            self.assertIsNone(repository.get_media_proxy_binding(instance_id, "item", upstream_identity=identity))
+            second = repository.create_media_proxy_binding(**{**binding, "guangya_file_id": "new-file"})
+            selected = repository.get_media_proxy_binding(instance_id, "item", upstream_identity=identity)
+            self.assertEqual(selected["guangya_file_id"], "new-file")
+            self.assertEqual([row["id"] for row in repository.list_media_proxy_bindings(instance_id)], [7, first["id"], second["id"]])
 
     def test_record_contract_and_redaction_remain_behind_facade(self):
         with isolated_test_database("media-proxy-record-repository.db"):

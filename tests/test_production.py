@@ -544,6 +544,7 @@ class MediaProxyTests(InitializedWebTestCase):
                 payload,
                 1,
                 "item-1",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=proxy_module.DynamicGuangYaMappings(),
                 item_level_scopes=proxy_module.ItemLevelBindingScopes(),
                 playback_grants=proxy_module.PlaybackGrantRegistry(),
@@ -578,14 +579,17 @@ class MediaProxyTests(InitializedWebTestCase):
                 self.assertEqual(
                     get_media_proxy_instance_result["name"], "Test Jellyfin"
                 )
-                binding_id = int(media_proxy_repo.create_media_proxy_binding(
+                created = media_proxy_repo.create_media_proxy_binding(
                     instance_id=instance_id,
                     media_item_id="item-1",
                     media_source_id="source-1",
                     source_type="local",
                     local_relative_path="Movies/video.mkv",
-                )["id"])
-                binding = media_proxy_repo.get_media_proxy_binding(instance_id, "item-1", "source-1")
+                )
+                binding_id = int(created["id"])
+                binding = media_proxy_repo.get_media_proxy_binding(
+                    instance_id, "item-1", "source-1", upstream_identity=created["upstream_identity"],
+                )
                 assert binding is not None
                 self.assertEqual(int(binding["id"]), binding_id)
                 self.assertTrue(media_proxy_repo.delete_media_proxy_instance(instance_id))

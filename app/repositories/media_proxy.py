@@ -124,15 +124,23 @@ def create_media_proxy_binding(
     enabled: int = 1,
 ) -> sqlite3.Row:
     """在同一事务内创建并回读绑定，避免并发删除造成响应竞态。"""
+    from app.modules.media_server_profiles import media_proxy_binding_identity
+
     timestamp = db.now()
     with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        instance = conn.execute("SELECT * FROM media_proxy_instances WHERE id=?", (instance_id,)).fetchone()
+        if instance is None:
+            raise LookupError("媒体反代实例不存在")
+        upstream_identity = media_proxy_binding_identity(instance)
         cur = conn.execute(
             "INSERT INTO media_proxy_bindings("
-            "instance_id,media_item_id,media_source_id,source_type,guangya_file_id,"
+            "instance_id,upstream_identity,media_item_id,media_source_id,source_type,guangya_file_id,"
             "local_relative_path,enabled,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?)",
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 instance_id,
+                upstream_identity,
                 media_item_id,
                 media_source_id,
                 source_type,
@@ -165,20 +173,24 @@ def get_media_proxy_binding(
     instance_id: int,
     media_item_id: str,
     media_source_id: str = "",
+    *,
+    upstream_identity: str,
 ) -> sqlite3.Row | None:
+    if not upstream_identity:
+        return None
     with db.get_conn() as conn:
         if media_source_id:
             row = conn.execute(
                 "SELECT * FROM media_proxy_bindings WHERE instance_id=? "
-                "AND media_item_id=? AND media_source_id=? AND enabled=1",
-                (instance_id, media_item_id, media_source_id),
+                "AND upstream_identity=? AND media_item_id=? AND media_source_id=? AND enabled=1",
+                (instance_id, upstream_identity, media_item_id, media_source_id),
             ).fetchone()
             if row:
                 return row
         return conn.execute(
             "SELECT * FROM media_proxy_bindings WHERE instance_id=? "
-            "AND media_item_id=? AND enabled=1 ORDER BY id LIMIT 1",
-            (instance_id, media_item_id),
+            "AND upstream_identity=? AND media_item_id=? AND enabled=1 ORDER BY id LIMIT 1",
+            (instance_id, upstream_identity, media_item_id),
         ).fetchone()
 
 

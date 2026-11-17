@@ -217,13 +217,14 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
                     listen_host="127.0.0.1",
                     listen_port=port,
                 )
-                binding = repository.create_media_proxy_binding(
-                    instance_id=instance_id,
-                    media_item_id="item",
-                    media_source_id="source",
-                    source_type="guangya",
-                    guangya_file_id="file",
-                )
+                with patch.object(media_server_profiles.config, "get", side_effect=lambda name, default="": values.get(name, default)):
+                    binding = repository.create_media_proxy_binding(
+                        instance_id=instance_id,
+                        media_item_id="item",
+                        media_source_id="source",
+                        source_type="guangya",
+                        guangya_file_id="file",
+                    )
                 manager = media_proxy.MediaProxyManager()
                 runtime = media_proxy.ProxyRuntime(
                     instance_id=instance_id,
@@ -1450,6 +1451,7 @@ class LocalPlaybackPassthroughTests(unittest.TestCase):
                 payload,
                 7,
                 "item-local",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=media_proxy.DynamicGuangYaMappings(),
                 item_level_scopes=media_proxy.ItemLevelBindingScopes(),
                 playback_grants=media_proxy.PlaybackGrantRegistry(),

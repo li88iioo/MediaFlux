@@ -25,6 +25,7 @@ from app.modules.media_proxy_forwarding import (
 )
 from app.modules.media_server_profiles import (
     list_configured_profiles,
+    media_proxy_binding_identity,
     resolve_proxy_instance,
 )
 from app.web import api_error, api_response, require_api_login
@@ -96,7 +97,7 @@ def _instance_json(row, runtime: dict | None = None) -> dict:
     }
 
 
-def _binding_json(row) -> dict:
+def _binding_json(row, upstream_identity: str) -> dict:
     return {
         "id": int(row["id"]),
         "instance_id": int(row["instance_id"]),
@@ -106,6 +107,7 @@ def _binding_json(row) -> dict:
         "guangya_file_id": row["guangya_file_id"] or "",
         "local_relative_path": row["local_relative_path"] or "",
         "enabled": bool(row["enabled"]),
+        "needs_review": not upstream_identity or row["upstream_identity"] != upstream_identity,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -418,10 +420,15 @@ async def test_instance(instance_id: int, request: Request):
 @router.get("/{instance_id}/bindings")
 async def list_bindings(instance_id: int, request: Request):
     require_api_login(request)
-    if not await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id):
+    instance = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
+    if not instance:
         return api_error("媒体反代实例不存在", 404)
+    try:
+        upstream_identity = media_proxy_binding_identity(instance)
+    except ValueError:
+        upstream_identity = ""
     return api_response([
-        _binding_json(row)
+        _binding_json(row, upstream_identity)
         for row in await asyncio.to_thread(media_proxy_repo.list_media_proxy_bindings, instance_id)
     ])
 
@@ -441,7 +448,11 @@ async def create_binding(instance_id: int, request: Request, data: dict = Body(.
         )
     except sqlite3.IntegrityError:
         return api_error("该媒体项目和媒体源已经存在绑定", 409)
-    return api_response({"success": True, "binding": _binding_json(row)}, 201)
+    except LookupError as exc:
+        return api_error(str(exc), 404)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    return api_response({"success": True, "binding": _binding_json(row, row["upstream_identity"])}, 201)
 
 
 @router.delete("/{instance_id}/bindings/{binding_id}")

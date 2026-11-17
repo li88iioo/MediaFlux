@@ -2077,6 +2077,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 payload,
                 7,
                 "multi-item",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=self.app.state.dynamic_mappings,
                 item_level_scopes=self.app.state.item_level_scopes,
                 playback_grants=self.app.state.playback_grants,
@@ -2103,7 +2104,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "media_source_id": "cloud version/4k",
         }
 
-        def binding_lookup(_instance_id, _item_id, source_id=""):
+        def binding_lookup(_instance_id, _item_id, source_id="", *, upstream_identity):
             return binding if source_id in {"cloud version/4k", ""} else None
 
         with patch(
@@ -2116,6 +2117,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 7,
                 "path-item",
                 auth_scope=media_proxy._auth_scope_fingerprint("client-token"),
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=app.state.dynamic_mappings,
                 item_level_scopes=app.state.item_level_scopes,
                 playback_grants=app.state.playback_grants,
@@ -2169,6 +2171,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 payload,
                 7,
                 "mixed-item",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=self.app.state.dynamic_mappings,
                 item_level_scopes=self.app.state.item_level_scopes,
                 playback_grants=self.app.state.playback_grants,
@@ -2223,6 +2226,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 7,
                 "single-item",
                 auth_scope=media_proxy._auth_scope_fingerprint("client-token"),
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=app.state.dynamic_mappings,
                 item_level_scopes=app.state.item_level_scopes,
                 playback_grants=app.state.playback_grants,
@@ -3651,7 +3655,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         calls = []
 
-        def lookup(instance_id, item_id, source_id=""):
+        def lookup(instance_id, item_id, source_id="", *, upstream_identity):
             calls.append((instance_id, item_id, source_id))
             if item_id == stored_canonical and source_id == stored_canonical:
                 return binding
@@ -3662,7 +3666,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             side_effect=lookup,
         ):
             resolved = media_proxy._media_proxy_binding(
-                7, compact, compact, item_level_scopes=self.app.state.item_level_scopes
+                7, compact, compact, upstream_identity="fixture-upstream",
+                item_level_scopes=self.app.state.item_level_scopes,
             )
 
         self.assertIs(resolved, binding)
@@ -3777,6 +3782,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 payload,
                 7,
                 "item-1",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=self.app.state.dynamic_mappings,
                 item_level_scopes=self.app.state.item_level_scopes,
                 playback_grants=self.app.state.playback_grants,
@@ -4611,6 +4617,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                         playback_session_token="ambiguous-capability",
                         native_client_mode="web",
                         browser_direct_redirect_signatures=allowed_signatures,
+                        upstream_identity="fixture-upstream",
                         dynamic_mappings=self.app.state.dynamic_mappings,
                         item_level_scopes=self.app.state.item_level_scopes,
                         playback_grants=self.app.state.playback_grants,
@@ -7163,6 +7170,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 7,
                 "web-item",
                 native_client_mode="web",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=self.app.state.dynamic_mappings,
                 item_level_scopes=self.app.state.item_level_scopes,
                 playback_grants=self.app.state.playback_grants,
@@ -7402,6 +7410,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                         7,
                         "android-item",
                         native_client_mode="jellyfin_android",
+                        upstream_identity="fixture-upstream",
                         dynamic_mappings=self.app.state.dynamic_mappings,
                         item_level_scopes=self.app.state.item_level_scopes,
                         playback_grants=self.app.state.playback_grants,
@@ -9628,6 +9637,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 payload,
                 7,
                 "mixed-item",
+                upstream_identity="fixture-upstream",
                 dynamic_mappings=self.app.state.dynamic_mappings,
                 item_level_scopes=self.app.state.item_level_scopes,
                 playback_grants=self.app.state.playback_grants,

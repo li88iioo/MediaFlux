@@ -1817,6 +1817,27 @@ def _migrate_strm_refresh_intent_v42(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE strm_refresh_outbox ADD COLUMN refresh_intent_json TEXT")
 
 
+def _migrate_media_proxy_binding_upstream_v43(conn: sqlite3.Connection) -> None:
+    """保留已有绑定和 ID，历史上游未知的行留待管理者核对。"""
+    from app.database_schema import MEDIA_PROXY_BINDINGS_TABLE
+
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(media_proxy_bindings)")]
+    if not columns or "upstream_identity" in columns:
+        return
+    sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='media_proxy_bindings'").fetchone()
+    conn.execute(MEDIA_PROXY_BINDINGS_TABLE.replace("media_proxy_bindings", "media_proxy_bindings_v43", 1))
+    fields = ",".join(columns)
+    conn.execute(f"INSERT INTO media_proxy_bindings_v43 ({fields}) SELECT {fields} FROM media_proxy_bindings")
+    conn.execute("DROP TABLE media_proxy_bindings")
+    conn.execute("ALTER TABLE media_proxy_bindings_v43 RENAME TO media_proxy_bindings")
+    if sequence:
+        updated = conn.execute(
+            "UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='media_proxy_bindings'", (sequence[0],)
+        )
+        if not updated.rowcount:
+            conn.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('media_proxy_bindings',?)", (sequence[0],))
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1860,4 +1881,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     39: _migrate_missing_resource_source_v40,
     40: _migrate_share_retry_count_v41,
     41: _migrate_strm_refresh_intent_v42,
+    42: _migrate_media_proxy_binding_upstream_v43,
 }

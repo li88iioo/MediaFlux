@@ -911,7 +911,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.assertFalse(any(request["path"].endswith("/bindings") for request in self.requests))
 
     def test_proxy_old_binding_list_cannot_replace_another_instance(self):
-        page = self.make_page("media_proxy")
+        page = self.make_page("media_proxy", 390)
         self.hold_reply(PROXY + "/1/bindings", "old-list", method="GET", payload=[{
             "id": 11, "media_item_id": "old-instance-item", "media_source_id": "source-1",
             "source_type": "guangya", "guangya_file_id": "cloud-1",
@@ -921,10 +921,18 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         page.locator("#bindingsModal [data-bindings-close]").first.click()
         self.replies[("GET", PROXY + "/2/bindings")] = [(200, [{
             "id": 22, "media_item_id": "current-instance-item", "media_source_id": "source-2",
-            "source_type": "guangya", "guangya_file_id": "cloud-2",
+            "source_type": "guangya", "guangya_file_id": "active-cloud", "needs_review": False,
+        }, {
+            "id": 23, "media_item_id": "current-instance-item", "media_source_id": "source-2",
+            "source_type": "guangya", "guangya_file_id": "historical-cloud", "needs_review": True,
         }])]
         self.open_proxy_bindings(2)
-        page.locator("#proxyBindingList strong").filter(has_text="current-instance-item").wait_for()
+        cards = page.locator("#proxyBindingList .proxy-binding-card")
+        cards.filter(has_text="historical-cloud").get_by_text("待核对上游").wait_for()
+        self.assertEqual(cards.filter(has_text="active-cloud").get_by_text("待核对上游").count(), 0)
+        self.assertTrue(page.locator("#bindingsModal .media-config-dialog").evaluate(
+            "node => node.scrollWidth <= node.clientWidth + 1"
+        ))
         current = page.locator("#proxyBindingList").inner_html()
         self.release_reply("old-list")
         self.assertTrue(page.locator("#bindingsModal").is_visible())

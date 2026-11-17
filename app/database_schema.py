@@ -1,5 +1,23 @@
 """SQLite 建表声明；初始化、连接和版本协调由 app.database 唯一负责。"""
 
+MEDIA_PROXY_BINDINGS_TABLE = """
+CREATE TABLE IF NOT EXISTS media_proxy_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id INTEGER NOT NULL,
+    upstream_identity TEXT NOT NULL DEFAULT '',
+    media_item_id TEXT NOT NULL,
+    media_source_id TEXT DEFAULT '',
+    source_type TEXT NOT NULL,
+    guangya_file_id TEXT DEFAULT '',
+    local_relative_path TEXT DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (instance_id) REFERENCES media_proxy_instances(id) ON DELETE CASCADE,
+    UNIQUE(instance_id, upstream_identity, media_item_id, media_source_id)
+);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS organize_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1632,22 +1650,9 @@ CREATE TABLE IF NOT EXISTS media_proxy_instances (
 );
 CREATE INDEX IF NOT EXISTS idx_media_proxy_instances_enabled ON media_proxy_instances(enabled, id);
 
-CREATE TABLE IF NOT EXISTS media_proxy_bindings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id INTEGER NOT NULL,
-    media_item_id TEXT NOT NULL,
-    media_source_id TEXT DEFAULT '',
-    source_type TEXT NOT NULL,
-    guangya_file_id TEXT DEFAULT '',
-    local_relative_path TEXT DEFAULT '',
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (instance_id) REFERENCES media_proxy_instances(id) ON DELETE CASCADE,
-    UNIQUE(instance_id, media_item_id, media_source_id)
-);
+""" + MEDIA_PROXY_BINDINGS_TABLE + """
 CREATE INDEX IF NOT EXISTS idx_media_proxy_bindings_lookup
-ON media_proxy_bindings(instance_id, media_item_id, enabled);
+ON media_proxy_bindings(instance_id, upstream_identity, media_item_id, enabled);
 
 CREATE TABLE IF NOT EXISTS media_proxy_playback_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
