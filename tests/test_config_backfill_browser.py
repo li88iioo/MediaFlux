@@ -206,6 +206,7 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
             page.locator("#testAgentModelBtn").click()
             expect(state).to_have_attribute("data-tone", "warning")
         for call in (models.await_args, probe.await_args):
+            assert call is not None
             self.assertEqual((call.kwargs["base_url"], call.kwargs["api_key"]), (draft_url, ""))
         self.assertEqual(self.config_posts, [])
         self.assertEqual(config.get("AGENT_LLM_API_KEY"), "stored-test-key")

@@ -279,11 +279,13 @@ def test_bot_reload_retries_the_saved_config_after_old_polling_thread_exits(bot_
             config.set_and_save({"TG_BOT_TOKEN": "123:old", "TG_CHAT_ID": "456"})
             update = {"TG_BOT_TOKEN": "123:replacement"}
             first = save(update, background_services=True)
+            assert isinstance(first, dict)
             assert first["success"] and first["restart_required"] and first["warnings"]
             assert config.get("TG_BOT_TOKEN") == update["TG_BOT_TOKEN"]
             assert stop_requested.is_set() and old_polling.is_alive()
 
             unchanged = save(update, background_services=True)
+            assert isinstance(unchanged, dict)
             assert unchanged["restart_required"]
             start.assert_not_called()
             reset.assert_not_called()
