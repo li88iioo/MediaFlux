@@ -180,29 +180,60 @@ MediaFlux 严格隔离只读代码与持久化数据：
 
 ## 命令行运维 (CLI)
 
-源码运行与容器内均可通过 `python mediaflux.py` 使用命令行运维工具：
+源码运行与容器内均可通过 `python mediaflux.py` 使用命令行运维工具。源码实例使用自定义目录时，请先加载[下文的目录环境变量](#源码备份与恢复)。容器操作命令见[部署指南](docs/部署指南.md#6-版本升级与数据备份)。
 
 ```bash
-# 启动服务
-python mediaflux.py start [--host HOST] [--port PORT] [--data-dir /path/to/data]
-
 # 查看服务状态
 python mediaflux.py status
 
 # 环境与权限诊断
 python mediaflux.py doctor --source /path/to/downloads --target /path/to/media
 
-# 创建数据备份
-python mediaflux.py backup create --reason before-upgrade
-
-# 校验备份完整性
-python mediaflux.py backup verify /path/to/backup.zip
-
-# 恢复备份（需先停止服务）
-python mediaflux.py backup restore /path/to/backup.zip
-
 # 生成脱敏支持包（排查问题时使用，不含数据库和密码密钥）
 python mediaflux.py support-bundle
+```
+
+### 源码备份与恢复
+
+从源码目录执行下列命令。使用默认目录的实例可直接执行启动与备份命令。使用自定义目录时，将以下绝对路径改为实际值，把同一组环境变量交给启动服务的进程和每个运维终端。下例沿用仅指定 `start --data-dir /path/to/mediaflux-data` 时的目录布局。已有实例若单独指定了配置、缓存、日志或 STRM 目录，保留各自的实际路径。
+
+```bash
+DATA_DIR='/path/to/mediaflux-data'
+export MEDIAFLUX_DATA_DIR="$DATA_DIR"
+export MEDIAFLUX_CONFIG_DIR="$DATA_DIR/config"
+export MEDIAFLUX_CACHE_DIR="$DATA_DIR/cache"
+export MEDIAFLUX_LOG_DIR="$DATA_DIR/logs"
+export MEDIAFLUX_STRM_DIR="$DATA_DIR/strm-data"
+```
+
+```bash
+python mediaflux.py start
+```
+
+服务运行时可创建并校验快照。将 `BACKUP` 改为 `create` 输出的实际 ZIP 路径。
+
+```bash
+python mediaflux.py backup create --reason before-upgrade
+BACKUP='/path/to/backup.zip'
+python mediaflux.py backup verify "$BACKUP"
+```
+
+恢复前先停止目标服务和所有共用其数据目录的实例。在恢复终端设置 `BACKUP` 为实际 ZIP 路径，加载目标实例的目录配置，再用下列命令查看数据库和 `user.env` 的目标绝对路径。异机恢复时，`BACKUP` 使用复制后的 ZIP 路径，目录配置使用新设备上将要启动的实例路径。
+
+```bash
+python - <<'PY'
+from app.runtime_paths import get_runtime_paths
+
+paths = get_runtime_paths()
+print("Database", paths.database_path)
+print("user.env", paths.env_file)
+PY
+```
+
+确认这两个路径都属于目标实例后，校验 ZIP 并恢复。恢复成功后用相同的目录配置重新执行 `python mediaflux.py start`。
+
+```bash
+python mediaflux.py backup verify "$BACKUP" && python mediaflux.py backup restore "$BACKUP"
 ```
 
 ---
