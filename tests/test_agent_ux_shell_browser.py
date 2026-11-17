@@ -385,18 +385,50 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
                 self.assertEqual(unexpected, [])
                 self.assertEqual(errors, [])
 
-    def test_idle_background_wait_keeps_send_and_hides_stop(self):
-        page, unexpected, errors = self.session_stop_shell({'width': 390, 'height': 844}, {
-            'active_turn': None, 'pending_effect_count': 1,
-            'last_turn': {'request_id': 'background', 'turn_id': 'background-turn', 'status': 'waiting'},
-        })
-        self.assertTrue(page.locator('#agentStopSession').is_hidden())
-        self.assertTrue(page.locator('#agentSend').is_hidden())
-        page.locator('#agentPrompt').fill('继续问一个问题')
-        self.assertTrue(page.locator('#agentSend').is_visible())
-        self.assertTrue(page.locator('#agentSend').is_enabled())
-        self.assertEqual(unexpected, [])
-        self.assertEqual(errors, [])
+    def test_idle_background_wait_keeps_sending_available_and_can_be_stopped(self):
+        for width in (320, 390, 1280):
+            with self.subTest(width=width):
+                page, unexpected, errors = self.session_stop_shell({'width': width, 'height': 844}, {
+                    'active_turn': None, 'pending_effect_count': 1,
+                    'last_turn': {'request_id': 'background', 'turn_id': 'background-turn', 'status': 'waiting'},
+                })
+                stop = page.get_by_role('button', name='停止任务')
+                send = page.locator('#agentSend')
+                slot = page.locator('.agent-submit-slot')
+                self.assertTrue(stop.is_enabled())
+                self.assertTrue(send.is_hidden())
+                slot_bounds = slot.bounding_box()
+                page.locator('#agentPrompt').fill('继续问一个问题')
+                self.assertTrue(send.is_visible())
+                self.assertTrue(send.is_enabled())
+                stop_bounds, send_bounds = stop.bounding_box(), send.bounding_box()
+                expected_size = 44 if width <= 680 else 38
+                for bounds in (stop_bounds, send_bounds):
+                    self.assertEqual((bounds['width'], bounds['height']), (expected_size, expected_size))
+                self.assertLessEqual(stop_bounds['x'] + stop_bounds['width'], send_bounds['x'])
+
+                stop.focus()
+                page.keyboard.press('Enter')
+                self.assertTrue(stop.is_disabled())
+                self.assertTrue(send.is_hidden())
+                self.assertEqual(slot.bounding_box(), slot_bounds)
+                stop.evaluate("node => node.dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+                self.assertEqual(page.evaluate('window.__sessionStopCalls'), [{'session_id': 'session_shell_0000000001'}])
+                page.evaluate("""() => {
+                    window.__stopSnapshot = {pending_effect_count: 0,
+                        last_turn: {request_id: 'background', turn_id: 'background-turn',
+                            status: 'cancelled', message: '后台续行已停止'}};
+                    window.__completeSessionStop();
+                }""")
+                page.get_by_text('后台续行已停止', exact=True).wait_for()
+                self.assertTrue(stop.is_hidden())
+                self.assertTrue(send.is_enabled())
+                self.assertEqual(send.bounding_box(), send_bounds)
+                self.assertEqual(slot.bounding_box(), slot_bounds)
+                self.assertEqual(page.locator('#agentPrompt').input_value(), '继续问一个问题')
+                self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
+                self.assertNotIn('/api/agent/query', [call['url'] for call in page.evaluate('window.__kernelCalls')])
+                self.assertEqual((unexpected, errors), ([], []))
 
     def test_session_stop_reports_running_uncancellable_and_unconfirmed_results(self):
         page, unexpected, errors = self.session_stop_shell({'width': 390, 'height': 844})

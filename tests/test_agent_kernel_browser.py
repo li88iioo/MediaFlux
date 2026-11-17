@@ -1639,15 +1639,21 @@ Season 1 / S01E01
         before = page.locator(".agent-submit-slot").bounding_box()
         send_before = page.locator("#agentSend").bounding_box()
         assert send_before is not None
-        self.assertAlmostEqual(send_before["width"], send_before["height"], delta=0.5)
+        self.assertEqual((send_before["width"], send_before["height"]), (44, 44))
         assert before is not None
-        self.assertAlmostEqual(send_before["width"], before["width"], delta=0.5)
+        self.assertAlmostEqual(send_before["x"] + send_before["width"], before["x"] + before["width"], delta=0.5)
         page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
         page.wait_for_function("document.querySelector('#agentSend').getAttribute('aria-busy') === 'true'")
         during = page.locator(".agent-submit-slot").bounding_box()
         assert during is not None
         self.assertAlmostEqual(before["width"], during["width"], delta=0.5)
         self.assertAlmostEqual(before["height"], during["height"], delta=0.5)
+        stop_bounds = page.locator("#agentStopSession").bounding_box()
+        assert stop_bounds is not None
+        for key in ("x", "y"):
+            self.assertAlmostEqual(stop_bounds[key] - during[key], send_before[key] - before[key], delta=0.5)
+        for key in ("width", "height"):
+            self.assertAlmostEqual(stop_bounds[key], send_before[key], delta=0.5)
         layout = page.evaluate("""() => {
           const composer = document.querySelector('.agent-composer').getBoundingClientRect();
           return {

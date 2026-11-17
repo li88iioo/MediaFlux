@@ -11,6 +11,7 @@
     const promptInput = document.getElementById('agentPrompt');
     const sendButton = document.getElementById('agentSend');
     const sessionStopButton = document.getElementById('agentStopSession');
+    const submitSlot = sessionStopButton?.parentElement;
     const newSessionButton = document.getElementById('agentNewSession');
     const mainChatButton = document.getElementById('agentMainChat');
     const replyBar = document.getElementById('agentReplyBar');
@@ -90,6 +91,7 @@
     let sessionLoadGeneration = 0;
     let sessionNavigationGeneration = 0;
     let busy = false;
+    let pendingSessionEffects = false;
     const sessionStopOwners = new Map();
     let initialRestore = consoleNode?.dataset.initialRestore === 'true';
     let startupAttempt = 0;
@@ -270,6 +272,7 @@
             ++sessionLoadGeneration;
             ++sessionNavigationGeneration;
             invalidateActiveRequest();
+            pendingSessionEffects = false;
             setBusy(false);
             expireCandidateCards();
             memoryDrafts.clear();
@@ -2442,6 +2445,7 @@
         }
         active.receiptPollDelay = RECEIPT_POLL_INTERVAL_MS;
         if (payload) active.receiptSnapshotKey = receiptSnapshotKey(payload);
+        if (!payload && handedOff) pendingSessionEffects = true;
         if (active.candidateGroup?.isConnected) active.candidateGroup.dataset.previewing = 'false';
         setBusy(false);
         resizePrompt();
@@ -2541,6 +2545,7 @@
             if (!isCurrentActiveRequest(active)) return;
             if (configureDraftScope(payload.draft_scope) || !isCurrentActiveRequest(active)) return;
             if (payload?.session_id !== active.sessionId || !Array.isArray(payload?.messages)) throw new Error('会话状态响应无效');
+            const hasPendingEffects = updatePendingSessionEffects(payload);
             renderTaskSnapshot(payload.task);
             if (active.receiptOnly) {
                 if (payload.active_turn) {
@@ -2548,9 +2553,8 @@
                     return;
                 }
                 const snapshotKey = receiptSnapshotKey(payload);
-                const pendingCount = Math.max(0, Number(payload.pending_effect_count) || 0);
                 const changed = active.receiptSnapshotKey !== snapshotKey;
-                if (changed || pendingCount === 0) {
+                if (changed || !hasPendingEffects) {
                     const lastTurn = payload.last_turn;
                     const terminalTurn = lastTurn
                         && lastTurn.status !== 'completed'
@@ -2561,7 +2565,7 @@
                     }
                     active.receiptSnapshotKey = snapshotKey;
                 }
-                if (pendingCount > 0) scheduleReceiptObservation(active);
+                if (hasPendingEffects) scheduleReceiptObservation(active);
                 else {
                     finishReceiptObservation(active, {completed: true});
                     refreshSessions({quiet: true});
@@ -2639,20 +2643,30 @@
         syncCandidateButtons();
     }
 
+    function updatePendingSessionEffects(payload) {
+        const pending = Number(payload.pending_effect_count) > 0;
+        if (pending !== pendingSessionEffects) {
+            pendingSessionEffects = pending;
+            syncSend();
+        }
+        return pending;
+    }
+
     function syncSend() {
         const stopping = sessionStopOwners.has(sessionId);
-        const showStop = busy || stopping;
+        const inputBlocked = busy || stopping;
+        const showStop = inputBlocked || pendingSessionEffects;
+        submitSlot?.toggleAttribute('data-background-wait', pendingSessionEffects);
         if (sendButton) {
-            // 有内容才出现发送按钮；任务进行中由停止按钮占位。
-            sendButton.hidden = showStop || !promptInput?.value.trim();
-            sendButton.disabled = showStop || initialRestore || !promptInput?.value.trim();
+            sendButton.hidden = inputBlocked || !promptInput?.value.trim();
+            sendButton.disabled = inputBlocked || initialRestore || !promptInput?.value.trim();
         }
         if (sessionStopButton) {
             sessionStopButton.hidden = !showStop;
             sessionStopButton.disabled = initialRestore || stopping;
             sessionStopButton.setAttribute('aria-busy', String(stopping));
         }
-        nextActions?.querySelectorAll('[data-agent-action-key]').forEach(button => { button.disabled = showStop || initialRestore; });
+        nextActions?.querySelectorAll('[data-agent-action-key]').forEach(button => { button.disabled = inputBlocked || initialRestore; });
     }
 
     function resizePrompt() {
@@ -3350,6 +3364,7 @@
         clearTaskSnapshot();
         invalidateActiveRequest();
         clearDownloadCards();
+        pendingSessionEffects = false;
         return ++sessionLoadGeneration;
     }
 
@@ -3375,7 +3390,8 @@
                 restoreDraft();
             }
             if (viewingChannel) setChannelMode('');
-            if (!(Number(payload.pending_effect_count) > 0)) receiptObservationWindows.delete(targetId);
+            const hasPendingEffects = updatePendingSessionEffects(payload);
+            if (!hasPendingEffects) receiptObservationWindows.delete(targetId);
             if (active) {
                 renderTaskSnapshot(payload.task);
                 const lastTurn = payload.last_turn;
@@ -3405,7 +3421,7 @@
                     pollTimer: null,
                     observerController: null,
                     observing: true,
-                } : Number(payload.pending_effect_count) > 0 ? {
+                } : hasPendingEffects ? {
                     controller: new AbortController(),
                     requestId: String(payload.last_turn?.request_id || ''),
                     turnId: String(payload.last_turn?.turn_id || ''),

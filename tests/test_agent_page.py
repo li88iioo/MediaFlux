@@ -400,14 +400,6 @@ class AgentPageTests(InitializedWebTestCase):
                 re.DOTALL,
             ),
         )
-        self.assertRegex(
-            styles,
-            re.compile(
-                r"@media \(max-width: 680px\)[\s\S]*?"
-                r"\.agent-send \{[^}]*width: 44px;[^}]*height: 44px;",
-                re.DOTALL,
-            ),
-        )
         self.assertNotIn('id="closeAgentShortcuts"', template)
 
     def test_agent_styles_reserve_layout_and_support_mobile_and_reduced_motion(self):
@@ -420,32 +412,7 @@ class AgentPageTests(InitializedWebTestCase):
                 re.DOTALL,
             ),
         )
-        self.assertRegex(
-            source,
-            re.compile(
-                r"\.agent-submit-slot\s*\{[^}]*width:\s*44px[^}]*"
-                r"height:\s*44px[^}]*min-width:\s*44px",
-                re.DOTALL,
-            ),
-        )
-        self.assertRegex(
-            source,
-            re.compile(
-                r"\.agent-send\s*\{[^}]*"
-                r"width:\s*38px[^}]*height:\s*38px[^}]*min-width:\s*38px",
-                re.DOTALL,
-            ),
-        )
-        self.assertRegex(
-            source,
-            re.compile(
-                r"@media \(max-width:\s*680px\)[\s\S]*?"
-                r"\.agent-send\s*\{[^}]*"
-                r"width:\s*44px[^}]*height:\s*44px",
-                re.DOTALL,
-            ),
-        )
-        # 状态行及耗时的布局稳定性由 UX 浏览器用例实测。
+        # 发送/停止按钮的尺寸与位置、状态行和耗时的稳定性由 UX 浏览器用例实测。
         self.assertIn(".agent-confirmation-executing", source)
         self.assertRegex(
             source,
