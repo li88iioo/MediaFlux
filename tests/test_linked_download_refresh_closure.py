@@ -12,6 +12,7 @@ from app.modules.local_media_notifications import (
 )
 from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
 from app.modules.telegram_notification_center import NotificationPublishResult
+from app.notifier import NotificationEvent
 from tests.support import isolated_test_database
 
 
@@ -70,14 +71,36 @@ def test_refresh_failure_survives_resultless_notification_rebuild(notification_c
     assert '入库完成' not in str(rebuilt.title)
 
 
-def test_unrelated_warning_does_not_invent_refresh_failure(notification_case):
+def test_legacy_qb_removal_failure_does_not_invent_refresh_failure(notification_case):
     rid, tid, _sid = notification_case
-    local_media_repo.update_local_media_task(tid, warning='qB任务移除失败')
+    local_media_repo.update_local_media_task(
+        tid, warning='qB任务移除失败：媒体已安全入库，任务保持暂停；请在 qB 手动删除任务，来源垃圾文件已保留',
+    )
     event = build_download_lifecycle_event(download_requests_repo.get_download_request(rid), stats={'media_refresh_status':'completed'})
-    assert event.state == 'completed'
-    refresh_text = dict(event.fields)['媒体库']
+    assert event.state == 'error'
+    fields = dict(event.fields)
+    assert '手动移除' in str(fields['qB 收尾'])
+    refresh_text = fields['媒体库']
     assert isinstance(refresh_text, str)
     assert '刷新完成' in refresh_text
+
+
+@pytest.mark.parametrize(('previous_refresh', 'expected'), [
+    ('Jellyfin 请求已受理', 'Jellyfin 请求已受理'),
+    ('已排队（合并刷新） ⏳', '未入队'),
+])
+def test_rebuilt_linked_card_keeps_peer_refresh_and_corrects_stale_local_value(
+    notification_case, previous_refresh, expected,
+):
+    rid, tid, _sid = notification_case
+    local_media_repo.update_local_media_task(tid, warning='媒体库刷新未入队：无可用刷新目标')
+    download_requests_repo.update_download_request(
+        rid, targets='both', gy_status='completed', organize_status='completed', strm_status='completed',
+    )
+    previous = NotificationEvent('旧下载卡', fields=(('媒体库', previous_refresh),))
+    with patch('app.modules.telegram_download_lifecycle.get_notification_thread_event', return_value=previous):
+        event = build_download_lifecycle_event(download_requests_repo.get_download_request(rid))
+    assert dict(event.fields)['媒体库'] == expected
 
 
 def test_peer_refresh_success_does_not_hide_local_refresh_failure(notification_case):

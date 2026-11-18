@@ -37,6 +37,7 @@ from app.modules.local_media_models import LocalMediaTask
 from tests.support import (
     IsolatedDatabaseTestCase,
     isolated_test_database,
+    media_refresh_providers,
     release_parse_result,
 )
 
@@ -1986,6 +1987,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         mode: str = "move",
         conflict_indexes: tuple[int, ...] = (),
         execute: bool = True,
+        refresh: bool = False,
     ):
         source_root, target_root = root / "downloads", root / "library"
         source_root.mkdir(parents=True)
@@ -2006,7 +2008,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         inspection = service.inspect_source("admin", source_id, source_root)
         rules = OrganizeRules(
             region_split=False, year_split=False, naming_scope="both",
-            conflict_strategy=1, emby_refresh=False, clean_empty=False,
+            conflict_strategy=1, emby_refresh=refresh, clean_empty=False,
             media_probe_enabled=False,
         )
         with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules):
@@ -2028,6 +2030,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_download_notification_uses_real_local_media_file_outcome(self):
         from app.modules import telegram_notification_center as center
+        from app.modules.local_media_notifications import build_local_media_event
         from app.modules.local_media_outcomes import local_media_task_outcome
         from app.modules.telegram_download_lifecycle import publish_download_lifecycle
         from app.modules.telegram_notification_center import (
@@ -2060,6 +2063,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             patch.object(center, "wake_telegram_notification_dispatcher"),
             patch.object(center, "send_event_result", side_effect=AssertionError("Telegram transport is disabled")),
             patch.object(center, "edit_event_result", side_effect=AssertionError("Telegram transport is disabled")),
+            media_refresh_providers(),
             tempfile.TemporaryDirectory() as temporary_root,
         ):
             root = Path(temporary_root)
@@ -2068,13 +2072,26 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                     service, task_id = self._prepare_notification_local_task(
                         root / name, name=f"notification-{name}", filenames=filenames,
                         media_type=media_type, mode=mode, conflict_indexes=conflicts,
+                        execute=False, refresh=True,
                     )
                     try:
-                        task = local_media_repo.get_local_media_task(task_id, owner="admin")
+                        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
+                        result = service.execute_task("admin", task_id)
+                        self.assertEqual(result["media_refresh_status"], "skipped")
+                        task = _require_task(task_id)
                         outcome = local_media_task_outcome(
                             task, local_media_repo.list_local_media_task_items(task_id, owner="admin"),
                         )
                         self.assertEqual(outcome["file_outcome"], expected_outcome)
+                        source = local_media_repo.get_local_media_source(task.source_id, owner="admin")
+                        for payload in (result, None):
+                            standalone = build_local_media_event(task, source, payload)
+                            standalone_fields = dict(standalone.fields)
+                            self.assertIn(expected_fields[expected_outcome], str(standalone_fields["执行结果"]))
+                            self.assertEqual(standalone_fields["媒体库刷新"], "未入队")
+                            self.assertNotIn("警告", render_event(standalone))
+                            if expected_outcome in {"preview_only", "conflict_skipped"}:
+                                self.assertNotIn("整理完成", str(standalone.title))
 
                         request_id, _ = download_requests_repo.create_download_request(
                             f"notification-local-{name}", "magnet", title=name, chat_id="100",
@@ -2101,6 +2118,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                         local_value = dict(event.fields)["本地整理"]
                         assert isinstance(local_value, str)
                         self.assertIn(expected_fields[expected_outcome], local_value)
+                        self.assertEqual(dict(event.fields)["媒体库"], "未入队")
                         if expected_outcome in {"preview_only", "conflict_skipped"}:
                             self.assertEqual(event.title, "✅ 下载完成（自动入库已跳过）")
                             self.assertEqual(event.state, "downloaded")

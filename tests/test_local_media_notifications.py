@@ -24,7 +24,15 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             self.source_id, "", "/downloads/Movie/file.mkv", owner="admin", trigger="manual"
         )
 
+    def _record_archive(self):
+        local_media_repo.add_local_media_task_item(
+            self.task_id, "/downloads/Movie/file.mkv", "/media/Movies/Film/Film.mkv",
+            role="video", action="move",
+        )
+        local_media_repo.update_local_media_task(self.task_id, status="completed", completed_at=db.now())
+
     def test_completed_event_is_detailed_and_hides_absolute_paths(self):
+        self._record_archive()
         task = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         source = local_media_repo.get_local_media_source(self.source_id, owner="admin")
         event = build_local_media_event(task, source, {
@@ -49,6 +57,7 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
 
 
     def test_refresh_failure_is_not_reported_as_completed(self):
+        self._record_archive()
         task = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         source = local_media_repo.get_local_media_source(self.source_id, owner="admin")
         rendered = render_event(build_local_media_event(task, source, {
@@ -62,7 +71,8 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
         self.assertIn("媒体库刷新：</b> 刷新失败（需处理） ❌", rendered)
         self.assertNotIn("媒体库刷新：</b> 刷新完成", rendered)
 
-    def test_unrelated_warning_does_not_change_successful_refresh_status(self):
+    def test_qb_cleanup_warning_does_not_change_successful_refresh_status(self):
+        self._record_archive()
         task = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         source = local_media_repo.get_local_media_source(self.source_id, owner="admin")
         rendered = render_event(build_local_media_event(task, source, {
@@ -73,7 +83,8 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             "media_refresh_status": "completed",
         }))
         self.assertIn("媒体库刷新：</b> 刷新完成 🎯", rendered)
-        self.assertNotIn("完成（有警告）", rendered)
+        self.assertIn("本地媒体整理部分完成", rendered)
+        self.assertIn("手动移除", rendered)
 
     def test_requires_manual_event_contains_reason_and_candidate(self):
         local_media_repo.update_local_media_task(
@@ -151,15 +162,17 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
         )
 
     def test_notify_uses_structured_sender_without_real_transport(self):
-        result = {"status": "completed", "moved": [], "deleted_junk": [], "warnings": []}
+        self._record_archive()
         with patch(
             "app.modules.telegram_notification_center.publish_notification_thread",
             return_value=NotificationPublishResult(True, delivered=True, status="sent"),
         ) as publisher:
-            self.assertTrue(notify_local_media_task(self.task_id, result, owner="admin"))
+            self.assertTrue(notify_local_media_task(self.task_id, owner="admin"))
         publisher.assert_called_once()
         self.assertEqual(publisher.call_args.args[0], f"local-media:{self.task_id}")
-        self.assertIn("本地媒体整理完成", publisher.call_args.args[1].title)
+        event = publisher.call_args.args[1]
+        self.assertIn("本地媒体整理完成", event.title)
+        self.assertEqual(dict(event.fields)["媒体库刷新"], "状态未记录")
 
     def test_notify_binds_local_confirmation_buttons_to_explicit_chat(self):
         local_media_repo.update_local_media_task(
@@ -203,18 +216,23 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
         self.assertNotIn("/srv/private", rendered)
 
     def test_warning_and_failure_details_never_expose_absolute_paths(self):
+        self._record_archive()
+        conflict_note = "按冲突策略保留现有文件，跳过 1 项"
+        refresh_warning = "Jellyfin 刷新失败: /srv/media/Movies; timeout"
+        local_media_repo.update_local_media_task(
+            self.task_id, warning=f" {conflict_note}； {refresh_warning}；",
+        )
         task = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         source = local_media_repo.get_local_media_source(self.source_id, owner="admin")
-        completed = render_event(build_local_media_event(task, source, {
-            "status": "completed", "moved": [], "deleted_junk": [],
-            "warnings": ["Jellyfin 刷新失败: /srv/media/Movies"],
-        }))
+        for payload in ({"warnings": [conflict_note, refresh_warning]}, None):
+            completed = render_event(build_local_media_event(task, source, payload))
+            self.assertNotIn("/srv/media", completed)
+            self.assertIn("1 条警告", completed)
+            self.assertIn("刷新失败（需处理）", completed)
         failed = render_event(build_local_media_event(
             task, source, {"status": "failed"}, error="移动失败: C:\\Media\\Movie.mkv"
         ))
-        self.assertNotIn("/srv/media", completed)
         self.assertNotIn("C:\\Media", failed)
-        self.assertIn("1 条警告", completed)
         self.assertIn("任务详情", failed)
 
     def test_failure_event_uses_grouped_operational_card(self):

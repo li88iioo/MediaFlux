@@ -61,13 +61,18 @@ class LocalMediaRefreshTests(TestCase):
         request.assert_called_once_with("/Library/VirtualFolders")
 
     def test_unbound_refresh_batches_paths_and_isolates_provider_failures(self):
+        plans = [
+            SimpleNamespace(provider="", library_id="", library_name="", target=Path(path))
+            for path in ("/media/B/Film.mkv", "/media/A/Film.mkv", "/media/A/Film.srt")
+        ]
         with patch(
             "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
             return_value={"Jellyfin": "failed", "Emby": "queued"},
         ) as enqueue:
-            warnings = LocalMediaService._refresh_paths({"/media/B", "/media/A"})
+            status, warnings = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], plans))
 
         enqueue.assert_called_once_with(["/media/A", "/media/B"])
+        self.assertEqual(status, "failed")
         self.assertTrue(any("Jellyfin 刷新入队失败" in item for item in warnings))
         self.assertFalse(any("Emby" in item for item in warnings))
 
@@ -87,14 +92,12 @@ class LocalMediaRefreshTests(TestCase):
         )]
         with patch(
             "app.modules.media_server_profiles.list_configured_profiles", return_value=[profile]
-        ), patch("app.clients.jellyfin.JellyfinClient", return_value=client), patch.object(
-            LocalMediaService, "_refresh_paths", return_value=[]
-        ) as fallback, patch(
+        ), patch("app.clients.jellyfin.JellyfinClient", return_value=client), patch(
             "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
             return_value={"Jellyfin": "queued"},
         ) as enqueue:
-            warnings = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], plans))
-        self.assertEqual(warnings, [])
+            result = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], plans))
+        self.assertEqual(result, ("queued", []))
         client.list_virtual_folders.assert_not_called()
         enqueue.assert_called_once_with(
             ["/media/Movies/Film"],
@@ -103,7 +106,6 @@ class LocalMediaRefreshTests(TestCase):
         )
         client.refresh_for_paths.assert_not_called()
         client.refresh_library.assert_not_called()
-        fallback.assert_not_called()
 
     def test_bound_target_maps_container_path_to_selected_server_location(self):
         profile = SimpleNamespace(
@@ -129,9 +131,9 @@ class LocalMediaRefreshTests(TestCase):
             "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
             return_value={"Jellyfin": "queued"},
         ) as enqueue:
-            warnings = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], plans))
+            result = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], plans))
 
-        self.assertEqual(warnings, [])
+        self.assertEqual(result, ("queued", []))
         enqueue.assert_called_once_with(
             ["//NAS/Video/Anime/作品/Season 1"],
             providers=("jellyfin",),

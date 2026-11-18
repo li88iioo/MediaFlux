@@ -71,6 +71,26 @@ class DownloadTrackerLifecycleTests(unittest.TestCase):
         self.assertIn("候选卡会单独发送", str(event.footer))
         self.assertIn("Web 待确认队列", str(event.footer))
 
+    def test_download_failure_title_distinguishes_all_targets_from_partial_success(self) -> None:
+        cases = (
+            ("failed", "", "failed", "❌ 下载失败"),
+            ("", "failed", "failed", "❌ 下载失败"),
+            ("failed", "failed", "failed", "❌ 下载失败"),
+            ("", "", "failed", "❌ 下载失败"),
+            ("failed", "completed", "completed", "⚠️ 下载入库部分完成"),
+        )
+        with patch(
+            "app.modules.telegram_download_lifecycle.get_notification_thread_event",
+            return_value=None,
+        ):
+            for qb, gy, status, title in cases:
+                with self.subTest(qb=qb, gy=gy, status=status):
+                    event = build_download_lifecycle_event(
+                        {"status": status, "qb_status": qb, "gy_status": gy}, probe_progress={},
+                    )
+                    self.assertEqual(event.title, title)
+                    self.assertEqual(event.state, "error")
+
     def test_stop_returns_false_while_worker_remains_alive(self) -> None:
         class StubbornThread:
             def is_alive(self) -> bool:

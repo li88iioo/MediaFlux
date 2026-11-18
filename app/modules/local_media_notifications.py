@@ -9,7 +9,15 @@ from app import config
 from app.repositories import local_media as local_media_repo
 from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
-from app.modules.local_media_outcomes import local_media_refresh_status
+from app.modules.local_media_outcomes import (
+    LOCAL_REFRESH_LABELS,
+    QB_CLEANUP_WARNING,
+    local_media_archive_stage,
+    local_media_qb_cleanup_pending,
+    local_media_refresh_status,
+    local_media_task_outcome,
+    local_media_warning_count,
+)
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from app.sensitive_data import redact_sensitive_text
 
@@ -84,32 +92,22 @@ def build_local_media_event(
         ("目标文件", target_name),
     ]
     lines: list[str] = []
+    qb_cleanup_pending = local_media_qb_cleanup_pending(task, result)
+    if qb_cleanup_pending:
+        fields.append(("qB 收尾", QB_CLEANUP_WARNING))
 
     if status == "completed":
-        moved = list(_value(payload, "moved", []) or [])
-        deleted = list(_value(payload, "deleted_junk", []) or [])
-        warnings = list(_value(payload, "warnings", []) or [])
-        if not warnings and not result:
-            warnings = [
-                item
-                for item in str(getattr(task, "warning", "") or "").split("；")
-                if item
-            ]
-        refresh_status = local_media_refresh_status(task, result) or "completed"
-        refresh_label = {
-            "completed": "刷新完成 🎯",
-            "queued": "已排队（合并刷新） ⏳",
-            "failed": "刷新失败（需处理） ❌",
-            "skipped": "未启用",
-        }.get(refresh_status, "状态未知")
+        items = local_media_repo.list_local_media_task_items(task.id, owner=task.owner)
+        outcome = local_media_task_outcome(task, items)
+        archive_status, archive_detail = local_media_archive_stage(outcome)
+        warning_count = local_media_warning_count(task, result)
+        refresh_status = local_media_refresh_status(task, result, archive_status=archive_status)
+        deleted = len(_value(payload, "deleted_junk", []) or [])
+        summary = f"{archive_detail} · 清理 {deleted} 个确认垃圾文件" if deleted else archive_detail
         fields.extend(
             (
-                (
-                    "执行结果",
-                    f"已移动 {len(moved)} · "
-                    f"清理 {len(deleted)} 个确认垃圾文件 · 警告 {len(warnings)}",
-                ),
-                ("媒体库刷新", refresh_label),
+                ("执行结果", summary),
+                ("媒体库刷新", LOCAL_REFRESH_LABELS.get(refresh_status, "状态未记录")),
             )
         )
         media = list(_value(payload, "media", []) or [])
@@ -126,11 +124,18 @@ def build_local_media_event(
                 lines.append(f"└── 📄 {target_name}")
         if len(media) > 8:
             lines.append(f"…另有 {len(media) - 8} 个媒体未展示")
-        if warnings:
-            lines.append(f"⚠️ 共有 {len(warnings)} 条警告，请到本地媒体任务详情查看。")
-        title = "✅ 本地媒体整理完成"
-        if refresh_status == "failed":
+        if warning_count:
+            lines.append(f"⚠️ 共有 {warning_count} 条警告，请到本地媒体任务详情查看。")
+        if qb_cleanup_pending or refresh_status == "failed":
             title = "⚠️ 本地媒体整理部分完成"
+        elif outcome["file_outcome"] == "preview_only":
+            title = "ℹ️ 本地媒体预览完成"
+        elif archive_status == "skipped":
+            title = "ℹ️ 本地媒体整理已跳过"
+        elif archive_status == "completed":
+            title = "✅ 本地媒体整理完成"
+        else:
+            title = "ℹ️ 本地媒体归档结果待核对"
         return NotificationEvent(
             title,
             fields=tuple(fields),
@@ -272,36 +277,33 @@ def notify_local_media_task(
     task = local_media_repo.get_local_media_task(task_id, owner=owner)
     if task is None:
         return False
-    source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
-    event = build_local_media_event(
-        task,
-        source,
-        result,
-        error=error,
-        chat_id=chat_id,
-    )
+    status = str((result or {}).get("status") or task.status)
     linked_requests = local_media_repo.list_download_requests_for_local_media_task(task_id)
+    event = None
+    if not linked_requests or status == "requires_manual":
+        source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
+        event = build_local_media_event(task, source, result, error=error, chat_id=chat_id)
+
+    accepted = False
     if linked_requests:
         from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 
-        accepted = False
         for request in linked_requests:
             outcome = publish_download_lifecycle(
                 int(request["id"]),
                 stats=result,
             )
             accepted = bool(outcome) or accepted
-        # 人工候选按钮必须独立保留；其余结果已合并到下载事务消息。
-        if event.actions:
-            from app.modules.organize_confirmations import publish_confirmation_event
-
-            accepted = publish_confirmation_event(event, chat_id=chat_id) or accepted
+    if event is None:
         return accepted
 
+    # 人工候选按钮必须独立保留；其余结果已合并到下载事务消息。
     if event.actions:
         from app.modules.organize_confirmations import publish_confirmation_event
 
-        return publish_confirmation_event(event, chat_id=chat_id)
+        return publish_confirmation_event(event, chat_id=chat_id) or accepted
+    if linked_requests:
+        return accepted
 
     from app.modules.telegram_notification_center import publish_notification_thread
     from app.modules.telegram_notification_policy import (
@@ -309,7 +311,6 @@ def notify_local_media_task(
         NotificationTopic,
     )
 
-    status = str((result or {}).get("status") or getattr(task, "status", ""))
     importance = (
         NotificationImportance.ERROR
         if str(event.title).startswith(("❌", "⚠️"))
@@ -324,9 +325,6 @@ def notify_local_media_task(
             topic=NotificationTopic.LOCAL_MEDIA,
             importance=importance,
             chat_id=chat_id,
-            topic_enabled=(
-                config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED")
-                and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY")
-            ),
+            topic_enabled=notifications_enabled,
         )
     )

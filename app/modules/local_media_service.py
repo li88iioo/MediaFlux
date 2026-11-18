@@ -41,6 +41,12 @@ from app.modules.local_media_models import (
     canonical_local_media_content_path,
     local_media_paths_overlap,
 )
+from app.modules.local_media_outcomes import (
+    LOCAL_CONFLICT_SKIP_PREFIX,
+    LOCAL_PREVIEW_WARNING,
+    LOCAL_REFRESH_NO_TARGET,
+    QB_CLEANUP_WARNING,
+)
 from app.modules.local_media_recognition_summary import (
     build_recognition_summary,
     serialize_recognition_summary,
@@ -1710,23 +1716,10 @@ class LocalMediaService:
         }
 
     @staticmethod
-    def _refresh_paths(paths: set[str]) -> list[str]:
-        """未绑定目标也只持久入队；实际刷新由统一合并器执行。"""
+    def _refresh_plans(plans: list[LocalMovePlan]) -> tuple[str, list[str]]:
+        """持久提交映射后的变化路径，绑定由刷新消费者延迟校验。"""
         from app.modules.media_refresh_coordinator import enqueue_media_refresh_paths
 
-        try:
-            results = enqueue_media_refresh_paths(sorted(paths))
-        except Exception as exc:
-            return [f"媒体库刷新入队失败: {exc}"]
-        warnings: list[str] = []
-        for label, status in results.items():
-            if status == "failed":
-                warnings.append(f"{label} 刷新入队失败")
-        return warnings
-
-    @staticmethod
-    def _refresh_plans(plans: list[LocalMovePlan]) -> list[str]:
-        """持久提交映射后的变化路径，绑定由刷新消费者延迟校验。"""
         warnings: list[str] = []
         bound_paths: dict[tuple[str, str, str], set[str]] = {}
         unbound_paths: set[str] = set()
@@ -1757,24 +1750,29 @@ class LocalMediaService:
                 (provider, library_id, library_name), set(),
             ).add(target_parent)
 
+        queued = False
         if unbound_paths:
-            warnings.extend(LocalMediaService._refresh_paths(unbound_paths))
-        if not bound_paths:
-            return warnings
-
-        from app.modules.media_refresh_coordinator import enqueue_media_refresh_paths
+            try:
+                receipts = enqueue_media_refresh_paths(sorted(unbound_paths))
+            except Exception as exc:
+                warnings.append(f"媒体库刷新入队失败: {exc}")
+            else:
+                queued = "queued" in receipts.values()
+                warnings.extend(f"{label} 刷新入队失败" for label, status in receipts.items() if status == "failed")
 
         # 文件已落盘：先保存绑定和映射后的路径，再由统一消费者查询/校验媒体库。
         # 此处不做网络 I/O，媒体服务器临时不可用也不会丢掉刷新意图。
         for (provider, library_id, library_name), paths in sorted(bound_paths.items()):
-            queued = enqueue_media_refresh_paths(
+            receipt = enqueue_media_refresh_paths(
                 sorted(paths), providers=(provider,),
                 library_binding={"id": library_id, "name": library_name},
             )
             label = {"jellyfin": "Jellyfin", "emby": "Emby"}.get(provider, provider)
-            if queued.get(label) != "queued":
+            if receipt.get(label) == "queued":
+                queued = True
+            else:
                 warnings.append(f"{label} 刷新入队失败 {library_name or library_id}")
-        return warnings
+        return ("failed" if warnings else "queued" if queued else "skipped"), warnings
 
     @staticmethod
     def _committed_move_failure_message(
@@ -2059,15 +2057,14 @@ class LocalMediaService:
                     })
             local_media_repo.update_local_media_task(task_id, owner=owner, **recognition_fields)
             if source.mode == "preview_only":
-                warning = "仅预览模式：未移动文件"
                 local_media_repo.update_local_media_task(
-                    task_id, owner=owner, status="completed", warning=warning,
+                    task_id, owner=owner, status="completed", warning=LOCAL_PREVIEW_WARNING,
                     completed_at=db.now(), error="",
                 )
                 return {
                     "status": "completed", "task_id": task_id, "preview": preview,
                     "moved": [], "deleted_junk": [], "retained_junk": [],
-                    "qb_cleanup_pending": False, "warnings": [warning],
+                    "qb_cleanup_pending": False, "warnings": [LOCAL_PREVIEW_WARNING],
                     "media_refresh_status": "skipped", "media": preview.get("matches", []),
                 }
             if task.qb_hash and qb_client is not None:
@@ -2097,7 +2094,7 @@ class LocalMediaService:
             local_media_repo.update_local_media_task(task_id, owner=owner, status="verifying")
             warnings = list(result.warnings)
             if skipped_plans:
-                warnings.append(f"按冲突策略保留现有文件，跳过 {len(skipped_plans)} 项")
+                warnings.append(f"{LOCAL_CONFLICT_SKIP_PREFIX}{len(skipped_plans)} 项")
             cleanup_allowed = not task.qb_hash
             qb_cleanup_pending = False
             if task.qb_hash and qb_client is not None:
@@ -2109,10 +2106,7 @@ class LocalMediaService:
                 except Exception as exc:
                     logger.warning("qB 任务收尾失败，保留待清理 type=%s", type(exc).__name__)
                     qb_cleanup_pending = True
-                    warnings.append(
-                        "qB 任务移除失败：媒体已安全入库，任务保持暂停；"
-                        "请在 qB 手动删除任务，来源垃圾文件已保留"
-                    )
+                    warnings.append(f"{QB_CLEANUP_WARNING}。来源垃圾文件已保留")
             cleanup_result = None
             cleanup_candidates = preview.get("_cleanup_candidates") or []
             if cleanup_allowed and (cleanup_candidates or rules.clean_empty):
@@ -2126,10 +2120,11 @@ class LocalMediaService:
                 warnings.extend(cleanup_result.warnings)
             local_media_repo.update_local_media_task(task_id, owner=owner, status="refreshing")
             media_refresh_status = "skipped"
-            if rules.emby_refresh:
-                refresh_warnings = self._refresh_plans(executable_plans)
+            if rules.emby_refresh and result.moved:
+                media_refresh_status, refresh_warnings = self._refresh_plans(executable_plans)
                 warnings.extend(refresh_warnings)
-                media_refresh_status = "failed" if refresh_warnings else "queued"
+                if media_refresh_status == "skipped":
+                    warnings.append(LOCAL_REFRESH_NO_TARGET)
             final_status = (
                 "requires_manual" if result.status == "requires_manual" else "completed"
             )

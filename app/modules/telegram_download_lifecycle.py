@@ -14,6 +14,10 @@ from app.modules.agent_download_verification_notifications import (
     _RESULT_LABELS as _VERIFICATION_RESULT_LABELS,
 )
 from app.modules.local_media_outcomes import (
+    LOCAL_REFRESH_LABELS,
+    QB_CLEANUP_WARNING,
+    local_media_archive_stage,
+    local_media_qb_cleanup_pending,
     local_media_refresh_status,
     local_media_task_outcome,
 )
@@ -109,34 +113,25 @@ def _download_label(row) -> str:
     return " · ".join(parts) or _label(_value(row, "status"), empty="等待开始")
 
 
-def _archive_stage(row, task) -> tuple[str, str, str]:
+def _archive_stage(row, task, downloads: set[str]) -> tuple[str, str, str]:
     """一次读取本地文件事实，阶段文案、总状态及投递级别共同使用。"""
     local_status = _status(_value(row, "local_import_status"))
     organize_status = _status(_value(row, "organize_status"))
     if local_status == "completed" and task is not None:
         outcome = local_media_task_outcome(task, local_media_repo.list_local_media_task_items(task.id))
-        kind = outcome["file_outcome"]
-        archived, skipped = outcome["archived_video_count"], outcome["skipped_video_count"]
-        if kind == "preview_only":
-            return "本地整理", "skipped", "仅预览，未移动文件"
-        if kind == "conflict_skipped":
-            return "本地整理", "skipped", f"冲突跳过 {skipped} 项，未新增归档"
-        if kind not in {"archived", "partial"} or outcome["unknown_video_count"]:
-            return "本地整理", "manual_review", "归档结果待核对"
-        detail = f"已归档 {archived} 项" + (f" · 冲突跳过 {skipped} 项" if skipped else "")
-        return "本地整理", "completed", detail
+        status, detail = local_media_archive_stage(outcome)
+        return "本地整理", status, detail
     if local_status:
         return "本地整理", local_status, _label(local_status)
     if organize_status:
         return "光鸭整理", organize_status, _label(organize_status)
-    downloads = {_status(_value(row, key)) for key in ("qb_status", "gy_status")} - {""}
     if downloads and downloads.issubset({"failed", "manual_review", "cancelled", "resubmitted"}):
         return "自动整理", "", "未启动（需核对下载状态）" if "manual_review" in downloads else "未启动（下载已停止）"
     detail = "尚无入库完成记录" if _status(_value(row, "status")) in {"completed", "success"} else "等待下载完成"
     return "自动整理", "", detail
 
 
-def _overall_state(row, *, archive_status: str, verification_status: str = "", refresh_status: str = "") -> str:
+def _overall_state(row, *, archive_status: str, verification_status: str = "", local_issue: bool = False) -> str:
     states = {
         _status(_value(row, key))
         for key in (
@@ -148,7 +143,7 @@ def _overall_state(row, *, archive_status: str, verification_status: str = "", r
     verification = _status(verification_status)
     if states.intersection(_ATTENTION_STATES) or verification == "attention":
         return "attention"
-    if states.intersection(_ERROR_STATES) or refresh_status == "failed":
+    if states.intersection(_ERROR_STATES) or local_issue:
         return "error"
     if states.intersection(_PROCESSING_STATES) or verification in {"pending", "running", "retry_wait"}:
         return "processing"
@@ -245,12 +240,18 @@ def build_download_lifecycle_event(
     suffix = reference.removeprefix("local-media-task:")
     task_id = int(suffix) if reference.startswith("local-media-task:") and len(suffix) <= 19 and suffix.isascii() and suffix.isdigit() else 0
     task = local_media_repo.get_local_media_task(task_id) if 0 < task_id < 2**63 else None
-    archive_name, archive_status, archive_value = _archive_stage(row, task)
-    refresh_status = local_media_refresh_status(task, stats) if task is not None else ""
-    state = _overall_state(row, archive_status=archive_status, verification_status=verification_status, refresh_status=refresh_status)
+    downloads = {_status(_value(row, key)) for key in ("qb_status", "gy_status")} - {""}
+    downloads_failed = downloads == {"failed"} or (not downloads and _status(_value(row, "status")) == "failed")
+    archive_name, archive_status, archive_value = _archive_stage(row, task, downloads)
+    refresh_status = local_media_refresh_status(task, stats, archive_status=archive_status) if task is not None else ""
+    qb_cleanup_pending = task is not None and local_media_qb_cleanup_pending(task, stats)
+    state = "error" if downloads_failed else _overall_state(
+        row, archive_status=archive_status, verification_status=verification_status,
+        local_issue=qb_cleanup_pending or refresh_status == "failed",
+    )
     title = {
         "attention": "⚠️ 下载入库需要处理",
-        "error": "⚠️ 下载入库部分完成",
+        "error": "❌ 下载失败" if downloads_failed else "⚠️ 下载入库部分完成",
         "completed": "✅ 下载与入库完成",
         "downloaded": "✅ 下载完成（自动入库已跳过）" if archive_status == "skipped" else "✅ 下载完成",
         "processing": "⏳ 下载与入库处理中",
@@ -267,15 +268,17 @@ def build_download_lifecycle_event(
         ("下载", _download_label(row)),
         (archive_name, archive_value),
     ]
+    if qb_cleanup_pending:
+        fields.append(("qB 收尾", QB_CLEANUP_WARNING))
     strm_status = _status(_value(row, "strm_status"))
     if strm_status:
         fields.append(("STRM", _label(strm_status)))
-    refresh_value = (media_refresh or "").strip() or {
-        "failed": "刷新失败（需处理） ❌",
-        "queued": "已排队（合并刷新） ⏳",
-        "completed": "刷新完成 🎯",
-        "skipped": "未启用",
-    }.get(refresh_status, "") or _previous_field(previous, "媒体库")
+    previous_refresh = _previous_field(previous, "媒体库")
+    local_refresh = LOCAL_REFRESH_LABELS.get(refresh_status, "")
+    if refresh_status == "skipped" and strm_status and previous_refresh not in LOCAL_REFRESH_LABELS.values():
+        # 本地未入队时保留同请求 STRM 已发布的刷新回执，淘汰旧本地入队文案。
+        local_refresh = previous_refresh or local_refresh
+    refresh_value = (media_refresh or "").strip() or local_refresh or previous_refresh
     if refresh_status == "failed":
         # 同请求另一后端的刷新成功不能掩盖本地入队失败。
         refresh_value = "本地媒体库刷新失败（需处理） ❌"

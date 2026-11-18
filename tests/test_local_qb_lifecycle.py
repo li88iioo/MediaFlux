@@ -1,6 +1,7 @@
 """qB 任务与本地媒体移动的安全调用顺序。"""
 from __future__ import annotations
 
+import os
 from typing import cast
 from app.modules.scraper import TMDBScraper
 
@@ -9,6 +10,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.modules import telegram_notification_center as center
+from app.modules.local_media_notifications import notify_local_media_task
+from app.notifier import TelegramSendResult
+from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import (
     LocalMediaService,
@@ -16,7 +21,7 @@ from app.modules.local_media_service import (
 )
 from app.modules.local_storage import LocalFilesystemAdapter
 from app.modules.scraper import MatchResult
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, media_refresh_providers
 from tests.test_local_media_service import FakeScraper
 
 
@@ -54,7 +59,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         root, source, target, task_id, service = self._fixture()
         self.addCleanup(root.cleanup)
         qb = FakeQB()
-        with patch("app.modules.local_media_service.LocalMediaService._refresh_paths", return_value=[]):
+        with media_refresh_providers():
             result = service.execute_task("admin", task_id, qb_client=qb)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(qb.calls, [("pause", "hash-1"), ("delete", "hash-1", False)])
@@ -79,13 +84,41 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         root, source, _target, task_id, service = self._fixture()
         self.addCleanup(root.cleanup)
         qb = FakeQB(delete_error=OSError("delete failed"))
-        with patch("app.modules.local_media_service.LocalMediaService._refresh_paths", return_value=[]):
+        with media_refresh_providers():
             result = service.execute_task("admin", task_id, qb_client=qb)
         self.assertEqual(result["status"], "completed")
         self.assertTrue((source / "下载必看.txt").exists())
         self.assertTrue(result["qb_cleanup_pending"])
         self.assertEqual(qb.calls, [("pause", "hash-1"), ("delete", "hash-1", False)])
         self.assertTrue(any("任务保持暂停" in item for item in result["warnings"]))
+        self.assertNotIn("入库", "；".join(result["warnings"]))
+
+        with (
+            patch.dict(os.environ, {
+                "TG_NOTIFICATION_ENABLED": "1", "TG_NOTIFICATION_LEVEL": "essential",
+                "GY_ORGANIZE_NOTIFY_ENABLED": "1", "GY_ORGANIZE_LIBRARY_NOTIFY": "1",
+            }),
+            patch.object(center, "send_event_result", side_effect=[
+                TelegramSendResult(True, message_id=71), TelegramSendResult(True, message_id=72),
+            ]) as send,
+            patch.object(center, "edit_event_result") as edit,
+            patch.object(center, "wake_telegram_notification_dispatcher"),
+        ):
+            self.assertTrue(notify_local_media_task(task_id, result, chat_id="100"))
+            request_id, _ = download_requests_repo.create_download_request(
+                "qb-retirement-failed", "magnet", title="Movie", chat_id="100",
+            )
+            download_requests_repo.update_download_request(
+                request_id, status="completed", qb_status="completed",
+                local_import_status="completed", local_import_target=f"local-media-task:{task_id}",
+            )
+            self.assertTrue(notify_local_media_task(task_id))
+        self.assertEqual(send.call_count, 2)
+        edit.assert_not_called()
+        for call in send.call_args_list:
+            event = call.args[0]
+            self.assertIn("部分完成", str(event.title))
+            self.assertIn("手动移除", str(dict(event.fields)["qB 收尾"]))
 
 
     def test_post_commit_database_failure_keeps_qb_paused_and_requires_manual(self):

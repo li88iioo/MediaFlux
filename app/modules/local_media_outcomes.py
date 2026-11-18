@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import re
+from collections.abc import Iterable, Mapping
 from typing import Any
+
+LOCAL_PREVIEW_WARNING = "仅预览模式：未移动文件"
+LOCAL_CONFLICT_SKIP_PREFIX = "按冲突策略保留现有文件，跳过 "
+LOCAL_REFRESH_NO_TARGET = "媒体库刷新未入队：无可用刷新目标"
+QB_CLEANUP_WARNING = "qB 任务移除失败，任务保持暂停。请在 qB 中手动移除任务并保留文件"
+LOCAL_REFRESH_LABELS = {
+    "completed": "刷新完成 🎯",
+    "queued": "已排队（合并刷新） ⏳",
+    "failed": "刷新失败（需处理） ❌",
+    "skipped": "未入队",
+}
 
 
 def _field(value: Any, name: str, default: Any = "") -> Any:
@@ -26,7 +38,7 @@ def local_media_task_outcome(task: Any, items: Iterable[Any]) -> dict[str, Any]:
         dict.fromkeys(_basename(_field(item, "source_path")) for item in videos)
     )
     status = str(_field(task, "status"))
-    preview_only = "仅预览模式：未移动文件" in str(_field(task, "warning"))
+    preview_only = LOCAL_PREVIEW_WARNING in str(_field(task, "warning"))
     completed = status == "completed" and not preview_only
     archived = (
         sum(_field(item, "action") in {"move", "replace"} for item in videos)
@@ -64,15 +76,53 @@ def local_media_task_outcome(task: Any, items: Iterable[Any]) -> dict[str, Any]:
     }
 
 
-def local_media_refresh_status(task: Any, result: Any = None) -> str:
-    """共用同一刷新事实：显式结果优先，重建通知时仍保留持久警告。"""
+def local_media_archive_stage(outcome: Mapping[str, Any]) -> tuple[str, str]:
+    kind = outcome["file_outcome"]
+    archived, skipped = outcome["archived_video_count"], outcome["skipped_video_count"]
+    if kind == "preview_only":
+        return "skipped", "仅预览，未移动文件"
+    if kind == "conflict_skipped":
+        return "skipped", f"冲突跳过 {skipped} 项，未新增归档"
+    if kind not in {"archived", "partial"} or outcome["unknown_video_count"]:
+        return "manual_review", "归档结果待核对"
+    detail = f"已归档 {archived} 项" + (f" · 冲突跳过 {skipped} 项" if skipped else "")
+    return "completed", detail
+
+
+def _persisted_warnings(task: Any) -> tuple[str, ...]:
+    return tuple(str(_field(task, "warning") or "").split("；"))
+
+
+def local_media_warning_count(task: Any, result: Any = None) -> int:
+    """仅统计需要查看的警告。策略说明仍保留在任务记录里。"""
+    warnings = _field(result, "warnings", ()) or _persisted_warnings(task)
+    return sum(
+        bool(warning)
+        and warning not in {LOCAL_PREVIEW_WARNING, LOCAL_REFRESH_NO_TARGET}
+        and not re.fullmatch(rf"{LOCAL_CONFLICT_SKIP_PREFIX}\d+ 项", warning)
+        for warning in (str(item).strip() for item in warnings)
+    )
+
+
+def local_media_qb_cleanup_pending(task: Any, result: Any = None) -> bool:
+    """兼容旧任务的移除失败警告，且保留已经提交的文件归档事实。"""
+    return bool(_field(result, "qb_cleanup_pending", False)) or any(
+        "qb任务移除失败" in "".join(str(warning).casefold().split())
+        for warning in (*_persisted_warnings(task), *(_field(result, "warnings", ()) or ()))
+    )
+
+
+def local_media_refresh_status(task: Any, result: Any = None, *, archive_status: str = "") -> str:
+    """投影实际入队回执及任务警告，重建时不把无回执推定为完成。"""
+    if archive_status == "skipped":
+        return "skipped"
     status = str(_field(result, "media_refresh_status") or "").strip().lower()
-    if status in {"failed", "queued", "completed", "skipped"}:
+    if status in LOCAL_REFRESH_LABELS:
         return status
-    warnings = _field(result, "warnings", ()) or ()
-    if not warnings:
-        warnings = str(_field(task, "warning") or "").split("；")
+    warnings = (*_persisted_warnings(task), *(_field(result, "warnings", ()) or ()))
     failure_markers = ("刷新失败", "刷新入队失败", "未刷新媒体库", "已跳过刷新")
     if any(any(marker in str(item) for marker in failure_markers) for item in warnings):
         return "failed"
+    if any(str(item).strip() == LOCAL_REFRESH_NO_TARGET for item in warnings):
+        return "skipped"
     return ""
