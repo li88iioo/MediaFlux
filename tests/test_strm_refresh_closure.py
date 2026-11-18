@@ -362,7 +362,7 @@ def test_run_fence_preserves_newer_confirmation_after_origin_gc(tmp_path, newer_
         row = confirmations.get_organize_confirmation("s06-newer")
         assert row is not None
         newer = json.loads(row["result_json"])["_downstream"]
-        assert newer["media_refresh"] == ("Emby 已刷新" if newer_finished else "Emby 已排队")
+        assert newer["media_refresh"] == ("Emby 请求已受理" if newer_finished else "Emby 已排队")
         client.refresh_for_paths.return_value = {"ok": False, "fallback": "late HTTP 503"}
         with patch.object(worker, "_client_for", return_value=client):
             worker._process_group(old)
@@ -735,6 +735,16 @@ def test_commit_and_overflow_share_frozen_policy_and_do_not_duplicate_paths(tmp_
 def test_notification_pending_refresh_label_is_localized_and_not_failed():
     label = scheduler_module._refresh_notification_label({"媒体库": "pending", "Emby": "queued"})
     assert label == "媒体库 待重试（等待配置恢复） / Emby 已排队"
+
+
+@pytest.mark.parametrize("success", [True, "success"])
+def test_strm_summary_reports_accepted_refresh_and_partial_provider(success):
+    event = STRMScheduler._build_success_event(
+        {"generated": 1}, {"Jellyfin": success, "Emby": "partial"}, 1.0,
+        "manual", [{"id": "s", "name": "S"}], "/synthetic/strm",
+    )
+    assert event.title == "⚠️ STRM 同步部分完成"
+    assert dict(event.fields)["媒体库刷新"] == "Jellyfin 请求已受理 / Emby 部分失败（请手动刷新）"
 
 
 @pytest.mark.parametrize("refresh_result", [

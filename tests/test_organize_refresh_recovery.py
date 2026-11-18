@@ -207,7 +207,7 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
                 assert after_recovery["delivered_revision"] == after_recovery["revision"]
                 assert "等待后台重试" not in after_recovery["footer"]
             assert after_recovery["revision"] == after_handoff["revision"] + 1
-            assert dict(after_recovery["fields"])["媒体库"] == "Jellyfin 已刷新"
+            assert dict(after_recovery["fields"])["媒体库"] == "Jellyfin 请求已受理"
             assert after_recovery["event_key"] == before["event_key"]
             assert dict(after_recovery["fields"])["整理"] == dict(before["fields"])["整理"]
             assert after_recovery["state"] == ("partial" if parent_failed else "completed")

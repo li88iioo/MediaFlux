@@ -158,8 +158,16 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertTrue(all(row["status"] == "pending" and row["review_status"] == "waiting" for row in rows))
 
     def test_pagination_details_and_legacy_selection_keep_same_message(self):
-        self._create(7)
+        tokens = self._create(13)
+        completed = json.dumps({"_downstream": {"strm": "完成", "media_refresh": "Jellyfin 请求已受理"}})
+        for token in tokens[7:]:
+            organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=completed)
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True))
+        summary = self._snapshot().event
+        self.assertIn(("媒体组", "13"), summary.fields)
+        self.assertIn(("分页", "1/2"), summary.fields)
+        self.assertIn("媒体 6 · 待确认", render_event(summary))
+        self.assertNotIn("媒体 12 ·", render_event(summary))
         self._callback(self._action("下一页"))
         self.assertIn(("分页", "2/2"), self._snapshot().event.fields)
         self._callback(self._action("查看"))
@@ -184,6 +192,15 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertEqual(delivery["status"], "sent")
         self._callback(self._action("返回批次"))
         self.assertIn(("分页", "2/2"), self._snapshot().event.fields)
+        for token in tokens[5:7]:
+            organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=completed)
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
+        clamped = self._snapshot().event
+        self.assertNotIn("分页", dict(clamped.fields))
+        self.assertIn("媒体 4 · 待确认", render_event(clamped))
+        self.assertIn("媒体 0 · 待确认", render_event(clamped))
+        self.assertFalse(any(action.label in {"上一页", "下一页"} for action in clamped.actions))
+        self.assertEqual(self._snapshot().message_id, 77)
 
     def test_frozen_digest_rejects_new_suggestion_then_only_submits_displayed_choices(self):
         first, second, untouched = self._create(3)
@@ -463,31 +480,45 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM telegram_notification_outbox").fetchone()[0], 1)
 
     def test_downstream_partial_waiting_complete_and_detail_survive_queue_completion(self):
-        tokens = self._create(3)
+        tokens = self._create(4)
         downstream = (
-            {"strm": "已完成", "media_refresh": "刷新失败", "partial": True, "error": "媒体库暂不可用"},
-            {"strm": "已排队", "media_refresh": "等待 STRM 完成"},
-            {"strm": "已完成", "media_refresh": "已完成"},
+            {"strm": "已完成", "media_refresh": "Jellyfin 请求已受理 / Emby 刷新失败", "partial": True, "error": "媒体库暂不可用"},
+            {"strm": "完成", "media_refresh": "Jellyfin 已刷新 / Emby 待重试（等待配置恢复）"},
+            {"strm": "已完成", "media_refresh": "Jellyfin 已刷新 / Emby 完成"},
+            {"strm": "完成", "media_refresh": "Jellyfin 请求已受理"},
         )
-        for token, result in zip(tokens, downstream):
-            organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=json.dumps({"_downstream": result}, ensure_ascii=False))
+        for index, (token, receipt) in enumerate(zip(tokens, downstream)):
+            result: dict = {"_downstream": receipt}
+            if index == 3:
+                result["failed"] = 1
+            organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=json.dumps(result, ensure_ascii=False))
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
         summary = self._snapshot().event
         fields = dict(summary.fields)
-        self.assertEqual(set(str(fields["STRM 状态"]).split(" · ")), {"已完成 2 组", "已排队 1 组"})
-        self.assertEqual(set(str(fields["媒体库刷新"]).split(" · ")), {
-            "刷新失败 1 组", "等待 STRM 完成 1 组", "请求已受理 1 组",
-        })
-        progress = dict(summary.fields)["进度"]
+        self.assertNotIn("STRM 状态", fields)
+        self.assertNotIn("媒体库刷新", fields)
+        progress = fields["进度"]
         assert isinstance(progress, str)
-        self.assertIn("整理完成 3", progress)
-        self.assertNotIn("入库已完成", render_event(summary))
-        self._callback(f"orgb:{tokens[0]}:d:1")
+        self.assertIn("整理完成 4", progress)
+        rendered = render_event(summary)
+        self.assertIn("媒体 0 · 整理完成\n媒体库刷新：Emby 刷新失败", rendered)
+        self.assertIn("媒体 1 · 整理完成\n媒体库刷新：Emby 待重试（等待配置恢复）", rendered)
+        self.assertIn("媒体 3 · 整理部分完成\n整理：失败 1", rendered)
+        self.assertNotIn("媒体 2 ·", rendered)
+        self.assertNotIn("Jellyfin", rendered)
+        self._callback(next(action.callback_data for action in summary.actions if action.callback_data.startswith(f"orgb:{tokens[0]}:d:")))
         detail = self._snapshot().event
         self.assertIn(("STRM 状态", "已完成"), detail.fields)
-        self.assertIn(("媒体库刷新", "刷新失败"), detail.fields)
+        self.assertIn(("媒体库刷新", "Jellyfin 请求已受理 / Emby 刷新失败"), detail.fields)
         self.assertIn("媒体库暂不可用", render_event(detail))
         self.assertFalse(any(action.callback_data.startswith("orgc:") for action in detail.actions))
+        for legacy in ("已刷新", "完成"):
+            with self.subTest(legacy=legacy):
+                confirmations.update_confirmation_lifecycle_downstream(
+                    tokens[0], chat_id="100", strm_status="完成", media_refresh=f"Jellyfin {legacy} / Emby 刷新失败",
+                    partial=True, error="媒体库暂不可用",
+                )
+                self.assertIn(("媒体库刷新", "Jellyfin 请求已受理 / Emby 刷新失败"), self._snapshot().event.fields)
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
         self.assertEqual(self._snapshot().event.lifecycle["confirmation_batch"]["detail_token"], tokens[0])
 
@@ -496,17 +527,16 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         for token in tokens:
             organize_confirmations_repo.update_organize_confirmation(token, status="completed")
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
-        waiting = dict(self._snapshot().event.fields)
-        self.assertEqual(waiting["STRM 状态"], "等待回执 3 组")
-        self.assertEqual(waiting["媒体库刷新"], "等待回执 3 组")
+        waiting = render_event(self._snapshot().event)
+        self.assertIn("媒体 0 · 整理完成\nSTRM：等待回执\n媒体库刷新：等待回执", waiting)
         for token in tokens:
             confirmations.update_confirmation_lifecycle_downstream(
-                token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已排队",
+                token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 请求已受理 / Emby 已排队",
             )
         event = self._snapshot().event
         self.assertEqual(event.title, "✅ 整理批次已完成")
-        self.assertIn(("STRM 状态", "已完成 3 组"), event.fields)
-        self.assertIn(("媒体库刷新", "Jellyfin 待后台提交 3 组"), event.fields)
+        self.assertEqual(event.fields, (("媒体组", "3"), ("进度", "整理完成 3")))
+        self.assertEqual(event.lines, ())
         self.assertEqual(event.actions, ())
         assert isinstance(event.footer, str)
         self.assertIn("收到后台刷新回执", event.footer)
@@ -516,15 +546,18 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertEqual(self._snapshot().revision, revision)
         for token in tokens:
             confirmations.update_confirmation_lifecycle_downstream(
-                token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已刷新 / Emby 已跳过",
+                token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 请求已受理 / Emby 完成",
             )
         finished = self._snapshot().event
-        self.assertIn(("媒体库刷新", "Jellyfin 请求已受理 3 组 · Emby 已跳过 3 组"), finished.fields)
+        self.assertEqual(finished.title, "✅ 整理批次已完成")
+        self.assertEqual(finished.fields, event.fields)
+        self.assertEqual(finished.lines, ())
         self.assertEqual(finished.actions, ())
+        self.assertNotIn("收到后台刷新回执", str(finished.footer))
         notifications.drain_telegram_notifications(limit=1)
         self.sent.assert_called_once()
         self.assertEqual(self.edited.call_args.kwargs["message_id"], 77)
-        self.assertIn("Jellyfin 请求已受理 3 组", render_event(self.edited.call_args.args[0]))
+        self.assertEqual(self.edited.call_args.args[0], finished)
 
     def test_new_run_with_same_summary_rejects_inflight_old_receipt(self):
         tokens = self._create(2)
@@ -638,6 +671,8 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         event = self._snapshot().event
         self.assertTrue(any(f"orgb:{tokens[0]}:d:" in action.callback_data for action in event.actions))
         self.assertFalse(any(f"orgb:{tokens[1]}:d:" in action.callback_data for action in event.actions))
+        self.assertIn("媒体 2 · 整理完成\nSTRM：已排队\n媒体库刷新：等待 STRM 完成", render_event(event))
+        self.assertNotIn("媒体 1 ·", render_event(event))
         self.assertTrue(any(action.label == "刷新摘要" for action in event.actions))
         assert isinstance(event.title, str)
         self.assertIn("待确认", event.title)
@@ -693,9 +728,13 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
                 self.assertEqual(downstream["strm"], expected)
                 self.assertEqual(downstream["partial"], partial)
                 self.assertEqual(downstream["media_refresh"], "未触发")
-                fields = dict(self._snapshot().event.fields)
-                self.assertIn(expected, str(fields["STRM 状态"]))
-                self.assertIn("未触发", str(fields["媒体库刷新"]))
+                event = self._snapshot().event
+                if partial:
+                    self.assertIn(f"STRM：{expected}", render_event(event))
+                    self.assertNotIn("媒体库刷新：未触发", render_event(event))
+                else:
+                    self.assertEqual(event.title, "✅ 整理批次已完成")
+                    self.assertEqual(event.lines, ())
 
     def test_outbox_retries_failed_send_without_new_thread_and_rejects_stale_revision(self):
         tokens = self._create()

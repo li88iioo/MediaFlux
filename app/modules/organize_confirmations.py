@@ -579,7 +579,7 @@ def _terminal_status_label(value: object, *, media_library: bool = False) -> str
         return f"{text} ⏳"
     if "跳过" in text:
         return f"{text} ⏭️"
-    if any(marker in text for marker in ("完成", "成功", "已刷新")):
+    if any(marker in text for marker in ("完成", "成功", "已刷新", "请求已受理")):
         return f"{text} {'🎯' if media_library else '✅'}"
     return text
 

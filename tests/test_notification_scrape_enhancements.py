@@ -654,7 +654,7 @@ class StrmDetailedNotificationTests(IsolatedDatabaseTestCase):
         self.assertIn("0 失败", rendered)
         self.assertIn("电影/坏目录：连接超时", rendered)
         self.assertIn("Emby 已排队", rendered)
-        self.assertIn("Jellyfin ❌", rendered)
+        self.assertIn("Jellyfin 失败", rendered)
 
     def test_legacy_sync_summary_without_read_telemetry_defaults_to_zero(self):
         from app.bot import handlers

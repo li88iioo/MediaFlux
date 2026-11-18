@@ -151,10 +151,10 @@ def _refresh_notification_label(refresh: dict) -> str:
     labels = []
     for name, status in refresh.items():
         value = {
-            True: "完成",
+            True: "请求已受理",
             False: "失败",
             "failed": "失败",
-            "success": "已刷新",
+            "success": "请求已受理",
             "partial": "部分失败（请手动刷新）",
             "queued": "已排队",
             "pending": _REFRESH_PENDING_LABEL,
@@ -2418,7 +2418,7 @@ class STRMScheduler:
             or int(stats.get("metadata_failed", 0) or 0) > 0
             or int(stats.get("failure_ledger_failed", 0) or 0) > 0
             or bool(stats.get("clean_skipped"))
-            or any(value in {False, "failed", "pending"} for value in refresh.values())
+            or any(value in {False, "failed", "partial", "pending"} for value in refresh.values())
         )
         names = [str(item.get("name") or item.get("id") or "未命名") for item in sources]
         source_text = f"{len(sources)} 个"
@@ -2426,20 +2426,7 @@ class STRMScheduler:
             source_text += " · " + "、".join(names[:3])
             if len(names) > 3:
                 source_text += f" 等 {len(names)} 个"
-        def refresh_label(value: object) -> str:
-            if value == "pending":
-                return _REFRESH_PENDING_LABEL
-            if value == "queued":
-                return "已排队"
-            if value == "skipped":
-                return "已跳过"
-            if value is True:
-                return "✅"
-            return "❌"
-
-        refresh_text = " / ".join(
-            f"{name} {refresh_label(status)}" for name, status in refresh.items()
-        ) or "未启用或本轮无变化"
+        refresh_text = _refresh_notification_label(refresh) if refresh else "未启用或本轮无变化"
         fields = (
             ("触发方式", STRMScheduler._trigger_label(trigger_type)),
             ("同步来源", source_text),

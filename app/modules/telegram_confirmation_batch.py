@@ -6,6 +6,7 @@ import hashlib
 import re
 from collections import Counter
 from hmac import compare_digest
+from typing import NamedTuple
 
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.agent import feature_gate
@@ -18,6 +19,7 @@ from app.notifier import (
     NotificationAction,
     NotificationEvent,
     notification_target_chat_id,
+    safe_int,
     truncate_telegram_text,
 )
 
@@ -28,6 +30,19 @@ _STATUSES = {
     "pending": "待确认", "queued": "已排队", "running": "整理中",
     "completed": "整理完成", "failed": "失败", "cancelled": "已结束", "expired": "已过期",
 }
+_ISSUE_STATES = {"partial", "waiting"}
+
+
+class _Receipt(NamedTuple):
+    state: str
+    label: str
+
+
+class _GroupStatus(NamedTuple):
+    state: str
+    organize_issue: str
+    strm: _Receipt
+    refresh: tuple[_Receipt, ...]
 
 
 def _thread_key(batch_id: str) -> str:
@@ -42,58 +57,87 @@ def _batch_items(batch_id: str, chat_id: str) -> dict:
     )
 
 
-def _downstream_counts(items: list[dict]) -> dict[str, int]:
-    counts = {"partial": 0, "waiting": 0, "submitted": 0, "completed": 0}
-    for item in items:
-        downstream = item.get("downstream") or {}
-        if downstream.get("partial") or downstream.get("error") or item.get("status") == "failed":
-            counts["partial"] += 1
-        elif item.get("status") == "completed":
-            states = [str(downstream.get(key) or "").lower() for key in ("strm", "media_refresh")]
-            if any(any(word in state for word in ("失败", "异常", "failed", "error")) for state in states):
-                counts["partial"] += 1
-            elif states[0] in {"完成", "已完成", "success", "completed"} and all(
-                re.search(r"(?:^|\s)(?:已排队|queued|已刷新|(?:已)?完成|成功|已跳过|未启用(?:或无目标)?|无目标|skipped|disabled|success|completed)$", part.strip())
-                for part in states[1].split("/")
-            ) and ("已排队" in states[1] or "queued" in states[1]):
-                # 队列接管是持久回执，不是缺回执；也不能据此声称媒体库扫描完成。
-                counts["submitted"] += 1
-            elif any(not state or any(word in state for word in (
-                "等待", "排队", "进行中", "执行中", "未完成", "pending", "queued", "running",
-            )) for state in states):
-                counts["waiting"] += 1
-            elif all(any(word in state for word in (
-                "完成", "成功", "已刷新", "跳过", "未启用", "未触发", "无变更", "关闭",
-                "completed", "success", "skipped", "disabled", "not_required",
-            )) for state in states):
-                counts["completed"] += 1
-            else:
-                counts["waiting"] += 1
-    return counts
+def _receipt(value: object, *, media_refresh: bool = False) -> _Receipt:
+    label = str(value or "").strip() or "等待回执"
+    provider, state = "", label.lower()
+    if media_refresh:
+        parts = label.split(maxsplit=1)
+        if len(parts) == 2 and parts[0].lower() in {"jellyfin", "emby", "媒体库"}:
+            provider, state = f"{parts[0]} ", parts[1].lower()
+    if state in {"完成", "已完成", "成功", "success", "completed"} or (
+        media_refresh and state in {"已刷新", "请求已受理"}
+    ):
+        return _Receipt("completed", f"{provider}请求已受理" if media_refresh else "已完成")
+    if media_refresh and state in {"已排队", "queued", "待后台提交"}:
+        return _Receipt("submitted", f"{provider}待后台提交")
+    if any(word in state for word in ("失败", "异常", "错误", "部分完成", "已停止", "failed", "error")):
+        return _Receipt("partial", label)
+    if any(word in state for word in (
+        "等待", "排队", "进行中", "执行中", "未完成", "待重试", "pending", "queued", "running",
+    )):
+        return _Receipt("waiting", label)
+    if any(word in state for word in (
+        "完成", "成功", "已刷新", "请求已受理", "跳过", "未启用", "未触发", "无变更", "关闭", "无目标",
+        "completed", "success", "skipped", "disabled", "not_required",
+    )):
+        return _Receipt("completed", label)
+    return _Receipt("waiting", label)
 
 
-def _receipt_labels(item: dict) -> tuple[str, list[str]]:
+def _organize_issue(item: dict) -> str:
+    if item.get("error"):
+        return str(item["error"])
+    execution = item.get("execution") or {}
+    issues = []
+    for key, label in (("failed", "失败"), ("rename_failed", "改名失败"),
+                       ("need_confirm", "文件待确认"), ("duplicate_cleanup_failed", "同版本回收失败")):
+        count = safe_int(execution.get(key), minimum=0)
+        if count:
+            issues.append(f"{label} {count}")
+    warnings = execution.get("warnings") or execution.get("scan_errors") or []
+    return " · ".join([*issues, *warnings[:1]])
+
+
+def _group_status(item: dict) -> _GroupStatus:
     downstream = item.get("downstream") or {}
-    strm = str(downstream.get("strm") or "等待回执")
-    if strm in {"完成", "成功", "completed", "success"}:
-        strm = "已完成"
-    refresh = []
-    for part in str(downstream.get("media_refresh") or "等待回执").split(" / "):
-        label = part.strip()
-        # 成功回执只证明刷新请求被受理。保留等待 STRM 完成等非终态的原始含义。
-        match = re.fullmatch(r"(?:(Jellyfin|Emby|媒体库)\s+)?(已刷新|已完成|完成|成功|success|completed|queued|已排队)", label, re.I)
-        if match:
-            state = "待后台提交" if match[2].lower() in {"queued", "已排队"} else "请求已受理"
-            label = f"{match[1]} {state}" if match[1] else state
-        refresh.append(label)
-    return strm, refresh
+    organize_issue = _organize_issue(item)
+    strm = _receipt(downstream.get("strm"))
+    refresh = tuple(_receipt(part, media_refresh=True) for part in str(downstream.get("media_refresh") or "").split("/"))
+    states = {strm.state, *(receipt.state for receipt in refresh)}
+    status = item.get("status")
+    if downstream.get("partial") or downstream.get("error") or status == "failed":
+        state = "partial"
+    elif status != "completed":
+        state = ""
+    elif organize_issue or "partial" in states:
+        state = "partial"
+    elif "waiting" in states:
+        state = "waiting"
+    elif "submitted" in states:
+        # STRM 已完成才可将媒体刷新交给后台接管，并等待实际提交回执。
+        state = "submitted" if strm.label == "已完成" else "waiting"
+    else:
+        state = "completed"
+    return _GroupStatus(state, organize_issue, strm, refresh)
 
 
-def _receipt_summary(counts: Counter[str]) -> str:
-    parts = [f"{truncate_telegram_text(label, 72)} {count} 组" for label, count in counts.most_common(6)]
-    if len(counts) > len(parts):
-        parts.append(f"另有 {len(counts) - len(parts)} 种状态")
-    return " · ".join(parts)
+def _downstream_issues(item: dict, receipts: _GroupStatus) -> list[str]:
+    downstream = item.get("downstream") or {}
+    organized = item.get("status") == "completed"
+    issues = []
+    if (organized or downstream.get("strm")) and receipts.strm.state in _ISSUE_STATES:
+        issues.append(f"STRM：{truncate_telegram_text(receipts.strm.label, 100)}")
+    if organized or downstream.get("media_refresh"):
+        refresh = " / ".join(receipt.label for receipt in receipts.refresh if receipt.state in _ISSUE_STATES or (
+            receipts.state == "waiting" and receipt.state == "submitted"
+        ))
+        if refresh:
+            issues.append(f"媒体库刷新：{truncate_telegram_text(refresh, 160)}")
+    if downstream.get("error"):
+        issues.append(f"后续处理：{truncate_telegram_text(downstream['error'], 140)}")
+    elif downstream.get("partial") and not issues:
+        issues.append("后续处理：部分完成")
+    return issues
 
 
 def _candidate(item: dict, index: object) -> dict | None:
@@ -175,27 +219,30 @@ def _button(label: str, token: str, action: str, value: object) -> NotificationA
 
 
 def _batch_event(
-    batch_id: str, items: list[dict], *, chat_id: str, page: int, detail_token: str,
-    truncated: bool = False,
-    downstream_digest: str,
+    batch_id: str, items: list[dict], receipts: list[_GroupStatus], *, chat_id: str, page: int,
+    detail_token: str, counts: Counter[str], downstream_counts: dict[str, int],
+    truncated: bool, downstream_digest: str,
 ) -> NotificationEvent:
-    pages = max(1, (len(items) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    attention = [(item, receipt) for item, receipt in zip(items, receipts)
+                 if item.get("status") in {"pending", "queued", "running", "failed", "expired"}
+                 or receipt.state in _ISSUE_STATES]
+    pages = max(1, (len(attention) + _PAGE_SIZE - 1) // _PAGE_SIZE)
     page = max(1, min(page, pages))
     anchor = str(items[0]["confirmation_id"])
-    counts = Counter(str(item.get("status") or "pending") for item in items)
-    downstream_counts = _downstream_counts(items)
     active = bool(counts["pending"] or counts["queued"] or counts["running"] or downstream_counts["waiting"] or truncated)
-    settled = not active and not downstream_counts["partial"]
     status_text = " · ".join(f"{label} {counts[status]}" for status, label in _STATUSES.items() if counts[status])
     metadata: dict = {
         "batch_id": batch_id, "page": page, "detail_token": detail_token,
         "progress": dict(counts), "downstream": downstream_counts, "truncated": truncated,
         "downstream_digest": downstream_digest,
     }
-    detail = next((item for item in items if item["confirmation_id"] == detail_token), None) if not settled else None
+    detail_index = None
+    if detail_token and (active or attention):
+        detail_index = next((index for index, item in enumerate(items) if item["confirmation_id"] == detail_token), None)
     lines: list[str] = []
     actions: list[NotificationAction] = []
-    if detail is not None:
+    if detail_index is not None:
+        detail, detail_receipts = items[detail_index], receipts[detail_index]
         status = str(detail.get("status") or "pending")
         fields = (
             ("媒体", str(detail.get("identity") or "待确认媒体")),
@@ -231,11 +278,11 @@ def _batch_event(
                 actions.append(NotificationAction(
                     f"选择 {index + 1} · {label}", f"orgc:{detail_token}:{index}",
                 ))
-        if detail.get("error"):
-            lines.append(truncate_telegram_text(detail["error"], 240))
+        if detail_receipts.organize_issue:
+            lines.append(truncate_telegram_text(detail_receipts.organize_issue, 240))
         downstream = detail.get("downstream") or {}
-        strm, refresh = _receipt_labels(detail)
-        fields += (("STRM 状态", strm), ("媒体库刷新", " / ".join(refresh)))
+        fields += (("STRM 状态", detail_receipts.strm.label),
+                   ("媒体库刷新", " / ".join(receipt.label for receipt in detail_receipts.refresh)))
         if downstream.get("partial"):
             lines.append("后续处理部分完成，请查看 STRM 与媒体库状态。")
         if downstream.get("error"):
@@ -259,23 +306,26 @@ def _batch_event(
         reviewing = [item for item in items if item.get("review_status")]
         review_count = sum(item.get("status") == "pending" and item["review_status"] in {"waiting", "pending", "running"}
                            for item in reviewing)
-        fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text), ("分页", f"{page}/{pages}"))
-        strm_counts: Counter[str] = Counter()
-        refresh_counts: Counter[str] = Counter()
-        for item in items:
-            if item.get("downstream") or item.get("status") == "completed":
-                strm, refresh = _receipt_labels(item)
-                strm_counts[strm] += 1
-                refresh_counts.update(dict.fromkeys(refresh, 1))
-        if strm_counts:
-            fields += (("STRM 状态", _receipt_summary(strm_counts)), ("媒体库刷新", _receipt_summary(refresh_counts)))
+        fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text))
+        if pages > 1:
+            fields += (("分页", f"{page}/{pages}"),)
         if review_count:
             # 复核逐组完成时不重发消息，避免刷屏；进度在刷新或最后一组完成时更新。
             fields += (("Agent 复核", f"已完成 {len(reviewing) - review_count}/{len(reviewing)} 组，点「刷新摘要」查看最新建议"),)
-        for offset, item in enumerate(items[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE], (page - 1) * _PAGE_SIZE + 1):
+        start = (page - 1) * _PAGE_SIZE
+        visible = attention[start:start + _PAGE_SIZE]
+        for offset, (item, item_receipts) in enumerate(visible, start + 1):
             identity = truncate_telegram_text(item.get("identity") or item.get("directory") or "待确认媒体", 70)
             status = str(item.get("status") or "pending")
-            lines.append(f"{offset}. {identity} · {_STATUSES.get(status, status)}")
+            label = _STATUSES.get(status, status)
+            if status == "failed":
+                label = "整理失败"
+            elif status == "completed" and item_receipts.organize_issue:
+                label = "整理部分完成"
+            lines.append(f"{offset}. {identity} · {label}")
+            if item_receipts.organize_issue:
+                lines.append(f"整理：{truncate_telegram_text(item_receipts.organize_issue, 140)}")
+            lines.extend(_downstream_issues(item, item_receipts))
             suggestion = item.get("suggestion")
             candidate = _candidate(item, suggestion.get("candidate_index")) if isinstance(suggestion, dict) else None
             if candidate and status == "pending":
@@ -283,14 +333,12 @@ def _batch_event(
                 lines.append(f"建议：{_candidate_label(candidate)}\n{truncate_telegram_text(suggestion.get('summary') or '请查看候选详情', 140)}")
             elif item.get("review_summary") and status == "pending":
                 lines.append(f"复核：{truncate_telegram_text(item['review_summary'], 140)}")
-            item_downstream = _downstream_counts([item])
-            if status in {"pending", "queued", "running", "failed"} or item_downstream["partial"] or item_downstream["waiting"]:
-                actions.append(_button(f"查看 {offset} · {identity}", item["confirmation_id"], "d", page))
-        if page > 1 and not settled:
+            actions.append(_button(f"查看 {offset} · {identity}", item["confirmation_id"], "d", page))
+        if page > 1:
             actions.append(_button("上一页", anchor, "p", page - 1))
-        if page < pages and not settled:
+        if page < pages:
             actions.append(_button("下一页", anchor, "p", page + 1))
-        footer = ("可分页查看并手动选择候选；没有建议的媒体不会自动选择。" if counts["pending"] else
+        footer = ("打开媒体详情可手动选择候选。没有建议的媒体不会自动选择。" if counts["pending"] else
                   "后续处理仍在进行，可刷新摘要查看状态。" if active else
                   "请在 Web 整理日志查看处理明细。")
         if downstream_counts["submitted"]:
@@ -304,10 +352,12 @@ def _batch_event(
                 preview = _suggestion_preview(items, chat_id)
             except ValueError as exc:
                 lines.append(f"建议暂不可提交：{truncate_telegram_text(str(exc), 160)}")
-        lines.extend(_skipped_notice(item, error) for item, error in (preview or {}).get("skipped", [])[:3])
+        visible_tokens = {item["confirmation_id"] for item, _receipt in visible}
+        lines.extend(_skipped_notice(item, error) for item, error in (preview or {}).get("skipped", [])
+                     if item["confirmation_id"] in visible_tokens)
         mapped = preview.get("mapping_items", []) if preview else []
         if mapped:
-            lines.extend(_mapping_notice(item) for item in mapped[:3])
+            lines.extend(_mapping_notice(item) for item in mapped if item["confirmation_id"] in visible_tokens)
             footer += f"\n{len(mapped)} 组涉及季集映射，请在 Web 查看完整映射；TG 批量仅确认其余普通建议。"
         if preview and preview.get("entries"):
             metadata["digest"] = preview["digest"]
@@ -351,29 +401,33 @@ def _publish_batch_view(
         truncated = bool(result.get("selection_truncated") or result["total"] > len(items))
         if not items:
             return False
+        counts = Counter(item["status"] for item in items)
+        receipts = [_group_status(item) for item in items]
+        downstream_counts = dict.fromkeys(("partial", "waiting", "submitted", "completed"), 0)
+        downstream_counts.update(Counter(receipt.state for receipt in receipts if receipt.state))
         downstream_digest = hashlib.sha256(json.dumps([
-            (item["confirmation_id"], item.get("downstream_run_id", 0), item.get("downstream") or {})
-            for item in items
+            (item["confirmation_id"], item.get("downstream_run_id", 0), item.get("downstream") or {}, receipt.organize_issue)
+            for item, receipt in zip(items, receipts)
         ], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         # 只读复核逐组落盘时先保留已展示的冻结按钮，最后一组完成再统一更新。
         # 手动刷新与执行状态回执始终走 outbox；重启后仍可从持久状态重建。
         if (not deliver_now and expected_confirmation_delivery is None and expected_revision is None
                 and snapshot and not previous.get("detail_token")
-                and previous.get("progress") == dict(Counter(item["status"] for item in items))
-                and previous.get("downstream") == _downstream_counts(items)
+                and previous.get("progress") == dict(counts)
+                and previous.get("downstream") == downstream_counts
                 and previous.get("downstream_digest") == downstream_digest
                 and previous.get("truncated") == truncated
                 and any(item.get("status") == "pending" and item.get("review_status") in {"waiting", "pending", "running"} for item in items)):
             return True
         event = _batch_event(
-            batch_id, items, chat_id=target,
+            batch_id, items, receipts, chat_id=target,
             page=page if page is not None else int(previous.get("page") or 1),
             detail_token=detail_token if detail_token is not None else str(previous.get("detail_token") or ""),
-            truncated=truncated, downstream_digest=downstream_digest,
+            counts=counts, downstream_counts=downstream_counts, truncated=truncated, downstream_digest=downstream_digest,
         )
         published = publish_notification_thread(
             _thread_key(batch_id), event, topic=NotificationTopic.CONFIRMATION,
-            importance=NotificationImportance.ERROR if _downstream_counts(items)["partial"] else NotificationImportance.ACTION if any(item.get("status") == "pending" for item in items) else NotificationImportance.RESULT,
+            importance=NotificationImportance.ERROR if downstream_counts["partial"] else NotificationImportance.ACTION if counts["pending"] else NotificationImportance.RESULT,
             chat_id=target, preferred_message_id=message_id or 0, deliver_now=deliver_now,
             expected_confirmation_delivery=expected_confirmation_delivery,
             expected_revision=expected_revision if expected_revision is not None else snapshot.revision if snapshot else 0,
