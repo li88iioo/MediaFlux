@@ -106,6 +106,30 @@ class LocalMediaTrashDownloadTests(IsolatedDatabaseTestCase):
         self.assertEqual((destination / video.name).read_bytes(), b"media")
         self.assertEqual((other / "Movie.mkv").read_bytes(), b"other media")
 
+    def test_other_sources_download_does_not_infer_an_empty_prefix_for_selected_source(self):
+        repository.update_local_media_source(self.source_id, qb_path_prefix="")
+        for mapping in ("same-path", "explicit"):
+            other_root = Path(self.directory) / mapping
+            other_root.mkdir()
+            prefix = "" if mapping == "same-path" else "/qb/other"
+            repository.create_local_media_source(mapping, "configured:qb", prefix, str(other_root), enabled=0)
+            save_path = prefix or str(other_root)
+            for has_content_path in (False, True):
+                with self.subTest(mapping=mapping, has_content_path=has_content_path):
+                    name = f"{mapping}-{has_content_path}"
+                    selected, video, identity = self.directory_item(name)
+                    other_video = other_root / name / video.name
+                    other_video.parent.mkdir()
+                    other_video.write_bytes(b"other download")
+                    content_path = f"{save_path}/{name}" if has_content_path else ""
+                    self.qb.list_torrents.return_value = [
+                        self.torrent(content_path, state="metaDL", progress=0, save_path=save_path),
+                    ]
+                    destination = self.service.move_media_item_to_trash("admin", self.source_id, selected, identity)
+                    self.assertFalse(selected.exists())
+                    self.assertEqual((destination / video.name).read_bytes(), b"media")
+                    self.assertEqual(other_video.read_bytes(), b"other download")
+
     def test_other_downloader_profile_recycles_without_reading_current_qb(self):
         repository.update_local_media_source(self.source_id, qb_profile="other:qb")
         selected, video, identity = self.directory_item()
@@ -120,18 +144,26 @@ class LocalMediaTrashDownloadTests(IsolatedDatabaseTestCase):
 
     def test_empty_prefix_uses_existing_save_path_mapping(self):
         repository.update_local_media_source(self.source_id, qb_path_prefix="")
-        selected, video, identity = self.directory_item()
-        self.qb.list_torrents.return_value = [self.torrent()]
-        with self.assertRaisesRegex(LocalMediaServiceError, "qB.*尚未完成"):
-            self.service.move_media_item_to_trash("admin", self.source_id, selected, identity)
-        self.assertTrue(video.exists())
+        repository.create_local_media_source(
+            "offline-source", "configured:qb", "/qb/downloads", str(Path(self.directory) / "not-mounted"),
+        )
+        for name, child in (("Movie", ""), ("Pending", "/not-yet-created.mkv")):
+            with self.subTest(child=child):
+                selected, video, identity = self.directory_item(name)
+                self.qb.list_torrents.return_value = [self.torrent(f"/qb/downloads/{name}{child}")]
+                with self.assertRaisesRegex(LocalMediaServiceError, "qB.*尚未完成"):
+                    self.service.move_media_item_to_trash("admin", self.source_id, selected, identity)
+                self.assertTrue(video.exists())
 
     def test_unknown_content_path_protects_its_mapped_save_directory(self):
-        selected, video, identity = self.directory_item()
-        self.qb.list_torrents.return_value = [self.torrent("")]
-        with self.assertRaisesRegex(LocalMediaServiceError, "qB.*尚未完成"):
-            self.service.move_media_item_to_trash("admin", self.source_id, selected, identity)
-        self.assertTrue(video.exists())
+        for prefix, save_path in (("/qb/downloads", "/qb/downloads"), ("", str(self.root))):
+            with self.subTest(prefix=prefix):
+                repository.update_local_media_source(self.source_id, qb_path_prefix=prefix)
+                selected, video, identity = self.directory_item("explicit" if prefix else "same-path")
+                self.qb.list_torrents.return_value = [self.torrent("", save_path=save_path)]
+                with self.assertRaisesRegex(LocalMediaServiceError, "qB.*尚未完成"):
+                    self.service.move_media_item_to_trash("admin", self.source_id, selected, identity)
+                self.assertTrue(video.exists())
 
     def test_configured_downloader_read_failure_keeps_media(self):
         selected, video, identity = self.directory_item()

@@ -37,6 +37,7 @@ from app.modules.local_media_cleanup import (
 from app.modules.local_media_models import (
     LOCAL_MEDIA_CATEGORIES,
     LocalLibraryTarget,
+    LocalMediaSource,
     canonical_local_media_content_path,
     local_media_paths_overlap,
 )
@@ -53,6 +54,7 @@ from app.modules.local_move_transaction import (
 )
 from app.modules.local_path_mapping import (
     PathMapping,
+    PathMappingError,
     assert_within,
     require_container_absolute_path,
     is_windows_or_unc_path,
@@ -1875,9 +1877,10 @@ class LocalMediaService:
                 )
 
     @staticmethod
-    def _assert_no_downloading_qb_path(source, selected_path: Path) -> None:
+    def _assert_no_downloading_qb_path(source: LocalMediaSource, selected_path: Path) -> None:
         """在 qB writer 内核对下载路径；目录自身快照不能证明子文件已停止写入。"""
-        if source.qb_profile and source.qb_profile not in {"qb", "configured:qb", "default"}:
+        configured_profiles = {"", "qb", "configured:qb", "default"}
+        if source.qb_profile not in configured_profiles:
             return
         from app.modules.qb_control import configured_qb_client
 
@@ -1887,28 +1890,45 @@ class LocalMediaService:
         client = None
         try:
             client = configured_qb_client(settings)
-            tasks = client.list_torrents()
+            tasks = [task for task in client.list_torrents() if not is_qb_torrent_complete(task.state, task.progress)]
+            if not tasks:
+                return
+            prefix = source.qb_path_prefix.strip()
+            root = Path(source.local_root)
+            mappings = [PathMapping(prefix or source.local_root, root)]
+            if not prefix:
+                # 空前缀的推断必须让位给其它来源已声明的显式或同路径映射。
+                for peer in local_media_repo.list_local_media_sources(owner=source.owner):
+                    if peer.id == source.id or peer.qb_profile not in configured_profiles:
+                        continue
+                    try:
+                        peer_root = require_container_absolute_path(peer.local_root, label="来源目录")
+                        if peer_root.is_dir():
+                            mappings.append(PathMapping(peer.qb_path_prefix.strip() or str(peer_root), peer_root))
+                    except PathMappingError:
+                        continue
             for task in tasks:
-                if is_qb_torrent_complete(task.state, task.progress):
-                    continue
-                # 与完成接管使用同一 PathMapping：显式前缀优先，空前缀允许
-                # 两端同路径或 task.save_path 到容器来源根的映射。
-                prefixes = ((source.qb_path_prefix,) if source.qb_path_prefix.strip()
-                            else (source.local_root, task.save_path))
-                raw_path = task.content_path.strip() or task.save_path.strip()
+                content_path = (task.content_path or "").strip()
+                save_path = (task.save_path or "").strip()
+                raw_path = content_path or save_path
                 if not raw_path:
                     raise LocalMediaServiceError("无法核验未完成的 qB 下载路径，已保留本地条目")
-                for prefix in prefixes:
-                    if not prefix:
-                        continue
-                    mapping = PathMapping(prefix, Path(source.local_root))
-                    if not mapping.matches(raw_path):
-                        continue
-                    download_path = mapping.local_root.joinpath(*mapping.relative_parts(raw_path))
-                    if local_media_paths_overlap(selected_path, download_path):
-                        raise LocalMediaServiceError(
-                            "该条目关联的 qB 下载尚未完成，下载完成或移除任务后再回收"
-                        )
+                download_paths = [
+                    mapping.local_root.joinpath(*mapping.relative_parts(raw_path))
+                    for mapping in mappings if mapping.matches(raw_path)
+                ]
+                # 旧挂载推断要求具体内容对应到现存一级条目；下载中的子项可能尚未落盘。
+                # 只有保存目录的任务不能把保存目录直接当成本来源的 qB 前缀。
+                if not download_paths and not prefix and content_path and save_path:
+                    inferred = PathMapping(save_path, root)
+                    if inferred.matches(content_path):
+                        parts = inferred.relative_parts(content_path)
+                        if parts and (root / parts[0]).exists():
+                            download_paths.append(root.joinpath(*parts))
+                if any(local_media_paths_overlap(selected_path, path) for path in download_paths):
+                    raise LocalMediaServiceError(
+                        "该条目关联的 qB 下载尚未完成，下载完成或移除任务后再回收"
+                    )
         except LocalMediaServiceError:
             raise
         except Exception as exc:
