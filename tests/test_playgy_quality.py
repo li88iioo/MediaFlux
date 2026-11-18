@@ -638,6 +638,33 @@ class PlayGyQualityTests(unittest.TestCase):
                 refresh.assert_called_once()
                 self.assertEqual(json.loads(token_file.read_text())["access_token"], rotated)
 
+    def test_playback_renews_once_after_business_or_transport_rejection(self):
+        for view, sequence, expected in (
+            ("variants", (200,), 200),
+            ("variants", (503, 401), 200),
+            ("", (401,), 302),
+            ("", (200, 401), 502),
+        ):
+            with self.subTest(view=view, sequence=sequence), patch.object(
+                self.client, "_refresh_after_unauthorized",
+            ) as refresh, patch.object(proxy, "_playgy_signed_urls", proxy.SignedUrlCache()):
+                # 每项从实际取址开始，包括相邻的两次原画请求。
+                responses = iter(sequence)
+                upstream = self.provider.request
+
+                def respond(url, **kwargs):
+                    status = next(responses, None)
+                    if status is None:
+                        return upstream(url, **kwargs)
+                    if status == 200:
+                        return httpx.Response(200, json={"code": 0, "data": {"code": 401}})
+                    httpx.Response(status, request=httpx.Request("POST", url)).raise_for_status()
+                with patch.object(self.provider, "request", side_effect=respond) as request:
+                    response = self.http.get(self._url(view=view) if view else self.strm_url)
+                self.assertEqual(response.status_code, expected)
+                refresh.assert_called_once()
+                self.assertEqual(request.call_count, len(sequence) + int(expected != 502))
+
     def test_quality_401_stops_after_one_retry_or_at_deadline(self):
         for exhausted in (False, True):
             with self.subTest(exhausted=exhausted), patch.object(self.client, "_refresh_after_unauthorized") as refresh:

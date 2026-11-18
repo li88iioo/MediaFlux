@@ -10,6 +10,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
+from app.clients.guangya import is_guangya_unauthorized
 from app.logger import get_logger, log_throttled
 from app.modules.media_proxy import (
     PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
@@ -173,7 +174,7 @@ def play_gy(
             logger, logging.ERROR, f"playgy-error:{stage}:{type(exc).__name__}:{upstream_status}",
             "playgy 异常 stage=%s upstream_http=%s type=%s", stage, upstream_status, type(exc).__name__,
         )
-        return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=502 if view else 500)
+        return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=502 if view or is_guangya_unauthorized(exc) else 500)
 
 _PLAYGY_PATH = "/playgy/{file_id}/{etag}/{size}/{filename:path}"
 

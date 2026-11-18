@@ -898,7 +898,9 @@ def resolve_guangya_playback(
             cache.invalidate(file_id, **options)
         result = cache.get_or_fetch_sync_result(
             file_id,
-            lambda: client.get_download_url(file_id, timeout=remaining(), raise_timeout=True),
+            lambda: client.get_download_url(
+                file_id, timeout=remaining(), raise_timeout=True, refresh_unauthorized=True,
+            ),
             deadline=deadline, **options,
         )
         remaining()

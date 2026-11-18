@@ -41,6 +41,7 @@ class AccountClient(GuangYaClient):
         self.profile = PROFILE if profile is None else profile
         self.status_code = status_code
         self._raw = mock.Mock()
+        self._refresh_after_unauthorized = mock.Mock(return_value={})
         self._raw._account_headers.return_value = {"x-client-id": "test-client"}
         self._raw.request.side_effect = self._request
 

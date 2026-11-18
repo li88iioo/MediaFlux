@@ -23,6 +23,7 @@ from tests.test_agent_guangya_sdk_capabilities import _RecycleClient, _ShareClie
 class ReadClient(GuangYaClient):
     def __init__(self, payload):
         self._raw = mock.Mock()
+        self._refresh_after_unauthorized = mock.Mock(return_value={})
         for name in ("fs_files", "fs_detail", "fs_recycle_files", "share_user_list", "cloud_task_list", "get_task_status"):
             getattr(self._raw, name).return_value = payload
 

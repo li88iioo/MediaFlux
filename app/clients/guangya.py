@@ -636,6 +636,22 @@ class GuangYaReadRejected(RuntimeError):
         super().__init__(public_message)
 
 
+def _http_status_code(exc: BaseException) -> int:
+    response = getattr(exc, "response", None)
+    try:
+        return int(getattr(response, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_guangya_unauthorized(exc: BaseException) -> bool:
+    return any(
+        (isinstance(error, GuangYaReadRejected) and error.code == "401")
+        or _http_status_code(error) == 401
+        for error in _exception_chain(exc)
+    )
+
+
 def _raise_read_rejection(response: object, *, operation: str = "read") -> None:
     """统一识别 HTTP 200 内的业务失败，确保限流能进入正式重试链路。"""
     if not isinstance(response, dict):
@@ -1655,20 +1671,12 @@ class GuangYaClient:
             return self.refresh_now()
 
     @staticmethod
-    def _exception_status_code(exc: BaseException) -> int:
-        response = getattr(exc, "response", None)
-        try:
-            return int(getattr(response, "status_code", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    @classmethod
-    def _rate_limit_kind(cls, exc: BaseException) -> str:
+    def _rate_limit_kind(exc: BaseException) -> str:
         http_limited = False
         for current in _exception_chain(exc):
             if isinstance(current, GuangYaReadRejected) and current.rate_limited:
                 return "business"
-            http_limited |= cls._exception_status_code(current) == 429
+            http_limited |= _http_status_code(current) == 429
         return "http" if http_limited else ""
 
     @staticmethod
@@ -1697,13 +1705,13 @@ class GuangYaClient:
                     pass  # 缺失/非法响应头继续使用原有有界退避。
         return delay
 
-    @classmethod
-    def _read_retryable(cls, exc: Exception) -> bool:
+    @staticmethod
+    def _read_retryable(exc: Exception) -> bool:
         for current in _exception_chain(exc):
             if isinstance(current, GuangYaReadRejected) and current.retryable:
                 return True
-            status_code = cls._exception_status_code(current)
-            if status_code in {401, 408, 425, 429, 500, 502, 503, 504}:
+            status_code = _http_status_code(current)
+            if status_code in {408, 425, 429, 500, 502, 503, 504}:
                 return True
             if isinstance(current, httpx.TransportError):
                 return True
@@ -1760,11 +1768,16 @@ class GuangYaClient:
                 if rate_limited:
                     congestion.rejected(generation, delay)
                 retry_limit = 2 if rate_limit_kind == "business" else 1
-                if attempt >= retry_limit or not self._read_retryable(exc):
-                    raise
-                status_code = self._exception_status_code(exc)
-                if status_code == 401 and not refresh_unauthorized:
-                    raise
+                if is_guangya_unauthorized(exc):
+                    if not refresh_unauthorized:
+                        raise
+                    refresh_unauthorized = False
+                    status_code = 401
+                else:
+                    if attempt >= retry_limit or not self._read_retryable(exc):
+                        raise
+                    attempt += 1
+                    status_code = _http_status_code(exc)
                 if metrics is not None:
                     metrics.record_retry(status_code, rate_limited=rate_limited)
                 provider_code = (
@@ -1785,8 +1798,6 @@ class GuangYaClient:
                     self._refresh_after_unauthorized(observed_access_token)
                 elif not rate_limited:
                     _wait_read_delay(delay, deadline=deadline, should_stop=should_stop)
-                # 限流由共享调度器统一等待，不再让每个线程各自 sleep 后齐发。
-                attempt += 1
             else:
                 if metrics is not None:
                     metrics.record_request(monotonic() - started)
@@ -2022,11 +2033,7 @@ class GuangYaClient:
             except _ValidationRefreshBlocked:
                 logger.warning("光鸭只读校验检测到 SDK 刷新请求，已阻止")
             except Exception as exc:
-                if any(
-                    self._exception_status_code(error) == 401
-                    or (isinstance(error, GuangYaReadRejected) and error.code == "401")
-                    for error in _exception_chain(exc)
-                ):
+                if is_guangya_unauthorized(exc):
                     return "invalid"
             finally:
                 raw._mediaflux_refresh_blocked = previous_blocked
@@ -3363,6 +3370,7 @@ class GuangYaClient:
         *,
         timeout: float | None = None,
         raise_timeout: bool = False,
+        refresh_unauthorized: bool | None = None,
     ) -> Optional[str]:
         # 实测返回 {"msg":"success","data":{"signedURL":"https://...","urlDuration":21600,...}}
         deadline = None
@@ -3392,7 +3400,7 @@ class GuangYaClient:
 
         try:
             res = self._call_read(
-                "get_download_url", fetch, deadline=deadline
+                "get_download_url", fetch, deadline=deadline, refresh_unauthorized=refresh_unauthorized
             )
             if isinstance(res, dict):
                 data = res.get("data") or {}
@@ -3410,6 +3418,8 @@ class GuangYaClient:
             )
             if raise_timeout and self._is_timeout_error(exc):
                 raise TimeoutError("光鸭获取媒体直链超时") from exc
+            if refresh_unauthorized and is_guangya_unauthorized(exc):
+                raise
             return None
 
     # ===== 工具 =====
