@@ -31,6 +31,7 @@ from app.modules.agent_library_patrol_notifications import (
     send_library_patrol_notification_result,
     serialize_patrol_notification_payload,
 )
+from app.modules.telegram_notification_center import NotificationPublishResult
 from app.notifier import TelegramSendResult
 
 logger = get_logger(__name__)
@@ -57,7 +58,9 @@ class AgentLibraryPatrolScheduler:
         self,
         *,
         audit_executor: Callable[[dict], tuple[EpisodeAuditResult, int]] | None = None,
-        notification_sender: Callable[[dict, int], object] | None = None,
+        notification_sender: Callable[
+            [dict, int], NotificationPublishResult | TelegramSendResult | bool,
+        ] | None = None,
         interval: float = 30.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -388,15 +391,7 @@ class AgentLibraryPatrolScheduler:
                             next_attempt_at=current,
                         )
                         return 0
-                    raw_result = self._notification_sender(projection, notification_id)
-                result = (
-                    raw_result if isinstance(raw_result, TelegramSendResult)
-                    else TelegramSendResult(
-                        ok=bool(raw_result),
-                        error="" if raw_result else "DeliveryFailed",
-                        status_code=500 if raw_result is False else 0,
-                    )
-                )
+                    result = self._notification_sender(projection, notification_id)
             except AgentRuntimeDisabled:
                 agent_library_patrol_repo.release_agent_library_patrol_notification(
                     notification_id,
@@ -418,23 +413,29 @@ class AgentLibraryPatrolScheduler:
                         next_attempt_at=current,
                     )
                 return 1
-            if result.ok:
+            suppressed = (
+                isinstance(result, NotificationPublishResult)
+                and result.status in {"disabled", "suppressed"}
+            )
+            transport = result if isinstance(result, TelegramSendResult) else None
+            accepted = transport.ok if transport is not None else bool(result)
+            if suppressed or (transport is not None and transport.outcome_unknown):
+                agent_library_patrol_repo.discard_agent_library_patrol_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    error_type="NotificationPolicyDisabled" if suppressed else "DeliveryOutcomeUnknown",
+                )
+            elif accepted:
                 agent_library_patrol_repo.complete_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     sent_at=current,
                 )
-            elif result.outcome_unknown:
-                agent_library_patrol_repo.discard_agent_library_patrol_notification(
-                    notification_id,
-                    expected_lease_generation=generation,
-                    error_type="DeliveryOutcomeUnknown",
-                )
             elif self._runtime_allows(generation_guard):
                 self._retry_notification(
                     item,
                     error_type="DeliveryFailed",
-                    delay_override=result.retry_after_seconds,
+                    delay_override=transport.retry_after_seconds if transport is not None else 0,
                 )
             else:
                 agent_library_patrol_repo.release_agent_library_patrol_notification(

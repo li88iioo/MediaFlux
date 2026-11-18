@@ -68,6 +68,12 @@ def _patrol_result(*, status: str = "updates_available", ok: bool = True) -> Epi
     )
 
 
+def _recurring_patrol_results() -> list[tuple[EpisodeAuditResult, int]]:
+    recovered = _patrol_result(status="up_to_date")
+    recovered.data.update(updates_available_count=0, missing_episode_count=0, findings=[])
+    return [(_patrol_result(), 10), (recovered, 10), (_patrol_result(), 10)]
+
+
 class AgentLibraryPatrolConfigTests(unittest.TestCase):
     @staticmethod
     def _request():
@@ -745,17 +751,8 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(agent_library_patrol_repo.list_agent_library_patrol_notifications(), [])
 
     def test_recurring_findings_are_delivered_and_retry_reuses_the_same_event(self):
-        results = [
-            _patrol_result(),
-            _patrol_result(status="up_to_date"),
-            _patrol_result(),
-        ]
-        results[1].data.update(
-            {"updates_available_count": 0, "missing_episode_count": 0, "findings": []}
-        )
-        executor = Mock(side_effect=[(item, 10) for item in results])
         scheduler = AgentLibraryPatrolScheduler(
-            audit_executor=executor, clock=self.clock
+            audit_executor=Mock(side_effect=_recurring_patrol_results()), clock=self.clock,
         )
         sender = Mock(return_value=TelegramSendResult(True, message_id=100))
         real_publish = notification_center.publish_notification_event
@@ -798,6 +795,52 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         assert get_agent_library_patrol_result_6 is not None
         self.assertEqual(get_agent_library_patrol_result_6["result_revision"], 3)
 
+    def test_essential_recovery_is_discarded_before_standard_level_recurrence(self):
+        scheduler = AgentLibraryPatrolScheduler(
+            audit_executor=Mock(side_effect=_recurring_patrol_results()), clock=self.clock,
+        )
+        sender = Mock(return_value=TelegramSendResult(True, message_id=100))
+        level = "essential"
+        with (
+            self._config(notify=True),
+            patch.object(notification_policy, "notification_level", side_effect=lambda: level),
+            patch.multiple(
+                notification_center, notification_target_chat_id=Mock(return_value="100"),
+                send_event_result=sender, _dispatch_stop=Event(),
+                wake_telegram_notification_dispatcher=Mock(),
+            ),
+        ):
+            for day in (3, 4, 5):
+                self.clock.value = datetime(2026, 8, day, 12, 0, 0)
+                if day == 5:
+                    level = "standard"
+                self.assertEqual(scheduler.run_once(), 1)
+                while scheduler.dispatch_notification_once():
+                    pass
+
+        rows = agent_library_patrol_repo.list_agent_library_patrol_notifications()
+        self.assertEqual([(row["status"], row["attempts"]) for row in rows], [
+            ("sent", 0), ("discarded", 0), ("sent", 0),
+        ])
+        self.assertEqual([call.args[0].title for call in sender.call_args_list], [
+            "Agent 全库缺集巡检发现更新",
+            "Agent 全库缺集巡检发现更新",
+        ])
+
+    def test_center_policy_suppression_discards_an_accepted_event(self):
+        scheduler = AgentLibraryPatrolScheduler(
+            audit_executor=Mock(return_value=(_patrol_result(), 10)),
+            notification_sender=Mock(return_value=notification_center.NotificationPublishResult(
+                True, status="suppressed",
+            )),
+            clock=self.clock,
+        )
+        with self._config(notify=True):
+            scheduler.run_once()
+            self.assertEqual(scheduler.dispatch_notification_once(), 1)
+        row, = agent_library_patrol_repo.list_agent_library_patrol_notifications()
+        self.assertEqual((row["status"], row["attempts"]), ("discarded", 0))
+
     def test_delivery_success_marks_outbox_sent(self):
         sender = Mock(return_value=True)
         scheduler = AgentLibraryPatrolScheduler(
@@ -817,7 +860,9 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
     def test_delivery_failure_retries_without_rolling_back_patrol_result(self):
         scheduler = AgentLibraryPatrolScheduler(
             audit_executor=Mock(return_value=(_patrol_result(), 10)),
-            notification_sender=Mock(return_value=False),
+            notification_sender=Mock(return_value=TelegramSendResult(
+                False, status_code=429, retry_after_seconds=75,
+            )),
             clock=self.clock,
         )
         with self._config(notify=True):
@@ -829,7 +874,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(patrol["outcome"], "updates_available")
         self.assertEqual(notification["status"], "retry_wait")
         self.assertEqual(notification["attempts"], 1)
-        self.assertEqual(notification["next_attempt_at"], "2026-08-03 12:01:00")
+        self.assertEqual(notification["next_attempt_at"], "2026-08-03 12:01:15")
         self.assertEqual(notification["last_error_type"], "DeliveryFailed")
 
     def test_delivery_outcome_unknown_is_discarded_without_duplicate_retry(self):

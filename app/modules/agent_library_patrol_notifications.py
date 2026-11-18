@@ -8,8 +8,9 @@ from dataclasses import replace
 from typing import Any
 
 from app.modules.library_patrol import validate_persisted_patrol_projection
+from app.modules.telegram_notification_center import NotificationPublishResult
 from app.config import get, get_bool
-from app.notifier import NotificationAction, NotificationEvent, TelegramSendResult
+from app.notifier import NotificationAction, NotificationEvent
 
 _FINGERPRINT_SCHEMA_VERSION = 1
 _MAX_PAYLOAD_BYTES = 32_768
@@ -127,7 +128,7 @@ def _patrol_actions_configured() -> bool:
     )
 
 
-def send_library_patrol_notification_result(projection: Any, notification_id: int) -> TelegramSendResult:
+def send_library_patrol_notification_result(projection: Any, notification_id: int) -> NotificationPublishResult:
     """按持久通知 ID 移交本次巡检变化，重试复用同一事件。"""
     safe = _validated_projection(projection)
     event = build_library_patrol_event(safe)
@@ -141,8 +142,8 @@ def send_library_patrol_notification_result(projection: Any, notification_id: in
     )
 
     if not notifications_enabled():
-        return TelegramSendResult(False, error="NotificationsDisabled", status_code=503)
-    outcome = publish_notification_event(
+        return NotificationPublishResult(False, status="disabled")
+    return publish_notification_event(
         f"agent-library-patrol:{notification_id}",
         event,
         topic=NotificationTopic.AGENT,
@@ -151,9 +152,4 @@ def send_library_patrol_notification_result(projection: Any, notification_id: in
             if safe["patrol_status"] == "up_to_date"
             else NotificationImportance.ACTION
         ),
-    )
-    return TelegramSendResult(
-        ok=bool(outcome),
-        error="" if outcome else (outcome.status or "DeliveryFailed"),
-        status_code=0 if outcome else 503,
     )
