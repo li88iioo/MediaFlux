@@ -244,7 +244,7 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             with patch(
                 "app.modules.media_refresh_coordinator.get_media_refresh_coordinator"
             ):
-                self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), [])
+                self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), ("queued", []))
 
             endpoint = MediaEndpoint("/media/Movies")
             old_worker = MediaRefreshCoordinator()
@@ -261,7 +261,7 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             self.assertEqual(queue.claim_due_media_refreshes(owner=old_worker._owner, force=True), [])
             # 新变化重新入队，模拟进程在消费新工作时中断，而非媒体服务失败自动重试。
             with patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator"):
-                self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), [])
+                self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), ("queued", []))
             old_lease = queue.claim_due_media_refreshes(
                 owner=old_worker._owner, force=True
             )[0]
@@ -269,7 +269,7 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             with patch(
                 "app.modules.media_refresh_coordinator.get_media_refresh_coordinator"
             ):
-                self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), [])
+                self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), ("queued", []))
             saved_state = db.kv_get(queue._QUEUE_KEY)
             self.assertEqual(queue.media_refresh_queue_status()["paths"], 2)
             archive = create_backup(paths)

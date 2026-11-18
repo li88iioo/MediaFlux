@@ -40,8 +40,8 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
         with patch("app.modules.media_server_profiles.list_configured_profiles", return_value=[profile]), \
              patch("app.clients.jellyfin.JellyfinClient", return_value=client), \
              patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator"):
-            warnings = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], [plan]))
-        self.assertEqual(warnings, [])
+            result = LocalMediaService._refresh_plans(cast(list[LocalMovePlan], [plan]))
+        self.assertEqual(result, ("queued", []))
         client.list_virtual_folders.assert_not_called()
         self.assertEqual(media_refresh_queue_status()["paths"], 1)
 
