@@ -30,6 +30,7 @@ MEDIA_SUBSCRIPTION_DEFAULTS: Mapping[str, Any] = MappingProxyType({
     "sites": (),
     "check_interval_minutes": 4320,
 })
+_ACTIVE_DOWNLOAD_ADMISSION_STATES = "('claimed','dispatching','submitted','downloading','processing')"
 
 
 def get_conn():
@@ -844,9 +845,10 @@ def finalize_media_subscription_check(
                     "candidate_count": max(
                         0, int(result_payload.get("candidate_count") or 0)
                     ),
-                    "auto_submitted": max(
-                        0, int(result_payload.get("auto_submitted") or 0)
-                    ),
+                    **{
+                        key: max(0, int(result_payload.get(key) or 0))
+                        for key in ("auto_submitted", "auto_existing", "auto_pending", "auto_review")
+                    },
                 },
                 stamp=stamp,
             )
@@ -1202,10 +1204,21 @@ def list_active_media_download_admissions(subscription_id: int | None = None) ->
         params.append(subscription_id)
     with get_conn() as conn:
         return conn.execute(
-            "SELECT * FROM media_download_admissions WHERE status IN "
-            "('claimed','dispatching','submitted','downloading','processing')" + clause + " ORDER BY id",
+            "SELECT * FROM media_download_admissions "
+            f"WHERE status IN {_ACTIVE_DOWNLOAD_ADMISSION_STATES}{clause} ORDER BY id",
             params,
         ).fetchall()
+
+
+def get_active_media_download_request(media_key: str) -> sqlite3.Row | None:
+    """读取去重准入实际绑定的请求，供追更投影下载状态。"""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT r.status,r.qb_status,r.gy_status,r.attention_cleared_at "
+            "FROM media_download_admissions a JOIN download_requests r ON r.id=a.request_id "
+            f"WHERE a.media_key=? AND a.status IN {_ACTIVE_DOWNLOAD_ADMISSION_STATES}",
+            (media_key,),
+        ).fetchone()
 
 
 def _completed_request_target_error(request) -> str:
@@ -1470,8 +1483,8 @@ def claim_media_download_admission(
             conn.rollback()
             return 0
         duplicate = conn.execute(
-            "SELECT 1 FROM media_download_admissions WHERE media_key=? AND status IN "
-            "('claimed','dispatching','submitted','downloading','processing')",
+            "SELECT 1 FROM media_download_admissions "
+            f"WHERE media_key=? AND status IN {_ACTIVE_DOWNLOAD_ADMISSION_STATES}",
             (media_key,),
         ).fetchone()
         if duplicate is not None:

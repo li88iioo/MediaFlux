@@ -197,7 +197,7 @@ def test_tv_processes_search_publish_and_auto_download_before_the_next_target():
             candidate = repo.get_media_subscription_candidate(cid)
             assert candidate is not None and candidate["status"] == "available"
             events.append(("download", candidate["episode"]))
-            return {"ok": True}
+            return {"ok": True, "created": True}
         service = MediaSubscriptionService()
         with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
             "app.modules.media_subscriptions.get_indexer_service", return_value=SimpleNamespace(search_media=search),

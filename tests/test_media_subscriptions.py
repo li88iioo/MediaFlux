@@ -1293,7 +1293,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
             self._item("already-submitted"),
             self._item("available-next"),
         ], sites_attempted=("site",), sites_succeeded=("site",), errors=[], partial=False, cached=False)
-        download = AsyncMock(return_value={"ok": True})
+        download = AsyncMock(return_value={"ok": True, "created": True})
 
         async def scenario() -> dict:
             with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
@@ -1351,7 +1351,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
         aggregated = SimpleNamespace(items=[
             self._item("already-submitted"), self._item("available-next")
         ], sites_attempted=("site",), sites_succeeded=("site",), errors=[], partial=False, cached=False)
-        download = AsyncMock(return_value={"ok": True})
+        download = AsyncMock(return_value={"ok": True, "created": True})
 
         async def scenario() -> dict:
             with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
@@ -1387,7 +1387,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
         aggregated = SimpleNamespace(items=[self._item("first"), self._item("second")], sites_attempted=("site",), sites_succeeded=("site",), errors=[], partial=False, cached=False)
         download = AsyncMock(side_effect=[
             MediaSubscriptionError("候选已提交", status_code=409, code="unavailable"),
-            {"ok": True},
+            {"ok": True, "created": True},
         ])
 
         async def scenario() -> dict:

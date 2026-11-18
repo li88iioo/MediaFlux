@@ -928,7 +928,25 @@ class MediaSubscriptionService:
                                 self._ensure_active_check(subscription_id, revision, cancel_event)
                                 continue
                             raise
-                        result["auto_submitted"] += int(bool(downloaded.get("ok") or downloaded.get("duplicate")))
+                        if downloaded.get("ok"):
+                            counter = "auto_submitted" if downloaded.get("created") is True else "auto_existing"
+                        elif downloaded.get("duplicate"):
+                            request_id = int(downloaded.get("request_id") or 0)
+                            request = (
+                                download_requests_repo.get_download_request(request_id) if request_id
+                                else media_subscriptions_repo.get_active_media_download_request(target.media_key)
+                            )
+                            if request is None or request["status"] in {"cancelled", "resubmitted"}:
+                                counter = "auto_pending"
+                            elif download_requests_repo.download_request_attention_stages(request):
+                                counter = "auto_review"
+                            else:
+                                counter = "auto_existing"
+                        elif downloaded.get("status") == "manual_review":
+                            counter = "auto_review"
+                        else:
+                            break
+                        result[counter] = result.get(counter, 0) + 1
                         break
             stored_result = dict(result)
             public_result = dict(result)

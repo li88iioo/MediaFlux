@@ -228,6 +228,34 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self.assertIn("- <b>🎯 候选：</b> 4 个", body)
         self.assertIn("- <b>🚀 已提交：</b> 2 项", body)
 
+    def test_essential_level_only_notifies_when_mixed_receipts_need_review(self) -> None:
+        self._enable_rule()
+        payload = {
+            "action": "auto", "candidate_count": 6, "auto_submitted": 2,
+            "auto_existing": 1, "auto_pending": 3,
+        }
+        with (
+            patch("app.modules.telegram_notification_policy.notification_level", return_value="essential"),
+            patch("app.modules.telegram_notification_center.notification_target_chat_id", return_value="100"),
+            patch(
+                "app.modules.telegram_notification_center.send_event_result",
+                return_value=TelegramSendResult(ok=True, message_id=54),
+            ) as send,
+        ):
+            self._finalize(missing_count=6, payload=payload)
+            self.assertTrue(drain_media_subscription_notifications())
+            send.assert_not_called()
+            self._finalize(missing_count=7, payload={**payload, "auto_review": 1})
+            self.assertTrue(drain_media_subscription_notifications())
+
+        send.assert_called_once()
+        event = send.call_args.args[0]
+        self.assertIn("追更下载需要处理", render_event(event))
+        self.assertEqual(dict(event.fields)["已提交"], "2 项")
+        self.assertEqual(dict(event.fields)["已有下载请求"], "1 项")
+        self.assertEqual(dict(event.fields)["提交处理中"], "3 项")
+        self.assertEqual(dict(event.fields)["需处理"], "1 项")
+
     def test_missing_confirm_candidates_are_reported_as_actionable(self) -> None:
         self._enable_rule(notify_on_missing=True)
         self._finalize(payload={

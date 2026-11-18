@@ -11,6 +11,7 @@ from app.repositories import media_experience as repository
 
 from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
+from app.modules.telegram_notification_policy import NotificationImportance
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from app.repositories.media_experience import (
     claim_due_notifications,
@@ -22,7 +23,7 @@ from app.repositories.media_experience import (
 logger = get_logger(__name__)
 
 
-def _event(item: dict) -> NotificationEvent:
+def _event(item: dict) -> tuple[NotificationEvent, NotificationImportance]:
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
     title = sanitize_public_text(payload.get("title"), limit=120) or "媒体订阅"
     event_type = str(item.get("event_type") or "")
@@ -30,6 +31,9 @@ def _event(item: dict) -> NotificationEvent:
         missing = max(0, int(payload.get("missing_count") or 0))
         candidates = max(0, int(payload.get("candidate_count") or 0))
         submitted = max(0, int(payload.get("auto_submitted") or 0))
+        existing = max(0, int(payload.get("auto_existing") or 0))
+        pending = max(0, int(payload.get("auto_pending") or 0))
+        review = max(0, int(payload.get("auto_review") or 0))
         action = str(payload.get("action") or "notify").strip().lower()
         fields = [
             ("目标媒体", title),
@@ -38,15 +42,27 @@ def _event(item: dict) -> NotificationEvent:
         ]
         if candidates:
             fields.append(("候选", f"{candidates} 个"))
-        if submitted:
-            fields.append(("已提交", f"{submitted} 项"))
-            return NotificationEvent(
-                "✅ 追更已自动提交下载",
-                fields=tuple(fields),
-                footer="下载与后续入库状态会继续由对应任务通知更新。",
-                layout="relaxed",
+        fields.extend(
+            (label, f"{count} 项")
+            for label, count in (
+                ("已提交", submitted), ("已有下载请求", existing),
+                ("提交处理中", pending), ("需处理", review),
             )
-        if action == "confirm" and candidates:
+            if count
+        )
+        if review:
+            heading = "⚠️ 追更下载需要处理"
+            footer = "请在下载中心查看待处理事项。"
+        elif submitted:
+            heading = "✅ 追更已自动提交下载"
+            footer = "下载与后续入库状态会继续由对应任务通知更新。"
+        elif existing:
+            heading = "📥 追更已有下载请求"
+            footer = "请在下载中心查看已有任务的下载与入库状态。"
+        elif pending:
+            heading = "📥 追更下载提交处理中"
+            footer = ""
+        elif action == "confirm" and candidates:
             footer = "已找到候选，请在媒体追更中确认后再提交下载。"
             heading = "⚠️ 追更候选待确认"
         elif candidates:
@@ -55,12 +71,16 @@ def _event(item: dict) -> NotificationEvent:
         else:
             footer = "本轮未找到可用候选，可稍后重试或调整资源检索条件。"
             heading = "⚠️ 追更暂无可用资源"
+        importance = (
+            NotificationImportance.ACTION if review or not (submitted or existing or pending)
+            else NotificationImportance.RESULT
+        )
         return NotificationEvent(
             heading,
             fields=tuple(fields),
             footer=footer,
             layout="relaxed",
-        )
+        ), importance
     if event_type == "satisfied":
         return NotificationEvent(
             "✅ 追更已满足",
@@ -70,7 +90,7 @@ def _event(item: dict) -> NotificationEvent:
                 ("状态", "当前没有检测到缺失内容"),
             ),
             layout="relaxed",
-        )
+        ), NotificationImportance.RESULT
     if event_type == "inconclusive":
         reason = sanitize_public_text(payload.get("summary"), limit=220)
         return NotificationEvent(
@@ -78,13 +98,13 @@ def _event(item: dict) -> NotificationEvent:
             fields=(("目标媒体", title),),
             footer=reason or "请检查媒体服务器连接、媒体库映射与 TMDB 数据后重试。",
             layout="relaxed",
-        )
+        ), NotificationImportance.ERROR
     return NotificationEvent(
         "⚠️ 追更检查异常",
         fields=(("目标媒体", title),),
         footer="本轮检查未能完成，可稍后重试。",
         layout="relaxed",
-    )
+    ), NotificationImportance.ERROR
 
 
 def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
@@ -103,7 +123,6 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
     delivered = True
     from app.modules.telegram_notification_center import publish_notification_event
     from app.modules.telegram_notification_policy import (
-        NotificationImportance,
         NotificationTopic,
         notifications_enabled,
     )
@@ -112,21 +131,12 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
         generation = int(item["lease_generation"])
         try:
             event_type = str(item.get("event_type") or "")
-            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-            missing_actionable = (
-                event_type == "missing" and int(payload.get("auto_submitted") or 0) <= 0
-            )
+            event, importance = _event(item)
             outcome = publish_notification_event(
                 f"media-subscription:{item['id']}:{event_type}",
-                _event(item),
+                event,
                 topic=NotificationTopic.MEDIA_SUBSCRIPTION,
-                importance=(
-                    NotificationImportance.ERROR
-                    if event_type not in {"missing", "satisfied"}
-                    else NotificationImportance.ACTION
-                    if missing_actionable
-                    else NotificationImportance.RESULT
-                ),
+                importance=importance,
             )
             # 全局开关或通知等级主动抑制都属于已执行的消费策略；事务 outbox
             # 不应把同一条被策略拒绝的结果反复移交和重试。

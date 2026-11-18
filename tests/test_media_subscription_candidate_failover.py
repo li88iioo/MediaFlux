@@ -23,10 +23,14 @@ from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
 from app.indexers.service import IndexerService
 from app.modules import download_dispatcher, media_subscriptions
+from app.modules import telegram_notification_center as notification_center
+from app.modules import telegram_notification_policy as notification_policy
 from app.modules.media_subscriptions import (
     MediaSubscriptionError,
     MediaSubscriptionService,
 )
+from app.notifier import TelegramSendResult, render_event
+from app.repositories.media_experience import get_notification_rule, set_notification_rule
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -126,6 +130,25 @@ class MediaSubscriptionCandidateFailoverTests(IsolatedDatabaseTestCase):
             download_dispatcher, "_submit_guangya", side_effect=AssertionError("unexpected guangya backend"),
         ))
         return subscription_id, source, indexer, backend
+
+    def capture_notifications(self, subscription_id, *, level="standard"):
+        rule = get_notification_rule(subscription_id)
+        assert rule is not None
+        assert set_notification_rule(
+            subscription_id, expected_rule_revision=rule["revision"],
+            expected_subscription_revision=rule["subscription_revision"], updates={"enabled": True},
+        )
+        self.enterContext(patch.object(notification_policy, "notifications_enabled", return_value=True))
+        self.enterContext(patch.object(notification_policy, "notification_level", return_value=level))
+        self.enterContext(patch.multiple(
+            notification_center,
+            _dispatch_stop=threading.Event(),
+            notification_target_chat_id=lambda chat=None: chat or "100",
+        ))
+        self.enterContext(patch.object(notification_center, "wake_telegram_notification_dispatcher"))
+        return self.enterContext(patch.object(
+            notification_center, "send_event_result", return_value=TelegramSendResult(True, message_id=100),
+        ))
 
     @staticmethod
     def admissions(subscription_id):
@@ -264,6 +287,7 @@ class MediaSubscriptionCandidateFailoverTests(IsolatedDatabaseTestCase):
         }
         checked = asyncio.run(MediaSubscriptionService().check_subscription(subscription_id))
         self.assertEqual(checked["result"]["auto_submitted"], 0)
+        self.assertEqual(checked["result"]["auto_review"], 1)
         self.assertEqual(source.resolve_titles, [source.items[0].title])
         backend.assert_called_once()
         admissions = self.admissions(subscription_id)
@@ -294,6 +318,7 @@ class MediaSubscriptionCandidateFailoverTests(IsolatedDatabaseTestCase):
 
     def test_duplicate_bound_request_stops_candidate_search_without_backend_submit(self):
         subscription_id, source, _indexer, backend = self.scenario(failures=())
+        sender = self.capture_notifications(subscription_id)
         existing = download_dispatcher.create_request(
             download_dispatcher.normalize_download_url(source.items[0].magnet),
             "", "", origin="indexer:nyaa",
@@ -301,12 +326,74 @@ class MediaSubscriptionCandidateFailoverTests(IsolatedDatabaseTestCase):
         request_id = int(existing["id"])
         download_requests_repo.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
         checked = asyncio.run(MediaSubscriptionService().check_subscription(subscription_id))
-        self.assertEqual(checked["result"]["auto_submitted"], 1)
+        self.assertEqual(checked["result"]["auto_submitted"], 0)
+        self.assertEqual(checked["result"]["auto_existing"], 1)
         self.assertEqual(source.resolve_titles, [source.items[0].title])
         backend.assert_not_called()
         admissions = self.admissions(subscription_id)
         self.assertEqual(len(admissions), 1)
         self.assertEqual(admissions[0]["request_id"], request_id)
+        sender.assert_called_once()
+        body = render_event(sender.call_args.args[0])
+        self.assertIn("追更已有下载请求", body)
+        self.assertNotIn("已自动提交下载", body)
+
+    def test_reused_pending_request_is_dispatched_without_counting_a_new_request(self):
+        subscription_id, source, _indexer, backend = self.scenario(failures=())
+        existing = download_dispatcher.create_request(
+            download_dispatcher.normalize_download_url(source.items[0].magnet),
+            "", "", origin="indexer:nyaa",
+        )
+        result = asyncio.run(MediaSubscriptionService().check_subscription(subscription_id))["result"]
+        self.assertEqual((result["auto_submitted"], result["auto_existing"]), (0, 1))
+        request = download_requests_repo.get_download_request(int(existing["id"]))
+        assert request is not None
+        self.assertEqual(request["status"], "submitted")
+        self.assertEqual(self.request_count(), 1)
+        backend.assert_called_once()
+
+    def test_concurrent_placeholder_does_not_count_as_submitted_and_released_admission_can_retry(self):
+        subscription_id, source, _indexer, backend = self.scenario(failures=())
+        sender = self.capture_notifications(subscription_id, level="essential")
+        media_key = "tmdb:86034:movie"
+        previous_id, = seed_media_subscription_candidates(
+            subscription_id, media_key, season=None, episode=None,
+            candidates=[{"result_id": "previous-candidate", "download_state": "ready"}],
+            expires_at="2099-01-01 00:00:00",
+        )
+        row = media_subscriptions_repo.get_media_subscription(subscription_id)
+        assert row is not None
+        search = source.search
+
+        async def search_after_other_operation_claims(request):
+            admission = media_subscriptions_repo.claim_media_download_admission(
+                media_key=media_key, tmdb_id="86034", media_type="movie",
+                subscription_id=subscription_id, candidate_id=previous_id,
+                season=None, episode=None, subscription_revision=row["revision"],
+            )
+            self.assertGreater(admission or 0, 0)
+            return await search(request)
+
+        service = MediaSubscriptionService()
+        with patch.object(source, "search", side_effect=search_after_other_operation_claims):
+            result = asyncio.run(service.check_subscription(subscription_id))["result"]
+        self.assertEqual((result["auto_submitted"], self.request_count()), (0, 0))
+        self.assertEqual(result["auto_pending"], 1)
+        backend.assert_not_called()
+        self.assertEqual(source.resolve_titles, [])
+        sender.assert_not_called()
+        admission, = self.admissions(subscription_id)
+        self.assertEqual((admission["status"], admission["request_id"]), ("claimed", None))
+
+        self.assertTrue(media_subscriptions_repo.fail_unbound_media_download_admission(
+            admission["id"], "前一操作提交前失败",
+        ))
+        with patch.object(notification_policy, "notification_level", return_value="standard"):
+            retried = asyncio.run(service.check_subscription(subscription_id, trigger="retry"))["result"]
+        self.assertEqual((retried["auto_submitted"], self.request_count()), (1, 1))
+        backend.assert_called_once()
+        sender.assert_called_once()
+        self.assertIn("追更已自动提交下载", render_event(sender.call_args.args[0]))
 
     def test_failed_historical_request_creates_successor_before_marking_candidate_submitted(self):
         subscription_id, source, _indexer, backend = self.scenario(failures=())
