@@ -653,6 +653,19 @@ class PlayGyQualityTests(unittest.TestCase):
                 self.assertEqual(self._calls(), [_DETAIL] if exhausted else [_DETAIL, _DETAIL])
                 self.assertEqual(refresh.call_count, 0 if exhausted else 1)
 
+    def test_quality_failure_log_identifies_upstream_status_without_private_url(self):
+        def deny(call):
+            request = httpx.Request("POST", call["url"] + "?token=" + _ACCESS_TOKEN)
+            httpx.Response(403, request=request).raise_for_status()
+
+        self.provider.on_request = deny
+        with patch("app.logger._limiter_state", {}), self.assertLogs(proxy.logger, level="ERROR") as logs:
+            self._error(self.http.get(self._url(view="variants")), 502)
+        message = "\n".join(logs.output)
+        self.assertIn("stage=variants upstream_http=403", message)
+        self.assertNotIn(_ACCESS_TOKEN, message)
+        self.assertNotIn(_DETAIL, message)
+
     def test_total_budget_exhaustion_and_transport_timeout_return_504_without_secret(self):
         for detail_exhausts_budget in (True, False):
             with self.subTest(detail_exhausts_budget=detail_exhausts_budget):

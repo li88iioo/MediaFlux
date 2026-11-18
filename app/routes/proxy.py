@@ -6,6 +6,7 @@ import logging
 import time
 from functools import partial
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
@@ -166,9 +167,11 @@ def play_gy(
     except Exception as exc:
         if view and isinstance(exc, FileNotFoundError):
             return JSONResponse({"error": "所选画质已不可用，请刷新画质列表"}, status_code=404)
+        stage = view or "original"
+        upstream_status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
         log_throttled(
-            logger, logging.ERROR, f"playgy-error:{type(exc).__name__}",
-            "playgy 异常 type=%s", type(exc).__name__,
+            logger, logging.ERROR, f"playgy-error:{stage}:{type(exc).__name__}:{upstream_status}",
+            "playgy 异常 stage=%s upstream_http=%s type=%s", stage, upstream_status, type(exc).__name__,
         )
         return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=502 if view else 500)
 
