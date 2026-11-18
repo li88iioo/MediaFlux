@@ -434,7 +434,8 @@ def _tmdb_image_url(items: Sequence[object]) -> str:
 
 
 def build_media_events(
-    items: Sequence[object], *, layout: str = "default", inventory_final: bool = True
+    items: Sequence[object], *, layout: str = "default", inventory_final: bool = True,
+    verified_only: bool = False,
 ) -> list[NotificationEvent]:
     """按 TMDB、媒体类型和季号聚合媒体入库卡片。"""
     groups: dict[tuple[str, str, int | None], list[object]] = {}
@@ -446,6 +447,8 @@ def build_media_events(
             continue
         raw_season = _item_value(item, "season")
         season = safe_int(raw_season, None) if media_type == "tv" and raw_season not in (None, "") else None
+        if verified_only and season is not None and season < 0:
+            season = None
         groups.setdefault((tmdb_id, media_type, season), []).append(item)
 
     events: list[NotificationEvent] = []
@@ -460,33 +463,48 @@ def build_media_events(
             event_title = f"🎬 新片入库：{title_with_year}"
 
         fields: list[tuple[object, object]] = []
-        episodes = []
-        for item in current:
-            episode = _item_value(item, "episode")
-            parsed_episode = safe_int(episode, None)
-            if parsed_episode is not None:
-                episodes.append(parsed_episode)
+        episodes = [
+            episode for item in current
+            if (episode := safe_int(_item_value(item, "episode"), 0, minimum=0)) > 0
+        ]
         episode_range = _format_episode_range(episodes)
-        if media_type == "tv" and episode_range:
-            fields.append(("本次", episode_range))
-            season_total = max((
+        positions_known = season is not None and len(episodes) == len(current)
+        if media_type == "tv":
+            if verified_only and season is None:
+                fields.append(("说明", "季号未记录，未展开本次分集"))
+            else:
+                if episode_range:
+                    fields.append(("本次", episode_range))
+                if verified_only and not positions_known:
+                    fields.append(("说明", f"{len(current) - len(episodes)} 个文件未记录集号"))
+        if media_type == "tv" and episode_range and (not verified_only or positions_known):
+            season_totals = {
                 safe_int(_item_value(item, "season_total", 0), 0, minimum=0)
                 for item in current
-            ), default=0)
-            inventory_known = False
-            present_episodes: set[int] = set()
+            }
+            season_total = 0 if verified_only and len(season_totals) != 1 else max(season_totals)
+            expected = set(range(1, season_total + 1))
+            snapshots: list[set[int]] = []
             for item in current:
                 inventory = _item_value(item, "season_present_episodes", None)
                 if not isinstance(inventory, (list, tuple, set)):
                     continue
-                inventory_known = True
-                present_episodes.update(
+                snapshots.append({
                     parsed for value in inventory
                     if (parsed := safe_int(value, 0, minimum=0)) > 0
+                })
+            if verified_only:
+                # 确认分批完成，不能拼接不同时间的库存快照来证明一季齐全。
+                successful = set(episodes)
+                present_episodes = max(
+                    (observed for observed in snapshots if successful <= observed),
+                    key=lambda observed: len(observed & expected) if expected else len(observed),
+                    default=None,
                 )
-            if inventory_known:
+            else:
+                present_episodes = set().union(*snapshots) if snapshots else None
+            if present_episodes is not None:
                 if season_total:
-                    expected = set(range(1, season_total + 1))
                     present_in_range = present_episodes & expected
                     missing = sorted(expected - present_in_range)
                     complete = not missing
@@ -516,10 +534,11 @@ def build_media_events(
         explicit_versions = " ".join(str(_item_value(item, "version", "") or "") for item in current)
         filenames = " ".join(str(_item_value(item, "filename", "") or "") for item in current)
         version = _format_version(explicit_versions, filenames)
-        total_size = sum(
+        sizes = [
             safe_int(_item_value(item, "size", 0), 0, minimum=0)
             for item in current
-        )
+        ]
+        total_size = sum(sizes) if not verified_only or all(sizes) else 0
         tmdb_id = _first_value(current, "tmdb_id", "")
         fields.extend((
             ("来源", source),

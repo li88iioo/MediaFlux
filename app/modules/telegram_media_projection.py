@@ -72,6 +72,18 @@ def _episode_range(values: set[int]) -> str:
     )
 
 
+def read_organize_media_items(
+    stats: Mapping[str, object], *, moved: int,
+) -> tuple[dict, ...]:
+    """仅使用与本次成功移动计数相符的已落库明细。"""
+    items = stats.get("media_items")
+    if not isinstance(items, (list, tuple)) or len(items) != moved:
+        return ()
+    if not all(isinstance(item, dict) and str(item.get("title") or "").strip() for item in items):
+        return ()
+    return tuple(items)
+
+
 def _compact_blocks(items: Sequence[object]) -> tuple[str, ...]:
     grouped: dict[tuple[str, str, str, int], set[int]] = {}
     for item in items:
@@ -157,6 +169,7 @@ def _separated_blocks(
 
 def build_media_detail_blocks(
     items: Sequence[object], *, inventory_final: bool = True,
+    verified_only: bool = False,
 ) -> tuple[str, ...]:
     """恢复旧媒体卡的全部文本字段，并为无法成卡的数据保留紧凑兜底。"""
     rows = tuple(items or ())
@@ -169,6 +182,7 @@ def build_media_detail_blocks(
         _event_block(event)
         for event in build_media_events(
             identified, layout="relaxed", inventory_final=inventory_final,
+            verified_only=verified_only,
         )
     ]
     blocks.extend(_compact_blocks(fallback))

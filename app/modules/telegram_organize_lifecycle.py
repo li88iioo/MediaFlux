@@ -1,6 +1,7 @@
 """光鸭整理与后续 STRM/媒体库刷新的单消息事务投影。"""
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Mapping
@@ -10,6 +11,7 @@ from typing import Any, Sequence
 from app.modules.telegram_media_projection import (
     attach_bounded_media_details,
     build_media_detail_blocks,
+    read_organize_media_items,
 )
 from app.modules.telegram_notification_center import (
     NotificationPublishResult,
@@ -18,6 +20,7 @@ from app.modules.telegram_notification_center import (
     deserialize_notification_event,
 )
 from app.logger import get_logger
+from app.repositories.organize_history import get_organize_task_run_by_task_id
 from app.repositories.telegram_notifications import list_recovered_organize_refresh_notifications
 from app.modules.telegram_notification_policy import (
     NotificationImportance,
@@ -175,9 +178,11 @@ def build_organize_confirmation_rollup(
 ) -> dict[str, Any]:
     """生成可随候选卡持久化的最小任务基线，不复制媒体详情。"""
     counts = _counts(stats)
+    run_id = safe_int(stats.get("organize_run_id"), 0, minimum=0)
     return {
         "version": _CONFIRMATION_ROLLUP_VERSION,
         **counts,
+        **({"run_id": run_id} if run_id else {}),
         "actionable_files": safe_int(
             stats.get("notification_actionable_confirmation_files"),
             0,
@@ -252,11 +257,7 @@ def _confirmation_inventory_status(
 def _confirmation_media_lines(
     lines: Sequence[object], *, inventory_status: str,
 ) -> tuple[str, ...]:
-    """刷新媒体详情中的整理状态，移除已失效的待确认原因。
-
-    原汇总只持久化了已入库媒体的有界文本投影，无法安全重算整个季库存；
-    因此这里只按剩余问题改写或删除状态行，不猜测缺集和其它库存统计。
-    """
+    """按确认后的剩余问题替换或移除媒体块中的库存状态行。"""
     settled: list[str] = []
     for block in lines:
         updated_lines: list[str] = []
@@ -444,15 +445,30 @@ def update_organize_lifecycle_confirmations(
         key: safe_int(baseline.get(key), 0, minimum=0)
         for key in ("total", "moved", "metadata", "confirm", "skipped", "failed", "duplicate_recycled")
     }
+    manual_moved = safe_int(outcomes.get("moved"), 0, minimum=0)
+    manual_items = read_organize_media_items(outcomes, moved=manual_moved)
+    automatic_items: tuple[dict, ...] = ()
+    if manual_items and base["moved"]:
+        run = get_organize_task_run_by_task_id(
+            task_id, run_id=safe_int(baseline.get("run_id"), 0, minimum=0),
+        )
+        if run is not None:
+            if run["status"] in {"queued", "running"}:
+                # 候选卡可能先于父任务结算送达，留给已有的未回写恢复流程。
+                return NotificationPublishResult(False, status="pending_organize_run")
+            result = json.loads(run["result"])
+            stats = result.get("stats", result)
+            if isinstance(stats, dict):
+                automatic_items = read_organize_media_items(stats, moved=base["moved"])
+    media_items = automatic_items + manual_items if manual_items and len(automatic_items) == base["moved"] else ()
+
     resolved_files = min(
         base["confirm"],
         safe_int(outcomes.get("resolved_files"), 0, minimum=0),
     )
     counts = {
         "total": base["total"],
-        "moved": base["moved"] + safe_int(
-            outcomes.get("moved"), 0, minimum=0,
-        ),
+        "moved": base["moved"] + manual_moved,
         "metadata": base["metadata"] + safe_int(
             outcomes.get("metadata"), 0, minimum=0,
         ),
@@ -527,6 +543,11 @@ def update_organize_lifecycle_confirmations(
         footer = "人工确认已结束；跳过或失败项目可在 Web 整理日志中查看。"
     else:
         footer = "人工确认已全部完成；任务汇总已更新。"
+    if manual_moved and not media_items:
+        footer += (
+            " 部分入库明细缺少记录，作品明细沿用上次汇总。"
+            if previous.lines else " 部分入库明细缺少记录，暂未展开作品明细。"
+        )
 
     strm_status = _field_value(previous, "STRM")
     if stopped:
@@ -565,6 +586,14 @@ def update_organize_lifecycle_confirmations(
             "importance": "error" if parent_attention else "result",
         }},
     )
+    if media_items:
+        # 落库快照能证明批次内的正向结果，无法证明归档目录当前仍缺哪些集。
+        blocks = build_media_detail_blocks(
+            media_items, inventory_final=False, verified_only=True,
+        )
+        event = attach_bounded_media_details(
+            event, _confirmation_media_lines(blocks, inventory_status=inventory_status),
+        )
     return publish_notification_thread(
         thread_key,
         event,

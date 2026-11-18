@@ -2084,7 +2084,7 @@ class OrganizeTaskManager:
                     notification_sent = (lifecycle_sent and confirmations_sent)
                 else:
                     notification_sent = Organizer.notify_task_results(
-                        aggregate,
+                        {**aggregate, "organize_run_id": run_id},
                         rules,
                         source_name=f"{len(source_results)} 个源目录",
                         chat_id=chat_id,

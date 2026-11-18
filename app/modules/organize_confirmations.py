@@ -48,6 +48,7 @@ from app.modules.telegram_notification_center import (
     deserialize_notification_event,
     serialize_notification_event,
 )
+from app.modules.telegram_media_projection import read_organize_media_items
 from app.notifier import (
     NOTIFICATION_SECTION_BREAK,
     NotificationAction,
@@ -1015,6 +1016,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
         "failed": 0,
         "expired": 0,
     }
+    media_items = []
     for row in latest_rows:
         payload = payloads.get(int(row["id"])) or decode_json_object(
             row["payload_json"]
@@ -1032,6 +1034,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
             failed = safe_int(result.get("failed"), 0, minimum=0)
             unresolved = safe_int(result.get("need_confirm"), 0, minimum=0)
             outcomes["moved"] += moved
+            media_items.extend(read_organize_media_items(result, moved=moved))
             outcomes["metadata"] += safe_int(
                 result.get("metadata_moved"), 0, minimum=0,
             )
@@ -1049,7 +1052,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
             outcomes["expired"] += file_count
         else:
             outcomes["failed"] += file_count
-    return baseline, outcomes
+    return baseline, {**outcomes, "media_items": media_items}
 
 
 def _maybe_update_parent_organize_rollup(
@@ -1081,7 +1084,7 @@ def _maybe_update_parent_organize_rollup(
         ))
         if accepted:
             organize_confirmations_repo.mark_organize_confirmation_rollup_applied(
-                parent_id, chat_id=(chat_id or ""),
+                row for row in rows if row["status"] in _TERMINAL_CONFIRMATION_STATUSES
             )
         return accepted
 

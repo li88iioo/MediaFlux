@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from app import database as db
+from app.modules import organize_confirmations, telegram_notification_center as center
 from app.modules.organize import Organizer, OrganizeRules
+from app.modules.organize_results import build_organize_result
 from app.modules.telegram_notification_center import (
     NotificationPublishResult,
     NotificationThreadSnapshot,
@@ -12,11 +17,14 @@ from app.modules.telegram_organize_lifecycle import (
     build_organize_confirmation_rollup,
     build_organize_lifecycle_event,
     organize_lifecycle_downstream_settled,
+    publish_organize_lifecycle,
     update_organize_lifecycle_confirmations,
     update_organize_lifecycle_downstream,
     wait_for_organize_lifecycle_delivery,
 )
-from app.notifier import NotificationEvent
+from app.notifier import NotificationEvent, TelegramSendResult, render_event
+from app.repositories import organize_confirmations as confirmations_repo
+from app.repositories.organize_history import settle_organize_task_run
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -825,3 +833,225 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertTrue(delivered)
         lifecycle.assert_called_once()
         confirmation.assert_called_once()
+
+
+class OrganizeConfirmationMediaRollupTests(IsolatedDatabaseTestCase):
+    chat = "100"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.edit = Mock(return_value=TelegramSendResult(True, message_id=501))
+        self.enterContext(patch.multiple(
+            center,
+            allows_notification=Mock(return_value=True),
+            _dispatch_stop=Event(),
+            wake_telegram_notification_dispatcher=Mock(),
+            send_event_result=Mock(return_value=TelegramSendResult(True, message_id=501)),
+            edit_event_result=self.edit,
+        ))
+
+    @staticmethod
+    def _episode(
+        episode: int, mib: int, *, season: int = 1, inventory: list[int] | None = None,
+    ) -> dict:
+        return {
+            "title": "批次剧集", "year": "2026", "tmdb_id": "9123", "media_type": "tv",
+            "season": season, "episode": episode, "season_total": 35,
+            "season_present_episodes": inventory,
+            "filename": f"Batch.S{season:02d}E{episode:02d}.mkv", "size": mib * 1024 ** 2,
+        }
+
+    def _parent(self, task: str, items: list[dict], *, pending: int, groups: int) -> dict:
+        stats = {
+            "total": len(items) + pending, "moved": len(items), "media_items": items,
+            "need_confirm": pending, "notification_actionable_confirmation_files": pending,
+            "notification_actionable_confirmation_groups": groups,
+        }
+        self.assertTrue(publish_organize_lifecycle(
+            task, stats, source_name="隔离来源", chat_id=self.chat, strm_status="完成",
+        ))
+        return stats
+
+    def _thread(self, task: str) -> NotificationThreadSnapshot:
+        snapshot = center.get_notification_thread_snapshot(
+            f"organize:{task}", topic="organize", chat_id=self.chat,
+        )
+        assert snapshot is not None
+        return snapshot
+
+    def _candidate(
+        self, task: str, stats: dict, label: str, count: int, *, fingerprint: str = "",
+    ) -> str:
+        token = f"{task}-{label}"
+        confirmations_repo.create_organize_confirmation(
+            token=token, fingerprint=f"{task}-{fingerprint or label}", chat_id=self.chat,
+            source_name="隔离来源", directory_path="/incoming", organize_task_id=task,
+            expires_at="2099-01-01 00:00:00",
+            payload={
+                "files": [{"file_id": f"{label}-{idx}"} for idx in range(count)],
+                "organize_rollup": build_organize_confirmation_rollup(stats),
+            },
+        )
+        return token
+
+    def _finish(self, token: str, result: dict) -> None:
+        confirmations_repo.claim_organize_confirmation(token, chat_id=self.chat, selected_index=0)
+        self.assertIsNotNone(confirmations_repo.claim_queued_organize_confirmation(token))
+        confirmations_repo.complete_organize_confirmation_with_delivery(
+            token, result_json=json.dumps(result), event_json="", chat_id=self.chat,
+            message_id=None, enqueue_delivery=False,
+        )
+
+    def _rollup(self, task: str) -> bool:
+        return organize_confirmations._maybe_update_parent_organize_rollup(task, chat_id=self.chat)
+
+    def test_merged_details_recover_after_parent_settles_using_exact_task_id(self) -> None:
+        task = "rollup-persisted"
+        auto_inventory = [*range(1, 30), 34, 35]
+        stats = self._parent(task, [
+            self._episode(34, 1, inventory=auto_inventory),
+            self._episode(35, 2, inventory=auto_inventory),
+            self._episode(1, 8, season=2, inventory=[1]),
+        ], pending=4, groups=2)
+        initial = self._thread(task)
+        run_id = db.add_task_run("guangya_organize", "telegram", result=json.dumps({"task_id": task}))
+        db.add_task_run("guangya_organize", "telegram", "success", "invalid legacy JSON")
+        db.add_task_run("guangya_organize", "telegram", "success", json.dumps({
+            "task_id": task + "-other", "stats": {"media_items": [self._episode(29, 64)] * 3},
+        }))
+        first = self._candidate(task, stats, "first", 2)
+        self._candidate(task, stats, "second-superseded", 2, fingerprint="second")
+        second = self._candidate(task, stats, "second", 2)
+        self._finish(second, {"moved": 2, "media_items": [
+            self._episode(32, 2, inventory=[*range(1, 30), 32, 33, 34, 35]),
+            self._episode(33, 3, inventory=[*range(1, 30), 32, 33, 34, 35]),
+        ]})
+        self.assertFalse(self._rollup(task))
+        self.assertEqual(self._thread(task).revision, initial.revision)
+        self._finish(first, {"moved": 2, "media_items": [
+            self._episode(30, 1, inventory=list(range(1, 36))),
+            self._episode(31, 1, inventory=list(range(1, 36))),
+        ]})
+        self.assertFalse(self._rollup(task))
+        self.assertEqual(self._thread(task).revision, initial.revision)
+
+        receipt = build_organize_result(stats, status="completed", task_id=task)
+        receipt.update(stats=stats, request_settlement={
+            "status": "completed", "error": "", "message": "整理任务已完成", "requests": {},
+        })
+        settle_organize_task_run(run_id, receipt)
+        self.assertEqual(organize_confirmations._reconcile_unapplied_parent_rollups(), 1)
+        final = self._thread(task)
+        self.assertEqual(final.message_id, initial.message_id)
+        self.assertEqual(final.revision, initial.revision + 1)
+        self.assertEqual(dict(final.event.fields)["整理"], "视频 7 · 入库 7")
+        self.assertEqual(len(final.event.lines), 2)
+        first_season, second_season = map(str, final.event.lines)
+        self.assertIn("批次剧集 (2026) · S01", first_season)
+        self.assertIn("本次更新：E30-E35", first_season)
+        self.assertIn("35 / 35 集（全）", first_season)
+        self.assertIn("文件统计：6 个 · 10.00 MB", first_season)
+        self.assertIn("S02", second_season)
+        self.assertIn("本次更新：E01", second_season)
+        self.assertIn("文件统计：1 个 · 8.00 MB", second_season)
+        self.assertNotIn("缺集情况", render_event(final.event))
+        self.assertFalse(self._rollup(task))
+        self.assertEqual(self._thread(task).revision, final.revision)
+        self.edit.assert_called_once()
+
+    def test_missing_batch_evidence_preserves_legacy_details(self) -> None:
+        for missing in ("automatic", "manual", "wrong-run-id"):
+            with self.subTest(missing=missing):
+                task = f"rollup-missing-{missing}"
+                stats = self._parent(task, [self._episode(34, 2)], pending=1, groups=1)
+                if missing != "automatic":
+                    db.add_task_run("guangya_organize", "telegram", "success", json.dumps({
+                        "task_id": task, "stats": stats,
+                    }))
+                if missing == "wrong-run-id":
+                    stats["organize_run_id"] = db.add_task_run(
+                        "guangya_organize", "telegram", "success",
+                        json.dumps({"task_id": task + "-different", "stats": stats}),
+                    )
+                old = self._thread(task)
+                token = self._candidate(task, stats, "one", 1)
+                result: dict[str, object] = {"moved": 1}
+                if missing != "manual":
+                    result["media_items"] = [self._episode(30, 3)]
+                self._finish(token, result)
+                self.assertTrue(self._rollup(task))
+                final = self._thread(task).event
+                self.assertEqual(dict(final.fields)["整理"], "视频 2 · 入库 2")
+                self.assertIn("沿用上次汇总", str(final.footer))
+                self.assertEqual(
+                    "".join(map(str, final.lines)).strip(),
+                    "".join(map(str, old.event.lines)).strip(),
+                )
+
+    def test_confirmation_only_counts_files_without_claiming_unknown_capacity(self) -> None:
+        task = "rollup-confirmation-only"
+        stats = self._parent(task, [], pending=3, groups=2)
+        successful = self._candidate(task, stats, "success", 2)
+        cancelled = self._candidate(task, stats, "cancel", 1)
+        confirmations_repo.cancel_organize_confirmation(
+            cancelled, chat_id=self.chat, enqueue_delivery=False,
+        )
+        unknown_size = self._episode(10, 0)
+        unknown_size.pop("size")
+        self._finish(successful, {"moved": 2, "media_items": [unknown_size, self._episode(11, 2)]})
+        self.assertTrue(self._rollup(task))
+        final = self._thread(task).event
+        self.assertIn("跳过 1", str(dict(final.fields)["整理"]))
+        detail, = map(str, final.lines)
+        self.assertIn("本次更新：E10-E11", detail)
+        self.assertIn("文件统计：2 个", detail)
+        self.assertNotIn("MB", detail)
+        self.assertNotIn("本季进度", detail)
+
+    def test_primary_run_keeps_missing_tv_positions_and_disjoint_inventories_explicit(self) -> None:
+        task = "rollup-partial-position"
+        stats = self._parent(task, [
+            self._episode(34, 2, inventory=list(range(1, 36))),
+            {**self._episode(1, 3, season=2, inventory=[1]), "season_total": 2},
+        ], pending=3, groups=1)
+        stats["organize_run_id"] = db.add_task_run(
+            "guangya_organize", "telegram", "success", json.dumps({"task_id": task, "stats": stats}),
+        )
+        token = self._candidate(task, stats, "one", 3)
+        self._finish(token, {"moved": 3, "media_items": [
+            {**self._episode(30, 1), "season": None},
+            {**self._episode(31, 1), "episode": None},
+            {**self._episode(2, 4, season=2, inventory=[2]), "season_total": 2},
+        ]})
+        self.assertTrue(self._rollup(task))
+        first_season, second_season, unknown_season = map(str, self._thread(task).event.lines)
+        self.assertIn("本次更新：E34", first_season)
+        self.assertIn("1 个文件未记录集号", first_season)
+        self.assertIn("本次更新：E01-E02", second_season)
+        self.assertIn("文件统计：2 个 · 7.00 MB", second_season)
+        self.assertIn("季号未记录", unknown_season)
+        self.assertNotIn("E30", unknown_season)
+        self.assertNotIn("本季进度", first_season + second_season + unknown_season)
+
+    def test_new_terminal_receipt_during_parent_edit_is_reconciled(self) -> None:
+        task = "rollup-interleaved"
+        stats = self._parent(task, [], pending=1, groups=1)
+        original = self._candidate(task, stats, "original", 1)
+        confirmations_repo.cancel_organize_confirmation(
+            original, chat_id=self.chat, enqueue_delivery=False,
+        )
+
+        def complete_retry(*_args, **_kwargs):
+            self.edit.side_effect = None
+            retry = self._candidate(task, stats, "retry", 1, fingerprint="original")
+            self._finish(retry, {"moved": 1, "media_items": [self._episode(30, 3)]})
+            return TelegramSendResult(True, message_id=501)
+
+        self.edit.side_effect = complete_retry
+        self.assertTrue(self._rollup(task))
+        self.assertIn("跳过 1", str(dict(self._thread(task).event.fields)["整理"]))
+        self.assertEqual(organize_confirmations._reconcile_unapplied_parent_rollups(), 1)
+        final = self._thread(task).event
+        self.assertEqual(dict(final.fields)["整理"], "视频 1 · 入库 1")
+        self.assertIn("本次更新：E30", render_event(final))
+        self.assertFalse(self._rollup(task))

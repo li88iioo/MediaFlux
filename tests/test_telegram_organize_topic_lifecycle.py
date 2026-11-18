@@ -276,6 +276,9 @@ def test_task_result_delayed_confirmation_and_strm_keep_source_route(
         # 候选在初始整理之后才处理；真实 SQLite 确认行驱动父汇总更新。
         candidates = organize_confirmations_repo.list_organize_confirmations_for_task(state["id"], chat_id=str(chat_id))
         assert len(candidates) == 1
+        baseline = json.loads(candidates[0]["payload_json"])["organize_rollup"]
+        assert baseline["run_id"] == state["run_id"]
+        assert "media_items" not in baseline
         previous_revision = row["revision"]
         previous_sends = sender.call_count
         skip_confirmation(candidates[0]["token"], chat_id=str(chat_id))

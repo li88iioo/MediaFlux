@@ -642,6 +642,20 @@ def settle_organize_task_run(run_id: int, result: dict) -> dict:
         return _settle_organize_task_run_conn(conn, run_id, result, db.now())
 
 
+def get_organize_task_run_by_task_id(task_id: str, *, run_id: int = 0) -> sqlite3.Row | None:
+    """按运行主键核对父任务身份，旧通知按 task_id 查找唯一的整理回执。"""
+    run_clause = "id=? AND " if run_id else ""
+    params = (run_id, task_id) if run_id else (task_id,)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT status,result FROM task_runs WHERE task_name='guangya_organize' "
+            f"AND {run_clause}CASE WHEN json_valid(result) THEN json_extract(result,'$.task_id') END=? "
+            "LIMIT 2",
+            params,
+        ).fetchall()
+    return rows[0] if len(rows) == 1 else None
+
+
 def next_unsettled_organize_task_run(after_id: int = 0) -> sqlite3.Row | None:
     """既有 dispatcher 每周期取一个回执，轮转而非只看近期运行记录。"""
     with db.get_conn() as conn:

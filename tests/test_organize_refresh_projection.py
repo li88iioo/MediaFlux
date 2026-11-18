@@ -177,8 +177,8 @@ def test_recovery_keeps_chat_and_topic_route_when_edit_falls_back(transport):
         assert stored["_delivery_route"] == {"chat_id": chat, "message_thread_id": thread}
 
 
-@pytest.mark.parametrize("after_read", [False, True], ids=["before-recovery", "after-cas-read"])
-def test_confirmation_rollup_survives_refresh_recovery(transport, monkeypatch, after_read):
+@pytest.mark.parametrize("order", ["before-recovery", "after-cas-read", "after-recovery"])
+def test_confirmation_rollup_survives_refresh_recovery(transport, monkeypatch, order):
     stats = {"total": 2, "moved": 1, "need_confirm": 1,
              "notification_actionable_confirmation_files": 1,
              "notification_actionable_confirmation_groups": 1}
@@ -186,14 +186,14 @@ def test_confirmation_rollup_survives_refresh_recovery(transport, monkeypatch, a
     entries = _refresh_failure()
     assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
 
-    def confirm():
+    def confirm(*, refresh_pending=True):
         assert lifecycle.update_organize_lifecycle_confirmations(
             TASK, chat_id=CHAT, baseline=lifecycle.build_organize_confirmation_rollup(stats),
             outcomes={"groups": 1, "resolved_files": 1, "moved": 1, "metadata": 1},
         )
-        assert "refresh" in _event().lifecycle
+        assert ("refresh" in _event().lifecycle) == refresh_pending
 
-    if after_read:
+    if order == "after-cas-read":
         read_ready = lifecycle.list_recovered_organize_refresh_notifications
 
         def read_then_confirm(*args, **kwargs):
@@ -207,14 +207,20 @@ def test_confirmation_rollup_survives_refresh_recovery(transport, monkeypatch, a
             assert lifecycle.reconcile_organize_refresh_notifications() == 0
         assert dict(_event().fields)["整理"] == "视频 2 · 入库 2 · 元数据 1"
         assert "refresh" in _event().lifecycle
+    elif order == "after-recovery":
+        assert lifecycle.reconcile_organize_refresh_notifications() == 1
+        confirm(refresh_pending=False)
     else:
         confirm()
-    assert lifecycle.reconcile_organize_refresh_notifications() == 1
+    assert lifecycle.reconcile_organize_refresh_notifications() == (0 if order == "after-recovery" else 1)
     event = _event()
     assert (event.title, event.state) == ("✅ 光鸭整理完成", "completed")
     assert dict(event.fields)["整理"] == "视频 2 · 入库 2 · 元数据 1"
     assert dict(event.fields)["人工确认"] == "已处理 1 / 1 组 · 入库 1 个视频"
-    assert event.footer == "人工确认已全部完成；任务汇总已更新。"
+    assert event.footer == (
+        "人工确认已全部完成；任务汇总已更新。 部分入库明细缺少记录，暂未展开作品明细。"
+    )
+    assert event.lines == ()
     assert dict(event.fields)["媒体库"] == QUEUED
     assert "refresh" not in event.lifecycle
 

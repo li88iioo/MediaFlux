@@ -405,22 +405,15 @@ def list_unapplied_organize_confirmation_tasks(limit: int = 50) -> list[sqlite3.
 
 
 def mark_organize_confirmation_rollup_applied(
-    organize_task_id: str, *, chat_id: str = ""
+    rows: Iterable[sqlite3.Row],
 ) -> int:
-    """标记父任务当前全部确认记录已经投影到整理汇总。"""
-    task_id = (organize_task_id or "").strip()
-    if not task_id:
-        return 0
-    params: list[object] = [db.now(), task_id]
-    chat_clause = ""
-    if (chat_id or "").strip():
-        chat_clause = " AND chat_id=?"
-        params.append((chat_id or "").strip())
+    """只标记已读到的终态，新回执留给下一次收口。"""
+    timestamp = db.now()
     with db.get_conn() as conn:
-        cursor = conn.execute(
+        cursor = conn.executemany(
             "UPDATE organize_confirmations SET rollup_applied=1,updated_at=? "
-            "WHERE organize_task_id=?" + chat_clause,
-            params,
+            "WHERE id=? AND status=? AND rollup_applied=0",
+            ((timestamp, row["id"], row["status"]) for row in rows),
         )
         return cursor.rowcount
 
