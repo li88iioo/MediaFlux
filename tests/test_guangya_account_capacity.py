@@ -79,6 +79,16 @@ def read_status(client):
 
 
 class GuangYaAccountCapacityTests(unittest.TestCase):
+    def test_share_account_key_uses_authenticated_account_id_not_display_fields(self):
+        first = AccountClient(profile={"sub": "stable-user", "name": "Before"}).share_account_key()
+        renamed = AccountClient(profile={"sub": "stable-user", "name": "After"}).share_account_key()
+        other = AccountClient(profile={"sub": "other-user", "name": "Before"}).share_account_key()
+        self.assertEqual(first, renamed)
+        self.assertNotEqual(first, other)
+        self.assertNotIn("stable-user", first)
+        with self.assertRaisesRegex(ValueError, "账号标识"):
+            AccountClient(profile={"name": "Before"}).share_account_key()
+
     def test_actual_assets_schema_is_read_from_separate_endpoint(self):
         client = AccountClient()
         result = read_status(client)

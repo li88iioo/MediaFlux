@@ -2962,6 +2962,7 @@ def _handle_share_callback(bot, call, telebot) -> None:
             )
             if isinstance(accepted, dict):
                 _deliver_share_receipt(bot, call, accepted)
+                notice = "请查看转存回执"
             else:
                 worker = threading.Thread(
                     target=_dispatch_share_transfer_callback,
@@ -2973,8 +2974,9 @@ def _handle_share_callback(bot, call, telebot) -> None:
                     worker.start()
                 except RuntimeError:
                     _dispatch_share_transfer_callback(bot, call, accepted)
+                notice = "已受理，结果以转存回执为准"
             try:
-                bot.answer_callback_query(call.id, "已受理，结果以转存回执为准")
+                bot.answer_callback_query(call.id, notice)
             except Exception as exc:
                 logger.info("Telegram 光鸭分享确认应答未送达 (%s)", type(exc).__name__)
             return
@@ -3020,10 +3022,11 @@ def _dispatch_share_transfer_callback(bot, call, submission) -> None:
 
 
 def _deliver_share_receipt(bot, call, result: dict, *, target_id: str = "") -> None:
-    reference = f"请求: #{result['request_id']}"
+    request_id = result.get("request_id")
+    reference = f"\n请求: #{request_id}" if request_id else ""
     status = result.get("status")
     if result.get("success"):
-        text = f"<b>光鸭分享转存完成</b>\n{reference}"
+        text = f"<b>光鸭分享转存完成</b>{reference}"
         if result.get("duplicate"):
             text += "（幂等复用已有请求）"
         else:
@@ -3037,10 +3040,10 @@ def _deliver_share_receipt(bot, call, result: dict, *, target_id: str = "") -> N
                 text += "\n当前配置不触发后续整理链。"
     elif status in {"failed", "manual_review", "stopped"}:
         label = {"failed": "转存失败", "manual_review": "转存待核对", "stopped": "转存已停止"}[status]
-        text = f"光鸭分享{label}\n{reference}\n"
+        text = f"光鸭分享{label}{reference}\n"
         text += html.escape(result.get("error") or "请在下载记录查看任务状态")
     else:
-        text = f"光鸭分享转存已受理\n{reference}\n请在下载记录核对结果"
+        text = f"光鸭分享转存已受理{reference}\n请在下载记录核对结果"
     try:
         _edit_share_message(bot, call, text)
     except Exception as exc:

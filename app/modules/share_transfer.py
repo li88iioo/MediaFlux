@@ -47,6 +47,11 @@ class ShareTransferAccountChanged(ValueError):
         super().__init__("光鸭登录账号已变化，请重新解析分享链接并选择目标目录")
 
 
+class ShareTransferAccountUnavailable(ValueError):
+    def __init__(self) -> None:
+        super().__init__("无法核对光鸭账号，请检查登录并重新解析分享链接")
+
+
 def _share_generation(client: GuangYaClient) -> int | None:
     generation = client.credential_generation
     return generation if client.logged_in else None
@@ -57,6 +62,13 @@ def _require_share_generation(client: GuangYaClient, expected: int | None) -> No
         raise ShareTransferAccountChanged()
 
 
+def _require_share_account(generation: int | None, account_key: str) -> None:
+    if generation is None:
+        raise ValueError("光鸭未登录，请先登录再重新解析分享链接")
+    if not account_key:
+        raise ShareTransferAccountUnavailable()
+
+
 @dataclass(frozen=True)
 class ShareTransferSnapshot:
     preview_id: str
@@ -64,6 +76,7 @@ class ShareTransferSnapshot:
     share_id: str
     access_token: str
     credential_generation: int | None
+    account_key: str
     files: tuple[dict[str, Any], ...]
     selected_ids: tuple[str, ...]
     target_id: str
@@ -86,6 +99,7 @@ class _PreviewEntry:
     share_id: str
     access_token: str
     credential_generation: int | None
+    account_key: str
     files: dict[str, dict[str, Any]]
     file_order: tuple[str, ...]
     selected_ids: set[str]
@@ -204,6 +218,7 @@ class ShareTransferPreviewStore:
         user_id: str | int = "",
         *,
         credential_generation: int | None = None,
+        account_key: str = "",
         target_id: str = "0",
         target_name: str = "根目录",
     ) -> str:
@@ -236,6 +251,7 @@ class ShareTransferPreviewStore:
             share_id=share_id,
             access_token=access_token,
             credential_generation=credential_generation,
+            account_key=account_key,
             files=normalized,
             file_order=tuple(order),
             selected_ids=set(order),
@@ -347,6 +363,7 @@ class ShareTransferPreviewStore:
                 share_id=entry.share_id,
                 access_token=entry.access_token,
                 credential_generation=entry.credential_generation,
+                account_key=entry.account_key,
                 files=files,
                 selected_ids=selected,
                 target_id=chosen_target,
@@ -401,11 +418,12 @@ class ShareTransferPreviewStore:
         with self._lock:
             self._prune_locked(now)
             key = (action_id or "").strip()
-            action = self._actions.pop(key, None)
+            action = self._actions.get(key)
             owner = self.owner_key(chat_id, user_id)
             if action is None or action.owner_key != owner:
                 raise ValueError("操作已过期或无效")
             self._entry_locked(action.preview_id, chat_id, user_id, mutable=True)
+            del self._actions[key]
             return {
                 "preview_id": action.preview_id,
                 "action": action.action,
@@ -430,17 +448,53 @@ def share_request_key(
     share_id: str,
     selected_ids: list[str] | tuple[str, ...],
     target_id: str,
-    chat_id: str | int,
-    user_id: str | int = "",
+    *,
+    account_key: str = "",
+    legacy_owner: str = "",
 ) -> str:
     canonical = {
-        "chat": ShareTransferPreviewStore.owner_key(chat_id, user_id),
+        **({"account": account_key} if account_key else {"chat": legacy_owner}),
         "files": sorted({item.strip() for item in selected_ids if item.strip()}),
         "share": (share_id or "").strip(),
         "target": (target_id or "0").strip() or "0",
     }
     payload = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _inspect_share_for_transfer(
+    share_url: str,
+    chat_id: str | int,
+    user_id: str | int,
+    *,
+    client: GuangYaClient,
+    store: ShareTransferPreviewStore,
+) -> tuple[dict[str, Any], int | None, str]:
+    from app.modules.download_dispatcher import is_guangya_share_url
+
+    if not isinstance(share_url, str) or len(share_url) > 8192 or not is_guangya_share_url(share_url):
+        raise ValueError("请提供有效的光鸭分享链接")
+    ShareTransferPreviewStore.owner_key(chat_id, user_id)
+    generation = _share_generation(client)
+    inspected = client.inspect_share(share_url.strip())
+    account_key = ""
+    if generation is not None:
+        _require_share_generation(client, generation)
+        try:
+            account_key = client.share_account_key()
+        except Exception as exc:
+            # 分享内容仍可只读查看，转存须取得经认证的账号身份。
+            logger.warning("光鸭分享账号核对失败 type=%s", type(exc).__name__)
+        _require_share_generation(client, generation)
+    target_id = (get("GY_SHARE_TARGET_DIR", "0") or "0").strip() or "0"
+    target_name = (
+        get("GY_SHARE_TARGET_DIR_NAME", "根目录") or "根目录"
+    ).strip() or ("根目录" if target_id == "0" else "默认转存目录")
+    preview_id = store.create(
+        inspected, chat_id, user_id, credential_generation=generation, account_key=account_key,
+        target_id=target_id, target_name=target_name,
+    )
+    return store.snapshot(preview_id, chat_id, user_id), generation, account_key
 
 
 def inspect_share_for_transfer(
@@ -451,28 +505,11 @@ def inspect_share_for_transfer(
     client: GuangYaClient | None = None,
     store: ShareTransferPreviewStore | None = None,
 ) -> dict[str, Any]:
-    from app.modules.download_dispatcher import is_guangya_share_url
-
-    if not isinstance(share_url, str) or len(share_url) > 8192 or not is_guangya_share_url(share_url):
-        raise ValueError("请提供有效的光鸭分享链接")
-    ShareTransferPreviewStore.owner_key(chat_id, user_id)
     with _guangya_client_scope(client) as runtime_client:
-        generation = _share_generation(runtime_client)
-        inspected = runtime_client.inspect_share((share_url or "").strip())
-        store = store or get_share_transfer_store()
-        target_id = (get("GY_SHARE_TARGET_DIR", "0") or "0").strip() or "0"
-        target_name = (
-            get("GY_SHARE_TARGET_DIR_NAME", "根目录") or "根目录"
-        ).strip() or ("根目录" if target_id == "0" else "默认转存目录")
-        preview_id = store.create(
-            inspected,
-            chat_id,
-            user_id,
-            credential_generation=generation,
-            target_id=target_id,
-            target_name=target_name,
+        preview, _, _ = _inspect_share_for_transfer(
+            share_url, chat_id, user_id, client=runtime_client, store=store or get_share_transfer_store(),
         )
-        return store.snapshot(preview_id, chat_id, user_id)
+        return preview
 
 
 def prepare_share_transfer(
@@ -486,13 +523,12 @@ def prepare_share_transfer(
         raise ValueError("file_ids 必须是非空文件ID列表")
     selected = sorted({item.strip() for item in file_ids})
     with _guangya_client_scope(client) as runtime_client:
-        generation = _share_generation(runtime_client)
-        if generation is None:
+        if not runtime_client.logged_in:
             raise ValueError("光鸭未登录，请先重新登录")
-        preview = inspect_share_for_transfer(
-            share_url, chat_id, user_id, client=runtime_client, store=store,
+        preview, generation, account_key = _inspect_share_for_transfer(
+            share_url, chat_id, user_id, client=runtime_client, store=store or get_share_transfer_store(),
         )
-        _require_share_generation(runtime_client, generation)
+        _require_share_account(generation, account_key)
     files = {item["id"]: item for item in preview["files"]}
     if any(identity not in files for identity in selected):
         raise ValueError("选择中包含不属于该分享的文件")
@@ -501,6 +537,7 @@ def prepare_share_transfer(
         "snapshot": {
             "owner": owner, "url": share_url.strip(), "share_id": preview["share_id"],
             "credential_generation": generation,
+            "account_key": account_key,
             "files": [files[identity] for identity in selected],
             "target_id": preview["target_id"], "target_name": preview["target_name"],
         },
@@ -533,7 +570,7 @@ def submit_prepared_share_transfer(
             target_name=prepared["target_name"], origin=origin, tracker_chat_id=tracker_chat_id,
             client=runtime_client, store=store, cancel_check=cancel_check,
         )
-    row = download_requests_repo.get_download_request(result["request_id"])
+    row = download_requests_repo.get_download_request(result["request_id"]) if result["request_id"] else None
     if row is not None:
         result["request"] = download_request_public_summary(row)
     return result
@@ -567,18 +604,24 @@ def _find_share_staging_dir(client: GuangYaClient, parent_id: str, name: str) ->
     return unique[0] if unique else ""
 
 
-def _result_from_existing(row) -> dict[str, Any]:
-    status = str(row["status"] or "")
+def _result_from_existing(row, *, public_target: str | None = None, legacy: bool = False) -> dict[str, Any]:
+    status = "manual_review" if legacy else str(row["status"] or "")
+    private = public_target is None
+    error = str(row["error"] or "") if private else ""
+    if legacy:
+        error = "发现同一分享的历史转存，原光鸭账号无法核对，请先查看下载记录和目标目录"
+    elif not private and status in {"failed", "manual_review", "stopped"}:
+        error = "相同分享的转存需要核对，请先检查云盘目录"
     return {
         "success": status == "completed" and str(row["gy_status"] or "") == "completed",
         "accepted": status in {"pending", "submitting", "submitted", "downloading"},
         "created": False,
         "duplicate": True,
-        "request_id": int(row["id"]),
+        "request_id": int(row["id"]) if private else None,
         "count": 0,
-        "target_dir_name": str(row["gy_target_name"] or "根目录"),
+        "target_dir_name": str(row["gy_target_name"] or "根目录") if private else public_target,
         "status": status,
-        "error": str(row["error"] or ""),
+        "error": error,
     }
 
 
@@ -614,13 +657,17 @@ def accept_share_request(
     )
     if client is not None and (snapshot.credential_generation is not None or client.logged_in):
         _require_share_generation(client, snapshot.credential_generation)
+    _require_share_account(snapshot.credential_generation, snapshot.account_key)
+    identity = (snapshot.share_id, snapshot.selected_ids, snapshot.target_id)
+    legacy_key = share_request_key(*identity, legacy_owner=snapshot.owner_key)
+    legacy = download_requests_repo.get_download_request_by_request_key(legacy_key)
+    if legacy is not None and legacy["kind"] == "guangya_share":
+        # 历史键只能证明同一会话曾提交。不能把旧记录认领给当前账号。
+        return _result_from_existing(legacy, public_target=snapshot.target_name, legacy=True)
     key = share_request_key(
-        snapshot.share_id,
-        snapshot.selected_ids,
-        snapshot.target_id,
-        chat_id,
-        user_id,
+        *identity, account_key=snapshot.account_key,
     )
+    receipt_owner = hashlib.sha256(snapshot.owner_key.encode()).hexdigest()
     names = [redact_sensitive_text(file["name"] or "未命名项目") for file in snapshot.files]
     title = redact_sensitive_text(f"分享转存 {len(names)} 项: {', '.join(names[:3])}")
     request_id, created = download_requests_repo.create_share_transfer_request(
@@ -628,10 +675,16 @@ def accept_share_request(
         title=title,
         chat_id=(tracker_chat_id or ""),
         origin=(origin or "telegram"),
+        receipt_owner=receipt_owner,
     )
     if created:
         return ShareTransferSubmission(request_id, snapshot, title, retried=False)
-    if download_requests_repo.claim_failed_share_transfer_request(request_id):
+    row = download_requests_repo.get_download_request(request_id)
+    if row is None:
+        raise RuntimeError("分享转存请求状态丢失")
+    if row["user_id"] != receipt_owner:
+        return _result_from_existing(row, public_target=snapshot.target_name)
+    if download_requests_repo.claim_failed_share_transfer_request(request_id, receipt_owner=receipt_owner):
         return ShareTransferSubmission(request_id, snapshot, title, retried=True)
     return get_share_request_result(request_id)
 
@@ -729,9 +782,6 @@ def execute_share_request(
                 organize_target not in {"", "0"}
                 and snapshot.target_id not in {"", "0"}
             )
-            if snapshot.credential_generation is None and not runtime_client.logged_in:
-                return preparation_failed("光鸭未登录，请先重新登录")
-
             check_write()
             if auto_follow_up:
                 existing = download_requests_repo.get_download_request(request_id)

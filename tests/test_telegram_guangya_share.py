@@ -48,11 +48,15 @@ class FakeShareClient:
     def __init__(self, inspected: dict | None = None) -> None:
         self.logged_in = True
         self.credential_generation = 0
+        self.account_key = "fixture-shared-account"
         self.inspected = inspected or inspected_payload()
         self.inspect_calls: list[str] = []
         self.restore_calls: list[tuple[str, list[str], str]] = []
         self.create_dir_calls: list[tuple[str, str]] = []
         self.close_calls = 0
+
+    def share_account_key(self) -> str:
+        return self.account_key
 
     def inspect_share(self, share_url: str) -> dict:
         self.inspect_calls.append(share_url)
@@ -215,6 +219,19 @@ class GuangYaRestoreResultTests(unittest.TestCase):
 
 
 class ShareTransferPreviewStoreTests(unittest.TestCase):
+    def test_foreign_telegram_actor_cannot_consume_the_original_action(self):
+        from app.modules.share_transfer import ShareTransferPreviewStore
+
+        store = ShareTransferPreviewStore()
+        preview_id = store.create(inspected_payload(1), "room", "original")
+        action_id = store.create_action(preview_id, "room", "original", "confirm")
+        for room, user in (("room", "another"), ("different", "original")):
+            with self.assertRaises(ValueError):
+                store.resolve_action(action_id, room, user)
+        self.assertEqual(store.resolve_action(action_id, "room", "original")["action"], "confirm")
+        with self.assertRaises(ValueError):
+            store.resolve_action(action_id, "room", "original")
+
     def test_inspection_uses_the_saved_share_target_as_the_default(self):
         from app.modules.share_transfer import (
             ShareTransferPreviewStore,
@@ -317,6 +334,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
             chat_id="chat-100",
             user_id="user-200",
             credential_generation=self.client.credential_generation,
+            account_key=self.client.share_account_key(),
         )
 
     def test_selected_ids_are_revalidated_and_duplicate_request_is_idempotent(self):
@@ -507,7 +525,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         from app.modules.share_transfer import create_share_request, share_request_key
 
         key = share_request_key(
-            "demo123", ["file-1"], "dir-target", "chat-100", "user-200",
+            "demo123", ["file-1"], "dir-target", account_key=self.client.share_account_key(),
         )
         existing_id, created = download_requests_repo.create_share_transfer_request(
             key, title="existing", chat_id="chat-100", origin="telegram",
@@ -522,7 +540,8 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["accepted"])
         self.assertTrue(result["duplicate"])
-        self.assertEqual(result["request_id"], existing_id)
+        self.assertIsNone(result["request_id"])
+        self.assertIsNotNone(download_requests_repo.get_download_request(existing_id))
         self.assertEqual(result["status"], "submitting")
         self.assertEqual(self.client.restore_calls, [])
 
@@ -864,7 +883,8 @@ class TelegramShareConfirmationTests(IsolatedDatabaseTestCase):
                     chat_id, user_id = 100, 200
                     target_id = str(attempt - 1)
                     preview_id = store.create(client.inspected, chat_id, user_id, target_id=target_id,
-                                              credential_generation=client.credential_generation)
+                                              credential_generation=client.credential_generation,
+                                              account_key=client.share_account_key())
                     _, markup = _share_selection_view(
                         FAKE_TELEBOT, preview_id, chat_id=str(chat_id), user_id=str(user_id), store=store,
                     )
@@ -922,7 +942,11 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         from app.main import create_app
 
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM download_log")
+            conn.execute("DELETE FROM download_requests")
         self.client = TestClient(create_app(), raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
         self._login(self.client)
         page = self.client.get("/guangya/more")
         self.headers = {"X-CSRF-Token": self._csrf(page.text)}
@@ -1022,6 +1046,7 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
                 patch("app.clients.guangya._load_raw", return_value=Raw),
                 patch("app.routes.share_api.GuangYaClient", side_effect=lambda: GuangYaClient(token_file)),
                 patch.object(GuangYaClient, "inspect_share", return_value=inspected_payload(1)),
+                patch.object(GuangYaClient, "account_info", return_value={"sub": "fixture-account"}),
             ):
                 inspected = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
                 self.assertEqual(inspected.status_code, 200)
@@ -1036,6 +1061,115 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
                 })
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(restored_with, ["rotated-access-9999"])
+
+    def test_relogin_retains_same_account_deduplication_but_isolates_a_different_account(self):
+        clients = [FakeShareClient() for _ in range(3)]
+        clients[1].credential_generation = 1
+        clients[2].credential_generation = 2
+        clients[2].account_key = "different-cloud-account"
+        results = []
+        for fake in clients:
+            with patch("app.routes.share_api.GuangYaClient", return_value=fake):
+                inspected = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
+                self.assertEqual(inspected.status_code, 200, inspected.text)
+                self.assertNotIn(fake.account_key, inspected.text)
+                response = self.client.post("/api/share/restore", headers=self.headers, json={
+                    "preview_id": inspected.json()["preview_id"], "file_ids": ["file-1"],
+                    "target_dir_id": "0", "target_dir_name": "根目录",
+                })
+                self.assertEqual(response.status_code, 200, response.text)
+                results.append(response.json())
+        first, same_account, other_account = results
+        self.assertTrue(first["success"] and same_account["success"] and other_account["success"])
+        self.assertEqual(first["request_id"], same_account["request_id"])
+        self.assertNotEqual(first["request_id"], other_account["request_id"])
+        self.assertEqual([len(fake.restore_calls) for fake in clients], [1, 0, 1])
+
+    def test_missing_account_identity_keeps_preview_readable_and_refuses_submission(self):
+        fake = FakeShareClient()
+        fake.share_account_key = Mock(side_effect=ValueError("private-account-diagnostic"))
+        with patch("app.routes.share_api.GuangYaClient", return_value=fake):
+            inspected = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
+            self.assertEqual(inspected.status_code, 200, inspected.text)
+            self.assertEqual(inspected.json()["files"][0]["id"], "file-1")
+            response = self.client.post("/api/share/restore", headers=self.headers, json={
+                "preview_id": inspected.json()["preview_id"], "file_ids": ["file-1"], "target_dir_id": "0",
+            })
+        self.assertEqual(response.status_code, 410, response.text)
+        self.assertIn("无法核对光鸭账号", response.json()["error"])
+        self.assertNotIn("private-account-diagnostic", response.text)
+        self.assertFalse(fake.restore_calls)
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 0)
+
+    def test_unknown_web_share_blocks_telegram_and_agent_without_sharing_its_receipt(self):
+        from app.bot.handlers import _handle_share_callback, _inspect_telegram_share
+        from app.modules.share_transfer import (
+            ShareTransferPreviewStore,
+            prepare_share_transfer,
+            submit_prepared_share_transfer,
+        )
+
+        fake = FakeShareClient()
+        restore = fake.restore_share
+
+        def lose_reply(*args, **kwargs):
+            restore(*args, **kwargs)
+            raise TimeoutError("provider result unavailable")
+
+        fake.restore_share = Mock(side_effect=lose_reply)
+        store = ShareTransferPreviewStore()
+        bot = Mock()
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=100), from_user=SimpleNamespace(id=200),
+            message_id=5, message_thread_id=42,
+        )
+
+        def run_worker(*, target, args, **kwargs):
+            return SimpleNamespace(start=lambda: target(*args))
+
+        with (
+            patch("app.routes.share_api.GuangYaClient", return_value=fake),
+            patch("app.modules.share_transfer.GuangYaClient", return_value=fake),
+            patch("app.modules.share_transfer._store", store),
+            patch("app.bot.handlers.threading.Thread", side_effect=run_worker),
+        ):
+            inspected = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
+            self.assertEqual(inspected.status_code, 200, inspected.text)
+            files = [item["id"] for item in inspected.json()["files"]]
+            submitted = self.client.post("/api/share/restore", headers=self.headers, json={
+                "preview_id": inspected.json()["preview_id"], "file_ids": files,
+                "target_dir_id": "0", "target_dir_name": "仅 Web 知道的目录标签",
+            })
+            self.assertEqual(submitted.status_code, 502, submitted.text)
+            request_id = submitted.json()["request_id"]
+
+            _inspect_telegram_share(bot, message, SHARE_URL, FAKE_TELEBOT)
+            keyboard = bot.reply_to.call_args.kwargs["reply_markup"]
+            confirm = next(button for button in keyboard.buttons if button.text == "确认转存")
+            _handle_share_callback(
+                bot, SimpleNamespace(id="confirm", data=confirm.callback_data, message=message,
+                                     from_user=message.from_user), FAKE_TELEBOT,
+            )
+            telegram_receipt = bot.edit_message_text.call_args.args[0]
+            self.assertIn("待核对", telegram_receipt)
+            self.assertNotIn(f"#{request_id}", telegram_receipt)
+
+            prepared = prepare_share_transfer(SHARE_URL, files, "other-agent", "agent",
+                                              client=cast(GuangYaClient, fake), store=store)
+            agent_receipt = submit_prepared_share_transfer(
+                prepared["snapshot"], "other-agent", user_id="agent", origin="agent",
+                client=cast(GuangYaClient, fake), store=store,
+            )
+
+        self.assertEqual(len(fake.restore_calls), 1)
+        self.assertEqual(agent_receipt["status"], "manual_review")
+        self.assertIsNone(agent_receipt["request_id"])
+        self.assertNotIn("request", agent_receipt)
+        self.assertNotIn("仅 Web 知道", repr(agent_receipt) + telegram_receipt)
+        self.assertEqual(self.client.get(f"/api/share/requests/{request_id}").json()["status"], "manual_review")
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 1)
 
     def test_web_share_api_keeps_auth_csrf_session_isolation_and_secret_redaction(self):
         fake = FakeShareClient()
@@ -1060,12 +1194,14 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
         self.assertNotIn(SHARE_URL, repr(payload))
 
         other = TestClient(self.client.app, raise_server_exceptions=False)
+        self.addCleanup(other.close)
         self._login(other)
         other_page = other.get("/guangya/more")
+        other_headers = {"X-CSRF-Token": self._csrf(other_page.text)}
         with patch("app.routes.share_api.GuangYaClient", return_value=fake):
             cross_session = other.post(
                 "/api/share/restore",
-                headers={"X-CSRF-Token": self._csrf(other_page.text)},
+                headers=other_headers,
                 json={
                     "preview_id": payload["preview_id"],
                     "file_ids": ["file-1"],
@@ -1082,12 +1218,23 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
                     "target_dir_name": "电影",
                 },
             )
+            other_preview = other.post("/api/share/inspect", headers=other_headers, json={"url": SHARE_URL})
+            self.assertEqual(other_preview.status_code, 200, other_preview.text)
+            reused = other.post("/api/share/restore", headers=other_headers, json={
+                "preview_id": other_preview.json()["preview_id"], "file_ids": ["file-1"],
+                "target_dir_id": "dir-target", "target_dir_name": "本会话的目录名称",
+            })
 
         self.assertIn(cross_session.status_code, {400, 410})
         self.assertEqual(restored.status_code, 200)
         self.assertTrue(restored.json()["success"])
         self.assertNotIn(SECRET_TOKEN, restored.text)
         self.assertNotIn(SIGNED_URL, restored.text)
+        self.assertEqual(reused.status_code, 200, reused.text)
+        self.assertTrue(reused.json()["duplicate"])
+        self.assertIsNone(reused.json()["request_id"])
+        self.assertEqual(reused.json()["target_dir_name"], "本会话的目录名称")
+        self.assertEqual(len(fake.restore_calls), 1)
 
         request_id = restored.json()["request_id"]
         own_status = self.client.get(f"/api/share/requests/{request_id}")

@@ -877,6 +877,7 @@ def create_share_transfer_request(
     title: str,
     chat_id: str = "",
     origin: str = "telegram",
+    receipt_owner: str = "",
 ) -> tuple[int, bool]:
     """创建分享转存请求；敏感分享 URL、token 与文件 ID 不进入数据库。"""
     return create_download_request(
@@ -886,13 +887,14 @@ def create_share_transfer_request(
         source_value="",
         torrent_data=None,
         chat_id=chat_id,
+        user_id=receipt_owner,
         message_id="",
         origin=origin,
         initial_targets="guangya",
     )
 
 
-def claim_failed_share_transfer_request(request_id: int) -> bool:
+def claim_failed_share_transfer_request(request_id: int, *, receipt_owner: str = "") -> bool:
     """显式重试一次明确失败的分享转存；不确定结果禁止重新云写。"""
     timestamp = db.now()
     with db.get_conn() as conn:
@@ -900,8 +902,8 @@ def claim_failed_share_transfer_request(request_id: int) -> bool:
             "UPDATE download_requests SET status='submitting',gy_status='submitting',error='',"
             "share_retry_count=share_retry_count+1,gy_submitting_at=?,completed_at=NULL,updated_at=? "
             "WHERE id=? AND kind='guangya_share' AND status='failed' AND gy_status='failed' "
-            "AND share_retry_count=0",
-            (timestamp, timestamp, request_id),
+            "AND share_retry_count=0 AND user_id=?",
+            (timestamp, timestamp, request_id, receipt_owner),
         )
         return cur.rowcount == 1
 

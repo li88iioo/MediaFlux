@@ -1333,7 +1333,7 @@ class Cloud:
     @staticmethod
     @sdk_method('write')
     def transfer_share(url: str, file_ids: builtins.list[str]) -> dict:
-        """转存分享中明确选定的真实文件ID，沿用当前配置的分享目标。工作区冻结文件与目标后确认，冷确认重新核验；原脚本不重放。回执 request_id 可用 activity.timeline('download', request_id) 跟踪整理/STRM；未知受理不可重投，转存完成不等于入库。"""
+        """转存分享中明确选定的真实文件ID，沿用当前配置的分享目标。工作区冻结文件与目标后确认，冷确认重新核验；原脚本不重放。原会话可用回执 request_id 通过 activity.timeline('download', request_id) 跟踪整理/STRM。跨渠道防重只返回状态；未知受理不可重投，转存完成不等于入库。"""
         from app.modules.share_transfer import prepare_share_transfer, submit_prepared_share_transfer
 
         owner = _owner()

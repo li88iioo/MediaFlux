@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import unittest
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -33,7 +35,8 @@ def test_cancelled_share_finalizes_request_and_preserves_staging(stage, expected
     token = CancellationToken()
     client = FakeShareClient()
     store = ShareTransferPreviewStore()
-    preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
+    preview = store.create(client.inspected, "chat", "user",
+                           credential_generation=client.credential_generation, account_key=client.share_account_key())
     original_create, original_restore = client.create_dir, client.restore_share
 
     def create(name: str, parent_id: str = "0", *, before_write: Callable[[], None] | None = None) -> str:
@@ -128,7 +131,8 @@ def test_share_cancel_after_known_acceptance_preserves_completed_result():
     token = CancellationToken()
     client = FakeShareClient()
     store = ShareTransferPreviewStore()
-    preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
+    preview = store.create(client.inspected, "chat", "user",
+                           credential_generation=client.credential_generation, account_key=client.share_account_key())
     actual = client.restore_share
 
     def restore(access_token: str, file_ids: list[str], target_dir_id: str, *,
@@ -162,6 +166,7 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         self.client = LifecycleShareClient()
         self.preview = self.store.create(
             self.client.inspected, "chat", "user", credential_generation=self.client.credential_generation,
+            account_key=self.client.share_account_key(),
         )
         self.enterContext(
             patch("app.modules.share_transfer.get", return_value="archive")
@@ -459,12 +464,15 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         self.assertEqual(len(download_requests_repo.list_download_logs(source="guangya_share")), 1)
 
     def test_legacy_pending_duplicate_and_boot_recovery_do_not_replay(self):
-        from app.modules.share_transfer import share_request_key
-
-        key = share_request_key("demo123", ["file-1"], "target", "chat", "user")
+        legacy_identity = {"chat": "chat\x1fuser", "files": ["file-1"], "share": "demo123", "target": "target"}
+        key = hashlib.sha256(json.dumps(legacy_identity, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
         legacy, _ = download_requests_repo.create_download_request(key, "guangya_share", title="legacy")
         regular, _ = download_requests_repo.create_download_request("ordinary-pending", "magnet")
-        self.assertEqual(self.submit()["status"], "pending")
+        receipt = self.submit()
+        self.assertEqual(receipt["status"], "manual_review")
+        self.assertIn("原光鸭账号无法核对", receipt["error"])
+        self.assertIsNone(receipt["request_id"])
+        self.assertEqual(self.request()["status"], "pending")
         self.assertEqual(self.client.restore_calls, [])
         db.init_db()
         self.assertEqual(self.submit()["status"], "manual_review")
@@ -479,12 +487,16 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         assert get_download_request_result_5 is not None
         self.assertEqual(dict(get_download_request_result_5), recovered)
         self.assertEqual(self.client.restore_calls, [])
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_request_keys").fetchone()[0], 2)
 
     def test_retry_claim_after_log_clear_is_atomic_and_cannot_reset_after_second_failure(self):
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
-        request_id, _ = download_requests_repo.create_share_transfer_request("retry-race", title="Share")
+        request_id, _ = download_requests_repo.create_share_transfer_request(
+            "retry-race", title="Share", receipt_owner="originating-session",
+        )
 
         def finish():
             return download_requests_repo.finish_share_transfer_request(
@@ -493,13 +505,16 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
 
         self.assertTrue(finish())
         self.assertEqual(self.request()["share_retry_count"], 0)
+        self.assertFalse(download_requests_repo.claim_failed_share_transfer_request(
+            request_id, receipt_owner="different-session",
+        ))
         logs = [row["id"] for row in download_requests_repo.list_download_logs(source="guangya_share")]
         self.assertEqual(download_requests_repo.delete_download_logs(logs), logs)
         barrier = threading.Barrier(6)
 
         def claim():
             barrier.wait(timeout=5)
-            return download_requests_repo.claim_failed_share_transfer_request(request_id)
+            return download_requests_repo.claim_failed_share_transfer_request(request_id, receipt_owner="originating-session")
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             claimed = list(pool.map(lambda _: claim(), range(6)))
@@ -511,7 +526,9 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         download_requests_repo.delete_download_logs(logs)
         db.init_db()
         self.assertEqual(self.request()["share_retry_count"], 1)
-        self.assertFalse(download_requests_repo.claim_failed_share_transfer_request(request_id))
+        self.assertFalse(download_requests_repo.claim_failed_share_transfer_request(
+            request_id, receipt_owner="originating-session",
+        ))
 
     def test_retry_requires_both_request_and_provider_to_be_definitely_failed(self):
         for status, gy_status in (("failed", "manual_review"), ("manual_review", "failed"),
@@ -606,7 +623,8 @@ db.configure_database(sys.argv[1], test_mode=True)
 db.init_db()
 client = FakeShareClient()
 store = ShareTransferPreviewStore()
-preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
+preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation,
+                       account_key=client.share_account_key())
 def accepted_then_exit(*args, **kwargs):
  kwargs["cancel_check"]()
  Path(sys.argv[1]).with_suffix(".cloud-marker").write_text("accepted-once")
@@ -651,7 +669,9 @@ raise AssertionError("provider window not reached")
             recovered = dict(recovered_row)
             self.assertEqual(recovered["status"], "manual_review")
             self.assertEqual(recovered["gy_target_dir"], "staging-target")
-            self.assertFalse(download_requests_repo.claim_failed_share_transfer_request(request_id))
+            self.assertFalse(download_requests_repo.claim_failed_share_transfer_request(
+                request_id, receipt_owner=recovered["user_id"],
+            ))
             self.assertFalse(
                 download_requests_repo.finish_share_transfer_request(
                     request_id,
@@ -663,7 +683,8 @@ raise AssertionError("provider window not reached")
             )
             client = LifecycleShareClient()
             store = ShareTransferPreviewStore()
-            preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
+            preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation,
+                                   account_key=client.share_account_key())
             result = create_share_request(
                 preview,
                 ["file-1"],

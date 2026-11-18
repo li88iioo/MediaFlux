@@ -12,6 +12,7 @@ from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.share_transfer import (
     ShareTransferAccountChanged,
+    ShareTransferAccountUnavailable,
     create_share_request,
     get_share_transfer_store,
     inspect_share_for_transfer,
@@ -45,9 +46,11 @@ def _remember_share_request(request: Request, request_id: Any) -> None:
 
 
 def _preview_error(exc: Exception) -> JSONResponse:
-    if isinstance(exc, ShareTransferAccountChanged):
+    if isinstance(exc, (ShareTransferAccountChanged, ShareTransferAccountUnavailable)):
         return JSONResponse({"error": str(exc)}, status_code=410)
     message = str(exc or "")
+    if "光鸭未登录" in message:
+        return JSONResponse({"error": message}, status_code=503)
     status = 410 if "过期" in message or "无效" in message or "已使用" in message else 400
     if status == 410:
         message = "预览已过期或无效，请重新解析分享链接"

@@ -2674,6 +2674,13 @@ class GuangYaClient:
 
         return self._call_read("account_info", fetch)
 
+    def share_account_key(self) -> str:
+        """用已认证账号的稳定 ID 标识转存范围，不使用 token 或显示资料。"""
+        identity = _first(self.account_info(), "sub", "userId", "user_id")
+        if type(identity) not in (str, int) or not (value := str(identity).strip()):
+            raise ValueError("光鸭账号资料没有可用的账号标识")
+        return hashlib.sha256(f"guangya-account\0{value}".encode()).hexdigest()
+
     def account_storage_info(self) -> dict:
         """读取官网同源容量接口；totalSpaceSize/usedSpaceSize 原单位为字节。"""
         def fetch():

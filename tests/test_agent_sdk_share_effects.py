@@ -8,6 +8,7 @@ import os
 import socket
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Any
@@ -83,8 +84,9 @@ def test_transfer_cancel_during_staging_finishes_request_without_restore(backend
         assert plan is not None and not client.restore_calls
         create = client.create_dir
 
-        def create_then_cancel(name: str, parent_id: str = "0") -> str:
-            directory_id = create(name, parent_id)
+        def create_then_cancel(name: str, parent_id: str = "0", *,
+                               before_write: Callable[[], None] | None = None) -> str:
+            directory_id = create(name, parent_id, before_write=before_write)
             context.cancellation.cancel()
             return directory_id
 
