@@ -9,7 +9,8 @@ from typing import cast
 import json
 import unittest
 import unittest.mock
-from datetime import datetime
+from datetime import datetime, timedelta
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,6 +20,8 @@ from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.modules.library_patrol import patrol_status
 from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
+from app.modules import telegram_notification_center as notification_center
+from app.modules import telegram_notification_policy as notification_policy
 from app.notifier import TelegramSendResult
 from app.routes.api import save_config
 from tests.support import IsolatedDatabaseTestCase, authenticated_session, preserve_web_auth_config
@@ -741,7 +744,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(get_agent_library_patrol_result_5["result_revision"], 1)
         self.assertEqual(agent_library_patrol_repo.list_agent_library_patrol_notifications(), [])
 
-    def test_a_b_a_transitions_each_enqueue_a_new_revision(self):
+    def test_recurring_findings_are_delivered_and_retry_reuses_the_same_event(self):
         results = [
             _patrol_result(),
             _patrol_result(status="up_to_date"),
@@ -754,12 +757,43 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         scheduler = AgentLibraryPatrolScheduler(
             audit_executor=executor, clock=self.clock
         )
-        with self._config(notify=True):
-            for day in (3, 4, 5):
+        sender = Mock(return_value=TelegramSendResult(True, message_id=100))
+        real_publish = notification_center.publish_notification_event
+
+        def publish_then_lose_ack(*args, **kwargs):
+            assert real_publish(*args, **kwargs).delivered
+            raise RuntimeError("通知已送达，移交回执尚未返回")
+
+        with (
+            self._config(notify=True),
+            patch.object(notification_policy, "notification_level", return_value="standard"),
+            patch.multiple(
+                notification_center, notification_target_chat_id=Mock(return_value="100"),
+                send_event_result=sender, _dispatch_stop=Event(),
+                wake_telegram_notification_dispatcher=Mock(),
+            ),
+        ):
+            for day in (3, 4):
                 self.clock.value = datetime(2026, 8, day, 12, 0, 0)
                 self.assertEqual(scheduler.run_once(), 1)
+                self.assertEqual(scheduler.dispatch_notification_once(), 1)
+            self.clock.value = datetime(2026, 8, 5, 12, 0, 0)
+            self.assertEqual(scheduler.run_once(), 1)
+            with patch.object(
+                notification_center, "publish_notification_event", side_effect=publish_then_lose_ack,
+            ):
+                self.assertEqual(scheduler.dispatch_notification_once(), 1)
+            self.assertEqual(agent_library_patrol_repo.list_agent_library_patrol_notifications()[-1]["status"], "retry_wait")
+            self.clock.value += timedelta(minutes=1)
+            self.assertEqual(scheduler.dispatch_notification_once(), 1)
         notifications = agent_library_patrol_repo.list_agent_library_patrol_notifications()
         self.assertEqual([row["result_revision"] for row in notifications], [1, 2, 3])
+        self.assertEqual([row["status"] for row in notifications], ["sent"] * 3)
+        self.assertEqual([call.args[0].title for call in sender.call_args_list], [
+            "Agent 全库缺集巡检发现更新",
+            "Agent 全库缺集巡检已恢复正常",
+            "Agent 全库缺集巡检发现更新",
+        ])
         get_agent_library_patrol_result_6 = agent_library_patrol_repo.get_agent_library_patrol()
         assert get_agent_library_patrol_result_6 is not None
         self.assertEqual(get_agent_library_patrol_result_6["result_revision"], 3)

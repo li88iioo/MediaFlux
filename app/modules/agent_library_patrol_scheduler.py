@@ -57,7 +57,7 @@ class AgentLibraryPatrolScheduler:
         self,
         *,
         audit_executor: Callable[[dict], tuple[EpisodeAuditResult, int]] | None = None,
-        notification_sender: Callable[[dict], object] | None = None,
+        notification_sender: Callable[[dict, int], object] | None = None,
         interval: float = 30.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -388,7 +388,7 @@ class AgentLibraryPatrolScheduler:
                             next_attempt_at=current,
                         )
                         return 0
-                    raw_result = self._notification_sender(projection)
+                    raw_result = self._notification_sender(projection, notification_id)
                 result = (
                     raw_result if isinstance(raw_result, TelegramSendResult)
                     else TelegramSendResult(

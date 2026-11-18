@@ -119,7 +119,7 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
                 or NotificationPublishResult(True, delivered=True, status="sent")
             ),
         ):
-            self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
+            self.assertTrue(send_library_patrol_notification_result(_projection(), 1).ok)
         self.assertEqual(captured[0].actions, ())
 
     def test_delivery_keeps_actions_for_configured_telegram_agent(self):
@@ -141,7 +141,7 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
                     or NotificationPublishResult(True, delivered=True, status="sent")
                 ),
             ):
-                self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
+                self.assertTrue(send_library_patrol_notification_result(_projection(), 1).ok)
                 self.assertEqual(
                     [action.callback_data for action in captured[0].actions],
                     ["agp:summary", "agp:resources"] if expected else [],
@@ -182,8 +182,8 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
             "app.modules.telegram_notification_center.publish_notification_event",
             side_effect=publish,
         ):
-            self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
-            self.assertTrue(send_library_patrol_notification_result(recovered).ok)
+            self.assertTrue(send_library_patrol_notification_result(_projection(), 1).ok)
+            self.assertTrue(send_library_patrol_notification_result(recovered, 2).ok)
 
         self.assertEqual(captured, [
             NotificationImportance.ACTION,
