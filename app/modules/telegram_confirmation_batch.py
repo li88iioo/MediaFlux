@@ -72,6 +72,30 @@ def _downstream_counts(items: list[dict]) -> dict[str, int]:
     return counts
 
 
+def _receipt_labels(item: dict) -> tuple[str, list[str]]:
+    downstream = item.get("downstream") or {}
+    strm = str(downstream.get("strm") or "等待回执")
+    if strm in {"完成", "成功", "completed", "success"}:
+        strm = "已完成"
+    refresh = []
+    for part in str(downstream.get("media_refresh") or "等待回执").split(" / "):
+        label = part.strip()
+        # 成功回执只证明刷新请求被受理。保留等待 STRM 完成等非终态的原始含义。
+        match = re.fullmatch(r"(?:(Jellyfin|Emby|媒体库)\s+)?(已刷新|已完成|完成|成功|success|completed|queued|已排队)", label, re.I)
+        if match:
+            state = "待后台提交" if match[2].lower() in {"queued", "已排队"} else "请求已受理"
+            label = f"{match[1]} {state}" if match[1] else state
+        refresh.append(label)
+    return strm, refresh
+
+
+def _receipt_summary(counts: Counter[str]) -> str:
+    parts = [f"{truncate_telegram_text(label, 72)} {count} 组" for label, count in counts.most_common(6)]
+    if len(counts) > len(parts):
+        parts.append(f"另有 {len(counts) - len(parts)} 种状态")
+    return " · ".join(parts)
+
+
 def _candidate(item: dict, index: object) -> dict | None:
     if type(index) is not int or index < 0:
         return None
@@ -210,10 +234,8 @@ def _batch_event(
         if detail.get("error"):
             lines.append(truncate_telegram_text(detail["error"], 240))
         downstream = detail.get("downstream") or {}
-        fields += (
-            ("STRM 状态", str(downstream.get("strm") or "等待后续处理回执")),
-            ("媒体库刷新", str(downstream.get("media_refresh") or "等待后续处理回执")),
-        )
+        strm, refresh = _receipt_labels(detail)
+        fields += (("STRM 状态", strm), ("媒体库刷新", " / ".join(refresh)))
         if downstream.get("partial"):
             lines.append("后续处理部分完成，请查看 STRM 与媒体库状态。")
         if downstream.get("error"):
@@ -238,11 +260,15 @@ def _batch_event(
         review_count = sum(item.get("status") == "pending" and item["review_status"] in {"waiting", "pending", "running"}
                            for item in reviewing)
         fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text), ("分页", f"{page}/{pages}"))
-        if any(downstream_counts.values()):
-            fields += (("后续处理", " · ".join(f"{label} {downstream_counts[key]}" for key, label in (
-                ("partial", "部分完成"), ("waiting", "等待回执"),
-                ("submitted", "已交接后台刷新"), ("completed", "已完成"),
-            ) if downstream_counts[key])),)
+        strm_counts: Counter[str] = Counter()
+        refresh_counts: Counter[str] = Counter()
+        for item in items:
+            if item.get("downstream") or item.get("status") == "completed":
+                strm, refresh = _receipt_labels(item)
+                strm_counts[strm] += 1
+                refresh_counts.update(dict.fromkeys(refresh, 1))
+        if strm_counts:
+            fields += (("STRM 状态", _receipt_summary(strm_counts)), ("媒体库刷新", _receipt_summary(refresh_counts)))
         if review_count:
             # 复核逐组完成时不重发消息，避免刷屏；进度在刷新或最后一组完成时更新。
             fields += (("Agent 复核", f"已完成 {len(reviewing) - review_count}/{len(reviewing)} 组，点「刷新摘要」查看最新建议"),)
@@ -268,7 +294,7 @@ def _batch_event(
                   "后续处理仍在进行，可刷新摘要查看状态。" if active else
                   "请在 Web 整理日志查看处理明细。")
         if downstream_counts["submitted"]:
-            footer += "\nSTRM 已完成，刷新已交给后台；不代表媒体库已扫描完成。"
+            footer += "\n收到后台刷新回执后，会更新这条消息。"
         preview = None
         if truncated:
             footer = "此批次超过 1000 组，仅展示前 1000 组；请在 Web 分批审阅、复核和确认。"

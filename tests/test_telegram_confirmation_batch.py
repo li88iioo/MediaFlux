@@ -121,6 +121,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertTrue(all(row["status"] == "pending" and row["selected_index"] is None for row in rows))
         self.assertEqual(threads[0]["thread_key"], f"confirmation-batch:{next(iter(ids))}")
         self.assertEqual(self.sent.call_count, 1)
+        self.assertNotIn("STRM 状态", dict(self.sent.call_args.args[0].fields))
         self.edited.assert_not_called()
         self.assertTrue(all(len(action.callback_data.encode()) <= 64 for action in self.sent.call_args.args[0].actions))
 
@@ -472,7 +473,11 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=json.dumps({"_downstream": result}, ensure_ascii=False))
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
         summary = self._snapshot().event
-        self.assertIn(("后续处理", "部分完成 1 · 等待回执 1 · 已完成 1"), summary.fields)
+        fields = dict(summary.fields)
+        self.assertEqual(set(str(fields["STRM 状态"]).split(" · ")), {"已完成 2 组", "已排队 1 组"})
+        self.assertEqual(set(str(fields["媒体库刷新"]).split(" · ")), {
+            "刷新失败 1 组", "等待 STRM 完成 1 组", "请求已受理 1 组",
+        })
         progress = dict(summary.fields)["进度"]
         assert isinstance(progress, str)
         self.assertIn("整理完成 3", progress)
@@ -490,16 +495,21 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         tokens = self._create(3)
         for token in tokens:
             organize_confirmations_repo.update_organize_confirmation(token, status="completed")
+        batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+        waiting = dict(self._snapshot().event.fields)
+        self.assertEqual(waiting["STRM 状态"], "等待回执 3 组")
+        self.assertEqual(waiting["媒体库刷新"], "等待回执 3 组")
         for token in tokens:
             confirmations.update_confirmation_lifecycle_downstream(
                 token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已排队",
             )
         event = self._snapshot().event
         self.assertEqual(event.title, "✅ 整理批次已完成")
-        self.assertIn(("后续处理", "已交接后台刷新 3"), event.fields)
+        self.assertIn(("STRM 状态", "已完成 3 组"), event.fields)
+        self.assertIn(("媒体库刷新", "Jellyfin 待后台提交 3 组"), event.fields)
         self.assertEqual(event.actions, ())
         assert isinstance(event.footer, str)
-        self.assertIn("不代表媒体库已扫描完成", event.footer)
+        self.assertIn("收到后台刷新回执", event.footer)
         self.assertNotIn("等待回执", render_event(event))
         revision = self._snapshot().revision
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
@@ -509,8 +519,12 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
                 token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已刷新 / Emby 已跳过",
             )
         finished = self._snapshot().event
-        self.assertIn(("后续处理", "已完成 3"), finished.fields)
+        self.assertIn(("媒体库刷新", "Jellyfin 请求已受理 3 组 · Emby 已跳过 3 组"), finished.fields)
         self.assertEqual(finished.actions, ())
+        notifications.drain_telegram_notifications(limit=1)
+        self.sent.assert_called_once()
+        self.assertEqual(self.edited.call_args.kwargs["message_id"], 77)
+        self.assertIn("Jellyfin 请求已受理 3 组", render_event(self.edited.call_args.args[0]))
 
     def test_new_run_with_same_summary_rejects_inflight_old_receipt(self):
         tokens = self._create(2)
@@ -679,6 +693,9 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
                 self.assertEqual(downstream["strm"], expected)
                 self.assertEqual(downstream["partial"], partial)
                 self.assertEqual(downstream["media_refresh"], "未触发")
+                fields = dict(self._snapshot().event.fields)
+                self.assertIn(expected, str(fields["STRM 状态"]))
+                self.assertIn("未触发", str(fields["媒体库刷新"]))
 
     def test_outbox_retries_failed_send_without_new_thread_and_rejects_stale_revision(self):
         tokens = self._create()
