@@ -1275,7 +1275,7 @@ class STRMScheduler:
             "metadata_queue": metadata_queue,
             "organize_probe_queue": organize_probe_queue,
             "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "",
-            "last_run": self._row_to_dict(last),
+            "last_run": self.run_record(last),
         }
 
     def _set_progress(self, stage: str, completed: int, total: int, detail: str) -> None:
@@ -2829,13 +2829,15 @@ class STRMScheduler:
                 )
 
     @staticmethod
-    def _row_to_dict(row) -> dict:
+    def run_record(row) -> dict:
         if not row:
             return {}
         result = {}
         if row["result"]:
             try:
                 result = json.loads(row["result"])
+                if isinstance(result, dict):
+                    result.pop("strm_summary_chats", None)
             except (ValueError, TypeError):
                 result = {"raw": row["result"]}
         return {

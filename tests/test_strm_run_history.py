@@ -125,14 +125,16 @@ class StrmRunHistoryTests(IsolatedDatabaseTestCase):
         from app.modules.scheduler import STRMScheduler
         from app.routes import strm_api
         ids = self.seed(35)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE task_runs SET result=json_set(result,'$.strm_summary_chats',json_array('original-chat')) WHERE id=?", (ids[-1],))
         with patch.object(strm_api, "require_api_login"):
             response = strm_api.runs(cast(Any, object()))
         data = json.loads(bytes(response.body))
         self.assertEqual([item["id"] for item in data], list(reversed(ids))[:30])
         self.assertEqual(data[0]["error"], "SECRET ERROR")
         self.assertEqual(data[0]["result"]["sources"], ["PRIVATE"])
-        row = db.get_last_task_run("strm_sync")
-        self.assertEqual(STRMScheduler._row_to_dict(row)["result"], data[0]["result"])
+        self.assertNotIn("strm_summary_chats", data[0]["result"])
+        self.assertEqual(STRMScheduler().status()["last_run"], data[0])
 
     def test_overview_preserves_attention_for_partial_and_failed_runs(self):
         from app import sdk

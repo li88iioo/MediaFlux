@@ -1,7 +1,6 @@
 """STRM 调度 API：状态、历史、cron 校验、手动触发、启停。"""
 from __future__ import annotations
 
-import json
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Request
@@ -260,26 +259,7 @@ def run_full_now(request: Request):
 def runs(request: Request):
     require_api_login(request)
     rows = db.list_task_runs("strm_sync", limit=30)
-    result = []
-    for row in rows:
-        payload = {}
-        if row["result"]:
-            try:
-                payload = json.loads(row["result"])
-                if isinstance(payload, dict):
-                    payload.pop("strm_summary_chats", None)
-            except (ValueError, TypeError):
-                payload = {"raw": row["result"]}
-        result.append({
-            "id": row["id"],
-            "trigger_type": row["trigger_type"],
-            "status": row["status"],
-            "started_at": row["started_at"],
-            "finished_at": row["finished_at"],
-            "result": payload,
-            "error": row["error"] or "",
-        })
-    return api_response(result)
+    return api_response([STRMScheduler.run_record(row) for row in rows])
 
 
 def _metadata_owner(request: Request) -> str:
