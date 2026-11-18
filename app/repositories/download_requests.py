@@ -18,6 +18,7 @@ from app.repositories import local_media as local_media_repo
 _PLACEHOLDER_TITLES = ("", "磁力任务", "链接任务", "ED2K 任务", "未命名任务", "未命名下载请求", "离线下载", "torrent", "resource")
 
 DOWNLOAD_TARGETS = frozenset({"qb", "guangya", "both"})
+RSS_QB_SAVE_PATH_UNKNOWN = "无法确认原 RSS 下载的 qBittorrent 保存目录，请核对原目录后手动提交"
 
 
 def usable_download_title(value: object) -> bool:
@@ -644,6 +645,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                             content_type: str = "",
                             display_title: str = "",
                             initial_targets: str = "",
+                            qb_save_path: str = "",
                             retry_source_request_id: int | None = None,
                             retry_source_status: str = "",
                             verification_targets: list[dict] | None = None,
@@ -676,7 +678,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                     (retry_source_request_id, request_id),
                 )
             if created and initial_targets and not _claim_download_request_conn(
-                conn, request_id, initial_targets, timestamp
+                conn, request_id, initial_targets, timestamp, qb_save_path=qb_save_path,
             ):
                 raise RuntimeError("新下载请求未能认领")
             if created and admission_source_ids:
@@ -717,7 +719,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
         conn.execute("BEGIN IMMEDIATE")
         if retry_source_request_id is not None:
             source = conn.execute(
-                "SELECT status,qb_status,gy_status,organize_status FROM download_requests WHERE id=?",
+                "SELECT id,origin,status,qb_status,gy_status,organize_status,qb_save_path FROM download_requests WHERE id=?",
                 (retry_source_request_id,),
             ).fetchone()
             if source is None or str(source["status"] or "") != retry_source_status:
@@ -745,6 +747,11 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                 raise DownloadRequestRetryFenceError(
                     "原下载后端仍在处理或结果待核验，未重新提交"
                 )
+            if initial_targets in {"qb", "both"}:
+                if rss_qb_save_path_is_missing(source, connection=conn):
+                    raise DownloadRequestRetryFenceError(RSS_QB_SAVE_PATH_UNKNOWN)
+                if source["qb_save_path"] is not None:
+                    qb_save_path = source["qb_save_path"]
         keys = _compatible_request_keys(conn, keys, source_alias_key)
         rows = _request_rows_for_keys(
             conn,
@@ -973,16 +980,26 @@ def get_download_request(request_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def get_download_request_rss_qb_save_path(request_id: int) -> str | None:
-    """从持久化交付归属恢复 RSS 目录；无关联或目录冲突时沿用下载器默认值。"""
+def get_download_request_qb_save_path(request_id: int) -> str | None:
     with db.get_conn() as conn:
-        paths = conn.execute(
-            "SELECT DISTINCT COALESCE(i.qb_save_path,'') FROM rss_entries e "
-            "JOIN rss_items i ON i.id=e.rss_item_id "
-            "WHERE e.download_request_id=? AND e.download_backend='qb'",
-            (request_id,),
-        ).fetchall()
-    return str(paths[0][0]) if len(paths) == 1 else None
+        row = conn.execute("SELECT qb_save_path FROM download_requests WHERE id=?", (request_id,)).fetchone()
+        return row["qb_save_path"] if row else None
+
+
+def rss_qb_save_path_is_missing(row, *, connection: sqlite3.Connection | None = None) -> bool:
+    """只凭此请求的 qB 历史和 RSS 归属判定，内容 hash 相同不能证明归属。"""
+    if row["qb_save_path"] is not None or not row["qb_status"]:
+        return False
+    if str(row["origin"] or "").startswith("rss:"):
+        return True
+    if connection is not None:
+        return connection.execute(
+            "SELECT 1 FROM rss_entries WHERE download_request_id=? AND download_backend='qb' "
+            "UNION ALL SELECT 1 FROM download_log WHERE request_id=? AND source='qb' AND rss_item_id>0 LIMIT 1",
+            (row["id"], row["id"]),
+        ).fetchone() is not None
+    with db.get_conn() as conn:
+        return rss_qb_save_path_is_missing(row, connection=conn)
 
 
 def count_download_requests_requiring_attention(request_id: int | None = None) -> int:
@@ -1174,7 +1191,7 @@ def get_download_request_by_request_keys(
     return _preferred_request_row(active or rows, keys[0])
 
 
-def claim_download_request_targets(request_id: int, targets: str) -> tuple[str, ...]:
+def claim_download_request_targets(request_id: int, targets: str, *, qb_save_path: str = "") -> tuple[str, ...]:
     """原子认领已有请求中尚未提交（或可安全重试）的后端目标。"""
     desired = {"qb", "guangya"} if targets == "both" else {targets}
     if not desired or desired - {"qb", "guangya"}:
@@ -1183,7 +1200,7 @@ def claim_download_request_targets(request_id: int, targets: str) -> tuple[str, 
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT id,status,targets,qb_status,gy_status FROM download_requests WHERE id=?",
+            "SELECT id,origin,status,targets,qb_status,gy_status,qb_save_path FROM download_requests WHERE id=?",
             (request_id,),
         ).fetchone()
         # 在同一事务内阻止已取消/已交接的请求被迟到认领重新激活。
@@ -1199,7 +1216,8 @@ def claim_download_request_targets(request_id: int, targets: str) -> tuple[str, 
         if not active_existing:
             return ()
         missing: list[str] = []
-        if "qb" in desired and qb_status in {"", "failed"}:
+        if ("qb" in desired and qb_status in {"", "failed"}
+                and not rss_qb_save_path_is_missing(row, connection=conn)):
             missing.append("qb")
         if "guangya" in desired and gy_status in {"", "failed"}:
             missing.append("guangya")
@@ -1221,11 +1239,12 @@ def claim_download_request_targets(request_id: int, targets: str) -> tuple[str, 
         if "qb" in missing:
             sets.extend([
                 "qb_status='submitting'", "qb_submitting_at=?", "qb_task_id=''", "qb_task_missing_since=NULL",
+                "qb_save_path=COALESCE(qb_save_path,?)",
                 "qb_content_path=''",
                 "local_import_status=''", "local_import_attempts=0", "local_import_error=''",
                 "local_import_target=''", "local_import_started_at=NULL", "local_import_completed_at=NULL",
             ])
-            values.append(timestamp)
+            values.extend((timestamp, qb_save_path))
         if "guangya" in missing:
             sets.extend([
                 "gy_status='submitting'", "gy_submitting_at=?", "gy_task_id=''", "gy_task_ids='[]'", "gy_batch_count=0",
@@ -1303,6 +1322,7 @@ def cancel_pending_download_request(request_id: int, *, error: str = "") -> bool
 
 def _claim_download_request_conn(
     conn: sqlite3.Connection, request_id: int, targets: str, timestamp: str,
+    *, qb_save_path: str = "",
 ) -> bool:
     if targets not in {"qb", "guangya", "both"}:
         return False
@@ -1311,7 +1331,7 @@ def _claim_download_request_conn(
     cur = conn.execute(
         "UPDATE download_requests SET targets=?,status='submitting',"
         "qb_status=?,gy_status=?,qb_task_id='',gy_task_id='',gy_task_ids='[]',gy_batch_count=0,"
-        "qb_submitting_at=?,gy_submitting_at=?,"
+        "qb_submitting_at=?,gy_submitting_at=?,qb_save_path=COALESCE(qb_save_path,?),"
         "gy_expected_file_count=0,gy_settle_observed_file_count=0,gy_settle_attempts=0,"
         "gy_settle_snapshot='',gy_settle_stable_count=0,gy_selection_mode='',gy_unverified_manifest=0,"
         "organize_started=0,organize_attempts=0,organize_next_retry_at=NULL,"
@@ -1320,7 +1340,7 @@ def _claim_download_request_conn(
         "completed_at=NULL,error='',attention_cleared_at=NULL,attention_clear_note='',updated_at=? "
         "WHERE id=? AND status='pending'",
         (targets, qb_status, gy_status, timestamp if qb_status else None,
-         timestamp if gy_status else None, timestamp, request_id),
+         timestamp if gy_status else None, qb_save_path if qb_status else None, timestamp, request_id),
     )
     if cur.rowcount:
         from app.repositories.rss import _bind_rss_download_entries_conn
@@ -1329,10 +1349,10 @@ def _claim_download_request_conn(
     return cur.rowcount > 0
 
 
-def claim_download_request(request_id: int, targets: str) -> bool:
-    """原子认领待选择请求，防 callback 重放和并发重复提交。"""
+def claim_download_request(request_id: int, targets: str, *, qb_save_path: str = "") -> bool:
+    """原子认领待提交请求并保留 qB 路由，防 callback 重放和并发重复提交。"""
     with db.get_conn() as conn:
-        return _claim_download_request_conn(conn, request_id, targets, db.now())
+        return _claim_download_request_conn(conn, request_id, targets, db.now(), qb_save_path=qb_save_path)
 
 
 # 启动恢复、轮询补偿及整理/目录收口认领共用同一份后端准入事实。

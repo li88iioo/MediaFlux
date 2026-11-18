@@ -355,6 +355,7 @@ def create_request(
     supersede_request_id: int | None = None,
     admission_id: int | None = None,
     initial_targets: str = "",
+    qb_save_path: str = "",
     retry_source_request_id: int | None = None,
     retry_source_status: str = "",
     verification_targets: list[dict] | None = None,
@@ -370,6 +371,7 @@ def create_request(
         source_alias_key=request_source_alias_key(item),
         admission_id=admission_id,
         initial_targets=initial_targets,
+        qb_save_path=qb_save_path,
         retry_source_request_id=retry_source_request_id,
         retry_source_status=retry_source_status,
         verification_targets=verification_targets, verification_owner=verification_owner,
@@ -566,7 +568,6 @@ def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 class _DispatchOptions(TypedDict, total=False):
     guangya_credential_generation: int
-    qb_save_path: str
     qb_category: str
     qb_runtime_config: dict[str, Any]
     qb_task_id_hint: str
@@ -606,6 +607,10 @@ def _qb_client_options(runtime_config: dict[str, Any] | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         options["timeout"] = 10
     return options
+
+
+def _qb_save_path(save_path: str | None, runtime_config: dict[str, Any] | None) -> str:
+    return str(save_path if save_path is not None else (runtime_config or {}).get("default_save_path") or "")
 
 
 def _export_qb_torrent_for_resubmit(
@@ -755,6 +760,10 @@ def download_resubmit_capabilities(
     elif qb_status == "completed" and not allow_completed:
         qb_enabled = False
         qb_reason = "qBittorrent 已完成"
+    missing_rss_path = qb_enabled and download_requests_repo.rss_qb_save_path_is_missing(row)
+    if missing_rss_path:
+        qb_enabled = False
+        qb_reason = download_requests_repo.RSS_QB_SAVE_PATH_UNKNOWN
 
     gy_enabled = False
     gy_reason = "此请求无法重新提交到光鸭"
@@ -797,6 +806,8 @@ def download_resubmit_capabilities(
         qb_status == "completed" or gy_status == "completed"
     ):
         both_reason = "至少一个下载目标已完成"
+    elif missing_rss_path:
+        both_reason = download_requests_repo.RSS_QB_SAVE_PATH_UNKNOWN
     else:
         both_reason = "qBittorrent 与光鸭必须同时可用"
     return {
@@ -893,7 +904,6 @@ def resubmit_download_request(
     *,
     allow_completed: bool = False,
     origin: str = "web",
-    qb_save_path: str | None = None,
     qb_category: str | None = None,
     qb_runtime_config: dict[str, Any] | None = None,
     rss_item_id: int | None = None,
@@ -937,10 +947,6 @@ def resubmit_download_request(
     if check_cancelled is not None:
         check_cancelled()
         dispatch_kwargs["check_cancelled"] = check_cancelled
-    if qb_save_path is None and targets in {"qb", "both"}:
-        qb_save_path = download_requests_repo.get_download_request_rss_qb_save_path(source_request_id)
-    if qb_save_path is not None:
-        dispatch_kwargs["qb_save_path"] = qb_save_path
     if qb_category is not None:
         dispatch_kwargs["qb_category"] = qb_category
     if qb_runtime_config is not None:
@@ -1087,6 +1093,7 @@ def resubmit_download_request(
             ),
             # successor 认领和媒体准入/候选接管复用同一事务。
             initial_targets=targets,
+            qb_save_path=_qb_save_path(None, qb_runtime_config),
             retry_source_request_id=source_request_id,
             retry_source_status=source_status,
         )
@@ -1193,7 +1200,9 @@ def dispatch_missing_targets(
                         "content_type": "application/x-bittorrent"}
     if check_cancelled is not None:
         check_cancelled()
-    claimed = download_requests_repo.claim_download_request_targets(request_id, targets)
+    claimed = download_requests_repo.claim_download_request_targets(
+        request_id, targets, qb_save_path=_qb_save_path(qb_save_path, qb_runtime_config),
+    )
     if not claimed:
         return {"handled": False, "ok": False, "duplicate": True, "error": "该目标已提交或正在处理"}
     if prepared_row is not None and "guangya" in claimed:
@@ -1203,7 +1212,7 @@ def dispatch_missing_targets(
     result = _dispatch_claimed_targets(
         row, tuple(claimed),
         gy_target_dir=gy_target_dir, gy_target_name=gy_target_name,
-        qb_save_path=qb_save_path, qb_category=qb_category,
+        qb_category=qb_category,
         qb_runtime_config=qb_runtime_config, qb_task_id_hint=qb_task_id_hint,
         rss_item_id=rss_item_id, log_path=log_path,
         check_cancelled=check_cancelled,
@@ -1234,14 +1243,16 @@ def dispatch_request(
         return {"ok": False, "error": "下载请求不存在"}
     if check_cancelled is not None:
         check_cancelled()
-    if not download_requests_repo.claim_download_request(request_id, targets):
+    if not download_requests_repo.claim_download_request(
+        request_id, targets, qb_save_path=_qb_save_path(qb_save_path, qb_runtime_config),
+    ):
         return {"ok": False, "duplicate": True, "error": "该请求已提交或正在处理"}
 
     claimed = ("qb", "guangya") if targets == "both" else (targets,)
     return _dispatch_claimed_targets(
         row, claimed,
         gy_target_dir=gy_target_dir, gy_target_name=gy_target_name,
-        qb_save_path=qb_save_path, qb_category=qb_category,
+        qb_category=qb_category,
         qb_runtime_config=qb_runtime_config, qb_task_id_hint=qb_task_id_hint,
         rss_item_id=rss_item_id, log_path=log_path,
         check_cancelled=check_cancelled,
@@ -1255,7 +1266,6 @@ def _dispatch_claimed_targets(
     *,
     gy_target_dir: str = "",
     gy_target_name: str = "",
-    qb_save_path: str | None = None,
     qb_category: str | None = None,
     qb_runtime_config: dict[str, Any] | None = None,
     qb_task_id_hint: str = "",
@@ -1270,8 +1280,6 @@ def _dispatch_claimed_targets(
     source_value = str(row["source_value"] or "")
     results: dict[str, dict[str, Any]] = {}
     qb_options: _QBSubmissionOptions = {}
-    if qb_save_path is not None:
-        qb_options["save_path"] = qb_save_path
     if qb_category is not None:
         qb_options["category"] = qb_category
     if qb_runtime_config is not None:
@@ -1319,6 +1327,11 @@ def _dispatch_claimed_targets(
         with qb_lease if source == "qb" else nullcontext():
             proceed = before_submission()
             try:
+                if proceed and source == "qb":
+                    saved_path = download_requests_repo.get_download_request_qb_save_path(request_id)
+                    if saved_path is None:
+                        raise RuntimeError("qBittorrent 认领未保存投递目录")
+                    qb_options["save_path"] = saved_path
                 result: dict[str, Any] = submissions[source]() if proceed else {
                     "ok": False, "error": "操作已取消，未提交下载后端",
                 }
@@ -1704,7 +1717,7 @@ def _public_magnet_title(row) -> str | None:
 def _submit_qb(
     row,
     *,
-    save_path: str | None = None,
+    save_path: str = "",
     category: str | None = None,
     runtime_config: dict[str, Any] | None = None,
     task_id_hint: str = "",
@@ -1721,9 +1734,6 @@ def _submit_qb(
         else get("QB_CATEGORY", "")
     )
     resolved_category = str(category if category is not None else default_category or "")
-    resolved_save_path = str(
-        save_path if save_path is not None else (runtime or {}).get("default_save_path") or ""
-    )
     torrents = row["torrent_data"] if row["kind"] in {"torrent", "http"} else None
     urls = "" if torrents else str(row["source_value"] or "")
     public_title = _public_magnet_title(row)
@@ -1732,7 +1742,7 @@ def _submit_qb(
     try:
         result = client.add_torrent_detailed(
             urls=urls,
-            save_path=resolved_save_path,
+            save_path=save_path,
             category=resolved_category,
             torrents=torrents,
             can_proceed=can_proceed,

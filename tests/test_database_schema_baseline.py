@@ -23,6 +23,40 @@ from tests.support import seed_rss_entry_state
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    def test_v43_downloads_keep_existing_receipts_and_unknown_qb_directory(self):
+        subscription_id = rss_repo.add_rss_subscription(
+            "旧订阅", "https://feed.invalid/rss", download_method="qb", qb_save_path="/current/rss",
+        )
+        request_id, _ = download_requests_repo.create_download_request(
+            "historical-qb", "magnet", origin=f"rss:{subscription_id}",
+        )
+        entry_id = rss_repo.add_rss_entry_with_media(subscription_id, "旧条目", "old-qb")["id"]
+        seed_rss_entry_state(entry_id, "submitting")
+        rss_repo.bind_rss_entry_download(entry_id, "historical-qb", "qb")
+        download_requests_repo.update_download_request(request_id, status="failed", targets="qb", qb_status="failed")
+        with db.get_conn() as conn:
+            conn.execute("ALTER TABLE download_requests DROP COLUMN qb_save_path")
+            conn.execute("PRAGMA user_version=43")
+
+        db.init_db()
+
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 44)
+            request = conn.execute(
+                "SELECT id,qb_status,qb_save_path FROM download_requests WHERE id=?", (request_id,),
+            ).fetchone()
+            self.assertEqual(tuple(request), (request_id, "failed", None))
+            entry = conn.execute(
+                "SELECT download_request_id,download_backend FROM rss_entries WHERE id=?", (entry_id,),
+            ).fetchone()
+            self.assertEqual(tuple(entry), (request_id, "qb"))
+        self.assertTrue(download_requests_repo.claim_download_request(
+            download_requests_repo.create_download_request("new-qb", "magnet")[0], "qb",
+        ))
+        current = download_requests_repo.get_download_request_by_request_key("new-qb")
+        assert current is not None
+        self.assertEqual(current["qb_save_path"], "")
+
     def test_v37_and_unversioned_verification_jobs_migrate_targets_without_losing_receipts(self):
         for version in (37, 0):
             with self.subTest(version=version):

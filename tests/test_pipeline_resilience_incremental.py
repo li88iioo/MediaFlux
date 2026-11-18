@@ -121,7 +121,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         outcome: dict[str, object] = {}
         failures: list[Exception] = []
 
-        def slow_submit(_row):
+        def slow_submit(_row, **_options):
             started.set()
             if not release.wait(timeout=5):
                 raise TimeoutError("测试未释放下载提交")
@@ -452,6 +452,8 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
 
         with patch("app.repositories.download_requests.get_download_request", return_value=row), patch(
             "app.repositories.download_requests.claim_download_request", return_value=True,
+        ), patch(
+            "app.repositories.download_requests.get_download_request_qb_save_path", return_value="",
         ), patch("app.modules.download_dispatcher._submit_qb", return_value=backend), patch(
             "app.repositories.download_requests.finalize_download_request_submission", return_value="submitted",
         ) as finalize, patch("app.repositories.download_requests.add_download_log") as add_log:

@@ -289,9 +289,9 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         request_id = self.start_untyped_qb_request()
         claim = download_requests_repo.claim_download_request_targets
 
-        def cancel_before_claim(current_id, targets):
+        def cancel_before_claim(current_id, targets, **options):
             download_requests_repo.update_download_request(current_id, status="cancelled")
-            return claim(current_id, targets)
+            return claim(current_id, targets, **options)
 
         with patch.object(download_requests_repo, "claim_download_request_targets", side_effect=cancel_before_claim):
             self.submit("guangya")

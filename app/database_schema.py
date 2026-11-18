@@ -331,7 +331,8 @@ CREATE TABLE IF NOT EXISTS download_requests (
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    qb_save_path TEXT                -- NULL 原目录未知，空串由 qB 决定
 );
 CREATE INDEX IF NOT EXISTS idx_download_requests_status ON download_requests(status, id);
 

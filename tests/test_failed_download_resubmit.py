@@ -141,13 +141,21 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         client = SimpleNamespace(
             add_torrent_detailed=lambda **_kwargs: None, close=lambda: None,
         )
+        receipts = iter((
+            TorrentAddResult(False, "qb_auth_failed", False),
+            TorrentAddResult(False, "qb_rejected", False),
+            TorrentAddResult(True),
+        ))
+
+        def add_torrent(**options):
+            entry = assert_present(rss_repo.get_rss_entry(entry_id))
+            request = assert_present(download_requests_repo.get_download_request(entry["download_request_id"]))
+            self.assertEqual((request["qb_status"], request["qb_save_path"]), ("submitting", options["save_path"]))
+            return next(receipts)
+
         with (
             patch.object(dispatcher, "QBittorrentClient", return_value=client),
-            patch.object(client, "add_torrent_detailed", side_effect=[
-                TorrentAddResult(False, "qb_auth_failed", False),
-                TorrentAddResult(False, "qb_rejected", False),
-                TorrentAddResult(True),
-            ]) as backend,
+            patch.object(client, "add_torrent_detailed", side_effect=add_torrent) as backend,
             patch.object(dispatcher, "get", side_effect=lambda key, default="": {
                 "QB_URL": "http://qb.invalid", "QB_CATEGORY": "unified-category",
             }.get(key, default)),
@@ -161,6 +169,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             self.assertFalse(first["ok"], first)
             original_id = first["request_id"]
             for accepted in (False, True):
+                rss_repo.update_rss_subscription(sub_id, {"qb_save_path": f"/downloads/changed-{accepted}"})
                 response = downloads_api.resubmit_issue(
                     original_id, cast(Request, None), {"target": "qb"},
                 )

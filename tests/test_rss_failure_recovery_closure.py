@@ -20,7 +20,7 @@ from app.modules import download_dispatcher as dispatcher
 from app.modules.rss import RSSEngine, rss_entry_delivery
 from app.repositories.download_requests import apply_download_tracker_update
 from app.repositories.rss import bind_rss_entry_download, rss_retry_source_is_safe
-from app.routes import rss_api
+from app.routes import downloads_api, rss_api
 from tests.support import InitializedWebTestCase, isolated_test_database
 
 
@@ -46,11 +46,13 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         )["id"])
         return sid, eid, dispatcher.DownloadInput("magnet", "Episode", source)
 
-    def accepted(self, backend="qb", *, media_key=""):
+    def accepted(self, backend="qb", *, media_key="", legacy=False):
         sid, eid, item = self.pending(backend, media_key=media_key)
         self.assertTrue(rss_repo.claim_rss_entry(eid))
         bind_rss_entry_download(eid, dispatcher.request_key(item), backend)
-        rid = int(dispatcher.create_request(item, "", "", origin=f"rss:{sid}")["id"])
+        rid = int(dispatcher.create_request(
+            item, "", "", origin=f"rss:{sid}", initial_targets="" if legacy else backend,
+        )["id"])
         prefix = "qb" if backend == "qb" else "gy"
         download_requests_repo.update_download_request(rid, status="submitted", targets=backend, **{f"{prefix}_status": "submitted"})
         get_rss_entry_result = rss_repo.get_rss_entry(eid)
@@ -677,6 +679,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
             first = engine.download(eid)
             self.assertTrue(first["ok"], first)
             self.fail_request(first["request_id"])
+            rss_repo.update_rss_subscription(sid, {"qb_save_path": "/synthetic/changed"})
             retry = engine.download(eid)
             self.assertTrue(retry["ok"], retry)
             self.assertNotEqual(first["request_id"], retry["request_id"])
@@ -684,6 +687,62 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         routes = [(call.kwargs["save_path"], call.kwargs["category"])
                   for call in qb.add_torrent_detailed.call_args_list]
         assert routes == [("/synthetic/subscription", "shared-category")] * 2, routes
+
+    def test_legacy_rss_qb_retry_preserves_receipt_in_both_entries(self):
+        from app.modules import rss_delivery
+
+        rid, eid, _ = self.accepted(legacy=True)
+        self.fail_request(rid)
+        sub_id = assert_present(rss_repo.get_rss_entry(eid))["rss_item_id"]
+        rss_repo.update_rss_subscription(sub_id, {"qb_save_path": "/synthetic/changed"})
+        entry_before = dict(assert_present(rss_repo.get_rss_entry(eid)))
+        request_before = dict(assert_present(download_requests_repo.get_download_request(rid)))
+        self.assertIsNone(request_before["qb_save_path"])
+
+        with patch.object(dispatcher, "_submit_qb") as backend, patch.object(downloads_api, "require_api_login"):
+            responses = (
+                rss_api.download_entry(eid, cast(Request, None)),
+                downloads_api.resubmit_issue(rid, cast(Request, None), {"target": "qb"}),
+            )
+        for response in responses:
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("原 RSS 下载的 qBittorrent 保存目录", json.loads(bytes(response.body))["error"])
+        backend.assert_not_called()
+        self.assertEqual(dict(assert_present(rss_repo.get_rss_entry(eid))), entry_before)
+        self.assertEqual(dict(assert_present(download_requests_repo.get_download_request(rid))), request_before)
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 1)
+
+        self.assertEqual(rss_repo.update_rss_entries_processed([eid], False), 1)
+        pending_before = dict(assert_present(rss_repo.get_rss_entry(eid)))
+        arguments = {"entry_ids": [eid]}
+        runtime = {"url": "http://qb.invalid", "default_method": "qb"}
+        with (patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(runtime, "")),
+              patch.object(dispatcher, "_submit_qb") as backend):
+            _, confirmation = rss_delivery.prepare("download", arguments)
+            result = rss_delivery.execute("download", arguments, confirmation)
+        self.assertFalse(result["ok"], result)
+        backend.assert_not_called()
+        self.assertEqual(dict(assert_present(rss_repo.get_rss_entry(eid))), pending_before)
+
+    def test_unlinked_legacy_telegram_retry_ignores_rss_with_same_hash(self):
+        sid, eid, item = self.pending()
+        rss_repo.update_rss_subscription(sid, {"qb_save_path": "/synthetic/rss-only"})
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        with patch.object(dispatcher, "_submit_qb", side_effect=self.success) as backend:
+            first = engine.download(eid)
+            self.assertTrue(first["ok"], first)
+            rss_id = first["request_id"]
+            download_requests_repo.update_download_request(rss_id, status="completed", qb_status="completed")
+            telegram_id = int(dispatcher.create_request(item, "", "", origin="telegram")["id"])
+            self.assertNotEqual(telegram_id, rss_id)
+            self.assertIsNone(assert_present(download_requests_repo.get_download_request(telegram_id))["qb_save_path"])
+            self.fail_request(telegram_id)
+            retry = dispatcher.resubmit_download_request(telegram_id, "qb")
+            self.assertTrue(retry["ok"], retry)
+        self.assertEqual([call.kwargs["save_path"] for call in backend.call_args_list], ["/synthetic/rss-only", ""])
+        self.assertEqual(assert_present(rss_repo.get_rss_entry(eid))["download_request_id"], rss_id)
 
     def test_qb_leaves_empty_path_to_downloader_on_live_and_frozen_entries(self):
         """订阅未指定路径时不读取旧渠道全局路径，普通/批量/冻结入口都用统一分类。"""
@@ -702,17 +761,21 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
             qb.add_torrent_detailed.return_value = TorrentAddResult(True)
             engine = RSSEngine()
             self.addCleanup(engine.close)
-            single = engine.download(self.pending("")[1])
+            sid, eid, _ = self.pending("")
+            single = engine.download(eid)
             batch = engine.download_many([self.pending("")[1]])
             runtime, error = capture_rss_qb_runtime_config()
             self.assertEqual(error, "")
             frozen = engine._download_entry(
                 rss_repo.get_rss_entry(self.pending("")[1]), qb_runtime_config=runtime,
             )
-        self.assertTrue(single["ok"] and batch["success_count"] == 1 and frozen["ok"], (single, batch, frozen))
+            self.assertTrue(single["ok"] and batch["success_count"] == 1 and frozen["ok"], (single, batch, frozen))
+            self.fail_request(single["request_id"])
+            rss_repo.update_rss_subscription(sid, {"qb_save_path": "/synthetic/changed"})
+            self.assertTrue(engine.download(eid)["ok"])
         routes = [(call.kwargs["save_path"], call.kwargs["category"])
                   for call in qb.add_torrent_detailed.call_args_list]
-        assert routes == [("", "shared-category")] * 3, routes
+        assert routes == [("", "shared-category")] * 4, routes
 
     def test_qb_retry_keeps_frozen_config_when_live_config_changes(self):
         _sid, eid, _ = self.pending()
@@ -777,10 +840,12 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                     qb = factory.return_value
                     qb.add_torrent_detailed.return_value = TorrentAddResult(True)
                     qb.export_torrent.return_value = payload
-                    manual = submit_download_input(item, "qb", origin="manual-test", qb_runtime_config=runtime)
+                    manual = submit_download_input(item, "qb", origin="telegram", qb_runtime_config=runtime)
                     assert manual["dispatch"]["ok"], manual
                     engine = RSSEngine()
                     self.addCleanup(engine.close)
+                    sub_id = assert_present(rss_repo.get_rss_entry(eid))["rss_item_id"]
+                    rss_repo.update_rss_subscription(sub_id, {"qb_save_path": "/synthetic/rss-only"})
                     bound = engine._download_entry(rss_repo.get_rss_entry(eid), qb_runtime_config=runtime)
                     assert bound["ok"] and bound["request_id"] == manual["request_id"], bound
                     get_download_request_result = download_requests_repo.get_download_request(bound["request_id"])

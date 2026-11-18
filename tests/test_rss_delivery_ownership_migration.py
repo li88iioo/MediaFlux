@@ -32,7 +32,7 @@ class RSSDeliveryOwnershipMigrationTests(unittest.TestCase):
         eid = int(rss_repo.add_rss_entry_with_media(sid, "Episode", f"guid-{self.serial}", payload=json.dumps({"torrent_url": item.source_value}))["id"])
         self.assertTrue(rss_repo.claim_rss_entry(eid))
         bind_rss_entry_download(eid, dispatcher.request_key(item), backend)
-        rid = int(dispatcher.create_request(item, "", "", origin=f"rss:{sid}")["id"])
+        rid = int(dispatcher.create_request(item, "", "", origin=f"rss:{sid}", initial_targets=backend)["id"])
         current = assert_present(download_requests_repo.get_download_request(rid))
         targets = "both" if current["targets"] and current["targets"] != backend else backend
         field = "qb_status" if backend == "qb" else "gy_status"

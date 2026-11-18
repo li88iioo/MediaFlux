@@ -981,6 +981,11 @@ class RSSEngine:
 
         linked_key = str(self._entry_value(entry, "download_request_key", "") or "")
         retry_source = download_requests_repo.get_download_request(delivery["request_id"]) if delivery["request_id"] else None
+        if (linked_key and method == "qb" and retry_source is not None and rss_retry_source_is_safe(retry_source, method)
+                and download_requests_repo.rss_qb_save_path_is_missing(retry_source)):
+            return {"ok": False, "existing": True, "method": method, "request_id": delivery["request_id"],
+                    "status": delivery["status"], "retry_reason": "qb_save_path_unknown",
+                    "error": download_requests_repo.RSS_QB_SAVE_PATH_UNKNOWN}
         # 先复用下载中心的准入判断，再重开历史回执。配置/规则拒绝不等于
         # 后端提交失败，不得覆盖原受理记录或让用户丢失再次重试的入口。
         if delivery["retryable"] and auto_guard is None and not entry_already_claimed:
@@ -1031,9 +1036,6 @@ class RSSEngine:
         stage = "submit"
         try:
             submission_options: dict[str, Any] = {
-                "qb_save_path": str(
-                    self._entry_value(entry, "qb_save_path", "") or (runtime or {}).get("default_save_path") or ""
-                ),
                 "qb_category": str(defaults.get("category") or ""),
                 "qb_runtime_config": runtime,
             }
@@ -1080,6 +1082,7 @@ class RSSEngine:
                     item,
                     method,
                     origin=f"rss:{int(entry['rss_item_id'])}",
+                    qb_save_path=str(self._entry_value(entry, "qb_save_path", "") or "") or None,
                     gy_target_dir=str(self._entry_value(entry, "gy_target_dir", "") or ""),
                     gy_target_name=str(
                         self._entry_value(entry, "gy_target_dir_name", "") or ""
@@ -1371,6 +1374,8 @@ class RSSEngine:
             elif result.get("ok"):
                 submitted += 1
             else:
+                if result.get("retry_reason") == "qb_save_path_unknown":
+                    release_unsubmitted_rss_entries([row], submitted_at=submitted_at)
                 failed += 1
                 outcome_unknown += bool(result.get("review_required"))
         return {

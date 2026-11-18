@@ -18,7 +18,7 @@ from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
 from app.modules.download_tracker import DownloadTracker
 from app.modules.rss import RSSEngine, rss_entry_delivery
-from tests.support import isolated_test_database, seed_rss_entry_state
+from tests.support import assert_present, isolated_test_database, seed_rss_entry_state
 
 
 class DownloadRetrySymmetryAuditTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
         )
         self.serial = 0
 
-    def request(self, target="qb", peer_status="downloading", *, kind="magnet"):
+    def request(self, target="qb", peer_status="downloading", *, kind="magnet", qb_save_path=None):
         self.serial += 1
         item = dispatcher.DownloadInput(
             kind=kind,
@@ -53,7 +53,10 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
                 else f"magnet:?xt=urn:btih:{self.serial:040x}"
             ),
         )
-        created = dispatcher.create_request(item, "", "audit")
+        created = dispatcher.create_request(
+            item, "", "audit", initial_targets="qb" if qb_save_path is not None else "",
+            qb_save_path=qb_save_path or "",
+        )
         self.assertTrue(created["created"])
         request_id = int(created["id"])
         peer = "guangya" if target == "qb" else "qb"
@@ -72,18 +75,19 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
         download_requests_repo.update_download_request(request_id, **fields)
         return request_id
 
-    def test_in_place_qb_retry_restores_only_unambiguous_rss_directory(self):
+    def test_in_place_qb_retry_uses_request_directory_or_preserves_unknown_rss_history(self):
         cases = (
-            (("qb",), None, "/downloads/rss"),
-            (("qb",), "/downloads/manual", "/downloads/manual"),
-            (("qb",), "", ""),
-            (("guangya",), None, None),
-            ((), None, None),
-            (("qb", "qb"), None, None),
+            (("qb",), "/downloads/original"),
+            (("qb", "qb"), "/downloads/original"),
+            (("qb",), ""),
+            (("guangya",), None),
+            ((), None),
+            (("qb",), None),
+            (("qb", "qb"), None),
         )
-        for backends, qb_save_path, expected in cases:
+        for backends, qb_save_path in cases:
             with self.subTest(backends=backends, qb_save_path=qb_save_path):
-                request_id = self.request()
+                request_id = self.request(qb_save_path=qb_save_path)
                 row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 for index, backend in enumerate(backends):
@@ -98,14 +102,21 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
                     )["id"])
                     seed_rss_entry_state(entry_id, "submitting")
                     rss_repo.bind_rss_entry_download(entry_id, row["request_key"], backend)
+                before = dict(assert_present(download_requests_repo.get_download_request(request_id)))
                 with patch.object(dispatcher, "_submit_qb", return_value={
                     "ok": True, "task_id": "b" * 40,
                 }) as submit:
-                    result = dispatcher.resubmit_download_request(request_id, "qb", qb_save_path=qb_save_path)
+                    result = dispatcher.resubmit_download_request(request_id, "qb")
+                if "qb" in backends and qb_save_path is None:
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn("保存目录", result["error"])
+                    submit.assert_not_called()
+                    self.assertEqual(dict(assert_present(download_requests_repo.get_download_request(request_id))), before)
+                    continue
                 self.assertTrue(result["ok"], result)
                 self.assertFalse(result["created"])
                 self.assertEqual(result["request_id"], request_id)
-                self.assertEqual(submit.call_args.kwargs.get("save_path"), expected)
+                self.assertEqual(submit.call_args.kwargs["save_path"], qb_save_path or "")
                 after = download_requests_repo.get_download_request(request_id)
                 assert after is not None
                 self.assertEqual(after["gy_status"], "downloading")

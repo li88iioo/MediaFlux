@@ -6150,6 +6150,7 @@ class SecurityTests(InitializedWebTestCase):
         with (
             patch("app.repositories.download_requests.get_download_request", return_value=row),
             patch("app.repositories.download_requests.claim_download_request", side_effect=[True, False]),
+            patch("app.repositories.download_requests.get_download_request_qb_save_path", return_value=""),
             patch(
                 "app.modules.download_dispatcher._submit_qb",
                 return_value={"ok": True, "task_id": "abc", "error": ""},
@@ -6190,6 +6191,7 @@ class SecurityTests(InitializedWebTestCase):
         with (
             patch("app.repositories.download_requests.get_download_request", return_value=row),
             patch("app.repositories.download_requests.claim_download_request", return_value=True),
+            patch("app.repositories.download_requests.get_download_request_qb_save_path", return_value=""),
             patch(
                 "app.modules.download_dispatcher._submit_qb",
                 side_effect=RuntimeError("qB unavailable"),

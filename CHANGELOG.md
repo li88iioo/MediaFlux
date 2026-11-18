@@ -44,7 +44,7 @@
 - 光鸭画质查询会检查凭证并尝试续签；登录页分别显示访问令牌过期、凭证校验失败和暂时无法校验。媒体反代按具体媒体源优先匹配，Android 播放混合片源时保留本地来源。([画质查询](https://github.com/li88iioo/MediaFlux/commit/c5b4abdb)、[凭证状态](https://github.com/li88iioo/MediaFlux/commit/5d4652fe)、[媒体源匹配](https://github.com/li88iioo/MediaFlux/commit/c45eb32d)、[本地来源](https://github.com/li88iioo/MediaFlux/commit/d6ff48ea))
 
 ### 升级说明
-- 从 v0.1.16 升级的数据库跨度为 **schema41 → 43**。schema42 为待发送的媒体刷新记录保存目标上游，schema43 为反代手动绑定记录上游身份。升级前停止服务并备份数据目录。schema41 程序无法直接打开 schema43 数据库；若需回退，用 v0.1.16 的离线工具恢复升级前的备份，再启动旧版。见[离线恢复流程](docs/部署指南.md#63-离线恢复与安全回退)。
+- 从 v0.1.16 升级的数据库跨度为 **schema41 → 44**。schema42 为待发送的媒体刷新记录保存目标上游，schema43 为反代手动绑定记录上游身份，schema44 为下载请求保存首次投递给 qB 的目录。升级前的 RSS 失败请求若缺少原目录记录，重试时会提示核对，避免误投到后来修改的目录。升级前停止服务并备份数据目录。schema41 程序无法直接打开 schema44 数据库；若需回退，用 v0.1.16 的离线工具恢复升级前的备份，再启动旧版。见[离线恢复流程](docs/部署指南.md#63-离线恢复与安全回退)。
 - 已有手动绑定会显示“待核对上游”。如依赖某条绑定播放，在“媒体反代”中打开所属实例的播放映射，核对实际 Jellyfin／Emby 上游、条目及光鸭文件后重新建立绑定。([刷新迁移](https://github.com/li88iioo/MediaFlux/commit/c95a41fe)、[绑定迁移](https://github.com/li88iioo/MediaFlux/commit/463fe513))
 - 核对整理规则中的“自动回收同版本落选文件”：缺失配置时默认开启；不希望自动回收来源文件时，显式关闭 `GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED`。该项与“回收被替换的归档旧版本”分别控制（[`e131d784`](https://github.com/li88iioo/MediaFlux/commit/e131d784)）。
 - Agent 总开关统一为 `AGENT_LLM_ENABLED`，若旧 Agent 开关关闭而模型开关开启，升级后 Web Agent 会启用，Telegram 按其子开关和凭据接入。反向组合会关闭 Agent。升级前请按需要设置模型总开关。配置与对话历史保留，关闭总开关不自动撤销已交给下载器或整理队列的业务任务（[`c5f308ab`](https://github.com/li88iioo/MediaFlux/commit/c5f308ab)、[`8a0f0bd9`](https://github.com/li88iioo/MediaFlux/commit/8a0f0bd9)）。

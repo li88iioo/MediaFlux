@@ -352,6 +352,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             "",
             "rss-original",
             origin="rss:1",
+            initial_targets="qb",
         )
         request_id = int(created["id"])
         download_requests_repo.update_download_request(
@@ -412,6 +413,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             "",
             "rss-legacy",
             origin="rss:1",
+            initial_targets="qb",
         )
         request_id = int(created["id"])
         download_requests_repo.update_download_request(

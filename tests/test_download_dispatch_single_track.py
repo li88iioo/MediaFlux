@@ -220,18 +220,15 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
             'password': 'synthetic-password', 'api_key': 'synthetic-key', 'timeout': 7,
             'category': 'frozen-default', 'default_save_path': '/synthetic/frozen-default',
         }
-        operations = {
-            'first': dispatcher.dispatch_request,
-            'missing': dispatcher.dispatch_missing_targets,
-            'retry_in_place': dispatcher.resubmit_download_request,
-            'successor': dispatcher.resubmit_download_request,
-        }
-        for path, operation in operations.items():
+        for path in ('first', 'missing', 'retry_in_place', 'successor'):
             for save_path, category in (('/synthetic/subscription', 'rss'), ('', '')):
                 with self.subTest(path=path, save_path=save_path, category=category):
                     self.serial += 1
                     item = dispatcher.normalize_download_url(f'magnet:?xt=urn:btih:{self.serial:040x}')
-                    request_id = dispatcher.create_request(item, '', 'route-test')['id']
+                    retry = path in {'retry_in_place', 'successor'}
+                    request_id = dispatcher.create_request(
+                        item, '', 'route-test', initial_targets='qb' if retry else '', qb_save_path=save_path,
+                    )['id']
                     if path in {'missing', 'retry_in_place'}:
                         download_requests_repo.update_download_request(
                             request_id, status='downloading', targets='both',
@@ -248,8 +245,14 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                     ):
                         qb = factory.return_value
                         qb.add_torrent_detailed.return_value = TorrentAddResult(True)
-                        result = operation(request_id, 'qb', qb_save_path=save_path,
-                                           qb_category=category, qb_runtime_config=runtime)
+                        if retry:
+                            result = dispatcher.resubmit_download_request(
+                                request_id, 'qb', qb_category=category, qb_runtime_config=runtime,
+                            )
+                        else:
+                            submit = dispatcher.dispatch_request if path == 'first' else dispatcher.dispatch_missing_targets
+                            result = submit(request_id, 'qb', qb_save_path=save_path,
+                                            qb_category=category, qb_runtime_config=runtime)
                     self.assertTrue(result['ok'], result)
                     qb.add_torrent_detailed.assert_called_once()
                     self.assertEqual(qb.add_torrent_detailed.call_args.kwargs['save_path'], save_path)

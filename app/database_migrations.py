@@ -1838,6 +1838,13 @@ def _migrate_media_proxy_binding_upstream_v43(conn: sqlite3.Connection) -> None:
             conn.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('media_proxy_bindings',?)", (sequence[0],))
 
 
+def _migrate_download_qb_save_path_v44(conn: sqlite3.Connection) -> None:
+    """历史请求保留 NULL，订阅的现有目录无法证明首次投递目录。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(download_requests)")}
+    if columns and "qb_save_path" not in columns:
+        conn.execute("ALTER TABLE download_requests ADD COLUMN qb_save_path TEXT")
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1882,4 +1889,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     40: _migrate_share_retry_count_v41,
     41: _migrate_strm_refresh_intent_v42,
     42: _migrate_media_proxy_binding_upstream_v43,
+    43: _migrate_download_qb_save_path_v44,
 }
