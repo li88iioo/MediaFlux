@@ -10,6 +10,7 @@
 .gy-status-card { min-height: 286px; }
 .gy-token-header { display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:16px; }
 .gy-token-heading { display:flex; align-items:center; gap:12px; min-height:38px; }
+#gyTokenBadgeText { min-inline-size:7em; }
 .gy-token-actions { display:flex; flex-wrap:wrap; gap:8px; }
 .gy-token-action { min-width:112px; height:38px; width:112px; justify-content:center; white-space:nowrap; }
 .gy-token-action.is-danger { background:rgba(239,68,68,.12); color:var(--danger); border-color:rgba(239,68,68,.32); }
@@ -302,6 +303,9 @@
 }
 @media (max-width:760px) {
     .gy-token-header { align-items:stretch; }
+    .gy-token-heading { min-width:0; }
+    #gyCapabilityBadge { min-width:0; white-space:normal; }
+    #gyCapabilityBadge .dot { flex:none; }
     .gy-token-actions { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); width:100%; }
     .gy-token-action { min-width:0; width:100%; }
     .gy-auth-input-group { grid-template-columns: 1fr; }
@@ -321,7 +325,7 @@
         <div class="card card-pad" style="margin-bottom:18px;">
             <div class="gy-token-header">
                 <div class="gy-token-heading">
-                    <span class="badge online" id="gyTokenBadge"><span class="dot"></span>凭证在线</span>
+                    <span class="badge" id="gyTokenBadge" role="status"><span class="dot"></span><span id="gyTokenBadgeText">访问令牌待确认</span></span>
                     <div class="badge" id="gyCapabilityBadge" style="margin-left:8px;">
                         <span class="dot"></span><span id="gyCapabilityText">正在检测 SDK、302 反代与 STRM 配置</span>
                     </div>
@@ -579,23 +583,46 @@ function renderGyCapabilities(data){
     badge.title=details.join('；');
 }
 
-let gyDirectoryLoaded=false;
+const gyTokenLabels = {
+    valid:'访问令牌有效',
+    expired:'访问令牌已过期',
+    invalid:'访问令牌被拒绝',
+    unknown:'访问令牌待确认',
+};
+let gyHasToken=false;
+let gyDirectoryReadVersion=0;
+let gyDirectoryFailed=false;
+let gyStatusRequest=null;
+let gyTokenOperationPending=false;
 
-function renderGyTokenStatus(data){
+function renderGyTokenBadge(status, hasAccess=true){
+    const badge=document.getElementById('gyTokenBadge');
+    badge.classList.toggle('online',status==='valid');
+    badge.classList.toggle('warning',status==='invalid'||status==='expired');
+    const label=status==='invalid'&&!hasAccess?'缺少访问令牌':gyTokenLabels[status];
+    document.getElementById('gyTokenBadgeText').textContent=label;
+}
+
+function renderGyTokenStatus(data, directoryReadVersion=gyDirectoryReadVersion){
+    // 较晚完成的目录读取已证明凭证可用，忽略较早发起的校验结果。
+    if(directoryReadVersion!==gyDirectoryReadVersion) return;
+    const hadToken=gyHasToken;
     const hasToken=Boolean(data.has_access_token||data.has_refresh_token);
+    gyHasToken=hasToken;
     document.getElementById('gyStatusLoading').style.display='none';
     document.getElementById('gyStatusLoggedIn').style.display=hasToken?'block':'none';
     document.getElementById('gyStatusLoggedOut').style.display=hasToken?'none':'block';
-    if(!hasToken) return;
-    const badge = document.getElementById('gyTokenBadge');
-    if (badge) {
-        badge.className = 'badge ' + (data.valid ? 'online' : 'warning');
-        badge.innerHTML = '<span class="dot"></span>' + (data.valid ? '凭证有效' : '凭证失效');
+    if(!hasToken){
+        if(hadToken){
+            gyNavigator.cancel();
+            gyDirectoryFailed=false;
+            gyRenderItems([]);
+        }
+        return;
     }
-    if(data.has_access_token&&!gyDirectoryLoaded){
-        gyDirectoryLoaded=true;
-        gyNavigator.root();
-    }
+    const validationStatus=data.validation_status ?? (data.valid?'valid':'invalid');
+    renderGyTokenBadge(validationStatus,Boolean(data.has_access_token));
+    if(!hadToken) gyNavigator.root();
 }
 
 function setGyTokenButtonLoading(button, loading, pendingLabel=''){
@@ -615,46 +642,59 @@ function setGyTokenControlsBusy(loading, activeButton=null, pendingLabel=''){
     });
 }
 
-async function gyTokenOperation(path, buttonId, pendingLabel, successMessage){
+async function gyTokenOperation(path, buttonId, pendingLabel){
+    if(gyTokenOperationPending) return;
+    gyStatusRequest?.abort();
+    gyStatusRequest=null;
+    gyTokenOperationPending=true;
     const button=document.getElementById(buttonId);
+    const directoryReadVersion=gyDirectoryReadVersion;
+    const isValidation=path==='/token/validate';
     setGyTokenControlsBusy(true,button,pendingLabel);
     try{
         const data=await gyApi(path,{method:'POST'});
-        renderGyTokenStatus(data);
-        return data;
+        renderGyTokenStatus(data,isValidation?directoryReadVersion:undefined);
+        if(path==='/token/refresh'&&gyDirectoryFailed) gyNavigator.reload();
     }catch(error){
+        if(isValidation&&directoryReadVersion===gyDirectoryReadVersion) renderGyTokenBadge('unknown');
         await window.appAlert?.({type:'error', title:'操作失败', message: error.message||'未知错误', trigger:button});
-        throw error;
     }finally{
+        gyTokenOperationPending=false;
         setGyTokenControlsBusy(false);
     }
 }
 
 function gyRefreshToken(){
-    return gyTokenOperation('/token/refresh','gyRefreshTokenBtn','刷新中...','Token 已刷新并原子保存。').catch(()=>null);
+    return gyTokenOperation('/token/refresh','gyRefreshTokenBtn','刷新中...');
 }
 
 function gyValidateToken(){
-    return gyTokenOperation('/token/validate','gyValidateTokenBtn','校验中...','Token 校验已完成。').catch(()=>null);
+    return gyTokenOperation('/token/validate','gyValidateTokenBtn','校验中...');
 }
 
 async function gyClearToken(){
     const confirmed=await appConfirm({title:'清除光鸭 Token',message:'将删除本机保存的 Access Token 与 Refresh Token，需要重新短信登录才能继续访问。',confirmText:'清除 Token',danger:true});
     if(!confirmed) return;
-    await gyTokenOperation('/token/clear','gyClearTokenBtn','清除中...','Token 已清除。').catch(()=>null);
+    await gyTokenOperation('/token/clear','gyClearTokenBtn','清除中...');
 }
 
 async function gyLoadStatus(){
-    const results=await Promise.allSettled([
-        gyApi('/token/validate',{method:'POST'}),
-        gyApi('/capabilities'),
-    ]);
-    if(results[0].status==='fulfilled') renderGyTokenStatus(results[0].value);
-    else document.getElementById('gyStatusLoading').innerHTML='<p>状态获取失败</p>';
-    if(results[1].status==='fulfilled') renderGyCapabilities(results[1].value);
-    else {
-        const text=document.getElementById('gyCapabilityText');
-        if(text) text.textContent='能力状态获取失败';
+    if(gyStatusRequest||gyTokenOperationPending) return;
+    const controller=new AbortController();
+    gyStatusRequest=controller;
+    const directoryReadVersion=gyDirectoryReadVersion;
+    try{
+        const data=await gyApi('/token/validate',{method:'POST',signal:controller.signal});
+        if(!controller.signal.aborted) renderGyTokenStatus(data,directoryReadVersion);
+    }catch{
+        if(controller.signal.aborted) return;
+        if(gyHasToken){
+            if(directoryReadVersion===gyDirectoryReadVersion) renderGyTokenBadge('unknown');
+        }else{
+            document.querySelector('#gyStatusLoading p').textContent='状态获取失败，请刷新页面';
+        }
+    }finally{
+        if(gyStatusRequest===controller) gyStatusRequest=null;
     }
 }
 
@@ -1015,13 +1055,24 @@ function gyRenderItems(items){
 const gyNavigator = createGuangYaDirectoryNavigator({
     rootId: '0',
     fetchDirectory: (id,{signal}={})=>gyApi('/dirs?parent_id='+encodeURIComponent(id),{signal}),
-    onLoading: ()=>gyDirList.replaceChildren(gyEmptyState('加载中...')),
+    onLoading: ()=>{
+        gyDirectoryFailed=false;
+        gyDirList.replaceChildren(gyEmptyState('加载中...'));
+    },
     onPathChange: (state)=>{
         renderDirectoryBreadcrumb(gyBreadcrumb, state.path, index=>gyNavigator.goTo(index));
         gyUpBtn.disabled = state.isRoot;
     },
-    onLoaded: (items)=>gyRenderItems(items),
-    onError: (error)=>gyDirList.replaceChildren(gyEmptyState(error.message || '加载失败')),
+    onLoaded: (items)=>{
+        gyDirectoryReadVersion+=1;
+        renderGyTokenBadge('valid');
+        gyRenderItems(items);
+    },
+    onError: (error)=>{
+        gyDirectoryFailed=true;
+        gyDirList.replaceChildren(gyEmptyState(error.message || '加载失败'));
+        if(document.getElementById('gyTokenBadge').classList.contains('online')) gyLoadStatus();
+    },
 });
 window.gyNavigator = gyNavigator;
 
@@ -1058,6 +1109,15 @@ function gySetViewMode(mode) {
 
 gySetViewMode(gyViewMode);
 gySetSortMode(gySortMode);
+gyApi('/capabilities').then(renderGyCapabilities).catch(()=>{
+    document.getElementById('gyCapabilityText').textContent='能力状态获取失败';
+});
 gyLoadStatus();
+document.addEventListener('visibilitychange',()=>{
+    if(!document.hidden) gyLoadStatus();
+});
+window.addEventListener('pageshow',event=>{
+    if(event.persisted) gyLoadStatus();
+});
 </script>
 {% endblock %}

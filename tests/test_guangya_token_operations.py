@@ -869,18 +869,26 @@ class GuangYaTokenClientTests(unittest.TestCase):
             persisted = json.loads(token_file.read_text(encoding="utf-8"))
             self.assertEqual(persisted["access_token"], "rotated-access-9999")
 
-    def test_validate_rejects_expired_token_without_refresh_or_persist(self):
-        with tempfile.TemporaryDirectory() as directory:
-            token_file = self._token_file(directory, expires_at=time() - 60)
-            original_payload = token_file.read_text(encoding="utf-8")
-            with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
-                client = GuangYaClient(token_file=token_file)
-                valid = client.validate()
+    def test_access_token_probe_stays_read_only_through_actual_expiry(self):
+        for remaining, expected in ((30, "valid"), (0, "expired")):
+            with self.subTest(remaining=remaining), tempfile.TemporaryDirectory() as directory:
+                token_file = self._token_file(directory, expires_at=time() + remaining)
+                original_payload = token_file.read_text(encoding="utf-8")
+                with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
+                    client = GuangYaClient(token_file=token_file)
+                    self.addCleanup(client.close)
+                    raw = client._raw
+                    assert raw is not None
+                    raw.fs_files = Mock(wraps=raw.fs_files)
+                    result = client.access_token_validation_status()
 
-            self.assertFalse(valid)
-            assert client._raw is not None
-            self.assertEqual(client._raw.refresh_calls, [])
-            self.assertEqual(token_file.read_text(encoding="utf-8"), original_payload)
+                self.assertEqual(result, expected)
+                if remaining:
+                    raw.fs_files.assert_called_once_with(parent_id=None, page=0, page_size=1)
+                else:
+                    raw.fs_files.assert_not_called()
+                self.assertEqual(raw.refresh_calls, [])
+                self.assertEqual(token_file.read_text(encoding="utf-8"), original_payload)
 
     def test_validate_blocks_sdk_internal_refresh_and_does_not_persist(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -888,9 +896,9 @@ class GuangYaTokenClientTests(unittest.TestCase):
             original_payload = token_file.read_text(encoding="utf-8")
             with patch("app.clients.guangya._load_raw", return_value=_ValidateRefreshAttemptRawClient):
                 client = GuangYaClient(token_file=token_file)
-                valid = client.validate()
+                result = client.access_token_validation_status()
 
-            self.assertFalse(valid)
+            self.assertEqual(result, "unknown")
             assert client._raw is not None
             self.assertEqual(client._raw.fs_calls, 1)
             self.assertEqual(client._raw.refresh_calls, [])
@@ -911,9 +919,9 @@ class GuangYaTokenClientTests(unittest.TestCase):
             with patch.object(client, "_read_retry_delay", return_value=0), patch(
                 "app.clients.guangya.sleep"
             ):
-                valid = client.validate()
+                result = client.access_token_validation_status()
 
-            self.assertTrue(valid)
+            self.assertEqual(result, "valid")
             assert client._raw is not None
             self.assertEqual(client._raw.fs_files.call_count, 3)
             self.assertEqual(client._raw.refresh_calls, [])
@@ -1068,7 +1076,7 @@ class GuangYaTokenClientTests(unittest.TestCase):
             token_file = self._token_file(directory, expires_at=time() - 3600)
             with patch("app.clients.guangya._load_raw", return_value=_LoginMockRawClient):
                 client = GuangYaClient(token_file=token_file)
-                self.assertFalse(client.validate())
+                self.assertEqual(client.access_token_validation_status(), "expired")
                 ok = client.login("13800138000", "123456", verification_id="vid-1", captcha_token="cap-1")
                 self.assertTrue(ok)
                 self.assertTrue(client.logged_in)
@@ -1112,9 +1120,9 @@ class _ApiTokenClient:
         self.calls.append("refresh")
         return self._status(valid=True)
 
-    def validate(self):
-        self.calls.append("validate")
-        return False
+    def access_token_validation_status(self):
+        self.calls.append("access_token_validation_status")
+        return "invalid"
 
     def clear_tokens(self):
         self.calls.append("clear")
@@ -1157,11 +1165,15 @@ class GuangYaTokenApiTests(InitializedWebTestCase):
             raise AssertionError("页面未输出 CSRF Token")
         return match.group(1)
 
-    def assert_safe_response(self, response, *, valid: bool):
+    def assert_safe_response(self, response, *, valid: bool, validation_status: str | None = None):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(set(payload), SAFE_TOKEN_KEYS)
-        self.assertEqual(payload["valid"], valid)
+        if validation_status is None:
+            self.assertEqual(set(payload), SAFE_TOKEN_KEYS)
+        else:
+            self.assertEqual(set(payload), SAFE_TOKEN_KEYS | {"validation_status"})
+            self.assertEqual(payload["validation_status"], validation_status)
+        self.assertIs(payload["valid"], valid)
         serialized = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("must-never-leak", serialized)
         self.assertNotIn("nested-leak", serialized)
@@ -1189,7 +1201,7 @@ class GuangYaTokenApiTests(InitializedWebTestCase):
                 "/api/guangya/token/validate", headers=self.headers
             )
 
-        payload = self.assert_safe_response(response, valid=False)
+        payload = self.assert_safe_response(response, valid=False, validation_status="invalid")
         self.assertEqual(payload["access_token_masked"], "••••ield")
         self.assertEqual(payload["refresh_token_masked"], "••••mask")
         self.assertIsNone(payload["expires_at"])
@@ -1225,8 +1237,81 @@ class GuangYaTokenApiTests(InitializedWebTestCase):
         with patch("app.routes.guangya_api.GuangYaClient", _ApiTokenClient):
             response = self.client.post("/api/guangya/token/validate", headers=self.headers)
 
-        self.assert_safe_response(response, valid=False)
-        self.assertEqual(_ApiTokenClient.instances[-1].calls, ["validate", "status"])
+        self.assert_safe_response(response, valid=False, validation_status="invalid")
+        self.assertEqual(_ApiTokenClient.instances[-1].calls, ["access_token_validation_status", "status"])
+
+    def test_validate_api_distinguishes_provider_failures_from_auth_rejection(self):
+        request = httpx.Request("POST", "https://fixture.invalid/files")
+        failures = (
+            ("temporary transport", httpx.ConnectError("must-never-leak", request=request), "unknown"),
+            ("sustained rate limit", {"code": 127, "msg": "操作过于频繁，请稍后重试"}, "unknown"),
+            ("unexpected payload", {"data": {"unrecognized": True}}, "unknown"),
+            ("HTTP unauthorized", httpx.HTTPStatusError(
+                "must-never-leak", request=request, response=httpx.Response(401, request=request),
+            ), "invalid"),
+            ("business unauthorized", {"data": {"code": 401}}, "invalid"),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient),
+            patch.object(GuangYaClient, "_read_retry_delay", return_value=0),
+            patch.dict(guangya_module._READ_CONGESTION, {}, clear=True),
+        ):
+            token_file = Path(directory) / "guangya_token.json"
+            original = json.dumps({
+                "access_token": "access-secret-7890",
+                "refresh_token": "refresh-secret-4321",
+                "expires_at": time() + 3600,
+            })
+            token_file.write_text(original, encoding="utf-8")
+            for label, result, expected in failures:
+                with self.subTest(label=label):
+                    client = GuangYaClient(token_file=token_file)
+                    self.addCleanup(client.close)
+                    raw = client._raw
+                    assert raw is not None
+                    if isinstance(result, Exception):
+                        raw.fs_files = Mock(side_effect=result)
+                    else:
+                        raw.fs_files = Mock(return_value=result)
+                    with patch("app.routes.guangya_api.GuangYaClient", return_value=client):
+                        response = self.client.post("/api/guangya/token/validate", headers=self.headers)
+
+                    payload = self.assert_safe_response(response, valid=False, validation_status=expected)
+                    self.assertTrue(payload["has_access_token"])
+                    self.assertTrue(payload["has_refresh_token"])
+                    self.assertEqual(raw.refresh_calls, [])
+                    self.assertEqual(token_file.read_text(encoding="utf-8"), original)
+
+    def test_expired_access_is_renewed_by_directory_read_after_read_only_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "guangya_token.json"
+            original = json.dumps({
+                "access_token": "access-secret-7890",
+                "refresh_token": "refresh-secret-4321",
+                "expires_at": time() - 60,
+            })
+            token_file.write_text(original, encoding="utf-8")
+            with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient), patch(
+                "app.routes.guangya_api.GuangYaClient",
+                side_effect=lambda: GuangYaClient(token_file=token_file),
+            ):
+                self.assert_safe_response(
+                    self.client.post("/api/guangya/token/validate", headers=self.headers),
+                    valid=False, validation_status="expired",
+                )
+                self.assertEqual(token_file.read_text(encoding="utf-8"), original)
+
+                response = self.client.get("/api/guangya/dirs")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), [])
+                persisted = json.loads(token_file.read_text(encoding="utf-8"))
+                self.assertEqual(persisted["access_token"], "rotated-access-9999")
+
+                self.assert_safe_response(
+                    self.client.post("/api/guangya/token/validate", headers=self.headers),
+                    valid=True, validation_status="valid",
+                )
 
     def test_clear_api_removes_tokens_and_returns_empty_safe_status(self):
         with patch("app.routes.guangya_api.GuangYaClient", _ApiTokenClient), patch(
@@ -1246,7 +1331,6 @@ class GuangYaTokenUiTests(unittest.TestCase):
         for button_id in ("gyRefreshTokenBtn", "gyValidateTokenBtn", "gyClearTokenBtn"):
             self.assertIn(f'id="{button_id}"', template)
         self.assertIn(".gy-token-action", template)
-        self.assertIn("gyApi('/token/validate',{method:'POST'})", template)
         self.assertNotIn("gyApi('/status')", template)
         self.assertIn("min-width:", template)
         self.assertIn("height:", template)

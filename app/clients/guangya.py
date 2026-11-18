@@ -26,7 +26,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from secrets import token_hex
 from time import monotonic, sleep, time
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import parse_qs, unquote, urlparse, urlsplit, urlunsplit
 
 import httpx
@@ -1998,17 +1998,17 @@ class GuangYaClient:
         )
         return True
 
-    def validate(self) -> bool:
-        """执行只读校验；不主动刷新，也阻止 SDK 在到期或 401 时刷新。"""
-        if self._invalidate_if_stale():
-            return False
-        raw = self._raw
-        if raw is None:
-            return False
+    def access_token_validation_status(self) -> Literal["valid", "expired", "invalid", "unknown"]:
+        """只读探测当前 Access Token，区分确定失效与本次无法确认。"""
         with self._token_lock:
+            if self._invalidate_if_stale():
+                return "invalid"
+            raw = self._raw
+            if raw is None or not raw.token:
+                return "invalid"
             expires_at = self._expiry_timestamp(getattr(raw, "token_expires_at", None))
-            if expires_at and time() >= expires_at - 60:
-                return False
+            if expires_at is not None and time() >= expires_at:
+                return "expired"
             previous_blocked = bool(getattr(raw, "_mediaflux_refresh_blocked", False))
             raw._mediaflux_refresh_blocked = True
             try:
@@ -2017,15 +2017,20 @@ class GuangYaClient:
                     lambda: raw.fs_files(parent_id=None, page=0, page_size=1),
                     refresh_unauthorized=False,
                 )
-                _validate_read_response(response, operation="connection_probe")
-                return True
+                self._extract_list(response)
+                return "valid"
             except _ValidationRefreshBlocked:
-                logger.warning("光鸭只读校验检测到 SDK 刷新请求，已阻止并判定无效")
-                return False
-            except Exception:
-                return False
+                logger.warning("光鸭只读校验检测到 SDK 刷新请求，已阻止")
+            except Exception as exc:
+                if any(
+                    self._exception_status_code(error) == 401
+                    or (isinstance(error, GuangYaReadRejected) and error.code == "401")
+                    for error in _exception_chain(exc)
+                ):
+                    return "invalid"
             finally:
                 raw._mediaflux_refresh_blocked = previous_blocked
+            return "unknown"
 
     def clear_tokens(self) -> dict:
         """在跨进程锁内撤销世代并清除内存与磁盘凭证。"""

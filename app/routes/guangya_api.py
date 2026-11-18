@@ -26,16 +26,6 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/guangya")
 
 
-TOKEN_STATUS_KEYS = (
-    "has_access_token",
-    "has_refresh_token",
-    "expires_at",
-    "valid",
-    "access_token_masked",
-    "refresh_token_masked",
-)
-
-
 def _safe_masked_indicator(value) -> str:
     text = str(value or "")
     if not text:
@@ -109,12 +99,16 @@ def refresh_token(request: Request):
 
 @router.post("/token/validate")
 def validate_token(request: Request):
-    """通过最小只读目录请求校验当前 Token。"""
+    """只读校验 Access Token，保留布尔结果并返回具体状态。"""
     require_api_login(request)
     client = GuangYaClient()
     try:
-        valid = client.validate()
-        return _safe_token_status(client.token_status(valid=valid))
+        validation_status = client.access_token_validation_status()
+        status = _safe_token_status(client.token_status(valid=validation_status == "valid"))
+        if not status["has_access_token"]:
+            status["valid"] = False
+            validation_status = "invalid"
+        return {**status, "validation_status": validation_status}
     finally:
         close_guangya_client(client)
 

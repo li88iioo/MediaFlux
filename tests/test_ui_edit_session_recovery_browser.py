@@ -43,6 +43,7 @@ SUBSCRIPTIONS = [
     for i in (1, 2)
 ]
 SCRAPE = "/api/guangya/directory-scrape"
+GY_VALIDATE = "/api/guangya/token/validate"
 MEDIA = "/api/subscriptions/media"
 PROXY = "/api/media-proxy"
 PROXY_INSTANCES = [
@@ -168,7 +169,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.assertEqual(self.errors, [], "页面不能有未处理脚本异常")
         self.assertEqual(self.unexpected, [], "所有请求必须完全离线且在 fake 边界内")
 
-    def make_page(self, template, width=1280, *, fragment=""):
+    def make_page(self, template, width=1280, *, fragment="", ready=None):
         self.context = self.browser.new_context(
             viewport={"width": width, "height": 900 if width > 600 else 844},
             service_workers="block",
@@ -184,7 +185,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.page.set_default_timeout(2500)
         self.page.on("pageerror", lambda error: self.errors.append(str(error)))
         self.page.goto("http://offline.invalid/" + template + ("#" + fragment if fragment else ""))
-        ready = {
+        ready = ready or {
             "rss": '[data-subscription-id="1"]',
             "guangya": '[data-media-id="A"]',
             "media_proxy": '[data-proxy-instance="1"]',
@@ -291,8 +292,8 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             if path == "/api/subscriptions/watchlist":
                 route.fulfill(json={"items": [], "total": 0, "has_more": False, "next": None})
                 return
-            if path == "/api/guangya/token/validate":
-                route.fulfill(json={"has_access_token": True, "valid": True})
+            if path == GY_VALIDATE:
+                route.fulfill(json={"has_access_token": True, "valid": True, "validation_status": "valid"})
                 return
             if path == "/api/guangya/capabilities":
                 route.fulfill(json={})
@@ -1088,6 +1089,83 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator("#mediaSubFormStatus").inner_text(), "")
         self.assertTrue(self.page.locator("#mediaMappingCandidates").is_hidden())
         self.assertTrue(self.page.locator("#appMessageModal").is_hidden())
+
+    def test_guangya_directory_renewal_updates_badge_without_waiting_for_capabilities(self):
+        expired = {
+            "has_access_token": True, "has_refresh_token": True,
+            "expires_at": 1_700_000_000, "valid": False, "validation_status": "expired",
+        }
+        self.replies[("POST", GY_VALIDATE)] = [(200, expired)]
+        self.hold_transport[("GET", "/api/guangya/capabilities")] = "capabilities"
+        self.hold_transport[("GET", "/api/guangya/dirs")] = "directory"
+
+        page = self.make_page("guangya", ready="#gyTokenBadge")
+        badge = page.locator("#gyTokenBadge")
+        self.assertEqual(badge.inner_text(), "访问令牌已过期")
+        self.hold_reply(GY_VALIDATE, "before-renewal", {
+            "has_access_token": False, "has_refresh_token": False, "valid": False, "validation_status": "invalid",
+        })
+        page.locator("#gyValidateTokenBtn").click()
+        self.wait_reply("before-renewal")
+        self.pending.pop("directory").fulfill(json=[{"file_id": "A", "name": "A", "is_dir": True}])
+        page.locator('[data-media-id="A"]').wait_for()
+        self.assertEqual(badge.inner_text(), "访问令牌有效")
+        self.release_reply("before-renewal")
+
+        self.assertEqual(badge.inner_text(), "访问令牌有效")
+        self.assertIn("capabilities", self.pending)
+        self.assertEqual(
+            [request["path"] for request in self.requests if request["path"].startswith("/api/guangya/token/")],
+            [GY_VALIDATE, GY_VALIDATE],
+        )
+        self.pending.pop("capabilities").fulfill(json={})
+
+    def test_guangya_manual_validation_distinguishes_unknown_from_rejection_on_mobile(self):
+        page = self.make_page("guangya", 320)
+        measure = "els => els.map(el => [el.offsetLeft, el.offsetTop, el.offsetWidth, el.offsetHeight])"
+        actions = page.locator(".gy-token-action")
+        before = actions.evaluate_all(measure)
+        self.hold_reply(GY_VALIDATE, "validate", {
+            "has_access_token": True, "valid": False, "validation_status": "unknown",
+        })
+
+        page.locator("#gyValidateTokenBtn").click()
+        self.wait_reply("validate")
+        self.assertEqual(actions.evaluate_all(measure), before)
+        self.release_reply("validate")
+
+        self.assertEqual(page.locator("#gyTokenBadge").inner_text(), "访问令牌待确认")
+        self.assertEqual(actions.evaluate_all(measure), before)
+        self.replies[("POST", GY_VALIDATE)] = [(200, {
+            "has_access_token": True, "has_refresh_token": True, "valid": False, "validation_status": "invalid",
+        })]
+        page.locator("#gyValidateTokenBtn").click()
+        page.get_by_text("访问令牌被拒绝", exact=True).wait_for()
+        self.assertEqual(actions.evaluate_all(measure), before)
+        self.assertTrue(page.locator(".gy-token-heading").evaluate("el => el.scrollWidth === el.clientWidth"))
+        self.assertTrue(page.locator('[data-media-id="A"]').is_visible())
+        self.assertEqual(
+            sum(request["path"] == "/api/guangya/dirs" for request in self.requests), 1,
+        )
+
+    def test_guangya_restored_page_checks_credentials_and_ignores_late_result_after_clear(self):
+        page = self.make_page("guangya")
+        self.hold_reply(GY_VALIDATE, "restore", {
+            "has_access_token": True, "valid": True, "validation_status": "valid",
+        })
+        page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}))")
+        self.wait_reply("restore")
+
+        self.replies[("POST", "/api/guangya/token/clear")] = [(200, {
+            "has_access_token": False, "has_refresh_token": False, "valid": False,
+        })]
+        page.locator("#gyClearTokenBtn").click()
+        page.locator("#appConfirmSubmit").click()
+        page.locator("#gyStatusLoggedOut").wait_for()
+        self.release_reply("restore")
+
+        self.assertTrue(page.locator("#gyStatusLoggedOut").is_visible())
+        self.assertTrue(page.locator("#gyStatusLoggedIn").is_hidden())
 
     def test_manual_transport_is_cancelled_and_old_row_recovers(self):
         page = self.make_page("guangya")
