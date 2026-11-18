@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 _QUEUE_KEY = "media_refresh_queue:v1"
 _STATE_VERSION = 1
 _MAX_RECENT_TARGETS = 4096
+LEGACY_REFRESH_UNVERIFIED = "历史刷新未记录原媒体服务器，无法核验是否完成，请手动刷新"
 media_refresh_projection_lock = CrossProcessLock("media-refresh-projection")
 
 
@@ -576,7 +577,7 @@ def register_media_refresh_handoff(
                 # 历史 outbox 无法证明原目标。已排队事件继续由原租约结算。
                 for provider in tuple(outcomes) or ("媒体库",):
                     if outcomes.get(provider, {}).get("status", "pending") == "pending":
-                        outcomes[provider] = {"status": "failed", "error": "历史刷新未记录原媒体服务器，请手动刷新"}
+                        outcomes[provider] = {"status": "failed", "error": LEGACY_REFRESH_UNVERIFIED}
                         for key in event["origins"]:
                             state["origins"][key]["revision"] += 1
             elif targets:
@@ -636,13 +637,47 @@ def acknowledge_media_refresh_projections(revisions: list[tuple[int, int]]) -> N
         _write_state(conn, state)
 
 
+def _recover_legacy_run_receipts(conn, state: dict[str, Any]) -> bool:
+    if state.get("legacy_run_receipts_recovered"):
+        return False
+    # 旧队列按 provider 合并路径且 ACK 后失去运行关联。不能用当前上游重放，
+    # 也不能把旧历史的“已排队”当作已执行或声称原请求一定没有发生。
+    rows = conn.execute(
+        "SELECT id,result FROM task_runs WHERE task_name='strm_sync' AND status!='running' "
+        "AND json_type(CASE WHEN json_valid(result) THEN result ELSE '{}' END,'$.media_refresh')='object'"
+    )
+    for row in rows:
+        run_id = row["id"]
+        key = str(run_id)
+        result = json.loads(row["result"])
+        if key in state["origins"] or "media_refresh_origin" in result or "media_refresh_results" in result:
+            continue
+        refresh = result["media_refresh"]
+        providers = {
+            provider: {"status": "failed", "error": LEGACY_REFRESH_UNVERIFIED, "previous_status": status}
+            for provider, status in refresh.items()
+            if status in ("queued", "pending") or (status in ("failed", False) and result.get("refresh_pending"))
+        }
+        if not providers:
+            continue
+        token = f"legacy-run:{run_id}"
+        state["events"][token] = {"path": "", "providers": providers, "source": False, "origins": [key]}
+        state["origins"][key] = {
+            "run_id": run_id, "options": {}, "events": [token], "revision": 0, "projected_revision": -1,
+            "baseline": {provider: status for provider, status in refresh.items() if provider not in providers},
+        }
+    state["legacy_run_receipts_recovered"] = True
+    return True
+
+
 def recover_media_refresh_leases(*, now_epoch: float | None = None) -> int:
-    """在取得跨进程消费者锁后，立即恢复前一进程遗留的 running 租约。"""
+    """取得消费者锁后恢复遗留租约与待投影回执。"""
     now_value = float(time.time() if now_epoch is None else now_epoch)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         recovered = _recover_running_groups(state, now_value, force=True)
+        legacy = _recover_legacy_run_receipts(conn, state)
         for origin in state["origins"].values():
             if "completion" in origin:
                 continue
@@ -654,7 +689,7 @@ def recover_media_refresh_leases(*, now_epoch: float | None = None) -> int:
                                         "error": "STRM 同步未全部完成，请查看运行记录" if partial else ""}
                 recovered += 1
         pruned = _prune_recent(state, now_value)
-        if recovered or pruned:
+        if recovered or pruned or legacy:
             _write_state(conn, state)
     return recovered
 

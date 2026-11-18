@@ -15,6 +15,7 @@ from app.logger import get_logger, redact_sensitive_text
 from app.modules.media_server_profiles import MediaRefreshIntent, configured_media_refresh_targets
 from app.modules.process_lock import CrossProcessLock
 from app.repositories.media_refresh_queue import (
+    LEGACY_REFRESH_UNVERIFIED,
     claim_due_media_refreshes,
     settle_media_refresh,
     enqueue_media_refresh,
@@ -290,7 +291,7 @@ class MediaRefreshCoordinator:
         outcome: dict[str, Any]
         try:
             if not intent:
-                raise ValueError("历史刷新未记录原媒体服务器，请手动刷新")
+                raise ValueError(LEGACY_REFRESH_UNVERIFIED)
             client = self._client_for(provider, intent)
             if client is None:
                 raise ValueError("媒体服务器已停用或配置不完整")
