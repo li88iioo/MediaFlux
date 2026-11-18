@@ -13,6 +13,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, patch
 
 import pytest
@@ -115,6 +116,7 @@ def test_refresh_failure_updates_original_run_and_notifies_original_chat(tmp_pat
     saved_chat = "123"
     with (
         isolated_test_database(), _providers("jellyfin"),
+        patch.object(notification_center, "_dispatch_stop", Event()),
         patch.dict(os.environ, {
             "STRM_NOTIFY_ENABLED": "1", "TG_NOTIFICATION_ENABLED": "1", "TG_NOTIFICATION_LEVEL": level,
         }),

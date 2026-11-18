@@ -434,6 +434,8 @@ class OrganizeSchedulerTests(unittest.TestCase):
         ), patch(
             "app.modules.organize_confirmations.stop_confirmation_dispatcher"
         ), patch(
+            "app.modules.telegram_notification_center.stop_telegram_notification_dispatcher", return_value=True,
+        ), patch(
             "app.modules.scheduler.get_scheduler"
         ), self.assertLogs("app.main", level="WARNING") as captured:
             self.assertFalse(main.stop_background_services())
@@ -478,6 +480,8 @@ class OrganizeSchedulerTests(unittest.TestCase):
         ), patch(
             "app.modules.organize_confirmations.stop_confirmation_dispatcher",
         ), patch(
+            "app.modules.telegram_notification_center.stop_telegram_notification_dispatcher", return_value=True,
+        ), patch(
             "app.modules.scheduler.get_scheduler",
         ), self.assertLogs("app.main", level="WARNING") as captured:
             self.assertFalse(main.stop_background_services())
@@ -503,6 +507,8 @@ class OrganizeSchedulerTests(unittest.TestCase):
             "app.modules.rss_scheduler.get_rss_scheduler"
         ), patch("app.modules.organize_scheduler.get_organize_scheduler"), patch(
             "app.modules.local_media_scheduler.get_local_media_scheduler"
+        ), patch(
+            "app.modules.telegram_notification_center.stop_telegram_notification_dispatcher", return_value=True,
         ), patch("app.modules.scheduler.get_scheduler"), self.assertLogs(
             "app.main", level="WARNING"
         ) as captured:
