@@ -2257,8 +2257,12 @@ class GuangYaClient:
                     all_closed = False
             return all_closed and not getattr(self, "_retired_raws", {})
 
-    def create_dir(self, name: str, parent_id: str = "0") -> str:
-        res = self.raw.fs_create_dir(
+    def create_dir(self, name: str, parent_id: str = "0", *,
+                   before_write: Callable[[], None] | None = None) -> str:
+        raw = self.raw
+        if before_write is not None:
+            before_write()
+        res = raw.fs_create_dir(
             dir_name=name,
             parent_id=None if parent_id == "0" else parent_id,
             fail_if_name_exist=True,

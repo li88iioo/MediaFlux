@@ -42,12 +42,28 @@ SHARE_PREVIEW_MAX_ENTRIES = 256
 SHARE_ACTION_MAX_ENTRIES = 4096
 
 
+class ShareTransferAccountChanged(ValueError):
+    def __init__(self) -> None:
+        super().__init__("光鸭登录账号已变化，请重新解析分享链接并选择目标目录")
+
+
+def _share_generation(client: GuangYaClient) -> int | None:
+    generation = client.credential_generation
+    return generation if client.logged_in else None
+
+
+def _require_share_generation(client: GuangYaClient, expected: int | None) -> None:
+    if expected is None or _share_generation(client) != expected:
+        raise ShareTransferAccountChanged()
+
+
 @dataclass(frozen=True)
 class ShareTransferSnapshot:
     preview_id: str
     owner_key: str
     share_id: str
     access_token: str
+    credential_generation: int | None
     files: tuple[dict[str, Any], ...]
     selected_ids: tuple[str, ...]
     target_id: str
@@ -69,6 +85,7 @@ class _PreviewEntry:
     owner_key: str
     share_id: str
     access_token: str
+    credential_generation: int | None
     files: dict[str, dict[str, Any]]
     file_order: tuple[str, ...]
     selected_ids: set[str]
@@ -186,6 +203,7 @@ class ShareTransferPreviewStore:
         chat_id: str | int,
         user_id: str | int = "",
         *,
+        credential_generation: int | None = None,
         target_id: str = "0",
         target_name: str = "根目录",
     ) -> str:
@@ -217,6 +235,7 @@ class ShareTransferPreviewStore:
             owner_key=self.owner_key(chat_id, user_id),
             share_id=share_id,
             access_token=access_token,
+            credential_generation=credential_generation,
             files=normalized,
             file_order=tuple(order),
             selected_ids=set(order),
@@ -327,6 +346,7 @@ class ShareTransferPreviewStore:
                 owner_key=entry.owner_key,
                 share_id=entry.share_id,
                 access_token=entry.access_token,
+                credential_generation=entry.credential_generation,
                 files=files,
                 selected_ids=selected,
                 target_id=chosen_target,
@@ -437,6 +457,7 @@ def inspect_share_for_transfer(
         raise ValueError("请提供有效的光鸭分享链接")
     ShareTransferPreviewStore.owner_key(chat_id, user_id)
     with _guangya_client_scope(client) as runtime_client:
+        generation = _share_generation(runtime_client)
         inspected = runtime_client.inspect_share((share_url or "").strip())
         store = store or get_share_transfer_store()
         target_id = (get("GY_SHARE_TARGET_DIR", "0") or "0").strip() or "0"
@@ -447,6 +468,7 @@ def inspect_share_for_transfer(
             inspected,
             chat_id,
             user_id,
+            credential_generation=generation,
             target_id=target_id,
             target_name=target_name,
         )
@@ -464,11 +486,13 @@ def prepare_share_transfer(
         raise ValueError("file_ids 必须是非空文件ID列表")
     selected = sorted({item.strip() for item in file_ids})
     with _guangya_client_scope(client) as runtime_client:
-        if not runtime_client.logged_in:
+        generation = _share_generation(runtime_client)
+        if generation is None:
             raise ValueError("光鸭未登录，请先重新登录")
         preview = inspect_share_for_transfer(
             share_url, chat_id, user_id, client=runtime_client, store=store,
         )
+        _require_share_generation(runtime_client, generation)
     files = {item["id"]: item for item in preview["files"]}
     if any(identity not in files for identity in selected):
         raise ValueError("选择中包含不属于该分享的文件")
@@ -476,6 +500,7 @@ def prepare_share_transfer(
         "preview_id": preview["preview_id"],
         "snapshot": {
             "owner": owner, "url": share_url.strip(), "share_id": preview["share_id"],
+            "credential_generation": generation,
             "files": [files[identity] for identity in selected],
             "target_id": preview["target_id"], "target_name": preview["target_name"],
         },
@@ -495,6 +520,7 @@ def submit_prepared_share_transfer(
             or prepared.get("owner") != ShareTransferPreviewStore.owner_key(chat_id, user_id)):
         raise ValueError("分享确认归属已失效，请重新检查")
     with _guangya_client_scope(client) as runtime_client:
+        _require_share_generation(runtime_client, prepared.get("credential_generation"))
         current = prepare_share_transfer(
             prepared["url"], [item["id"] for item in prepared["files"]], chat_id, user_id,
             client=runtime_client, store=store,
@@ -573,6 +599,7 @@ def accept_share_request(
     target_name: str | None = None,
     origin: str = "telegram",
     tracker_chat_id: str | None = None,
+    client: GuangYaClient | None = None,
     store: ShareTransferPreviewStore | None = None,
 ) -> ShareTransferSubmission | dict[str, Any]:
     """冻结选集及目录，持久认领一次转存，或返回同一请求的现有状态。"""
@@ -585,6 +612,8 @@ def accept_share_request(
         target_id=target_id,
         target_name=target_name,
     )
+    if client is not None and (snapshot.credential_generation is not None or client.logged_in):
+        _require_share_generation(client, snapshot.credential_generation)
     key = share_request_key(
         snapshot.share_id,
         snapshot.selected_ids,
@@ -627,7 +656,7 @@ def create_share_request(
     accepted = accept_share_request(
         preview_id, chat_id, user_id=user_id, selected_ids=selected_ids,
         target_id=target_id, target_name=target_name, origin=origin,
-        tracker_chat_id=tracker_chat_id, store=store,
+        tracker_chat_id=tracker_chat_id, client=client, store=store,
     )
     if isinstance(accepted, dict):
         return accepted
@@ -651,8 +680,10 @@ def execute_share_request(
 
     def preparation_failed(error: str) -> dict[str, Any]:
         stale = finish(
-            success=False, target_dir_id=snapshot.target_id,
-            target_dir_name=persisted_target_name, title=title, error=error,
+            success=False, target_dir_id=effective_target_id if isolated else snapshot.target_id,
+            target_dir_name=effective_target_name, title=title, error=error,
+            isolated=isolated, staging_parent_dir=staging_parent_id, staging_name=staging_name,
+            staging_cleanup_status="retained" if isolated or creating_staging else "",
         )
         if stale is not None:
             return stale
@@ -670,16 +701,25 @@ def execute_share_request(
     creating_staging = False
     restore_started = False
 
-    def before_restore() -> None:
-        nonlocal restore_started
+    def check_write() -> None:
         if cancel_check is not None:
             cancel_check()
+        _require_share_generation(runtime_client, snapshot.credential_generation)
+
+    def before_create() -> None:
+        nonlocal creating_staging
+        check_write()
+        creating_staging = True
+
+    def before_restore() -> None:
+        nonlocal restore_started
+        check_write()
         restore_started = True
 
     try:
         with ExitStack() as stack:
             try:
-                client = stack.enter_context(_guangya_client_scope(client))
+                runtime_client = stack.enter_context(_guangya_client_scope(client))
             except Exception as exc:
                 # 尚未尝试任何云写，明确失败允许既有的一次显式重试。
                 logger.warning("光鸭分享客户端初始化失败 (%s)", type(exc).__name__)
@@ -689,12 +729,10 @@ def execute_share_request(
                 organize_target not in {"", "0"}
                 and snapshot.target_id not in {"", "0"}
             )
-            if not client.logged_in:
-                error = "光鸭未登录，请先重新登录"
-                return preparation_failed(error)
+            if snapshot.credential_generation is None and not runtime_client.logged_in:
+                return preparation_failed("光鸭未登录，请先重新登录")
 
-            if cancel_check is not None:
-                cancel_check()
+            check_write()
             if auto_follow_up:
                 existing = download_requests_repo.get_download_request(request_id)
                 existing_staging = str(existing["gy_target_dir"] or "") if existing else ""
@@ -728,27 +766,31 @@ def execute_share_request(
                         )
                     try:
                         effective_target_id = _find_share_staging_dir(
-                            client, staging_parent_id, staging_name
+                            runtime_client, staging_parent_id, staging_name
                         )
                         if not effective_target_id:
                             try:
-                                if cancel_check is not None:
-                                    cancel_check()
-                                creating_staging = True
                                 effective_target_id = (
-                                    client.create_dir(staging_name, staging_parent_id) or ""
+                                    runtime_client.create_dir(
+                                        staging_name, staging_parent_id, before_write=before_create,
+                                    ) or ""
                                 )
                                 creating_staging = False
+                            except ShareTransferAccountChanged:
+                                raise
                             except Exception:
                                 # Provider 已成功建目录但进程在落库前中断时，重试应复用
                                 # 确定性目录，而不是创建重复目录或永久失败。
                                 effective_target_id = _find_share_staging_dir(
-                                    client, staging_parent_id, staging_name
+                                    runtime_client, staging_parent_id, staging_name
                                 )
                                 if not effective_target_id:
                                     raise
                                 creating_staging = False
+                    except ShareTransferAccountChanged:
+                        raise
                     except Exception as exc:
+                        _require_share_generation(runtime_client, snapshot.credential_generation)
                         error = redact_sensitive_text(f"创建分享隔离目录失败：{exc}")
                         return preparation_failed(error)
                     if not effective_target_id:
@@ -763,16 +805,13 @@ def execute_share_request(
                 ):
                     return get_share_request_result(request_id)
 
-            if cancel_check is not None:
-                cancel_check()
+            check_write()
             try:
-                restore_args = (snapshot.access_token, list(snapshot.selected_ids), effective_target_id)
-                if cancel_check is not None:
-                    # 客户端取得 raw（含凭据刷新）后再检查，只有真正进入发送边界才算在途。
-                    result = client.restore_share(*restore_args, cancel_check=before_restore)
-                else:
-                    restore_started = True
-                    result = client.restore_share(*restore_args)
+                # 客户端取得 raw（含凭据刷新）后再检查，只有进入发送边界才算在途。
+                result = runtime_client.restore_share(
+                    snapshot.access_token, list(snapshot.selected_ids), effective_target_id,
+                    cancel_check=before_restore,
+                )
                 success = bool(result.get("success"))
                 retry_safe = bool(result.get("retry_safe", False))
                 failure_status = "failed" if retry_safe else "manual_review"
@@ -781,7 +820,11 @@ def execute_share_request(
                     if retry_safe
                     else "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
                 )
+            except ShareTransferAccountChanged:
+                raise
             except Exception as exc:
+                if not restore_started:
+                    _require_share_generation(runtime_client, snapshot.credential_generation)
                 logger.warning("光鸭分享转存请求 #%s 失败 (%s)", request_id, type(exc).__name__)
                 success = False
                 failure_status = "manual_review"
@@ -819,6 +862,11 @@ def execute_share_request(
                 "status": "completed" if success else failure_status,
                 "error": redact_sensitive_text(error),
             }
+    except ShareTransferAccountChanged as exc:
+        rejected = preparation_failed(str(exc))
+        if not rejected["created"]:
+            return rejected
+        raise
     except asyncio.CancelledError:
         # 取消也必须结算认领；已知目录保留身份，发送后的未知结果禁止重放。
         unknown = creating_staging or restore_started

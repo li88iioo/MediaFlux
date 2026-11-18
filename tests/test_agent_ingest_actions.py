@@ -95,7 +95,7 @@ def test_native_share_bridge_cold_confirm_and_repeated_approval_write_once(share
     assert "未建立媒体库可见性复核" in json.dumps(observed, ensure_ascii=False)
 
 
-@pytest.mark.parametrize("change", ["cancel", "foreign_owner", "file", "target", "cancel_during_read"])
+@pytest.mark.parametrize("change", ["cancel", "foreign_owner", "file", "target", "account", "cancel_during_read"])
 def test_native_share_rejects_changed_or_cancelled_confirmation_without_write(share_backend, monkeypatch, change):
     async def run():
         store = SQLiteKernelStore()
@@ -111,6 +111,8 @@ def test_native_share_rejects_changed_or_cancelled_confirmation_without_write(sh
             share_backend.inspected["files"][0]["size"] += 1
         elif change == "target":
             monkeypatch.setattr(share_transfer, "get", lambda *_a: "other-target")
+        elif change == "account":
+            share_backend.credential_generation += 1
         else:
             original = share_backend.inspect_share
             def cancel_read(url):

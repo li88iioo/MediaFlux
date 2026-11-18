@@ -14,7 +14,7 @@ import pytest
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient
-from app.modules.share_transfer import ShareTransferPreviewStore, create_share_request
+from app.modules.share_transfer import ShareTransferAccountChanged, ShareTransferPreviewStore, create_share_request
 from tests.support import isolated_test_database
 from tests.test_telegram_guangya_share import FakeShareClient
 
@@ -33,11 +33,11 @@ def test_cancelled_share_finalizes_request_and_preserves_staging(stage, expected
     token = CancellationToken()
     client = FakeShareClient()
     store = ShareTransferPreviewStore()
-    preview = store.create(client.inspected, "chat", "user")
+    preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
     original_create, original_restore = client.create_dir, client.restore_share
 
-    def create(name: str, parent_id: str = "0") -> str:
-        directory_id = original_create(name, parent_id)
+    def create(name: str, parent_id: str = "0", *, before_write: Callable[[], None] | None = None) -> str:
+        directory_id = original_create(name, parent_id, before_write=before_write)
         if stage in {"after_create", "during_create"}:
             token.cancel()
         if stage == "during_create":
@@ -128,7 +128,7 @@ def test_share_cancel_after_known_acceptance_preserves_completed_result():
     token = CancellationToken()
     client = FakeShareClient()
     store = ShareTransferPreviewStore()
-    preview = store.create(client.inspected, "chat", "user")
+    preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
     actual = client.restore_share
 
     def restore(access_token: str, file_ids: list[str], target_dir_id: str, *,
@@ -160,7 +160,9 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         self.enterContext(isolated_test_database())
         self.store = ShareTransferPreviewStore()
         self.client = LifecycleShareClient()
-        self.preview = self.store.create(self.client.inspected, "chat", "user")
+        self.preview = self.store.create(
+            self.client.inspected, "chat", "user", credential_generation=self.client.credential_generation,
+        )
         self.enterContext(
             patch("app.modules.share_transfer.get", return_value="archive")
         )
@@ -247,15 +249,44 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         observed = []
         actual = self.client.create_dir
 
-        def create(name, parent_id="0"):
+        def create(name, parent_id="0", *, before_write=None):
             row = self.request()
             observed.append((row["status"], row["gy_status"], row["targets"]))
-            return actual(name, parent_id)
+            return actual(name, parent_id, before_write=before_write)
 
         self.client.create_dir = create
         result = self.submit()
         self.assertTrue(result["success"])
         self.assertEqual(observed, [("submitting", "submitting", "guangya")])
+
+    def test_account_switch_between_directory_lookup_and_creation_stops_before_write(self):
+        def list_dir(parent_id="0"):
+            self.client.credential_generation += 1
+            return []
+
+        self.client.list_dir = list_dir
+        with self.assertRaises(ShareTransferAccountChanged):
+            self.submit()
+        self.assertEqual(self.client.create_dir_calls, [])
+        self.assertEqual(self.client.restore_calls, [])
+        self.assertEqual(self.request()["status"], "failed")
+
+    def test_account_switch_after_directory_creation_stops_restore_and_retains_staging(self):
+        actual = self.client.create_dir
+
+        def create(*args, **kwargs):
+            directory_id = actual(*args, **kwargs)
+            self.client.credential_generation += 1
+            return directory_id
+
+        self.client.create_dir = create
+        with self.assertRaises(ShareTransferAccountChanged):
+            self.submit()
+        row = self.request()
+        self.assertEqual((row["status"], row["gy_target_dir"], row["gy_staging_cleanup_status"]),
+                         ("failed", "staging-target", "retained"))
+        self.assertEqual(len(self.client.create_dir_calls), 1)
+        self.assertEqual(self.client.restore_calls, [])
 
     def test_recovered_or_cancelled_request_rejects_late_success_and_followup(self):
         for status in ("manual_review", "cancelled", "resubmitted"):
@@ -575,8 +606,9 @@ db.configure_database(sys.argv[1], test_mode=True)
 db.init_db()
 client = FakeShareClient()
 store = ShareTransferPreviewStore()
-preview = store.create(client.inspected, "chat", "user")
-def accepted_then_exit(*args):
+preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
+def accepted_then_exit(*args, **kwargs):
+ kwargs["cancel_check"]()
  Path(sys.argv[1]).with_suffix(".cloud-marker").write_text("accepted-once")
  os._exit(29)
 client.restore_share = accepted_then_exit
@@ -631,7 +663,7 @@ raise AssertionError("provider window not reached")
             )
             client = LifecycleShareClient()
             store = ShareTransferPreviewStore()
-            preview = store.create(client.inspected, "chat", "user")
+            preview = store.create(client.inspected, "chat", "user", credential_generation=client.credential_generation)
             result = create_share_request(
                 preview,
                 ["file-1"],

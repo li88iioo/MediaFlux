@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
@@ -45,6 +47,7 @@ def inspected_payload(count: int = 3) -> dict:
 class FakeShareClient:
     def __init__(self, inspected: dict | None = None) -> None:
         self.logged_in = True
+        self.credential_generation = 0
         self.inspected = inspected or inspected_payload()
         self.inspect_calls: list[str] = []
         self.restore_calls: list[tuple[str, list[str], str]] = []
@@ -55,7 +58,10 @@ class FakeShareClient:
         self.inspect_calls.append(share_url)
         return self.inspected
 
-    def create_dir(self, name: str, parent_id: str = "0") -> str:
+    def create_dir(self, name: str, parent_id: str = "0", *,
+                   before_write: Callable[[], None] | None = None) -> str:
+        if before_write is not None:
+            before_write()
         self.create_dir_calls.append((name, parent_id))
         return f"staging-{parent_id}"
 
@@ -310,6 +316,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
             self.client.inspected,
             chat_id="chat-100",
             user_id="user-200",
+            credential_generation=self.client.credential_generation,
         )
 
     def test_selected_ids_are_revalidated_and_duplicate_request_is_idempotent(self):
@@ -425,7 +432,8 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
                 )]
             return []
 
-        def create_dir(name, parent_id="0"):
+        def create_dir(name, parent_id="0", *, before_write):
+            before_write()
             state["created"] = True
             raise TimeoutError("response lost after create")
 
@@ -446,7 +454,8 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
             )
 
         self.assertTrue(result["success"])
-        self.client.create_dir.assert_called_once_with(staging_name, "dir-target")
+        self.client.create_dir.assert_called_once()
+        self.assertEqual(self.client.create_dir.call_args.args, (staging_name, "dir-target"))
         self.assertEqual(self.client.restore_calls, [
             (SECRET_TOKEN, ["file-1"], "staging-after-error"),
         ])
@@ -790,6 +799,51 @@ class TelegramShareViewTests(unittest.TestCase):
 
 
 class TelegramShareConfirmationTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM download_log")
+            conn.execute("DELETE FROM download_requests")
+
+    def test_switch_after_telegram_confirmation_stops_background_transfer(self):
+        from app.bot.handlers import _handle_share_callback, _inspect_telegram_share
+        from app.modules.share_transfer import ShareTransferPreviewStore
+
+        store = ShareTransferPreviewStore()
+        before, after = FakeShareClient(), FakeShareClient()
+        after.credential_generation = 1
+        bot = Mock()
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=100), from_user=SimpleNamespace(id=200),
+            message_id=5, message_thread_id=42,
+        )
+        workers = []
+
+        def hold_worker(*, target, args, **_kwargs):
+            return SimpleNamespace(start=lambda: workers.append((target, args)))
+
+        with (
+            patch("app.modules.share_transfer.get_share_transfer_store", return_value=store),
+            patch("app.modules.share_transfer.GuangYaClient", side_effect=[before, after]),
+            patch("app.bot.handlers.threading.Thread", side_effect=hold_worker),
+        ):
+            _inspect_telegram_share(bot, message, SHARE_URL, FAKE_TELEBOT)
+            keyboard = bot.reply_to.call_args.kwargs["reply_markup"]
+            confirm = next(button for button in keyboard.buttons if button.text == "确认转存")
+            _handle_share_callback(
+                bot, SimpleNamespace(id="confirm", data=confirm.callback_data, message=message,
+                                     from_user=message.from_user), FAKE_TELEBOT,
+            )
+            self.assertIn("已受理", bot.answer_callback_query.call_args.args[1])
+            self.assertEqual(len(workers), 1)
+            run, args = workers[0]
+            run(*args)
+
+        self.assertFalse(before.restore_calls or after.restore_calls or after.create_dir_calls)
+        self.assertIn("重新解析", bot.edit_message_text.call_args.args[0])
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT status,gy_status FROM download_requests").fetchone()
+        self.assertEqual(tuple(row), ("failed", "failed"))
+
     def test_telegram_timeouts_preserve_the_persisted_transfer_and_its_receipt(self):
         from app.bot.handlers import _handle_share_callback, _share_selection_view
         from app.modules.share_transfer import ShareTransferPreviewStore
@@ -809,7 +863,8 @@ class TelegramShareConfirmationTests(IsolatedDatabaseTestCase):
                 with self.subTest(failing_text=failing_text):
                     chat_id, user_id = 100, 200
                     target_id = str(attempt - 1)
-                    preview_id = store.create(client.inspected, chat_id, user_id, target_id=target_id)
+                    preview_id = store.create(client.inspected, chat_id, user_id, target_id=target_id,
+                                              credential_generation=client.credential_generation)
                     _, markup = _share_selection_view(
                         FAKE_TELEBOT, preview_id, chat_id=str(chat_id), user_id=str(user_id), store=store,
                     )
@@ -926,6 +981,61 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
         self.assertEqual(restored.status_code, 200)
         self.assertTrue(restored.json()['success'])
         self.assertEqual(len(fake.restore_calls), 1)
+
+    def test_web_and_agent_share_preview_cannot_write_after_switching_accounts(self):
+        before, after = FakeShareClient(), FakeShareClient()
+        after.credential_generation = 1
+        with db.get_conn() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0]
+        with patch("app.routes.share_api.GuangYaClient", side_effect=[before, after, after, after]):
+            first = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
+            self.assertEqual(first.status_code, 200)
+            payload = {"preview_id": first.json()["preview_id"], "file_ids": ["file-1"],
+                       "target_dir_id": "0", "target_dir_name": "根目录"}
+            stale = self.client.post("/api/share/restore", headers=self.headers, json=payload)
+            self.assertEqual(stale.status_code, 410, stale.text)
+            self.assertIn("重新解析", stale.json()["error"])
+            self.assertFalse(before.restore_calls or after.restore_calls)
+            with db.get_conn() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], count)
+
+            fresh = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
+            payload["preview_id"] = fresh.json()["preview_id"]
+            submitted = self.client.post("/api/share/restore", headers=self.headers, json=payload)
+            self.assertEqual(submitted.status_code, 200, submitted.text)
+            self.assertEqual(len(after.restore_calls), 1)
+
+    def test_share_preview_survives_access_token_rotation(self):
+        from tests.test_guangya_token_operations import _RotatingRawClient
+
+        restored_with = []
+
+        class Raw(_RotatingRawClient):
+            def share_restore(self, **kwargs):
+                restored_with.append(self.token)
+                return {"code": 0}
+
+        with TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token.json"
+            token_file.write_text('{"access_token":"access-before","refresh_token":"refresh-before"}', encoding="utf-8")
+            with (
+                patch("app.clients.guangya._load_raw", return_value=Raw),
+                patch("app.routes.share_api.GuangYaClient", side_effect=lambda: GuangYaClient(token_file)),
+                patch.object(GuangYaClient, "inspect_share", return_value=inspected_payload(1)),
+            ):
+                inspected = self.client.post("/api/share/inspect", headers=self.headers, json={"url": SHARE_URL})
+                self.assertEqual(inspected.status_code, 200)
+                renewing = GuangYaClient(token_file)
+                try:
+                    renewing.refresh_now()
+                finally:
+                    renewing.close()
+                response = self.client.post("/api/share/restore", headers=self.headers, json={
+                    "preview_id": inspected.json()["preview_id"], "file_ids": ["file-1"],
+                    "target_dir_id": "0", "target_dir_name": "根目录",
+                })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(restored_with, ["rotated-access-9999"])
 
     def test_web_share_api_keeps_auth_csrf_session_isolation_and_secret_redaction(self):
         fake = FakeShareClient()

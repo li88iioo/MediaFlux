@@ -11,6 +11,7 @@ from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.share_transfer import (
+    ShareTransferAccountChanged,
     create_share_request,
     get_share_transfer_store,
     inspect_share_for_transfer,
@@ -44,6 +45,8 @@ def _remember_share_request(request: Request, request_id: Any) -> None:
 
 
 def _preview_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ShareTransferAccountChanged):
+        return JSONResponse({"error": str(exc)}, status_code=410)
     message = str(exc or "")
     status = 410 if "过期" in message or "无效" in message or "已使用" in message else 400
     if status == 410:
