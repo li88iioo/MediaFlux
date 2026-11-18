@@ -202,6 +202,7 @@ class _BlockedSession:
     def __init__(self):
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.on_entered = None
         self.active = False
         self.close_count = 0
         self.closed_during_get = False
@@ -214,6 +215,8 @@ class _BlockedSession:
         self.active = True
         self.entered.set()
         try:
+            if self.on_entered is not None:
+                self.on_entered()
             if not self.release.wait(3):
                 raise AssertionError("blocked HTTP fixture was not released")
             return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
@@ -275,6 +278,12 @@ class EpisodeResearchCloseReliabilityTests(_OfflineCase):
         worker_closed = threading.Event()
         attempts = []
         main_thread = threading.current_thread().name
+        timeout = 10.0
+        timeout_owner, timeout_setting = (
+            (service, "_TOTAL_TIMEOUT_SECONDS") if outer_deadline else (runner, "_TIMEOUT_SECONDS")
+        )
+        started = None
+        runner_result = None
 
         class RecordingReader(core.EpisodeEvidenceReader):
             def close(self):
@@ -286,43 +295,42 @@ class EpisodeResearchCloseReliabilityTests(_OfflineCase):
                         worker_closed.set()
 
         async def offline_runner(payload, *, reader):
+            nonlocal started, runner_result
+            loop = asyncio.get_running_loop()
+            loop_time = loop.time
+            elapsed = 0.0
+
+            def expire():
+                nonlocal started, elapsed
+                started = time.monotonic()
+                elapsed = timeout
+
+            def monotonic():
+                return loop_time() + elapsed
+
+            # HTTP 已在工作线程中执行才推进时钟，保留 asyncio 和 runner 的真实超时路径。
+            session.on_entered = lambda: loop.call_soon_threadsafe(expire)
             model = ScriptedModel(rounds(call("inspect_case"), call("inspect_candidate", {"candidate_index": 0})))
-            return await runner.research_episode_case_async(payload, reader=reader, model=model)
+            with patch.object(loop, "time", monotonic), patch.object(runner, "time", SimpleNamespace(monotonic=monotonic)):
+                runner_result = await runner.research_episode_case_async(payload, reader=reader, model=model)
+                return runner_result
 
-        # 先完成本地解析冷初始化；只缩时runner，保持真实service/reader/HTTP生命周期。
-        core.normalize_case(self.payload)
-        started = time.monotonic()
         try:
-            with ExitStack() as stack:
-                stack.enter_context(patch.object(core, "TMDBClient", return_value=client))
-                stack.enter_context(patch.object(runner, "_TIMEOUT_SECONDS", 2 if outer_deadline else 0.12))
-                if outer_deadline:
-                    # 本用例验证在途读取的关闭所有权，不要求模型/线程在120ms内启动。
-                    # 等HTTP已进入后再触发真实wait_for超时，避免冷初始化抢先耗尽预算。
-                    real_wait_for = asyncio.wait_for
-                    armed = False
-
-                    async def expire_during_read(awaitable, timeout):
-                        nonlocal armed, started
-                        if armed:
-                            return await real_wait_for(awaitable, timeout)
-                        armed = True
-                        task = asyncio.create_task(awaitable)
-                        try:
-                            self.assertTrue(await asyncio.to_thread(session.entered.wait, 1))
-                            started = time.monotonic()
-                            return await real_wait_for(task, 0.03)
-                        finally:
-                            task.cancel()
-                            await asyncio.gather(task, return_exceptions=True)
-
-                    stack.enter_context(patch.object(service.asyncio, "wait_for", expire_during_read))
-                    stack.enter_context(patch.object(service, "_TOTAL_TIMEOUT_SECONDS", 2))
-                    stack.enter_context(patch.object(runner, "_CLEANUP_SECONDS", 0.03))
+            with (
+                patch.object(core, "TMDBClient", return_value=client),
+                patch.object(timeout_owner, timeout_setting, timeout),
+                patch.object(runner, "_CLEANUP_SECONDS", 0.03),
+            ):
                 result = service.research_confirmation_episodes(self.payload, runner=offline_runner, reader_factory=RecordingReader)
             self.assertEqual(result["reason_code"], "research_timeout")
-            self.assertLess(time.monotonic()-started, 1.0)
+            if outer_deadline:
+                self.assertIsNone(runner_result)
+            else:
+                self.assertIsNotNone(runner_result)
+                self.assertEqual(runner_result["reason_code"], "research_timeout")
             self.assertTrue(session.entered.is_set())
+            self.assertIsNotNone(started)
+            self.assertLess(time.monotonic() - started, 1.0)
             self.assertTrue(session.active)
             self.assertEqual(session.close_count, 0)
             self.assertFalse(any(name == main_thread for name, _active in attempts), attempts)
