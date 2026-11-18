@@ -549,6 +549,31 @@ def test_restore_rebinds_verified_payload_and_revokes_old_runtime(runtime_env, t
         gate.require_runtime_fence(conn, old_runtime.creation_binding.fence)
 
 
+@pytest.mark.parametrize("include_settings", [True, False], ids=["archived-env", "retained-env"])
+def test_restore_keeps_v1_backup_readable_by_both_versions(installed_v1, tmp_path, include_settings):
+    from app.modules import backup
+
+    paths = config.PATHS
+    archived_env = paths.env_file.read_bytes()
+    archive = backup.create_backup(paths, output=tmp_path / "v1-runtime.zip", include_settings=include_settings)
+    assert gate.initialize_runtime_fence() is not None
+    config.set_and_save({"DISCOVERY_ENABLED": "0"})
+    retained_env = paths.env_file.read_bytes()
+    assert retained_env != archived_env
+
+    backup.restore_backup(paths, archive)
+
+    assert paths.env_file.read_bytes() == (archived_env if include_settings else retained_env)
+    with legacy_runtime_fence():
+        restored = gate.initialize_runtime_fence()
+    assert restored is not None
+    assert restored.incarnation != installed_v1.fence.incarnation
+
+    upgraded = gate.initialize_runtime_fence()
+    assert upgraded is not None
+    assert (upgraded.v, upgraded.incarnation) == (gate.RUNTIME_FENCE_VERSION, restored.incarnation)
+
+
 def test_restore_rejects_changing_backup_without_touching_existing_db_or_env(runtime_env, tmp_path):
     import sqlite3
 

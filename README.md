@@ -230,7 +230,7 @@ print("user.env", paths.env_file)
 PY
 ```
 
-确认这两个路径都属于目标实例后，校验 ZIP 并恢复。恢复成功后用相同的目录配置重新执行 `python mediaflux.py start`。
+确认这两个路径都属于目标实例后，校验 ZIP 并恢复。回退到旧版时，使用回退目标版本的源码与依赖执行校验、恢复和启动。恢复成功后用相同的目录配置重新执行 `python mediaflux.py start`。
 
 ```bash
 python mediaflux.py backup verify "$BACKUP" && python mediaflux.py backup restore "$BACKUP"

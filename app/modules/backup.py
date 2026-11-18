@@ -13,7 +13,7 @@ import threading
 import uuid
 import zipfile
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Generator, IO, TYPE_CHECKING, Any, TypedDict
@@ -892,7 +892,12 @@ def restore_backup(paths: RuntimePaths, archive_path: Path) -> BackupManifest:
             # one recoverable transaction; ordinary startup never promotes a
             # changing fence. Legacy databases without a fence stay unchanged.
             from app import config
-            from app.agent.feature_gate import RUNTIME_FENCE_KEY, RUNTIME_FENCE_VERSION, read_runtime_fence
+            from app.agent.feature_gate import (
+                RUNTIME_FENCE_KEY,
+                RUNTIME_FENCE_VERSION,
+                _write_fence,
+                read_runtime_fence,
+            )
             from app.env_file import read_env_bytes
 
             with closing(sqlite3.connect(database_payload)) as restored, restored:
@@ -928,17 +933,14 @@ def restore_backup(paths: RuntimePaths, archive_path: Path) -> BackupManifest:
                     except (OSError, UnicodeError, ValueError, config.AtomicPublishError) as exc:
                         raise BackupError("无法安全读取恢复后的 user.env，已拒绝恢复") from exc
 
-                    rebound = {
-                        "v": RUNTIME_FENCE_VERSION,
-                        "incarnation": uuid.uuid4().hex,
-                        "epoch": 1,
-                        "phase": "stable",
-                        "config_digest": config._runtime_digest(env_values),
-                    }
-                    restored.execute(
-                        "UPDATE settings_kv SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key=?",
-                        (json.dumps(rebound, sort_keys=True), RUNTIME_FENCE_KEY),
+                    # 恢复后按归档格式核验授权，供回退目标版本直接启动。
+                    rebound = replace(
+                        fence,
+                        incarnation=uuid.uuid4().hex,
+                        epoch=1,
+                        config_digest=config._runtime_digest(env_values, legacy=fence.v != RUNTIME_FENCE_VERSION),
                     )
+                    _write_fence(restored, rebound)
             mapping = _restore_mapping(paths)
             files: dict[str, tuple[Path, Path | None]] = {
                 str(entry["name"]): (
