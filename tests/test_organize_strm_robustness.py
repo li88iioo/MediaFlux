@@ -1359,9 +1359,9 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             "changes": [{"path": "动漫/Private.Show/Private.S01E01.strm"}],
         }
         with patch(
-            "app.modules.telegram_notification_center.publish_notification_event",
+            "app.modules.telegram_notification_center.publish_notification_thread",
             return_value=True,
-        ) as send, patch(
+        ) as send, patch("app.modules.telegram_notification_center.publish_notification_event", side_effect=send), patch(
             "app.modules.telegram_notification_policy.allows_notification",
             return_value=True,
         ):
@@ -1402,9 +1402,9 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             "changes": [{"path": "动漫/Private.Show/Private.S01E01.strm"}],
         }
         with patch(
-            "app.modules.telegram_notification_center.publish_notification_event",
+            "app.modules.telegram_notification_center.publish_notification_thread",
             return_value=True,
-        ) as send, patch(
+        ) as send, patch("app.modules.telegram_notification_center.publish_notification_event", side_effect=send), patch(
             "app.modules.telegram_notification_policy.allows_notification",
             return_value=True,
         ), patch.object(
@@ -1452,9 +1452,9 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             "changes": [{"path": "动漫/Recovered.Private/Recovered.S01E01.strm"}],
         }
         with patch(
-            "app.modules.telegram_notification_center.publish_notification_event",
+            "app.modules.telegram_notification_center.publish_notification_thread",
             return_value=True,
-        ) as send, patch(
+        ) as send, patch("app.modules.telegram_notification_center.publish_notification_event", side_effect=send), patch(
             "app.modules.telegram_notification_policy.allows_notification",
             return_value=True,
         ):

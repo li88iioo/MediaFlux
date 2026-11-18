@@ -15,6 +15,7 @@ import math
 import os
 import threading
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -143,6 +144,12 @@ def _update_strm_requests(options: dict[str, Any], **fields) -> None:
         strm_request_ownership_repo.update_strm_request_state(
             owner, claimed_targets=options.get("strm_claimed_targets"), **fields
         )
+
+
+def _strm_generation_partial(stats: dict) -> bool:
+    return bool(stats.get("clean_skipped")) or any(
+        int(stats.get(key, 0) or 0) > 0 for key in ("failed", "metadata_failed", "failure_ledger_failed")
+    )
 
 
 def _refresh_notification_label(refresh: dict) -> str:
@@ -329,6 +336,41 @@ def _media_refresh_summary(events: dict[str, Any], baseline: dict[str, str] | No
                           for name, values in providers.items() if name != "媒体库" or "failed" in values}, "events": events}
 
 
+def _update_strm_summary_refresh(
+    run_id: int, trigger_type: str, chats: list[str], refresh: dict, *, strm_partial: bool,
+) -> None:
+    if not chats or not get_bool("STRM_NOTIFY_ENABLED"):
+        return
+    from app.modules.telegram_notification_center import (
+        get_notification_thread_event,
+        publish_notification_thread,
+    )
+    from app.modules.telegram_notification_policy import NotificationImportance, NotificationTopic
+
+    failed = any(status in {"partial", "failed"} for status in refresh.values())
+    label = _refresh_notification_label(refresh)
+    key = f"strm-run:{run_id}:{trigger_type}"
+    for chat in chats:
+        event = get_notification_thread_event(key, topic=NotificationTopic.STRM, chat_id=chat)
+        if event is None:
+            if not failed:
+                continue
+            event = NotificationEvent(
+                "", fields=(("触发方式", STRMScheduler._trigger_label(trigger_type)),), layout="relaxed",
+            )
+        fields = dict(event.fields)
+        fields["媒体库刷新"] = label
+        title = "⚠️ STRM 同步部分完成" if strm_partial else "✅ STRM 同步完成"
+        if failed and not strm_partial:
+            title = "⚠️ STRM 同步完成，媒体库刷新未完成"
+        publish_notification_thread(
+            key, replace(event, title=title, fields=tuple(fields.items()),
+                         footer="请在刷新失败的媒体服务器中手动刷新媒体库。" if failed else ""),
+            topic=NotificationTopic.STRM, chat_id=chat, deliver_now=False,
+            importance=NotificationImportance.ERROR if failed or strm_partial else NotificationImportance.RESULT,
+        )
+
+
 def reconcile_strm_media_refresh_results() -> None:
     """沿现有消费者恢复原运行与回执；投影失败保留修订号，下轮只重做投影。"""
     from app.repositories.media_refresh_queue import (
@@ -375,6 +417,11 @@ def reconcile_strm_media_refresh_results() -> None:
                     strm_run_id=origin["run_id"],
                 )
                 if not origin["outbox_pending"]:
+                    if not summary["pending"]:
+                        _update_strm_summary_refresh(
+                            origin["run_id"], row["trigger_type"], result.get("strm_summary_chats", []),
+                            summary["providers"], strm_partial=bool(completion.get("partial")),
+                        )
                     projected.append((origin["run_id"], origin["revision"]))
             except Exception:
                 logger.exception("媒体库刷新结果投影失败 run_id=%s，下轮仅重试投影", origin["run_id"])
@@ -2161,12 +2208,7 @@ class STRMScheduler:
                 "fallback_used": fallback_used,
                 "fallback_reason": fallback_reason,
             }
-            strm_partial = bool(
-                int(stats.get("failed", 0) or 0)
-                or int(stats.get("metadata_failed", 0) or 0)
-                or int(stats.get("failure_ledger_failed", 0) or 0)
-                or stats.get("clean_skipped")
-            )
+            strm_partial = _strm_generation_partial(stats)
             refresh_pending = any(
                 value in {False, "failed", "pending"} for value in media_refresh.values()
             ) or strm_request_ownership_repo.has_pending_strm_request_refresh(options.get("download_request_owners"))
@@ -2181,9 +2223,16 @@ class STRMScheduler:
                 else ""
             )
             terminal_status = "partial" if partial else "completed"
+            foreground_scopes = self._foreground_notification_scopes(options)
+            # 冻结原卡收件人。精简模式可以略过成功首报，终态失败仍应送达原会话。
+            saved_result = result
+            if trigger_type != "telegram" and get_bool("STRM_NOTIFY_ENABLED") and get_bool("TG_NOTIFICATION_ENABLED"):
+                chats = [scope["summary_chat"] for scope in foreground_scopes if scope["summary_chat"]]
+                if chats:
+                    saved_result = {**result, "strm_summary_chats": list(dict.fromkeys(chats))}
             db.finish_task_run(
                 run_id, "partial" if partial else "success",
-                result=json.dumps(result, ensure_ascii=False),
+                result=json.dumps(saved_result, ensure_ascii=False),
             )
             _update_strm_requests(options, strm_status=terminal_status,
                                   strm_error=partial_error, strm_finished_at=db.now())
@@ -2217,7 +2266,7 @@ class STRMScheduler:
                 strm_run_id=run_id,
             )
             self._notify_scoped_results(
-                options, stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
+                foreground_scopes, stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
                 run_id=run_id,
             )
             self._complete_refresh_handoff(run_id, strm_status="部分完成" if strm_partial else "完成",
@@ -2413,12 +2462,8 @@ class STRMScheduler:
     def _build_success_event(stats: dict, refresh: dict, elapsed: float,
                              trigger_type: str, sources: list[dict],
                              strm_root: str) -> NotificationEvent:
-        partial = (
-            int(stats.get("failed", 0) or 0) > 0
-            or int(stats.get("metadata_failed", 0) or 0) > 0
-            or int(stats.get("failure_ledger_failed", 0) or 0) > 0
-            or bool(stats.get("clean_skipped"))
-            or any(value in {False, "failed", "partial", "pending"} for value in refresh.values())
+        partial = _strm_generation_partial(stats) or any(
+            value in {False, "failed", "partial", "pending"} for value in refresh.values()
         )
         names = [str(item.get("name") or item.get("id") or "未命名") for item in sources]
         source_text = f"{len(sources)} 个"
@@ -2543,25 +2588,31 @@ class STRMScheduler:
                     or options.get("has_silent_notification_scope")
                     or scope.get("has_silent_notification_scope")
                 )
+                scoped["summary_chat"] = (
+                    recipient
+                    if scope.get("notify_override") is not False and not _has_linked_notification_thread(scoped)
+                    else ""
+                )
                 result.append(scoped)
         return result
 
     def _notify_scoped_results(
-        self, options: dict, stats: dict, refresh: dict, elapsed: float,
+        self, scopes: list[dict], stats: dict, refresh: dict, elapsed: float,
         trigger_type: str, sources: list[dict], strm_root: str, *, run_id: int = 0,
     ) -> None:
-        for scope in self._foreground_notification_scopes(options):
+        for scope in scopes:
             kwargs = {
                 "chat_ids": list(scope.get("chat_ids") or []),
                 "uses_default_notification_scope": scope.get("uses_default_notification_scope"),
                 "has_silent_notification_scope": bool(scope.get("has_silent_notification_scope")),
             }
             # 只抑制当前接收范围的独立汇总，不以其他 chat/父任务的线程为依据。
-            if not _has_linked_notification_thread(scope):
+            if scope["summary_chat"]:
                 _run_notification_side_effect(
                     "summary", lambda: self._notify_success(
                         stats, refresh, elapsed, trigger_type, sources, strm_root,
-                        run_id=run_id, notify_override=scope.get("notify_override"), **kwargs,
+                        run_id=run_id, chat_ids=[scope["summary_chat"]], uses_default_notification_scope=False,
+                        has_silent_notification_scope=scope["has_silent_notification_scope"],
                     ),
                 )
             _run_notification_side_effect(
@@ -2628,16 +2679,12 @@ class STRMScheduler:
             uses_default_notification_scope,
             has_silent_notification_scope,
         )
+        event = STRMScheduler._build_success_event(
+            stats, refresh, elapsed, trigger_type, sources, strm_root,
+        )
         if restricted:
-            partial = bool(
-                int(stats.get("failed", 0) or 0)
-                or int(stats.get("metadata_failed", 0) or 0)
-                or int(stats.get("failure_ledger_failed", 0) or 0)
-                or stats.get("clean_skipped")
-                or any(value in {False, "failed", "pending"} for value in refresh.values())
-            )
             event = NotificationEvent(
-                "⚠️ STRM 同步部分完成" if partial else "✅ STRM 同步完成",
+                event.title,
                 fields=((
                     "说明",
                     "本轮合并了多个整理请求；为避免跨来源暴露目录或文件信息，"
@@ -2649,11 +2696,7 @@ class STRMScheduler:
                 "STRM 合并任务包含多个通知范围，已隐藏跨来源汇总详情 chats=%s default=%s silent=%s",
                 len(recipients), send_default, has_silent_notification_scope,
             )
-        else:
-            event = STRMScheduler._build_success_event(
-                stats, refresh, elapsed, trigger_type, sources, strm_root
-            )
-        from app.modules.telegram_notification_center import publish_notification_event
+        from app.modules.telegram_notification_center import publish_notification_thread
         from app.modules.telegram_notification_policy import (
             NotificationImportance,
             NotificationTopic,
@@ -2665,14 +2708,14 @@ class STRMScheduler:
         )
         if recipients:
             for recipient in recipients:
-                publish_notification_event(
+                publish_notification_thread(
                     logical_key, event, topic=NotificationTopic.STRM,
-                    importance=importance, chat_id=recipient, topic_enabled=enabled,
+                    importance=importance, chat_id=recipient, topic_enabled=enabled, expected_revision=0,
                 )
         if send_default:
-            publish_notification_event(
+            publish_notification_thread(
                 logical_key, event, topic=NotificationTopic.STRM,
-                importance=importance, topic_enabled=enabled,
+                importance=importance, topic_enabled=enabled, expected_revision=0,
             )
 
     @staticmethod

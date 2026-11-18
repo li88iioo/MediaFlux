@@ -125,7 +125,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
             scheduler._run_lock.release()
             captured.append(options)
             _publish_linked_notification_threads(options, strm_status="完成", media_refresh="完成")
-            scheduler._notify_scoped_results(options, {}, {}, 0.0, trigger, [], "/fake-strm")
+            scheduler._notify_scoped_results(scheduler._foreground_notification_scopes(options), {}, {}, 0.0, trigger, [], "/fake-strm")
             return {"ok": True, "queued": True}
 
         for index in range(250):
@@ -262,7 +262,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(options["notification_scopes"]), 3)
         _publish_linked_notification_threads(options, strm_status="完成", media_refresh="完成")
         with patch.object(scheduler, "_notify_success") as summary, patch.object(scheduler, "_notify_details"), patch.object(scheduler, "_notify_failure") as failure:
-            scheduler._notify_scoped_results(options, {}, {}, 0.0, "organize", [], "/fake-strm")
+            scheduler._notify_scoped_results(scheduler._foreground_notification_scopes(options), {}, {}, 0.0, "organize", [], "/fake-strm")
             scheduler._notify_scoped_failure(options, "private-file", "organize")
         summary.assert_called_once()
         failure.assert_called_once()
@@ -361,7 +361,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.enterContext(patch.object(restarted, "_video_exts", return_value={"mkv"}))
         self.enterContext(patch.object(restarted, "_metadata_exts", return_value=set()))
         self.enterContext(patch.object(restarted, "_refresh_media_servers", return_value={}))
-        self.enterContext(patch("app.modules.scheduler.get", side_effect=lambda key, default="": {"GY_STRM_BASE_URL": "http://example.invalid", "STRM_ROOT": "/fake-strm"}.get(key, default)))
+        self.enterContext(patch("app.modules.scheduler.get", side_effect=lambda key, default="": {"GY_STRM_BASE_URL": "http://example.invalid", "STRM_ROOT": "/fake-strm", "TG_CHAT_ID": "admin"}.get(key, default)))
         self.enterContext(patch("app.modules.scheduler.get_int", return_value=0))
         with patch.object(restarted, "_run_incremental_sources", return_value=(stats, [{"id": "s", "name": "source", "stats": stats}], False, "")) as incremental, patch.object(restarted, "_run_full_sources", side_effect=AssertionError("禁止全量或远端访问")), patch.object(restarted, "_notify_details"), patch.object(restarted, "_notify_success") as summary:
             result = restarted.run_blocking("organize", sync_mode="fast")
@@ -390,7 +390,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         options = {"chat_ids": ["chat-a", "chat-b"], "uses_default_notification_scope": False,
                    "notify_override": True, "notification_threads": self.context()["notification_threads"]}
         with patch.object(scheduler, "_notify_success") as summary, patch.object(scheduler, "_notify_failure") as failure, patch.object(scheduler, "_notify_details"):
-            scheduler._notify_scoped_results(options, {}, {}, 0, "organize", [], "/fake-strm")
+            scheduler._notify_scoped_results(scheduler._foreground_notification_scopes(options), {}, {}, 0, "organize", [], "/fake-strm")
             scheduler._notify_scoped_failure(options, "private-path", "organize")
         summary.assert_called_once()
         failure.assert_called_once()

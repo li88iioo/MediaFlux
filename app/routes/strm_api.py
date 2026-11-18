@@ -266,6 +266,8 @@ def runs(request: Request):
         if row["result"]:
             try:
                 payload = json.loads(row["result"])
+                if isinstance(payload, dict):
+                    payload.pop("strm_summary_chats", None)
             except (ValueError, TypeError):
                 payload = {"raw": row["result"]}
         result.append({

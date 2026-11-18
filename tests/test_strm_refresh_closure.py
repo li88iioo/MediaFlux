@@ -5,6 +5,7 @@ from typing import cast
 from app.clients.guangya import GuangYaClient
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -21,10 +22,11 @@ from app import database as db
 from app.clients.guangya import GuangYaFile
 from app.modules import media_refresh_coordinator as refresh
 from app.modules import scheduler as scheduler_module
-from app.modules import strm
+from app.modules import strm, telegram_notification_center as notification_center
 from app.modules.media_refresh import plan_refresh_targets
 from app.modules.scheduler import STRMScheduler
 from app.modules.strm_metadata_worker import STRMMetadataWorker
+from app.notifier import TelegramSendResult
 from app.repositories import strm as repository
 from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
@@ -43,7 +45,7 @@ def _tree(*, flat=False, etag="e"):
 
 def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
          flat=False, retire=False, configured_text=None, queue_only=False,
-         trigger_type="manual", metadata_exts=None, run_options=None):
+         trigger_type="manual", metadata_exts=None, run_options=None, send_summary=False):
     """经真实 scheduler 注入策略；不直接为安装器伪造刷新行为。"""
     scheduler = STRMScheduler()
     sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""})
@@ -62,6 +64,8 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
                             ("_video_exts", {"mkv"}), ("_metadata_exts", set(metadata_exts or ()))):
             stack.enter_context(patch.object(scheduler, name, return_value=value))
         for name in ("_notify_success", "_notify_details", "_notify_failure", "_schedule_persisted_change_queue"):
+            if name == "_notify_success" and send_summary:
+                continue
             stack.enter_context(patch.object(scheduler, name))
         stack.enter_context(patch.object(scheduler_module, "sync_strm", side_effect=lambda **kw: strm.sync_strm(client=cast(GuangYaClient, client), **kw)))
         stack.enter_context(patch.object(scheduler_module, "sync_strm_incremental", side_effect=lambda **kw: strm.sync_strm_incremental(client=cast(GuangYaClient, client), **kw)))
@@ -106,10 +110,20 @@ def _consume(*, providers, expected_paths):
     assert media_refresh_queue_status()["paths"] == 0
 
 
-def test_refresh_failure_is_persisted_on_original_run_without_reverting_generation(tmp_path):
-    with isolated_test_database(), _providers("jellyfin"):
-        result = _run(tmp_path)
+@pytest.mark.parametrize("level", ["essential", "standard"])
+def test_refresh_failure_updates_original_run_and_notifies_original_chat(tmp_path, level):
+    saved_chat = "123"
+    with (
+        isolated_test_database(), _providers("jellyfin"),
+        patch.dict(os.environ, {
+            "STRM_NOTIFY_ENABLED": "1", "TG_NOTIFICATION_ENABLED": "1", "TG_NOTIFICATION_LEVEL": level,
+        }),
+        patch.object(notification_center, "send_event_result", return_value=TelegramSendResult(True, message_id=73)) as send,
+        patch.object(notification_center, "edit_event_result", return_value=TelegramSendResult(True, message_id=73)) as edit,
+    ):
+        result = _run(tmp_path, run_options={"notification_scopes": [{"chat_ids": [saved_chat]}]}, send_summary=True)
         assert result["stats"]["generated"] == 1
+        assert send.call_count == int(level == "standard")
         original = db.get_last_task_run("strm_sync")
         assert original is not None
         coordinator = refresh.MediaRefreshCoordinator()
@@ -132,6 +146,22 @@ def test_refresh_failure_is_persisted_on_original_run_without_reverting_generati
         assert "HTTP 503" not in str(public)
         assert list(tmp_path.rglob("*.strm"))
         assert claim_due_media_refreshes(owner="restart", force=True) == []
+
+        scheduler_module.reconcile_strm_media_refresh_results()
+        notification_center.drain_telegram_notifications()
+        STRMScheduler._notify_success(
+            result["stats"], {"Jellyfin": "queued"}, 1.0, "manual", [], str(tmp_path),
+            run_id=original["id"], chat_ids=[saved_chat],
+        )
+        assert send.call_count == 1
+        assert edit.call_count == int(level == "standard")
+        call = edit.call_args if level == "standard" else send.call_args
+        assert call.kwargs["chat_id"] == saved_chat
+        if level == "standard":
+            assert call.kwargs["message_id"] == 73
+            assert dict(call.args[0].fields)["STRM 变化"] == dict(send.call_args.args[0].fields)["STRM 变化"]
+        assert dict(call.args[0].fields)["媒体库刷新"] == "Jellyfin 失败"
+        assert "手动刷新" in call.args[0].footer
 
 
 @pytest.mark.parametrize("probe", [False, True])
@@ -773,7 +803,7 @@ def test_notification_pending_standalone_publish_cannot_claim_completion(tmp_pat
         assert result["partial"] and not result["strm_partial"]
         assert result["media_refresh"] == {"媒体库": "pending"}
         recipients = ["100", "200"] if restricted else ["100"]
-        with patch("app.modules.telegram_notification_center.publish_notification_event") as publish:
+        with patch("app.modules.telegram_notification_center.publish_notification_thread") as publish:
             STRMScheduler._notify_success(
                 result["stats"], result["media_refresh"], 1.0, "manual",
                 [{"id": "s", "name": "S"}], "/synthetic/private-root",

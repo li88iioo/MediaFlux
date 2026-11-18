@@ -25,7 +25,7 @@ def test_strm_switch_also_controls_organize_notifications(kind, enabled, overrid
               'TG_NOTIFICATION_LEVEL': 'detailed'}
     options = {'chat_ids': ['fixture-chat'], 'uses_default_notification_scope': False}
     with patch.object(config, 'get', side_effect=lambda key, default='': values.get(key, default)), patch(
-        'app.modules.telegram_notification_center.publish_notification_event',
+        'app.modules.telegram_notification_center.' + ('publish_notification_thread' if kind == 'summary' else 'publish_notification_event'),
     ) as publish:
         if kind == 'summary':
             STRMScheduler._notify_success({}, {}, 1, 'organize', [], '/fixture',
