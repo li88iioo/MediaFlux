@@ -858,12 +858,15 @@ class StrmRetiredPathRecoveryTests(unittest.TestCase):
 
     def test_retirement_recovers_v1_snapshot_root_and_current_root_with_fingerprinted_receipt(self):
         former, current = self.root / "Former", self.root / "Current"
+        alias = self.root / "PreviousMount"
+        former.mkdir()
+        alias.symlink_to(former, target_is_directory=True)
         sources = [{"id": "source", "name": "S"}]
-        # 老版仅保存最后一次来源发布的配置根，根目录单独保存后可与它失配。
+        # v1 保存的是 configured alias，生成器返回真实绝对路径。旧副本的清理凭据只能证明后者。
         db.kv_set(db._STRM_SOURCE_SNAPSHOT_KEY, json.dumps({
-            "version": 1, "strm_root": str(former), "sources": sources,
+            "version": 1, "strm_root": str(alias), "sources": sources,
         }))
-        sync(former, clean_invalid=False)
+        sync(alias, clean_invalid=False)
         previous = next(former.rglob("*.strm"))
         self.assertEqual(db.reconcile_configured_strm_sources(sources, str(current)), [])
         sync(current, clean_invalid=False)
@@ -882,6 +885,60 @@ class StrmRetiredPathRecoveryTests(unittest.TestCase):
             {(row["path"], row["allow_emby"]) for row in strm_repo.list_strm_refresh_entries()},
             {(str(previous), False), (str(latest), False)},
         )
+
+    def test_retired_legacy_alias_needs_the_original_absolute_path_and_fingerprint(self):
+        original, other, alias = (self.root / name for name in ("Original", "Other", "Alias"))
+        original.mkdir()
+        alias.symlink_to(original, target_is_directory=True)
+        sync(alias)
+        indexed = next(original.rglob("*.strm"))
+        payload = indexed.read_bytes()
+        copy = other / indexed.relative_to(original)
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(payload)
+        db.enqueue_strm_retired_source("source", "S", str(alias))
+        db.init_db()
+
+        alias.unlink()
+        alias.symlink_to(other, target_is_directory=True)
+        self.assertEqual(self._retire()["blocked"], 1)
+        self.assertEqual(indexed.read_bytes(), payload)
+        self.assertEqual(copy.read_bytes(), payload)
+        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+
+        alias.unlink()
+        alias.symlink_to(original, target_is_directory=True)
+        indexed.write_bytes(b"user changed the file")
+        self.assertEqual(self._retire()["blocked"], 1)
+        self.assertEqual(indexed.read_bytes(), b"user changed the file")
+        self.assertEqual(len(strm_repo.list_strm_index("guangya:source")), 1)
+
+        indexed.write_bytes(payload)
+        result = self._retire()
+        self.assertEqual((result["cleaned"], result["blocked"]), (1, 0), result)
+        self.assertFalse(indexed.exists())
+        self.assertEqual(copy.read_bytes(), payload)
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertEqual(strm_repo.list_strm_index("guangya:source"), [])
+        self.assertEqual([row["path"] for row in strm_repo.list_strm_refresh_entries()], [str(indexed)])
+
+    def test_retirement_does_not_infer_relative_index_root_through_legacy_alias(self):
+        original, alias = self.root / "Original", self.root / "Alias"
+        original.mkdir()
+        alias.symlink_to(original, target_is_directory=True)
+        sync(alias)
+        indexed = next(original.rglob("*.strm"))
+        with db.get_conn() as conn:
+            conn.execute("UPDATE strm_index SET strm_path=?", (str(indexed.relative_to(original)),))
+        db.enqueue_strm_retired_source("source", "S", str(alias))
+        db.init_db()
+
+        result = self._retire()
+        self.assertEqual((result["cleaned"], result["blocked"]), (0, 1), result)
+        self.assertTrue(indexed.is_file())
+        self.assertEqual(len(strm_repo.list_strm_index("guangya:source")), 1)
+        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
 
     def test_reactivated_source_keeps_its_legacy_retirement_root(self):
         former, current = self.root / "Former", self.root / "Current"

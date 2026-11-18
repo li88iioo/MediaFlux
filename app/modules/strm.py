@@ -1422,7 +1422,9 @@ def _remove_indexed_rows(
     }
     if not rows:
         return result
-    roots = _cleanup_roots(source_key, strm_root)
+    root_locations = _cleanup_roots(source_key, strm_root)
+    roots = tuple(dict.fromkeys(root_locations.values()))
+    primary = roots[0] if roots else None
     available = set()
     for root in roots:
         try:
@@ -1433,7 +1435,7 @@ def _remove_indexed_rows(
     by_root: dict[Path, list[tuple[Path | None, Any]]] = {}
     for row in rows:
         text = str(row["strm_path"] or "")
-        location = _cleanup_location(text, roots) if text else ((roots[0], None) if roots else None)
+        location = _cleanup_location(text, root_locations) if text else ((primary, None) if primary else None)
         if location is None or location[0] not in available:
             result["unsafe_paths_count"] += 1
             result["errors"].append((text, ValueError("STRM 输出根无法核实或访问，或路径经过链接，已保留索引")))
@@ -1445,7 +1447,7 @@ def _remove_indexed_rows(
         if not scoped:
             continue
         policy = refresh_policy
-        if policy is not None and (not strm_root or root != roots[0]):
+        if policy is not None and (not strm_root or root != primary):
             policy = replace(policy, media_root=str(root / STRM_SUBDIR))
         _remove_indexed_rows_at_root(source_key, scoped, str(root), should_stop, policy, result)
         if result["stopped"]:

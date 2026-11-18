@@ -55,26 +55,28 @@ def _managed_path(value: object, strm_root: str) -> Path | None:
         return None
 
 
-def _cleanup_roots(source_key: str, strm_root: str) -> tuple[Path, ...]:
+def _cleanup_roots(source_key: str, strm_root: str) -> dict[Path, Path]:
+    """按顺序保留登记根与物理路径，供绝对凭据核验。"""
     provider, _, source_id = source_key.partition(":")
     recorded = (
         db.get_strm_source_output_roots(source_id)
         if provider in {"guangya", "guangya-meta"} and source_id else []
     )
-    roots = [Path(root) for root in recorded]
-    if strm_root:
-        configured = Path(os.path.abspath(os.path.expanduser(strm_root)))
-        # 当前配置可以显式使用挂载别名。旧凭据只使用当时冻结的绝对路径。
+    configured = Path(os.path.abspath(os.path.expanduser(strm_root))) if strm_root else None
+    declared = ([configured] if configured is not None else []) + [Path(root) for root in recorded]
+    roots: dict[Path, Path] = {}
+    for root in dict.fromkeys(declared):
         try:
-            primary = configured.resolve()
+            physical = root.resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
-            primary = configured
-        roots = [primary, *(root for root in roots if root != configured)]
-    return tuple(dict.fromkeys(roots))
+            physical = root
+        # 当前配置显式授权物理根；历史别名只与原绝对凭据交叉核验。
+        roots[physical if root == configured else root] = physical
+    return roots
 
 
-def _cleanup_location(value: object, roots: tuple[Path, ...]) -> tuple[Path, Path] | None:
-    """从已登记的根定位记录；多个根下的旧版相对路径无从确认归属。"""
+def _cleanup_location(value: object, roots: dict[Path, Path]) -> tuple[Path, Path] | None:
+    """绝对凭据必须指向登记根的真实子树；相对凭据仅适用唯一且明确的根。"""
     from app.modules.strm import STRM_SUBDIR
 
     if not value:
@@ -84,12 +86,17 @@ def _cleanup_location(value: object, roots: tuple[Path, ...]) -> tuple[Path, Pat
     except RuntimeError:
         return None
     if raw.is_absolute():
+        # 历史根改指时，索引中原来的物理路径不会落入新目标。删除仍复核文件指纹。
         root = max(
-            (root for root in roots if raw.is_relative_to(root / STRM_SUBDIR)),
+            (physical for physical in roots.values() if raw.is_relative_to(physical / STRM_SUBDIR)),
             key=lambda root: len(root.parts), default=None,
         )
+    elif len(roots) == 1:
+        registered, root = next(iter(roots.items()))
+        if registered != root:
+            return None
     else:
-        root = roots[0] if len(roots) == 1 else None
+        return None
     if root is not None:
         subtree = root / STRM_SUBDIR
         path = _managed_path(value, str(root))
@@ -116,7 +123,7 @@ def recover_pending_paths(
     """
     from app.modules import strm
 
-    roots: tuple[Path, ...] | None = None
+    roots: dict[Path, Path] | None = None
     current = None
     reported_paths = set(stats.get("changed_strm_paths") or [])
     after_id = 0
@@ -139,7 +146,7 @@ def recover_pending_paths(
                 continue
             root, path = location
             by_root.setdefault(root, []).append((path, row))
-        for root in roots:
+        for root in dict.fromkeys(roots.values()):
             items = by_root.get(root)
             if not items:
                 continue
