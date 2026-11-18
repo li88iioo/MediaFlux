@@ -1730,14 +1730,13 @@ body.agent-page-body::after { display: none; }
 }
 @media (max-width: 900px) {
     .agent-page-body .workspace > .content { padding-top: 0; }
-    .agent-mobile-bar { min-height: 58px; display: grid; grid-template-columns: 44px 1fr 44px 44px; align-items: center; gap: 8px; padding: 7px 14px; background: var(--bg-card); border-bottom: 1px solid var(--border); }
+    .agent-mobile-bar { min-height: 58px; display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 8px; padding: 7px 14px; background: var(--bg-card); border-bottom: 1px solid var(--border); }
     .agent-mobile-bar > span { display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; font-weight: 700; }
     .agent-mobile-bar > span svg { width: 16px; height: 16px; color: var(--accent); }
     .agent-command-bar { padding-inline: 14px; }
 }
 @media (max-width: 680px) {
     .agent-command-state small { display: none; }
-    .agent-command-actions .theme-toggle { display: none; }
     .agent-new-session { width: 44px; min-width: 44px; height: 44px; padding: 0; }
     .agent-new-session span { display: none; }
     .agent-workbench { min-height: 0; }
