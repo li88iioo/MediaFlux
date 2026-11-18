@@ -50,6 +50,7 @@ def _execution_view(result: dict) -> dict | None:
         "failed", "need_confirm", "conflict", "stopped", "scan_complete",
         "audit_failures", "resolution",
         "duplicate_recycled", "duplicate_cleanup_failed",
+        "source_dir_cleanup_failed", "empty_dir_cleanup_failed",
     ) if key in result}
     if "media_items" in result:
         execution["media_items"] = [{key: item[key] for key in (

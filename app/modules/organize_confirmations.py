@@ -43,6 +43,7 @@ from app.modules.organize import (
     organize_rules_snapshot_changes,
     restore_organize_rules_snapshot,
 )
+from app.modules.organize_results import organize_strm_error
 from app.modules.scraper import MatchResult, TMDBScraper
 from app.modules.telegram_notification_center import (
     deserialize_notification_event,
@@ -597,6 +598,15 @@ def update_confirmation_lifecycle_downstream(
     strm_run_id: int | None = None,
 ) -> bool:
     """先保存 STRM/媒体库业务终态，再按通知偏好更新人工确认消息。"""
+    downstream = {"strm": strm_status, "media_refresh": media_refresh,
+                  "partial": partial, "error": redact_sensitive_text(error)}
+    if not organize_confirmations_repo.set_confirmation_downstream(token, downstream, strm_run_id=strm_run_id):
+        return False
+    return notify_enabled and _publish_confirmation_downstream(token, chat_id=chat_id, strm_run_id=strm_run_id)
+
+
+def _publish_confirmation_downstream(token: str, *, chat_id: str, strm_run_id: int | None = None) -> bool:
+    """投影已落盘的回执，在当前消息修订下发布。"""
     from app.modules.telegram_notification_center import get_notification_thread_snapshot
     from app.modules.telegram_notification_policy import NotificationTopic
 
@@ -604,11 +614,7 @@ def update_confirmation_lifecycle_downstream(
     if row is None:
         return False
     payload = decode_json_object(row["payload_json"])
-    downstream = {"strm": strm_status, "media_refresh": media_refresh,
-                  "partial": partial, "error": redact_sensitive_text(error)}
-    if not organize_confirmations_repo.set_confirmation_downstream(token, downstream, strm_run_id=strm_run_id):
-        return False
-    if not notify_enabled or not _confirmation_delivery_enabled(payload):
+    if not _confirmation_delivery_enabled(payload):
         return False
     batch_id = str(payload.get("_confirmation_batch") or "")
     if batch_id:
@@ -2167,6 +2173,19 @@ def _confirmation_source_display(payload: dict) -> str:
     return source or ("/" if directory == "/" else "路径未记录")
 
 
+def _confirmation_handoff_downstream(stats: dict) -> dict:
+    handoff = stats.get("strm")
+    if not isinstance(handoff, dict) or not handoff:
+        return {"strm": "回执缺失", "media_refresh": "状态未知", "partial": True, "error": ""}
+    error = redact_sensitive_text(handoff.get("error") or organize_strm_error(stats))
+    if error or handoff.get("skipped"):
+        return {
+            "strm": "启动失败" if error else handoff.get("reason") or "已跳过",
+            "media_refresh": "未触发", "partial": bool(error), "error": error,
+        }
+    return {"strm": "已排队", "media_refresh": "等待 STRM 完成", "partial": False, "error": ""}
+
+
 def _confirmation_result_event(
     payload: dict, candidate: dict, stats: dict, *, actor: str = "human"
 ) -> NotificationEvent:
@@ -2177,15 +2196,7 @@ def _confirmation_result_event(
     failed = safe_int(stats.get("failed"), 0, minimum=0)
     unresolved = safe_int(stats.get("need_confirm"), 0, minimum=0)
     warnings = len(list(stats.get("warnings") or []))
-    strm = stats.get("strm") if isinstance(stats.get("strm"), dict) else {}
-    if strm.get("ok"):
-        strm_label, refresh_label = "已排队", "等待 STRM 完成"
-    elif strm.get("skipped"):
-        strm_label, refresh_label = "已跳过", "未触发"
-    elif strm:
-        strm_label, refresh_label = "启动失败", "未触发"
-    else:
-        strm_label, refresh_label = "未启用或无变更", "未触发"
+    downstream = _confirmation_handoff_downstream(stats) if stats.get("strm") else {}
     partial = bool(
         failed
         or unresolved
@@ -2193,7 +2204,7 @@ def _confirmation_result_event(
         or stats.get("empty_dir_cleanup_failed")
         or stats.get("source_dir_cleanup_failed")
         or stats.get("duplicate_cleanup_failed")
-        or (strm and not strm.get("ok") and not strm.get("skipped"))
+        or downstream.get("partial")
     )
     result_label = (
         f"已移动 {moved} · 元数据 {metadata} · 跳过 {max(0, skipped - duplicate_recycled)} · 失败 {failed}"
@@ -2219,9 +2230,9 @@ def _confirmation_result_event(
               if "empty_dirs_cleaned" in stats and not download_cleanup else ()),
             *(( ("目录保留说明", "；".join(stats["empty_dir_cleanup_reasons"])), )
               if stats.get("empty_dir_cleanup_reasons") and not download_cleanup else ()),
-            ("STRM 状态", _terminal_status_label(strm_label)),
+            ("STRM 状态", _terminal_status_label(downstream.get("strm", "等待回执"))),
             ("媒体库刷新", _terminal_status_label(
-                refresh_label, media_library=True,
+                downstream.get("media_refresh"), media_library=True,
             )),
         ),
         layout="relaxed",
@@ -2947,8 +2958,8 @@ def _execute_guangya_confirmation(
             organize_confirmations_repo.update_organize_confirmation(token, result_json=json.dumps(stats, ensure_ascii=False, default=str))
         # 先把候选卡收敛为整理终态，再排队 STRM；即使 debounce=0，
         # 后续刷新也只会在同一条终态消息上补字段，不会被较旧内容覆盖。
-        if delivery_enabled:
-            _dispatch_due_confirmation_delivery(token)
+        terminal_published = delivery_enabled and _dispatch_due_confirmation_delivery(token)
+        warning = ""
         try:
             Organizer.trigger_post_actions(
                 stats,
@@ -2970,47 +2981,27 @@ def _execute_guangya_confirmation(
             warning = f"STRM 后处理启动失败：{redact_sensitive_text(post_exc)}"
             stats.setdefault("warnings", []).append(warning)
             stats["strm"] = {"ok": False, "error": warning}
-            update_confirmation_lifecycle_downstream(
-                token,
-                chat_id=chat_id,
-                strm_status="启动失败",
-                media_refresh="未触发",
-                partial=True,
-                error=warning,
-            )
-            organize_task_id = str(
-                payload.get("organize_task_id") or ""
-            ).strip()
-            if organize_task_id:
-                from app.modules.telegram_organize_lifecycle import (
-                    update_organize_lifecycle_downstream,
-                )
-
-                update_organize_lifecycle_downstream(
-                    organize_task_id,
-                    chat_id=chat_id,
-                    strm_status="启动失败",
-                    media_refresh="未触发",
-                    partial=True,
-                    error=warning,
-                )
             logger.warning(
                 "人工确认整理已完成但后处理启动失败 token=%s type=%s",
                 token[:6],
                 type(post_exc).__name__,
             )
         handoff = stats.get("strm")
-        if isinstance(handoff, dict) and handoff:
-            error = redact_sensitive_text(handoff.get("error") or "")
-            failed = handoff.get("ok") is False and not handoff.get("skipped")
-            skipped = bool(handoff.get("skipped"))
-            downstream = {
-                "strm": "启动失败" if failed or error else "已跳过" if skipped else "已排队",
-                "media_refresh": "未触发" if failed or skipped or error else "等待 STRM 完成",
-                "partial": bool(failed or error), "error": error,
-            }
-            organize_confirmations_repo.set_confirmation_strm_handoff(
-                token, handoff, downstream, warnings=stats.get("warnings"),
+        organize_confirmations_repo.set_confirmation_strm_handoff(
+            token, handoff if isinstance(handoff, dict) else {},
+            _confirmation_handoff_downstream(stats), warnings=stats.get("warnings"),
+        )
+        if terminal_published and current_rules.notify_enabled:
+            try:
+                _publish_confirmation_downstream(token, chat_id=chat_id)
+            except Exception as exc:  # 后处理回执投递故障不改变已完成的整理。
+                logger.warning("人工确认联动回执发布失败 token=%s type=%s", token[:6], type(exc).__name__)
+        if warning and (organize_task_id := str(payload.get("organize_task_id") or "").strip()):
+            from app.modules.telegram_organize_lifecycle import update_organize_lifecycle_downstream
+
+            update_organize_lifecycle_downstream(
+                organize_task_id, chat_id=chat_id, strm_status="启动失败",
+                media_refresh="未触发", partial=True, error=warning,
             )
         if download_request_ids:
             try:

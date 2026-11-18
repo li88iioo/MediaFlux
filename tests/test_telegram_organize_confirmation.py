@@ -1848,10 +1848,36 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 self.assertEqual(row["status"], "failed")
                 self.assertIn(reason, row["error"])
 
-    def test_worker_accepts_threshold_change_and_runs_preview_execute_and_post_actions(self):
-        rules = OrganizeRules()
+    def test_worker_preserves_preview_checks_and_settles_post_action_receipts(self):
+        self.enterContext(patch.object(notification_center, "allows_notification", return_value=True))
+        self.enterContext(patch.object(notification_center, "wake_telegram_notification_dispatcher"))
+        self.enterContext(patch.object(
+            notification_center, "edit_event_result", return_value=TelegramSendResult(ok=True, message_id=77),
+        ))
+        send = self.enterContext(patch.object(notification_center, "send_event_result"))
+        for outcome, strm_status, media_refresh, partial in (
+            ("queued", "已排队", "等待 STRM 完成", False),
+            ("fast", "完成", "Jellyfin 请求已受理", False),
+            ("disabled", "未启用", "未触发", False),
+            ("no_changes", "无变更", "未触发", False),
+            ("rejected", "启动失败", "未触发", True),
+            ("skipped_return", "已跳过", "未触发", False),
+            ("rejected_return", "启动失败", "未触发", True),
+            ("missing", "回执缺失", "状态未知", True),
+            ("missing_scheduler", "回执缺失", "状态未知", True),
+            ("raised", "启动失败", "未触发", True),
+        ):
+            with self.subTest(outcome=outcome):
+                self._assert_worker_post_actions(outcome, strm_status, media_refresh, partial)
+        send.assert_not_called()
+
+    def _assert_worker_post_actions(self, outcome, strm_status, media_refresh, partial):
+        rules = OrganizeRules(link_strm=outcome != "disabled", notify_enabled=True, library_notify=True)
         current_rules = replace(rules, small_file_mb=100)
         group = self._group()
+        file_id = f"file-{outcome}"
+        moved = int(outcome != "no_changes")
+        group["files"][0]["file_id"] = file_id
         group["files"][0]["size"] = 128 * 1024**2
         group["candidates"].append({
             "tmdb_id": "999999", "media_type": "tv",
@@ -1871,8 +1897,51 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
         calls: list[object] = []
         post_action_kwargs = []
+        initial_cards = []
+        settled_snapshot = None
+
+        def current_card():
+            snapshot = notification_center.get_notification_thread_snapshot(
+                f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+            )
+            assert snapshot is not None
+            return snapshot
+
+        def trigger(_source, **_options):
+            nonlocal settled_snapshot
+            if outcome == "fast":
+                self.assertTrue(confirmation_module.update_confirmation_lifecycle_downstream(
+                    token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 请求已受理", strm_run_id=2,
+                ))
+                settled_snapshot = current_card()
+            if outcome == "rejected":
+                return {"ok": False, "error": "STRM 调度器正在停止"}
+            if outcome == "missing_scheduler":
+                return None
+            return {"ok": True, "queued": True}
+
+        def post_actions(stats, rules, **kwargs):
+            nonlocal settled_snapshot
+            calls.append("post_actions")
+            post_action_kwargs.append(kwargs)
+            initial_cards.append(current_card())
+            if outcome == "skipped_return":
+                stats["strm"] = {"ok": True, "skipped": True}
+            elif outcome == "rejected_return":
+                stats["strm"] = {"ok": False}
+            elif outcome == "raised":
+                raise RuntimeError("启动失败测试")
+            elif outcome != "missing":
+                settings = {"GY_STRM_BASE_URL": "http://media.invalid", "STRM_ROOT": "/tmp/strm"}
+                with patch("app.modules.organize.get", side_effect=lambda key, default="": settings.get(key, default)), \
+                        patch("app.modules.scheduler.get_scheduler", return_value=SimpleNamespace(trigger=trigger)):
+                    Organizer.trigger_post_actions(stats, rules, **kwargs)
+                if outcome in {"disabled", "no_changes", "rejected"}:
+                    settled_snapshot = current_card()
 
         class FakeOrganizer:
+            trigger_post_actions = staticmethod(post_actions)
+
             def __init__(self, **_kwargs):
                 pass
 
@@ -1881,18 +1950,13 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
 
             def organize(self, *_args, **kwargs):
                 calls.append(("organize", kwargs["dry_run"]))
-                assert kwargs["source_member_ids"] == frozenset({"file-4"})
+                assert kwargs["source_member_ids"] == frozenset({file_id})
                 assert kwargs["group_pipeline"] is False
-                plans = [SimpleNamespace(file_id="file-4")]
-                return plans, ({"moved": 1} if not kwargs["dry_run"] else {})
-
-            @staticmethod
-            def trigger_post_actions(*_args, **kwargs):
-                calls.append("post_actions")
-                post_action_kwargs.append(dict(kwargs))
+                plans = [SimpleNamespace(file_id=file_id)]
+                return plans, ({"moved": moved} if not kwargs["dry_run"] else {})
 
         current_file = GuangYaFile(
-            "file-4", "Nagatoro - 04.mp4", False, size=128 * 1024**2,
+            file_id, "Nagatoro - 04.mp4", False, size=128 * 1024**2,
             etag="etag-4", parent_id="parent",
         )
         fake_client = SimpleNamespace(file_info=lambda _file_id: current_file)
@@ -1910,7 +1974,6 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ):
             start_confirmation(token, 0, chat_id="100")
-        published = []
         with patch(
             "app.modules.organize_confirmations.OrganizeRules.from_config",
             return_value=current_rules,
@@ -1929,18 +1992,16 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "app.modules.organize_confirmations._cleanup_confirmed_source",
         ) as cleanup, patch(
             "app.modules.organize_confirmations.get", return_value="8",
-        ), patch(
-            "app.modules.telegram_notification_center.publish_notification_thread",
-            side_effect=lambda _key, event, **_kwargs: (
-                published.append(event)
-                or NotificationPublishResult(True, delivered=True, status="sent")
-            ),
         ):
             result = callbacks[0]()
         cleanup.assert_called_once()
         self.assertEqual(cleanup.call_args.args[0]["source_parent_id"], "parent")
         self.assertEqual(cleanup.call_args.args[2], current_rules)
-        self.assertEqual(result["stats"], {"moved": 1})
+        self.assertEqual(result["stats"]["moved"], moved)
+        if outcome == "queued":
+            self.assertEqual(result["stats"]["strm"], {"ok": True, "queued": True})
+        if outcome == "missing":
+            self.assertNotIn("strm", result["stats"])
         self.assertEqual(
             [item for item in calls if isinstance(item, tuple)],
             [("organize", True), ("organize", False)],
@@ -1955,13 +2016,32 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertNotIn("rejected_tmdb_ids", kwargs)
         self.assertFalse(post_action_kwargs[0]["notify_result"])
         self.assertEqual(post_action_kwargs[0]["strm_debounce_seconds"], 8)
+        self.assertIn(("STRM 状态", "等待回执 ⏳"), initial_cards[0].event.fields)
+        self.assertNotIn("未触发", notifier.render_event(initial_cards[0].event))
         thread_ref = post_action_kwargs[0]["notification_threads"][0]
         self.assertEqual(thread_ref["topic"], "confirmation")
         self.assertEqual(thread_ref["token"], token)
         get_organize_confirmation_result_17 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_17 is not None
         self.assertEqual(get_organize_confirmation_result_17["status"], "completed")
-        self.assertIn("人工确认整理完成", published[-1].title)
+        card = current_card()
+        self.assertEqual(card.message_id, 77)
+        self.assertGreater(card.revision, initial_cards[0].revision)
+        self.assertIn("部分完成" if partial else "人工确认整理完成", str(card.event.title))
+        rendered = notifier.render_event(card.event)
+        self.assertNotIn("等待回执", rendered)
+        self.assertIn(strm_status, rendered)
+        self.assertIn(media_refresh, rendered)
+        if outcome == "rejected":
+            self.assertIn("STRM 调度器正在停止", rendered)
+        if outcome == "rejected_return":
+            self.assertIn("STRM 联动未受理", rendered)
+        receipt = json.loads(get_organize_confirmation_result_17["result_json"])["_downstream"]
+        self.assertEqual((receipt["strm"], receipt["media_refresh"], receipt["partial"]), (
+            strm_status, media_refresh, partial,
+        ))
+        if settled_snapshot is not None:
+            self.assertEqual(card, settled_snapshot)
 
     def test_worker_rejects_fixed_candidate_that_still_needs_confirmation(self):
         rules = OrganizeRules()

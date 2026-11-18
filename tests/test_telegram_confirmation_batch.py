@@ -559,6 +559,31 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.edited.call_args.kwargs["message_id"], 77)
         self.assertEqual(self.edited.call_args.args[0], finished)
 
+    def test_batch_shows_cleanup_failures_and_keeps_normal_retention_quiet(self):
+        tokens = self._create(4)
+        outcomes = (
+            {"source_dir_cleanup_failed": 1, "empty_dir_cleanup_reasons": ["非空目录已保留", "源目录收尾失败：来源父链无法确认"]},
+            {"empty_dir_cleanup_failed": 2, "empty_dir_cleanup_reasons": ["空目录读取失败"]},
+            {"empty_dir_cleanup_reasons": ["非空目录已保留"]},
+            {"empty_dirs_cleaned": 1},
+        )
+        for token, result in zip(tokens, outcomes):
+            organize_confirmations_repo.update_organize_confirmation(
+                token, status="completed", result_json=json.dumps({
+                    **result, "moved": 1, "_downstream": {"strm": "未启用", "media_refresh": "未触发"},
+                }, ensure_ascii=False),
+            )
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True))
+        event = self._snapshot().event
+        text = render_event(event)
+        self.assertEqual(event.title, "⚠️ 整理批次部分完成")
+        self.assertIn("媒体 0 · 整理部分完成\n整理：源目录清理失败 1", text)
+        self.assertIn("来源父链无法确认", text)
+        self.assertIn("媒体 1 · 整理部分完成\n整理：空目录清理失败 2", text)
+        self.assertNotIn("非空目录已保留", text)
+        self.assertNotIn("媒体 2 ·", text)
+        self.assertNotIn("媒体 3 ·", text)
+
     def test_new_run_with_same_summary_rejects_inflight_old_receipt(self):
         tokens = self._create(2)
         for token, run_id in zip(tokens, (1, 999)):

@@ -89,11 +89,18 @@ def _organize_issue(item: dict) -> str:
         return str(item["error"])
     execution = item.get("execution") or {}
     issues = []
+    cleanup_failed = False
     for key, label in (("failed", "失败"), ("rename_failed", "改名失败"),
-                       ("need_confirm", "文件待确认"), ("duplicate_cleanup_failed", "同版本回收失败")):
+                       ("need_confirm", "文件待确认"), ("duplicate_cleanup_failed", "同版本回收失败"),
+                       ("source_dir_cleanup_failed", "源目录清理失败"), ("empty_dir_cleanup_failed", "空目录清理失败")):
         count = safe_int(execution.get(key), minimum=0)
         if count:
             issues.append(f"{label} {count}")
+            cleanup_failed |= key in {"source_dir_cleanup_failed", "empty_dir_cleanup_failed"}
+    if cleanup_failed:
+        reason = next((text for text in execution.get("empty_dir_cleanup_reasons", []) if "失败" in text), "")
+        if reason:
+            issues.append(reason)
     warnings = execution.get("warnings") or execution.get("scan_errors") or []
     return " · ".join([*issues, *warnings[:1]])
 
