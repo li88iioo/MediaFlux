@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-## [0.1.17] - 2026-11-18
+## [0.1.17] - 2026-11-19
 
 ### Added
 - 光鸭整理新增跨页批量候选复核、人工选择与冻结预览，Web、Telegram 和 Agent 共用原确认队列；Telegram 可一键确认批次内全部已通过校验的建议，无建议项仍留待人工处理（[`80639db2`](https://github.com/li88iioo/MediaFlux/commit/80639db2)、[`4ee6f020`](https://github.com/li88iioo/MediaFlux/commit/4ee6f020)）。
@@ -27,6 +27,8 @@
 - 更新运行依赖锁与构建基础镜像，优化媒体库概览和统计查询；补充快速开始，更新使用指南、配置截图及业务拓扑（[`61b3f6f7`](https://github.com/li88iioo/MediaFlux/commit/61b3f6f7)、[`35cf4b13`](https://github.com/li88iioo/MediaFlux/commit/35cf4b13)、[`ca24a663`](https://github.com/li88iioo/MediaFlux/commit/ca24a663)、[`31203876`](https://github.com/li88iioo/MediaFlux/commit/31203876)）。
 
 ### Fixed
+- 人工确认入库后，原整理汇总会补入本次确认的集数。Telegram 待确认卡只保留仍可操作的分组，完成后显示 STRM 与媒体库刷新回执；独立 STRM 任务也会将最终刷新结果更新到原消息。[集数汇总](https://github.com/li88iioo/MediaFlux/commit/19672aae) · [确认批次](https://github.com/li88iioo/MediaFlux/commit/bbfea21f) · [操作按钮](https://github.com/li88iioo/MediaFlux/commit/009bb220) · [STRM 回执](https://github.com/li88iioo/MediaFlux/commit/388c1273)
+- 本地整理和下载通知分别显示各阶段结果，整理清理失败也会反映在确认回执中。订阅只统计本次新建的下载请求，Agent 媒体库巡检按当前通知策略投递后续发现。[整理与下载](https://github.com/li88iioo/MediaFlux/commit/9da172f8) · [清理回执](https://github.com/li88iioo/MediaFlux/commit/5cb2b9db) · [订阅计数](https://github.com/li88iioo/MediaFlux/commit/bb410a7f) · [巡检通知](https://github.com/li88iioo/MediaFlux/commit/9a4462d0)
 - 整理确认冻结所选候选及文件快照，人工整理后结清旧确认，跳过、取消及过期只更新对应快照内的日志；STRM 与媒体刷新结果持久回写原运行，不受通知开关影响，迟到回执不覆盖新运行（[`84bbc92a`](https://github.com/li88iioo/MediaFlux/commit/84bbc92a)、[`25f906f8`](https://github.com/li88iioo/MediaFlux/commit/25f906f8)、[`2dd7d9f6`](https://github.com/li88iioo/MediaFlux/commit/2dd7d9f6)、[`7fb0fef1`](https://github.com/li88iioo/MediaFlux/commit/7fb0fef1)）。
 - Agent 历史在会话事务中完整保存，归档后保留引用关系；切换会话、停止和失败恢复绑定原会话，未配置模型时仍可读取已有对话，切换 Telegram Agent 不再中断 Web 查询（[`731fd5a5`](https://github.com/li88iioo/MediaFlux/commit/731fd5a5)、[`59a061f7`](https://github.com/li88iioo/MediaFlux/commit/59a061f7)、[`a4dfd5d3`](https://github.com/li88iioo/MediaFlux/commit/a4dfd5d3)、[`285c1992`](https://github.com/li88iioo/MediaFlux/commit/285c1992)、[`fa8e5a53`](https://github.com/li88iioo/MediaFlux/commit/fa8e5a53)）。
 - Agent 原生 SDK 只读等待可持久恢复，不重放整段脚本或已执行写入；统一读取配额、调用身份和证据归属，保留确认与实际执行回执（[`432e6a13`](https://github.com/li88iioo/MediaFlux/commit/432e6a13)、[`ef4e3a15`](https://github.com/li88iioo/MediaFlux/commit/ef4e3a15)、[`2e8d5d49`](https://github.com/li88iioo/MediaFlux/commit/2e8d5d49)、[`ad5fac41`](https://github.com/li88iioo/MediaFlux/commit/ad5fac41)）。
