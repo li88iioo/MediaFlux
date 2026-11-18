@@ -1725,14 +1725,16 @@ class GuangYaClient:
         callback,
         *,
         deadline: float | None = None,
-        refresh_unauthorized: bool = True,
+        refresh_unauthorized: bool | None = None,
         should_stop: Callable[[], bool] | None = None,
     ):
         """对明确的只读操作执行限频、业务响应校验与有界重试。
 
-        ``deadline`` 仅用于可降级的媒体探测读取。它禁止 401 路径触发无法
-        继承该截止时间的 token 刷新，并把瞬时错误退避限制在剩余预算内。
+        限时探测默认跳过 401 续签。交互播放由外层播放线程池限时，可显式
+        开启续签；重试仍与首次请求共用截止时间。
         """
+        if refresh_unauthorized is None:
+            refresh_unauthorized = deadline is None
         congestion = _read_congestion(operation)
         attempt = 0
         while True:
@@ -1761,8 +1763,8 @@ class GuangYaClient:
                 if attempt >= retry_limit or not self._read_retryable(exc):
                     raise
                 status_code = self._exception_status_code(exc)
-                if status_code == 401 and (deadline is not None or not refresh_unauthorized):
-                    raise  # 有预算的探测与只读凭据校验不得触发无限时刷新。
+                if status_code == 401 and not refresh_unauthorized:
+                    raise
                 if metrics is not None:
                     metrics.record_retry(status_code, rate_limited=rate_limited)
                 provider_code = (
@@ -1779,6 +1781,7 @@ class GuangYaClient:
                     type(exc).__name__,
                 )
                 if status_code == 401:
+                    _wait_read_delay(0, deadline=deadline, should_stop=should_stop)
                     self._refresh_after_unauthorized(observed_access_token)
                 elif not rate_limited:
                     _wait_read_delay(delay, deadline=deadline, should_stop=should_stop)
@@ -3277,20 +3280,17 @@ class GuangYaClient:
 
         def read(endpoint: str, payload: dict, operation: str) -> dict:
             def fetch():
-                if self._invalidate_if_stale():
-                    raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
-                if self._raw is None:
-                    raise RuntimeError("光鸭未登录")
+                raw = self.raw
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise TimeoutError("光鸭画质读取超时")
-                return self._raw.request(
+                return raw.request(
                     f"https://api.guangyapan.com/{endpoint}", method="POST",
                     json=payload, timeout=remaining,
                 ).json()
 
             try:
-                result = self._call_read(operation, fetch, deadline=deadline)
+                result = self._call_read(operation, fetch, deadline=deadline, refresh_unauthorized=True)
             except Exception as exc:
                 if self._is_timeout_error(exc):
                     raise TimeoutError("光鸭画质读取超时") from exc

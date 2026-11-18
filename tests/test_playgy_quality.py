@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 from copy import deepcopy
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from time import time
 from typing import Any, cast
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -595,6 +599,59 @@ class PlayGyQualityTests(unittest.TestCase):
         self.assertEqual(self._calls(), [_DETAIL, _VOD_URL])
         self.assertEqual([call.kwargs.get("deadline") for call in reads.call_args_list], [1002.0, 1002.0])
         self.assertEqual([call["timeout"] for call in self.provider.calls], [2.0, 0.75])
+
+    def test_first_play_renews_credentials_and_resolves_the_same_file(self):
+        rotated = "renewed-quality-fixture"
+        for expires_in, rejected_endpoint in ((-10, None), (3600, _DETAIL), (3600, _VOD_URL)):
+            with self.subTest(expires_in=expires_in, rejected_endpoint=rejected_endpoint), ExitStack() as stack:
+                token_file = Path(stack.enter_context(TemporaryDirectory())) / "token.json"
+                token_file.write_text(json.dumps({
+                    "access_token": _ACCESS_TOKEN, "refresh_token": _REFRESH_TOKEN,
+                    "expires_at": time() + expires_in,
+                }))
+                unauthorized = []
+
+                def upstream(request):
+                    url = str(request.url)
+                    if request.headers["authorization"] != f"Bearer {rotated}":
+                        if rejected_endpoint is None or url == rejected_endpoint:
+                            unauthorized.append(url)
+                            return httpx.Response(401)
+                    return self.provider.request(url, method=request.method, json=json.loads(request.content))
+
+                stack.enter_context(patch("guangyaclient.client.Client", side_effect=lambda **kwargs:
+                    httpx.Client(transport=httpx.MockTransport(upstream), **kwargs)))
+                refresh = stack.enter_context(patch("guangyaclient.client.post", return_value=httpx.Response(
+                    200, json={"access_token": rotated, "expires_in": 3600},
+                )))
+
+                def load():
+                    client = GuangYaClient(token_file)
+                    stack.callback(client.close)
+                    return client
+
+                self.factory.side_effect = load
+                self._variants(self.http.get(self._url(view="variants")))
+                resolved = self._resolved(self.http.get(self._url(view="resolve", quality=_HLS_GCID)))
+                self.assertEqual(resolved["variant"]["id"], _HLS_GCID)
+                self.assertEqual(unauthorized, [rejected_endpoint] if rejected_endpoint else [])
+                refresh.assert_called_once()
+                self.assertEqual(json.loads(token_file.read_text())["access_token"], rotated)
+
+    def test_quality_401_stops_after_one_retry_or_at_deadline(self):
+        for exhausted in (False, True):
+            with self.subTest(exhausted=exhausted), patch.object(self.client, "_refresh_after_unauthorized") as refresh:
+                self.provider.calls.clear()
+
+                def reject(call):
+                    if exhausted:
+                        self._advance(call["timeout"])
+                    httpx.Response(401, request=httpx.Request("POST", call["url"])).raise_for_status()
+
+                self.provider.on_request = reject
+                self._error(self.http.get(self._url(view="variants")), 504 if exhausted else 502)
+                self.assertEqual(self._calls(), [_DETAIL] if exhausted else [_DETAIL, _DETAIL])
+                self.assertEqual(refresh.call_count, 0 if exhausted else 1)
 
     def test_total_budget_exhaustion_and_transport_timeout_return_504_without_secret(self):
         for detail_exhausts_budget in (True, False):
