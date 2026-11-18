@@ -203,20 +203,6 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertFalse(static_gate.get("continue-on-error", False))
         self.assertNotIn("|| true", static_gate["run"])
 
-    def test_regression_browser_cases_are_in_required_browser_job(self) -> None:
-        browser_job = self.text.split("  browser:", 1)[1].split("  smoke:", 1)[0]
-        self.assertIn('python -m pip install "playwright==1.65.2"', browser_job)
-        modules = browser_job.split("modules = (", 1)[1].split(")", 1)[0]
-        for module in (
-            "tests.test_node_fixes_agent_feedback",
-            "tests.test_settings_review_tooltips_browser",
-            "tests.test_metadata_settings_alignment_browser",
-        ):
-            with self.subTest(module=module):
-                self.assertIn(f'"{module}",', modules)
-        self.assertIn("unittest.defaultTestLoader.loadTestsFromNames(modules)", browser_job)
-        self.assertIn("result.wasSuccessful() and not result.skipped", browser_job)
-
     def test_runtime_lock_is_generated_with_production_python(self) -> None:
         header = "\n".join(
             Path("requirements-release-runtime.lock")

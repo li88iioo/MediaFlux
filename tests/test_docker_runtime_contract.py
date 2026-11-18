@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from textwrap import dedent
 from unittest.mock import patch
 
 import yaml
@@ -327,20 +328,11 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("支持定时扫描或下载完成自动触发", readme)
         self.assertNotIn("qB 完成触发与定时扫描独立开关", config_reference)
 
-    def test_browser_gate_covers_every_playwright_module_without_skips(self) -> None:
+    def test_browser_gate_is_required_and_has_pinned_dependencies(self) -> None:
         workflow = yaml.safe_load(self.workflow)
         jobs = workflow["jobs"]
         browser = jobs["browser"]
         browser_runs = "\n".join(str(step.get("run", "")) for step in browser["steps"])
-        playwright_modules = {
-            f"tests.{path.stem}"
-            for path in (self.ROOT / "tests").glob("test_*.py")
-            if re.search(
-                r"(?m)^\s*from playwright\.sync_api import ",
-                path.read_text(encoding="utf-8"),
-            )
-        }
-        self.assertTrue(playwright_modules, "没有发现任何原生 Playwright 测试，不能空跑门禁")
         self.assertNotIn("needs", browser)
         self.assertIn('python -m pip install "pytest==9.2.0"', browser_runs)
         self.assertIn('version("pytest") == "9.2.0"', browser_runs)
@@ -354,19 +346,60 @@ class DockerRuntimeContractTests(unittest.TestCase):
         ):
             with self.subTest(executable=executable):
                 self.assertIn(f"command -v {executable}", browser_runs)
-        for module in playwright_modules:
-            with self.subTest(module=module):
-                self.assertIn(f'"{module}"', browser_runs)
-        self.assertIn("if result.skipped:", browser_runs)
-        self.assertIn(
-            "result.wasSuccessful() and not result.skipped",
-            browser_runs,
-        )
         self.assertEqual(jobs["smoke"]["needs"], ["test", "browser"])
         self.assertEqual(
             jobs["build"]["needs"],
             ["test", "smoke"],
         )
+
+    def test_browser_gate_runs_indirect_fixtures_and_rejects_skips(self) -> None:
+        steps = yaml.safe_load(self.workflow)["jobs"]["browser"]["steps"]
+        step = next(step for step in steps if step.get("name") == "Run real browser regression tests without skips")
+        self.assertFalse(step.get("continue-on-error", False))
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "tests"
+            directory.mkdir()
+            (directory / "__init__.py").touch()
+            (directory / "browser_ci.py").write_bytes((self.ROOT / "tests" / "browser_ci.py").read_bytes())
+            (directory / "fixtures.py").write_text(dedent("""\
+                import unittest
+
+                class PageBrowserCase(unittest.TestCase):
+                    def setUp(self):
+                        self.page_ready = True
+                """), encoding="utf-8")
+            (directory / "test_review_ui.py").write_text(dedent("""\
+                import os
+                from . import fixtures
+
+                class ReviewTests(fixtures.PageBrowserCase):
+                    def test_can_open(self):
+                        if os.environ["BROWSER_CI_SKIP_FIXTURE"] == "1":
+                            self.skipTest("浏览器夹具不可用")
+                        self.assertTrue(self.page_ready)
+                """), encoding="utf-8")
+            (directory / "test_unrelated.py").write_text(
+                'raise AssertionError("浏览器门禁不应导入普通测试")\n', encoding="utf-8"
+            )
+            for skip in (0, 1):
+                with self.subTest(skip=skip):
+                    completed = subprocess.run(
+                        ["bash", "-e", "-c", step["run"]], cwd=temporary, text=True,
+                        capture_output=True, timeout=10, env={
+                            **os.environ,
+                            "PATH": os.pathsep.join((str(Path(sys.executable).parent), os.environ["PATH"])),
+                            "BROWSER_CI_SKIP_FIXTURE": str(skip),
+                        },
+                    )
+                    output = completed.stdout + completed.stderr
+                    self.assertEqual(completed.returncode, skip, output)
+                    self.assertIn("tests.test_review_ui.ReviewTests.test_can_open", output)
+                    self.assertIn("Ran 1 test", output)
+                    if skip:
+                        self.assertIn("Browser test skipped:", output)
+                        self.assertIn("浏览器夹具不可用", output)
+                    else:
+                        self.assertIn("\nOK\n", output)
 
     def test_v014_upgrade_smoke_retires_legacy_organize_outbox_safely(self) -> None:
         for value in (

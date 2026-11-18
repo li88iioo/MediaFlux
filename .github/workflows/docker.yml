@@ -125,54 +125,7 @@ jobs:
           MEDIAFLUX_DISABLE_FILE_LOGGING: "1"
         run: |
           umask 077
-          python - <<'PY'
-          import unittest
-
-          modules = (
-              "tests.test_setup_bootstrap_support",
-              "tests.test_agent_kernel_browser",
-              "tests.test_agent_confirmation_edit_browser",
-              "tests.test_node_fixes_agent_feedback",
-              "tests.test_telegram_guangya_share",
-              "tests.test_deep_audit_rss_browser",
-              "tests.test_rss_failure_recovery_browser",
-              "tests.test_rss_directory_picker_layer_browser",
-              "tests.test_agent_ux_browser",
-              "tests.test_agent_ux_shell_browser",
-              "tests.test_agent_task_consumers_browser",
-              "tests.test_agent_restore_browser",
-              "tests.test_agent_nsfw_clean_review_settings_browser",
-              "tests.test_douban_dbcl2_settings_browser",
-              "tests.test_settings_review_tooltips_browser",
-              "tests.test_config_backfill_browser",
-              "tests.test_metadata_settings_alignment_browser",
-              "tests.test_guangya_directory_scrape_browser",
-              "tests.test_guangya_directory_scrape_ui",
-              "tests.test_release_formats_browser",
-              "tests.test_media_profile_in_place_ui",
-              "tests.test_media_libraries_ui",
-              "tests.test_local_media_browser",
-              "tests.test_media_snapshot_browser",
-              "tests.test_logs_batch_correction_ui",
-              "tests.test_downloads_batch_ui",
-              "tests.test_subscriptions_api",
-              "tests.test_ui_edit_session_recovery_browser",
-              "tests.test_navigation_discovery_ui",
-              "tests.test_lucide_local_rendering",
-              "tests.test_discovery_search_ui",
-              "tests.test_indexer_progress_browser",
-              "tests.test_window_viewport_inset",
-              "tests.test_jellyfin_plugin_ui",
-          )
-          suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
-          if result.skipped:
-              for test, reason in result.skipped:
-                  print(f"Browser test skipped: {test}: {reason}")
-          raise SystemExit(
-              0 if result.wasSuccessful() and not result.skipped else 1
-          )
-          PY
+          python -m tests.browser_ci
 
   smoke:
     needs: [test, browser]
