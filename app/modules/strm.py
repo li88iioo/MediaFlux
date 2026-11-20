@@ -29,6 +29,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
+from itertools import chain
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
@@ -2360,6 +2361,9 @@ def _sync_strm_impl(
     metadata_candidates: dict[str, tuple[GuangYaFile, str, int]] = {}
 
     prefix = safe_path_component(rel_prefix) if rel_prefix.strip() else ""
+    preferred = db.get_strm_adoption_prefix(source_dir_id, strm_root, rel_prefix)
+    component = safe_path_component(preferred) if preferred else ""
+    filtered_videos: list[tuple[GuangYaFile, str]] = []
     scan_started = time.monotonic()
     scan_deadline = scan_started + scan_deadline_seconds
     scan_abort = threading.Event()
@@ -2605,6 +2609,9 @@ def _sync_strm_impl(
                         if ext not in exts:
                             continue
                         if threshold_bytes and 0 < file.size < threshold_bytes:
+                            # 旧实例可能生成过小视频的指针。目录归属仍可核实，生成遵从本机阈值。
+                            if preferred and len(filtered_videos) <= max_candidates:
+                                filtered_videos.append((file, str(Path(component, *rel_parts[1:]))))
                             continue
                         target = _strm_target(file, rel_dir, strm_root)
                         target_key = str(target)
@@ -2655,16 +2662,18 @@ def _sync_strm_impl(
         return stats
 
     adopted_fingerprints: dict[str, str] = {}
-    preferred = db.get_strm_adoption_prefix(source_dir_id, strm_root, rel_prefix)
     if preferred:
         from app.modules.strm_adoption import verify_strm_adoption
 
-        component = safe_path_component(preferred)
         try:
             videos = _rebase_strm_candidates(video_candidates, component, strm_root, _strm_target, should_stop)
             verified = verify_strm_adoption(
                 Path(strm_root).expanduser(), component,
-                ((file, Path(target)) for target, (file, _, _) in videos.items()), should_stop=should_stop,
+                chain(
+                    ((file, Path(target)) for target, (file, _, _) in videos.items()),
+                    ((file, _strm_target(file, folder, strm_root)) for file, folder in filtered_videos),
+                ),
+                should_stop=should_stop,
             )
             companions = _rebase_strm_candidates(metadata_candidates, component, strm_root, _metadata_target, should_stop)
             if stop_requested("scan"):

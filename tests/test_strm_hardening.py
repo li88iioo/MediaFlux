@@ -356,6 +356,10 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         file = GuangYaFile("1969243189619372086", "Movie.mkv", False, 20000000, "B" * 40, source)
         with tempfile.TemporaryDirectory() as root:
             pointer = generate_strm(file, "整理", "http://old-nas", root)
+            small = GuangYaFile("trailer", "Trailer.mp4", False, 1024, "C" * 40, source)
+            trailer = generate_strm(small, "整理", "http://old-nas", root)
+            subtitle = trailer.with_suffix(".srt")
+            subtitle.write_bytes(b"local subtitle")
             previous = pointer.read_bytes()
             with db.reconcile_strm_retired_sources_transaction(
                 [source], [], configured_sources=sources, configured_strm_root=root, previous_sources=[],
@@ -363,17 +367,20 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 pass
             assigned = db.get_strm_source_prefixes(sources)[source]
             fallback = pointer.parent.with_name(assigned)
-            client = _TreeClient({source: [file, GuangYaFile("dir", "子目录", True, parent_id=source)],
+            client = _TreeClient({source: [file, small, GuangYaFile("dir", "子目录", True, parent_id=source)],
                                   "dir": RuntimeError("云端读取失败")})
-            options = dict(client=cast(GuangYaClient, client), rel_prefix=assigned)
+            options = dict(client=cast(GuangYaClient, client), rel_prefix=assigned, skip_threshold_mb=10)
             partial = sync_strm(source, "http://new-nas", root, **options)
             self.assertTrue(partial["clean_skipped"])
             self.assertEqual(pointer.read_bytes(), previous)
             self.assertFalse(fallback.exists())
+            self.assertTrue(trailer.is_file())
             client.tree["dir"] = []
             finished = sync_strm(source, "http://new-nas", root, **options)
             self.assertEqual(finished.get("adopted_prefix"), "整理", finished)
             self.assertTrue(pointer.read_text().startswith("http://new-nas/playgy/"))
+            self.assertFalse(trailer.exists())
+            self.assertEqual(subtitle.read_bytes(), b"local subtitle")
             self.assertFalse(fallback.exists())
 
     def test_copied_pointer_changed_after_directory_check_is_preserved(self):
