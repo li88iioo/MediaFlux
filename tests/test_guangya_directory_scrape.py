@@ -2639,6 +2639,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             region_split=False,
             year_split=False,
             clean_empty=False,
+            conflict_strategy=1,  # 固定历史签名与同批冲突场景使用的不覆盖策略。
             link_strm=False,
             notify_enabled=False,
             keep_multi_versions=True,

@@ -1293,9 +1293,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         self.assertEqual(restored.nsfw_metatube_token, "server-secret")
         self.assertEqual(restored.nsfw_timeout_seconds, 8)
 
-    def test_local_preview_applies_shared_large_file_conflict_strategy(self):
-        from app.modules.organize import OrganizeRules
-
+    def test_local_preview_applies_default_classification_and_large_file_conflict_strategy(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "conflict-downloads"; target_root = root / "movies"
             source_root.mkdir(); target_root.mkdir()
@@ -1305,16 +1303,14 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(
                 tmdb_id="1", title="Movie", year="2026", media_type="movie", confidence=1.0
             ))))
+            self.addCleanup(service.close)
             inspection = service.inspect_source("admin", source_id, source_root)
-            rules = OrganizeRules(
-                region_split=False, year_split=False, naming_scope="both", conflict_strategy=2
-            )
-            with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules):
-                first = service.preview("admin", inspection["inspection_id"])
-                target = Path(first["plans"][0]["target_path"])
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(b"old")
-                second = service.preview("admin", inspection["inspection_id"])
+            first = service.preview("admin", inspection["inspection_id"])
+            target = Path(first["plans"][0]["target_path"])
+            self.assertEqual(target.parent.relative_to(target_root).parts, ("Movie (2026) {tmdb-1}",))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"old")
+            second = service.preview("admin", inspection["inspection_id"])
             self.assertEqual(second["plans"][0]["action"], "replace")
             self.assertIn("替换", second["plans"][0]["note"])
 

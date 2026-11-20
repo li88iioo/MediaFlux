@@ -68,7 +68,7 @@ class ReleaseChainConflictTests(IsolatedDatabaseTestCase):
                 wraps=organizer._parse_existing_media_fields,
             ) as parse:
                 organizer._preview_conflicts_with_inventory(
-                    plans, OrganizeRules(), lambda p: ("target", files, {})
+                    plans, OrganizeRules(conflict_strategy=1), lambda p: ("target", files, {})
                 )
             self.assertEqual(parse.call_count, len(files))
             self.assertTrue(all(plan.action == "skip" for plan in plans))

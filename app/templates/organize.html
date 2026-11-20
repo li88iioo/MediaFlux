@@ -378,7 +378,7 @@
                                 <label for="r_region">地区二次分类</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_region" data-key="GY_ORGANIZE_REGION_SPLIT" data-bool="1">
+                                <input type="checkbox" id="r_region" data-key="GY_ORGANIZE_REGION_SPLIT" data-bool="1"{% if organize_region_split %} checked{% endif %}>
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -392,7 +392,7 @@
                                 <label for="r_year">年份三次分类</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_year" data-key="GY_ORGANIZE_YEAR_SPLIT" data-bool="1">
+                                <input type="checkbox" id="r_year" data-key="GY_ORGANIZE_YEAR_SPLIT" data-bool="1"{% if organize_year_split %} checked{% endif %}>
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -438,9 +438,9 @@
                             </div>
                         </div>
                         <select class="form-select" id="r_conflict" data-key="GY_ORGANIZE_CONFLICT_STRATEGY">
-                            <option value="1">不覆盖</option>
-                            <option value="2">覆盖：大文件优先</option>
-                            <option value="3">覆盖：小文件优先</option>
+                            <option value="1"{% if organize_conflict_strategy == 1 %} selected{% endif %}>不覆盖</option>
+                            <option value="2"{% if organize_conflict_strategy == 2 %} selected{% endif %}>覆盖：大文件优先</option>
+                            <option value="3"{% if organize_conflict_strategy == 3 %} selected{% endif %}>覆盖：小文件优先</option>
                         </select>
                         <span class="organize-toggle-hint">目标位置存在同名文件时的覆盖规则</span>
                     </div>

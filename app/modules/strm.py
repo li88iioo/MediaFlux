@@ -45,7 +45,7 @@ from app.clients.guangya import (
     close_guangya_client,
 )
 from app.config import get, get_bool, get_int
-from app.defaults import DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
+from app.defaults import DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_SKIP_THRESHOLD_MB, DEFAULT_STRM_VIDEO_EXTS
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
@@ -3405,7 +3405,10 @@ def _retry_filter_config(runtime: dict | None = None) -> dict:
             defaults=DEFAULT_STRM_METADATA_EXTS,
         ) if metadata_enabled else (),
     )
-    threshold = runtime["skip_threshold_mb"] if "skip_threshold_mb" in runtime else get_int("STRM_SKIP_THRESHOLD_MB", 0)
+    threshold = (
+        runtime["skip_threshold_mb"] if "skip_threshold_mb" in runtime
+        else get_int("STRM_SKIP_THRESHOLD_MB", DEFAULT_STRM_SKIP_THRESHOLD_MB)
+    )
     return {"video_exts": tuple(sorted(video_exts)), "metadata_enabled": metadata_enabled,
             "metadata_exts": tuple(sorted(metadata_exts)), "skip_threshold_mb": max(0, int(threshold))}
 

@@ -42,7 +42,7 @@ def backend(tmp_path, monkeypatch):
     settings = {"GY_STRM_SOURCE_DIRS": '[{"id":"source","name":"测试来源"}]',
                 "GY_STRM_BASE_URL": "http://mediaflux.invalid", "STRM_ROOT": str(tmp_path / "strm"),
                 "STRM_VIDEO_EXTS": "mkv", "STRM_METADATA_EXTS": "nfo", "STRM_METADATA_ENABLED": "0"}
-    client = _TreeClient({"source": [GuangYaFile(f"video-{i}", f"Video-{i}.mkv", False, 1024, f"e{i}", "source")
+    client = _TreeClient({"source": [GuangYaFile(f"video-{i}", f"Video-{i}.mkv", False, 128 * 1024**2, f"e{i}", "source")
                                       for i in range(5)]})
     setattr(client, "close", Mock())
     with (isolated_test_database(),

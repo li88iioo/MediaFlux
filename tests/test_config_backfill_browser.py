@@ -271,15 +271,43 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertFalse(self._checked(rules, "GY_ORGANIZE_EMBY_REFRESH"))
         self.assertFalse(self._checked(rules, "GY_ORGANIZE_CLEAN_EMPTY"))
         self.assertTrue(self._checked(rules, "GY_ORGANIZE_REGION_SPLIT"))
-        # 缺失键由 GET 回填后端唯一默认（开启），页面不再自行补勾选。
-        for key in ("GY_ORGANIZE_YEAR_SPLIT", "GY_ORGANIZE_LINK_STRM"):
-            self.assertTrue(self._checked(rules, key), key)
+        self.assertTrue(rules.locator("#r_region").evaluate("input => input.defaultChecked"))
+        self.assertFalse(self._checked(rules, "GY_ORGANIZE_YEAR_SPLIT"))
+        self.assertTrue(self._checked(rules, "GY_ORGANIZE_LINK_STRM"))
+        self.assertEqual(rules.locator("#r_conflict").input_value(), "2")
+        self.assertTrue(rules.locator('#r_conflict option[value="2"]').evaluate("option => option.defaultSelected"))
         self.assertEqual(rules.locator('[data-key="GY_ORGANIZE_SCHEDULE_CRON"]').input_value(), "")
 
         execute = self._open("/organize")
         self.assertFalse(self._checked(execute, "GY_ORGANIZE_CLEAN_EMPTY"))
         self.assertEqual(self.config_posts, [], "仅加载页面不能写配置")
         self.assertIn("GY_ORGANIZE_EMBY_REFRESH=''", config.ENV_FILE.read_text(encoding="utf-8"))
+
+        self._write(GY_ORGANIZE_YEAR_SPLIT="1")
+        rules.reload()
+        rules.wait_for_function(READY["/organize-rules"])
+        self.assertTrue(self._checked(rules, "GY_ORGANIZE_YEAR_SPLIT"))
+        self.assertTrue(rules.locator("#r_year").evaluate("input => input.defaultChecked"))
+        self.assertEqual(self.config_posts, [], "回填历史值不能写配置")
+
+        strategy = rules.locator("#r_conflict")
+        for value in ("1", "3"):
+            with self.subTest(strategy=value):
+                rules.locator('[data-tab-target="policy"]').click()
+                strategy.select_option(value)
+                rules.locator("#saveOrganizeConfigBtn").click()
+                rules.wait_for_function("document.getElementById('organizeSaveState')?.classList.contains('is-success')")
+                status, changes = self.config_posts[-1]
+                self.assertEqual(status, 200)
+                self.assertEqual(changes["GY_ORGANIZE_CONFLICT_STRATEGY"], value)
+                self.assertTrue(changes.keys().isdisjoint({"GY_ORGANIZE_REGION_SPLIT", "GY_ORGANIZE_YEAR_SPLIT"}))
+                self.assertEqual(config.all_items()["GY_ORGANIZE_CONFLICT_STRATEGY"], value)
+                rules.reload()
+                rules.wait_for_function(READY["/organize-rules"])
+                self.assertEqual(strategy.input_value(), value)
+                self.assertEqual(strategy.locator("option[selected]").get_attribute("value"), value)
+        self.assertEqual(config.all_items()["GY_ORGANIZE_REGION_SPLIT"], " y ")
+        self.assertEqual(config.all_items()["GY_ORGANIZE_YEAR_SPLIT"], "1")
 
     def test_defaults_are_api_owned_and_recommended_extensions_do_not_use_saved_values(self):
         from app.modules.organize_rules import DEFAULT_ORGANIZE_VIDEO_EXTS
@@ -308,6 +336,9 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
                     page.set_viewport_size({"width": width, "height": 900})
                     for key in keys:
                         self.assertEqual(page.locator(f'[data-key="{key}"]').input_value(), expected[key], key)
+                    if path == "/organize-rules" and not updates:
+                        self.assertFalse(self._checked(page, "GY_ORGANIZE_REGION_SPLIT"))
+                        self.assertFalse(self._checked(page, "GY_ORGANIZE_YEAR_SPLIT"))
                     dirty = page.locator(form).evaluate("node => collectConfigFields(node)")
                     self.assertFalse(set(keys) & set(dirty), dirty)
                     if path == "/organize-rules" and updates:
@@ -345,6 +376,25 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(self.config_posts[-1][0], 200)
         self.assertEqual(self.config_posts[-1][1]["GY_ORGANIZE_SCHEDULE_CRON"], "30 5 * * *")
         self.assertEqual(config.get("GY_ORGANIZE_SCHEDULE_CRON"), "30 5 * * *")
+
+    def test_strm_threshold_defaults_to_10_and_saved_zero_survives_reload(self):
+        page = self._open("/guangya/strm")
+        threshold = page.locator('[data-key="STRM_SKIP_THRESHOLD_MB"]')
+        self.assertEqual(threshold.input_value(), "10")
+        self.assertEqual(threshold.get_attribute("value"), "10")
+
+        threshold.fill("0")
+        page.locator("#saveStrmBtn").click()
+        page.wait_for_function("document.getElementById('strmSaveState')?.classList.contains('is-success')")
+        self.assertEqual(
+            [(status, payload.get("STRM_SKIP_THRESHOLD_MB")) for status, payload in self.config_posts],
+            [(200, "0")],
+        )
+        self.assertEqual(config.all_items()["STRM_SKIP_THRESHOLD_MB"], "0")
+        page.reload()
+        page.wait_for_function(READY["/guangya/strm"])
+        self.assertEqual(threshold.input_value(), "0")
+        self.assertEqual(threshold.get_attribute("value"), "0")
 
     def test_strm_page_keeps_explicit_empty_and_rejects_clearing_cron(self):
         self._write(STRM_SCHEDULE_CRON="")

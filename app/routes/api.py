@@ -978,7 +978,7 @@ def _ui_defaults() -> dict[str, str]:
     defaults["STRM_SKIP_THRESHOLD_MB"] = str(DEFAULT_STRM_SKIP_THRESHOLD_MB)
     defaults["GY_ORGANIZE_VIDEO_EXTS"] = ",".join(DEFAULT_ORGANIZE_VIDEO_EXTS)
     defaults["GY_ORGANIZE_METADATA_EXTS"] = ",".join(DEFAULT_ORGANIZE_METADATA_EXTS)
-    for field in ("small_file_mb", "conflict_strategy", "nsfw_category_name", "nsfw_timeout_seconds", "automatic_match_preset"):
+    for field in ("small_file_mb", "nsfw_category_name", "nsfw_timeout_seconds", "automatic_match_preset"):
         defaults[f"GY_ORGANIZE_{field.upper()}"] = str(getattr(OrganizeRules, field))
     defaults.update(dict.fromkeys(_CRON_KEYS, DEFAULT_SCHEDULE_CRON))
     return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
@@ -1037,6 +1037,8 @@ def get_config(request: Request):
     for key in managed_fields:
         default = (items.get(key, _AGENT_SETTINGS_DEFAULTS.get(key, "")) or "")
         items[key] = config.get(key, default)
+    conflict_key = "GY_ORGANIZE_CONFLICT_STRATEGY"
+    items[conflict_key] = str(config.int_setting_value(conflict_key, items[conflict_key]))
     raw_sites = items.get(
         "INDEXER_ENABLED_SITES",
         config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS)),

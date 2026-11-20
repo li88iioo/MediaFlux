@@ -46,7 +46,8 @@ def _tree(*, flat=False, etag="e"):
 
 def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
          flat=False, retire=False, configured_text=None, queue_only=False,
-         trigger_type="manual", metadata_exts=None, run_options=None, send_summary=False):
+         trigger_type="manual", metadata_exts=None, run_options=None, send_summary=False,
+         threshold_mb=0):
     """经真实 scheduler 注入策略；不直接为安装器伪造刷新行为。"""
     scheduler = STRMScheduler()
     sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""})
@@ -56,10 +57,12 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
             [{"id": item["id"], "name": item["name"]} for item in sources]
         ),
     }
+    if threshold_mb is not None:
+        values["STRM_SKIP_THRESHOLD_MB"] = str(threshold_mb)
     client = _TreeClient(_tree(flat=flat) if tree is None else tree)
     with ExitStack() as stack:
         stack.enter_context(patch.object(scheduler_module, "get", side_effect=lambda k, d="": values.get(k, d)))
-        stack.enter_context(patch.object(scheduler_module, "get_int", return_value=0))
+        stack.enter_context(patch.object(scheduler_module, "get_int", side_effect=lambda k, d=0: int(values.get(k, d))))
         stack.enter_context(patch.object(scheduler_module, "configured_strm_source_plans", return_value=(sources, "" if sources else "来源为空")))
         for name, value in (("validate_config", ""), ("_source_dirs", sources),
                             ("_video_exts", {"mkv"}), ("_metadata_exts", set(metadata_exts or ()))):
@@ -86,6 +89,21 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
         changes = [{"source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
                     "parent_id": "s" if flat else "d", "name": "Movie.mkv", "rel_dir": "" if flat else "Film"}]
         return scheduler.run_blocking(trigger_type, sync_mode=mode, organize_changes=changes if mode == "fast" and not queue_only else None)
+
+
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize(("threshold_mb", "size", "generated"), [
+    (None, 10 * 1024**2 - 1, False),
+    (None, 10 * 1024**2, True),
+    (0, 10 * 1024**2 - 1, True),
+])
+def test_strm_scheduler_applies_default_size_filter_and_preserves_unlimited(tmp_path, mode, threshold_mb, size, generated):
+    tree = {"s": [GuangYaFile("v", "Movie.mkv", False, size, "etag", "s")]}
+    with isolated_test_database():
+        result = _run(tmp_path, mode=mode, flat=True, tree=tree, enabled=False, threshold_mb=threshold_mb)
+        assert result["ok"], result
+        assert result["mode"] == mode
+        assert (tmp_path / strm.STRM_SUBDIR / "Movie.strm").is_file() is generated
 
 
 @contextmanager

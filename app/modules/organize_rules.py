@@ -7,8 +7,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 
-from app.config import get, get_bool, get_int
-from app.defaults import DEFAULT_ORGANIZE_RECYCLE_DUPLICATES_ENABLED
+from app.config import get, get_bool, get_int, get_int_setting
+from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_ORGANIZE_RECYCLE_DUPLICATES_ENABLED, INT_SETTING_BOUNDS
 from app.modules.naming import (
     MOVIE_DEFAULT,
     MOVIE_DIR_DEFAULT,
@@ -103,11 +103,11 @@ class OrganizeRules:
     target_dir_id: str = "0"
     add_kids: bool = False
     add_concert: bool = False
-    region_split: bool = True
-    year_split: bool = True
+    region_split: bool = DEFAULT_BOOL_CONFIG_VALUES["GY_ORGANIZE_REGION_SPLIT"]
+    year_split: bool = DEFAULT_BOOL_CONFIG_VALUES["GY_ORGANIZE_YEAR_SPLIT"]
     small_file_mb: int = 10
     clean_empty: bool = True
-    conflict_strategy: int = 1  # 1=不覆盖仅同名 2=覆盖大文件优先 3=覆盖小文件优先
+    conflict_strategy: int = INT_SETTING_BOUNDS["GY_ORGANIZE_CONFLICT_STRATEGY"][0]
     remux_first: bool = True
     resolution_first: bool = True
     dolby_first: bool = True
@@ -152,7 +152,7 @@ class OrganizeRules:
             year_split=get_bool("GY_ORGANIZE_YEAR_SPLIT"),
             small_file_mb=max(0, get_int("GY_ORGANIZE_SMALL_FILE_MB", cls.small_file_mb)),
             clean_empty=get_bool("GY_ORGANIZE_CLEAN_EMPTY"),
-            conflict_strategy=max(1, min(get_int("GY_ORGANIZE_CONFLICT_STRATEGY", cls.conflict_strategy), 3)),
+            conflict_strategy=get_int_setting("GY_ORGANIZE_CONFLICT_STRATEGY"),
             remux_first=get_bool("GY_ORGANIZE_REMUX_FIRST"),
             resolution_first=get_bool("GY_ORGANIZE_RESOLUTION_FIRST"),
             dolby_first=get_bool("GY_ORGANIZE_DOLBY_FIRST"),

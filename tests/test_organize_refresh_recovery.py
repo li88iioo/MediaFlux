@@ -53,7 +53,7 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
         finished = threading.Event()
         source = {"id": "source", "name": "isolation", "rel_prefix": strm.STRM_SUBDIR if change_root else "Films"}
         media = GuangYaFile(file_id="v1", name="Movie.mkv", is_dir=False,
-                           etag="e1", size=128, parent_id="source")
+                           etag="e1", size=128 * 1024**2, parent_id="source")
         client = _TreeClient({"source": [media]})
         change = {"source_id": "source", "kind": "video", "action": "upsert",
                   "file_id": "v1", "parent_id": "source", "name": "Movie.mkv", "rel_dir": ""}

@@ -18,7 +18,7 @@ from app.main import create_app
 from tests.support import initialized_web_runtime
 
 DEFAULT_ON = (
-    "GY_ORGANIZE_EMBY_REFRESH", "GY_ORGANIZE_REGION_SPLIT", "GY_ORGANIZE_CLEAN_EMPTY",
+    "GY_ORGANIZE_EMBY_REFRESH", "GY_ORGANIZE_CLEAN_EMPTY",
     "GY_ORGANIZE_NOTIFY_ENABLED", "STRM_NOTIFY_ENABLED",
 )
 CRON_KEYS = ("STRM_SCHEDULE_CRON", "GY_ORGANIZE_SCHEDULE_CRON")
@@ -295,18 +295,18 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self._write_raw(STRM_METADATA_ENABLED="1")
 
         defaults = {
-            "STRM_SKIP_THRESHOLD_MB": "0",
+            "STRM_SKIP_THRESHOLD_MB": "10",
             "STRM_METADATA_EXTS": "nfo,srt,ass,ssa,sub,idx,jpg,jpeg,png,webp",
             "GY_ORGANIZE_VIDEO_EXTS": ",".join(DEFAULT_ORGANIZE_VIDEO_EXTS),
             "GY_ORGANIZE_METADATA_EXTS": ",".join(DEFAULT_ORGANIZE_METADATA_EXTS),
-            "GY_ORGANIZE_SMALL_FILE_MB": "10", "GY_ORGANIZE_CONFLICT_STRATEGY": "1",
+            "GY_ORGANIZE_SMALL_FILE_MB": "10",
             "GY_ORGANIZE_NSFW_CATEGORY_NAME": "成人内容", "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS": "8",
             "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET": "balanced",
         }
         custom = {
             "STRM_SKIP_THRESHOLD_MB": "0", "STRM_METADATA_EXTS": "nfo,webp",
             "GY_ORGANIZE_VIDEO_EXTS": "mp4", "GY_ORGANIZE_METADATA_EXTS": "nfo",
-            "GY_ORGANIZE_SMALL_FILE_MB": "0", "GY_ORGANIZE_CONFLICT_STRATEGY": "3",
+            "GY_ORGANIZE_SMALL_FILE_MB": "0",
             "GY_ORGANIZE_NSFW_CATEGORY_NAME": "收藏", "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS": "20",
             "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET": "conservative",
         }
@@ -317,10 +317,50 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
                 payload = self._config()
                 self.assertEqual({key: payload[key] for key in expected}, expected)
                 rules = OrganizeRules.from_config()
-                for field in ("small_file_mb", "conflict_strategy", "nsfw_category_name", "nsfw_timeout_seconds", "automatic_match_preset"):
+                for field in ("small_file_mb", "nsfw_category_name", "nsfw_timeout_seconds", "automatic_match_preset"):
                     self.assertEqual(str(getattr(rules, field)), payload[f"GY_ORGANIZE_{field.upper()}"])
                 self.assertEqual(STRMScheduler._metadata_exts(), set(payload["STRM_METADATA_EXTS"].split(",")))
                 self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_organize_classification_and_conflict_defaults_preserve_explicit_rules(self):
+        from app.modules.organize_rules import (
+            OrganizeRules, organize_rules_snapshot, restore_organize_rules_snapshot,
+        )
+
+        fields = ("region_split", "year_split", "conflict_strategy")
+        keys = tuple(f"GY_ORGANIZE_{field.upper()}" for field in fields)
+        defaults = OrganizeRules()
+        self.assertEqual(tuple(getattr(defaults, field) for field in fields), (False, False, 2))
+        cases = (
+            (None, ("0", "0", "2"), (False, False, 2)),
+            (("true", " y ", "1"), ("true", " y ", "1"), (True, True, 1)),
+            (("", "0", "3"), ("", "0", "3"), (False, False, 3)),
+            (("0", "", ""), ("0", "", "2"), (False, False, 2)),
+        )
+        for saved, displayed, effective in cases:
+            with self.subTest(saved=saved):
+                if saved is not None:
+                    self._write_raw(**dict(zip(keys, saved, strict=True)))
+                before = config.ENV_FILE.read_bytes()
+                payload = self._config()
+                self.assertEqual(tuple(payload[key] for key in keys), displayed)
+                rules = OrganizeRules.from_config()
+                snapshot = organize_rules_snapshot(rules)
+                self.assertEqual(tuple(snapshot[field] for field in fields), effective)
+                restored = restore_organize_rules_snapshot(snapshot, trusted_rules=defaults)
+                self.assertEqual(tuple(getattr(restored, field) for field in fields), effective)
+                self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+        overrides = dict(zip(keys, ("1", "on", " 03 "), strict=True))
+        with patch.dict(os.environ, overrides), patch.object(
+            config, "_STARTUP_ENV_OVERRIDES", config._STARTUP_ENV_OVERRIDES | overrides.keys(),
+        ):
+            payload = self._config()
+            self.assertEqual(tuple(payload[key] for key in keys), ("1", "on", "3"))
+            self.assertTrue(set(keys).issubset(payload["__managed_fields"]))
+            rules = OrganizeRules.from_config()
+            self.assertEqual(tuple(getattr(rules, field) for field in fields), (True, True, 3))
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
 
     def test_missing_defaults_fill_while_explicit_empty_switches_and_cron_stay_empty(self):
         from app.modules.organize_rules import OrganizeRules
@@ -332,7 +372,7 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         for key in CRON_KEYS:
             self.assertEqual(payload[key], DEFAULT_SCHEDULE_CRON, key)
         rules = OrganizeRules.from_config()
-        self.assertTrue(rules.emby_refresh and rules.region_split and rules.clean_empty and rules.notify_enabled)
+        self.assertTrue(rules.emby_refresh and rules.clean_empty and rules.notify_enabled)
         self.assertEqual(current_policy("strm")["cron"], DEFAULT_SCHEDULE_CRON)
 
         self._write_raw(**dict.fromkeys((*DEFAULT_ON, *CRON_KEYS), ""), AGENT_LLM_PROTOCOL="", TAVILY_MAX_RESULTS="")
@@ -342,7 +382,7 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         # 其他字段空值的回填规则不属于本切片，保持原样。
         self.assertEqual((payload["AGENT_LLM_PROTOCOL"], payload["TAVILY_MAX_RESULTS"]), ("auto", "5"))
         rules = OrganizeRules.from_config()
-        self.assertFalse(rules.emby_refresh or rules.region_split or rules.clean_empty or rules.notify_enabled)
+        self.assertFalse(rules.emby_refresh or rules.clean_empty or rules.notify_enabled)
         self.assertEqual((current_policy("strm")["cron"], current_policy("organize")["cron"]), ("", ""))
         self.assertFalse(current_policy("strm")["notify_enabled"])
 

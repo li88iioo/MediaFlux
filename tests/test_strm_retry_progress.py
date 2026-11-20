@@ -237,6 +237,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 "STRM_ROOT": root,
                 "STRM_VIDEO_EXTS": "mkv",
                 "STRM_METADATA_EXTS": "",
+                "STRM_SKIP_THRESHOLD_MB": "0",
             }
             with patch(
                 "app.modules.strm.get",
@@ -286,6 +287,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 "STRM_ROOT": root,
                 "STRM_VIDEO_EXTS": "mkv",
                 "STRM_METADATA_EXTS": "",
+                "STRM_SKIP_THRESHOLD_MB": "0",
             }
             with patch(
                 "app.modules.strm.get",
@@ -412,7 +414,7 @@ class StrmProgressTests(IsolatedDatabaseTestCase):
     def test_retry_progress_is_bounded_instead_of_emitted_per_failure(self):
         source_id = "source-retry-progress"
         files = [
-            GuangYaFile(f"video-{index}", f"Retry-{index}.mkv", False, 100, f"e{index}", source_id)
+            GuangYaFile(f"video-{index}", f"Retry-{index}.mkv", False, 16 * 1024**2, f"e{index}", source_id)
             for index in range(55)
         ]
         for file in files:
@@ -798,7 +800,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
             strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
             result = strm_module.retry_strm_failures(
                 [failure_id], "manual", client=cast(GuangYaClient, client),
-                runtime_config={**self._runtime(root, "source"), "video_exts": {"mkv", "mp4"}},
+                runtime_config={**self._runtime(root, "source"), "video_exts": {"mkv", "mp4"}, "skip_threshold_mb": 0},
             )
             self.assertEqual(result["resolved"], 1)
             self.assertEqual(result["failed"], 0)
@@ -809,7 +811,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
 
     def test_retry_respects_changed_video_filters_and_can_resume_after_reenable(self):
         for mode in ("selected", "all"):
-            for reason in ("type", "size"):
+            for reason in ("type", "size", "default_size"):
                 with self.subTest(mode=mode, reason=reason), tempfile.TemporaryDirectory() as root:
                     with db.get_conn() as conn:
                         conn.execute("DELETE FROM strm_failures")
@@ -823,8 +825,12 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
                     self.assertEqual(failed["failed"], 1)
                     before = dict(db.list_strm_failures(status="open")[0])
                     with self._config(root, '[{"id":"source","name":"Source"}]') as values:
-                        values.update(STRM_VIDEO_EXTS="mp4" if reason == "type" else "mkv",
-                                      STRM_SKIP_THRESHOLD_MB="1" if reason == "size" else "0")
+                        if reason == "type":
+                            values["STRM_VIDEO_EXTS"] = "mp4"
+                        elif reason == "size":
+                            values["STRM_SKIP_THRESHOLD_MB"] = "1"
+                        else:
+                            values.pop("STRM_SKIP_THRESHOLD_MB")
                         result = strm_module.retry_all_strm_failures("source", "generate", "web", client=cast(GuangYaClient, client)) if mode == "all" else strm_module.retry_strm_failures([before["id"]], "web", client=cast(GuangYaClient, client))
                         self.assertEqual(result["resolved"], 0)
                         self.assertEqual(result["failed"], 0)
@@ -1084,7 +1090,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
                     })
                     ids = [self._failure(source["id"], source["name"], video.file_id, video.name) for source in sources]
                     runtime = {"sources": list(reversed(sources)) if reverse else sources,
-                               "strm_root": root, "base_url": "http://mediaflux.invalid"}
+                               "strm_root": root, "base_url": "http://mediaflux.invalid", "skip_threshold_mb": 0}
                     if retry_all:
                         result = strm_module.retry_all_strm_failures("", "generate", "manual", client=cast(GuangYaClient, client), runtime_config=runtime)
                     else:
@@ -1119,7 +1125,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
         sources = strm_module.plan_strm_sources([
             {"id": "new", "name": "New"}, {"id": "old", "name": "Old"},
         ])
-        video = GuangYaFile("moved", "Episode.mkv", False, 10, "etag", "new")
+        video = GuangYaFile("moved", "Episode.mkv", False, 16 * 1024**2, "etag", "new")
         failure_id = self._failure("old", "Old", video.file_id, video.name)
         client = _TreeClient({"new": [video], "old": []})
         with tempfile.TemporaryDirectory() as root:
@@ -1293,7 +1299,7 @@ class StrmRetryConcurrencyStateTests(IsolatedDatabaseTestCase):
 
     def test_retry_claim_is_released_to_open_after_processing_failure(self):
         failure_id = self._failure()
-        file = GuangYaFile("video", "Movie.mkv", False, 1, "e", "source-lock")
+        file = GuangYaFile("video", "Movie.mkv", False, 16 * 1024**2, "e", "source-lock")
         client = _TreeClient({"source-lock": [file]})
         values = {
             "GY_STRM_SOURCE_DIRS": '[{"id":"source-lock","name":"锁来源"}]',
@@ -1461,7 +1467,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
 
     def test_partial_missing_items_resolve_found_and_finish_total_progress(self):
         source = "source-meta"
-        found = GuangYaFile("found", "Movie.mkv", False, 10, "e", source)
+        found = GuangYaFile("found", "Movie.mkv", False, 16 * 1024**2, "e", source)
         found_id = self._failure(source, "found", "Movie.mkv", action="generate")
         missing_id = self._failure(source, "missing", "Missing.mkv", action="generate")
         client = _TreeClient({source: [found]})
@@ -1659,7 +1665,8 @@ class StrmRetryBatchAndSchedulerSafetyTests(IsolatedDatabaseTestCase):
         ):
             result = strm_module.retry_all_strm_failures(
                 "source-batch", "generate", "web",
-                client=cast(GuangYaClient, client), runtime_config=self._bulk_runtime(root),
+                client=cast(GuangYaClient, client),
+                runtime_config={**self._bulk_runtime(root), "skip_threshold_mb": 0},
             )
 
         self.assertTrue(result["ok"])

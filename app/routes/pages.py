@@ -10,7 +10,12 @@ from fastapi.responses import RedirectResponse
 
 from app import config
 from app.agent.feature_gate import is_agent_enabled
-from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB, DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
+from app.defaults import (
+    DEFAULT_OFFLINE_MIN_FILE_MB,
+    DEFAULT_STRM_METADATA_EXTS,
+    DEFAULT_STRM_SKIP_THRESHOLD_MB,
+    DEFAULT_STRM_VIDEO_EXTS,
+)
 from app.discovery.models import normalize_search_query
 from app.modules.global_search import build_global_search
 from app.services import (
@@ -212,6 +217,7 @@ def guangya_strm(request: Request):
         request, "guangya_strm.html", "guangya_strm",
         strm_full_video_exts=",".join(DEFAULT_STRM_VIDEO_EXTS),
         strm_full_metadata_exts=",".join(DEFAULT_STRM_METADATA_EXTS),
+        strm_skip_threshold_mb=config.get("STRM_SKIP_THRESHOLD_MB") or DEFAULT_STRM_SKIP_THRESHOLD_MB,
     )
 
 
@@ -302,6 +308,9 @@ def organize(request: Request):
 def organize_rules(request: Request):
     return _page(
         request, "organize.html", "organize_rules", organize_view="rules",
+        organize_region_split=config.get_bool("GY_ORGANIZE_REGION_SPLIT"),
+        organize_year_split=config.get_bool("GY_ORGANIZE_YEAR_SPLIT"),
+        organize_conflict_strategy=config.get_int_setting("GY_ORGANIZE_CONFLICT_STRATEGY"),
         **_organize_extension_defaults(),
     )
 

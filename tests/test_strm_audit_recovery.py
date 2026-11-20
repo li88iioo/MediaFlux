@@ -23,7 +23,7 @@ def seed(root, count=3):
             parent_id="s", filename=file.name,
             rel_dir="", target_rel_path=f"{file.name}.strm", action="generate", error="disk failed")
     runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""}),
-               "strm_root": str(root), "base_url": "http://play.invalid"}
+               "strm_root": str(root), "base_url": "http://play.invalid", "skip_threshold_mb": 0}
     return _TreeClient({"s": files}), runtime
 
 
@@ -176,7 +176,9 @@ def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
         plans = strm.plan_strm_sources([{"id": "s1", "name": "Films"}, {"id": "s2", "name": "Films"}])
         files = [GuangYaFile(f"v{i}", "Same.mkv", False, 100, f"e{i}", f"s{i}") for i in (1, 2)]
         client = _TreeClient({file.parent_id: [file] for file in files})
-        runtime: dict[str, Any] = {"sources": plans, "strm_root": str(tmp_path), "base_url": "http://play.invalid"}
+        runtime: dict[str, Any] = {
+            "sources": plans, "strm_root": str(tmp_path), "base_url": "http://play.invalid", "skip_threshold_mb": 0,
+        }
         for file in files:
             db.record_strm_failure(source_id=file.parent_id, source_name="Films", file_id=file.file_id,
                 parent_id=file.parent_id, filename=file.name, rel_dir="", target_rel_path=file.name,

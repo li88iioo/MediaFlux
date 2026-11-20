@@ -89,6 +89,7 @@ def test_full_run_reconciles_registered_old_root_and_keeps_current_deletion_inde
         save(
             STRM_ROOT=str(old), GY_STRM_BASE_URL="http://127.0.0.1:1258",
             GY_STRM_SOURCE_DIRS=json.dumps([{"id": "source", "name": "Audit"}]),
+            STRM_SKIP_THRESHOLD_MB="0",
             STRM_NOTIFY_ENABLED="0",
         )
         old_directory = old / strm.STRM_SUBDIR / "Audit"
