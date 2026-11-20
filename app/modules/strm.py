@@ -469,6 +469,11 @@ def _safe_rel_parts(rel_dir: str) -> list[str]:
     return [safe_path_component(_jellyfin_visible_name(part)) for part in parts]
 
 
+def source_directory_component(rel_prefix: str) -> str:
+    """来源分配、目录核验及清理共用生成器实际使用的目录名。"""
+    return _safe_rel_parts(safe_path_component(rel_prefix))[0] if rel_prefix.strip() else ""
+
+
 def _relative_size(parts: list[str]) -> int:
     return len("/".join(parts).encode("utf-8"))
 
@@ -1082,7 +1087,7 @@ def _install_video_candidate(
     source_key: str,
     existing_by_id: dict[str, Any],
     existing_by_path: dict[str, dict[str, Any]],
-    *, refresh_policy: StrmRefreshPolicy | None = None,
+    *, refresh_policy: StrmRefreshPolicy | None = None, verified_fingerprint: str = "",
 ) -> tuple[int, str]:
     """事务式安装视频赢家；失败时仅回滚仍由本事务持有的内容。"""
     current_raw = existing_by_id.get(file.file_id)
@@ -1096,11 +1101,11 @@ def _install_video_candidate(
         current["strm_path"] if current else "", strm_root
     )
     target_owners = list(existing_by_path.get(str(expected), {}).values())
-    target_fingerprint = ""
+    target_fingerprint = verified_fingerprint
     if expected.is_file():
         if previous_path == expected:
             # 已索引文件可自动修复；替换前仍复核快照，保护并发外部写入。
-            target_fingerprint = _content_fingerprint(expected)
+            target_fingerprint = verified_fingerprint or _content_fingerprint(expected)
         elif not target_owners and not _retained_indexed_paths([str(expected)], strm_root):
             # 首次安装和迁移共用恢复判定：全局无所有者且逐字节等于本轮
             # 签名 URL 才补索引与刷新，不能仅凭文件存在认领陌生内容。
@@ -2251,6 +2256,24 @@ def _source_snapshot_directories(
     return directories
 
 
+def _rebase_strm_candidates(
+    candidates: dict[str, tuple[GuangYaFile, str, int]],
+    preferred: str, strm_root: str, target_for: Callable[[GuangYaFile, str, str], Path],
+    should_stop: Callable[[], bool] | None,
+) -> dict[str, tuple[GuangYaFile, str, int]]:
+    """复用正常生成的路径规则；新前缀可能改变超长路径的折叠结果。"""
+    rebased = {}
+    for file, rel_dir, duplicates in candidates.values():
+        if should_stop and should_stop():
+            raise ValueError("STRM 目录核对已取消")
+        target_dir = str(Path(preferred, *Path(rel_dir).parts[1:]))
+        target = str(target_for(file, target_dir, strm_root))
+        if target in rebased or duplicates:
+            raise ValueError("云端文件映射到同一目标，无法唯一确认目录")
+        rebased[target] = (file, target_dir, duplicates)
+    return rebased
+
+
 def _sync_strm_impl(
     source_dir_id: str,
     base_url: str,
@@ -2631,6 +2654,33 @@ def _sync_strm_impl(
         )
         return stats
 
+    adopted_fingerprints: dict[str, str] = {}
+    preferred = db.get_strm_adoption_prefix(source_dir_id, strm_root, rel_prefix)
+    if preferred:
+        from app.modules.strm_adoption import verify_strm_adoption
+
+        component = safe_path_component(preferred)
+        try:
+            videos = _rebase_strm_candidates(video_candidates, component, strm_root, _strm_target, should_stop)
+            verified = verify_strm_adoption(
+                Path(strm_root).expanduser(), component,
+                ((file, Path(target)) for target, (file, _, _) in videos.items()), should_stop=should_stop,
+            )
+            companions = _rebase_strm_candidates(metadata_candidates, component, strm_root, _metadata_target, should_stop)
+            if stop_requested("scan"):
+                return stats
+            db.adopt_verified_strm_directory(source_dir_id, strm_root, rel_prefix, preferred, verified)
+        except (ValueError, OSError) as exc:
+            if stop_requested("scan"):
+                return stats
+            _append_error_sample(stats, "保留现有 STRM 目录分配", preferred, exc)
+            logger.info("STRM 同名目录未接管 source=%s reason=%s", source_dir_id, redact_sensitive_text(str(exc)))
+        else:
+            video_candidates, metadata_candidates = videos, companions
+            adopted_fingerprints = {row["strm_path"]: row["content_fingerprint"] for row in verified}
+            rel_prefix = stats["adopted_prefix"] = preferred
+            logger.info("STRM 已核实并沿用迁入目录 source=%s prefix=%s files=%d", source_dir_id, preferred, len(verified))
+
     failure_snapshots = db.get_strm_failure_resolution_snapshot(source_dir_id)
     existing_rows = strm_repo.list_strm_index(source_key)
     existing_by_id, existing_by_path = _build_index_maps(existing_rows, strm_root)
@@ -2744,6 +2794,7 @@ def _sync_strm_impl(
                     cleaned, installed_fingerprint = _install_video_candidate(
                         file, rel_dir, expected, base_url, strm_root, source_key,
                         existing_by_id, existing_by_path, refresh_policy=refresh_policy,
+                        verified_fingerprint=adopted_fingerprints.get(target_text, ""),
                     )
                     stats["cleaned"] += cleaned
                     if cleaned and current:
@@ -3191,26 +3242,24 @@ def plan_strm_sources(
         })
 
     # 已有本地分类和退役来源均保留目录，新增来源不能抢占。
-    seen = {
-        safe_path_component(value)
-        for value in [*prefixes.values(), *(occupied_prefixes or ())] if value
-    }
+    seen = {source_directory_component(value) for value in prefixes.values() if value}
+    seen.update(occupied_prefixes or ())
     reserved = seen.copy()
-    reserved.update(safe_path_component(row["rel_prefix"]) for row in planned if row["rel_prefix"])
+    reserved.update(source_directory_component(row["rel_prefix"]) for row in planned if row["rel_prefix"])
     for row in sorted(
         planned, key=lambda item: (name_counts[item["name"]] == 1, item["id"]),
     ):
         if row["id"] in prefixes:
             continue
-        component = safe_path_component(row["rel_prefix"])
+        component = source_directory_component(row["rel_prefix"])
         if component in seen:
             candidate = f"{row['rel_prefix']} [source {row['id']}]"
             suffix = 1
-            component = safe_path_component(candidate)
+            component = source_directory_component(candidate)
             while component in reserved:
                 suffix += 1
                 candidate = f"{row['rel_prefix']} [source {row['id']} #{suffix}]"
-                component = safe_path_component(candidate)
+                component = source_directory_component(candidate)
             row["rel_prefix"] = candidate
             reserved.add(component)
         seen.add(component)
@@ -4056,9 +4105,13 @@ def clean_empty_strm_dirs(
     owned_root: Path | None = None,
 ) -> dict:
     """整轮任务结束后自底向上清理一次共享 STRM 空目录。"""
-    root = owned_root or (Path(strm_root).expanduser().resolve(strict=False) / STRM_SUBDIR)
+    from app.modules.strm_recovery import _protected_adoption_dirs
+
+    media_root = Path(strm_root).expanduser().resolve(strict=False) / STRM_SUBDIR
+    root = owned_root or media_root
     if not root.is_dir() or root.absolute() != root.resolve(strict=False):
         return {"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False}
+    protected_dirs = _protected_adoption_dirs(media_root)
     empty_dirs = 0
     removed_dir_paths: list[str] = []
     stopped = False
@@ -4071,6 +4124,8 @@ def clean_empty_strm_dirs(
         if should_stop and should_stop():
             stopped = True
             break
+        if protected_dirs and any(directory.is_relative_to(item) for item in protected_dirs):
+            continue
         try:
             if not any(directory.iterdir()):
                 directory.rmdir()

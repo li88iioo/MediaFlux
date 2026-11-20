@@ -167,19 +167,28 @@ class TestStrmRoundCleanup:
         assert all(result["stats"]["clean_skipped"] is True for result in source_results)
         assert any("整轮扫描未完整" in str(item) for item in aggregate["error_samples"])
 
-    def test_scoped_round_never_retires_unselected_sources_or_sweeps_global_root(self):
+    @pytest.mark.parametrize(
+        ("adopted_prefix", "directory"),
+        [("", "整理 [source a]"), ("整理  {metatube-123} (123456)", "整理 (123456)")],
+    )
+    def test_scoped_round_never_retires_unselected_sources_or_sweeps_global_root(
+        self, adopted_prefix, directory,
+    ):
         scheduler = STRMScheduler()
-        sources = [{"id": "a", "name": "整理", "rel_prefix": "整理"}]
+        assigned_prefix = "整理 [source a]"
+        sources = [{"id": "a", "name": "整理", "rel_prefix": assigned_prefix}]
         scheduler._source_runtime = [
             {"id": "a", "name": "整理", "status": "pending", "completed": 0, "total": 0}
         ]
         source_stats = scheduler._empty_stats()
+        if adopted_prefix:
+            source_stats["adopted_prefix"] = adopted_prefix
         with patch(
             "app.modules.scheduler.configured_strm_source_plans",
             return_value=(sources, ""),
         ), patch(
             "app.modules.scheduler.sync_strm", return_value=source_stats,
-        ), patch(
+        ) as sync, patch(
             "app.modules.scheduler.clean_retired_strm_sources",
         ) as retire, patch(
             "app.modules.scheduler.clean_empty_strm_dirs",
@@ -202,9 +211,12 @@ class TestStrmRoundCleanup:
         assert aggregate["retired_sources"] == 0
         retire.assert_not_called()
         empty_cleanup.assert_called_once()
-        assert str(empty_cleanup.call_args.kwargs["owned_root"]).endswith(
-            "/光鸭云盘/整理"
-        )
+        effective_prefix = adopted_prefix or assigned_prefix
+        assert sync.call_args.kwargs["rel_prefix"] == assigned_prefix
+        assert sources[0]["rel_prefix"] == assigned_prefix
+        assert self.reconcile.call_args.args[2][0]["rel_prefix"] == effective_prefix
+        assert source_results[0]["local_dir"] == f"/tmp/strm/光鸭云盘/{directory}"
+        assert str(empty_cleanup.call_args.kwargs["owned_root"]) == source_results[0]["local_dir"]
 
     def test_source_local_dir_uses_same_single_component_sanitizing_as_strm_targets(self):
         from app.modules.scheduler import _source_local_dir

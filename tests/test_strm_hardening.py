@@ -300,6 +300,106 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             db.reconcile_configured_strm_sources(sources, root)
             self.assertEqual(db.get_strm_source_prefixes(sources), prefixes)
 
+    def test_full_sync_adopts_copied_library_after_a_numbered_directory_was_used(self):
+        self.enterContext(isolated_test_database())
+        source = "1926237371362619423"
+        sources = [{"id": source, "name": "整理"}]
+        file = GuangYaFile("1969243189619372086", "影片.mkv", False, 20000000, "A" * 40, "season")
+        tree = _TreeClient({source: [GuangYaFile("season", "剧集", True, parent_id=source)], "season": [file]})
+        with tempfile.TemporaryDirectory() as root:
+            original = generate_strm(file, "整理/剧集", "http://old-nas:1258", root)
+            payload = original.read_bytes()
+            artwork = original.with_name("poster.jpg")
+            artwork.write_bytes(b"Jellyfin poster")
+            subtitle = original.with_suffix(".srt")
+            subtitle.write_bytes(b"local subtitle")
+            sidecars = [(p, p.read_bytes(), p.stat().st_mtime_ns) for p in (artwork, subtitle)]
+            unmanaged = original.with_name("private.strm")
+            unmanaged.write_text("https://example.invalid/video")
+            db.reconcile_configured_strm_sources(sources, root)
+            numbered = db.get_strm_source_prefixes(sources)[source]
+            self.assertIn(f"[source {source}]", numbered)
+
+            def full():
+                return sync_strm(source, "http://new-nas:1258", root, client=cast(GuangYaClient, tree),
+                                 rel_prefix=db.get_strm_source_prefixes(sources)[source])
+
+            first = full()
+            self.assertNotIn("adopted_prefix", first)
+            numbered_file = Path(root) / STRM_SUBDIR / numbered / "剧集" / original.name
+            self.assertTrue(numbered_file.exists())
+            self.assertEqual(original.read_bytes(), payload)
+            unmanaged.unlink()
+            with patch.object(db, "_save_strm_source_snapshot", side_effect=RuntimeError("commit interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "commit interrupted"):
+                    full()
+            self.assertEqual(db.get_strm_source_prefixes(sources)[source], numbered)
+            self.assertEqual(strm_repo.list_strm_index(f"guangya:{source}")[0]["strm_path"], str(numbered_file))
+            self.assertEqual(original.read_bytes(), payload)
+
+            fixed = full()
+            self.assertEqual(fixed.get("adopted_prefix"), "整理", fixed)
+            self.assertEqual(fixed["failed"], 0, fixed)
+            self.assertTrue(original.read_text().startswith("http://new-nas:1258/playgy/"))
+            self.assertFalse(numbered_file.exists())
+            db.reconcile_configured_strm_sources(sources, root)
+            stamp = original.stat().st_mtime_ns
+            self.assertEqual(full()["generated"], 0)
+            self.assertEqual(original.stat().st_mtime_ns, stamp)
+            for path, content, mtime in sidecars:
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (content, mtime))
+
+    def test_copied_library_is_reused_on_first_complete_scan_without_data_directory(self):
+        self.enterContext(isolated_test_database())
+        source = "1926237371362619423"
+        sources = [{"id": source, "name": "整理"}]
+        file = GuangYaFile("1969243189619372086", "Movie.mkv", False, 20000000, "B" * 40, source)
+        with tempfile.TemporaryDirectory() as root:
+            pointer = generate_strm(file, "整理", "http://old-nas", root)
+            previous = pointer.read_bytes()
+            with db.reconcile_strm_retired_sources_transaction(
+                [source], [], configured_sources=sources, configured_strm_root=root, previous_sources=[],
+            ):
+                pass
+            assigned = db.get_strm_source_prefixes(sources)[source]
+            fallback = pointer.parent.with_name(assigned)
+            client = _TreeClient({source: [file, GuangYaFile("dir", "子目录", True, parent_id=source)],
+                                  "dir": RuntimeError("云端读取失败")})
+            options = dict(client=cast(GuangYaClient, client), rel_prefix=assigned)
+            partial = sync_strm(source, "http://new-nas", root, **options)
+            self.assertTrue(partial["clean_skipped"])
+            self.assertEqual(pointer.read_bytes(), previous)
+            self.assertFalse(fallback.exists())
+            client.tree["dir"] = []
+            finished = sync_strm(source, "http://new-nas", root, **options)
+            self.assertEqual(finished.get("adopted_prefix"), "整理", finished)
+            self.assertTrue(pointer.read_text().startswith("http://new-nas/playgy/"))
+            self.assertFalse(fallback.exists())
+
+    def test_copied_pointer_changed_after_directory_check_is_preserved(self):
+        from app.modules import strm_adoption
+
+        self.enterContext(isolated_test_database())
+        source = "1926237371362619423"
+        sources = [{"id": source, "name": "整理"}]
+        video = GuangYaFile("1970000000000000000", "Movie.mkv", False, 20000000, "A" * 40, source)
+        with tempfile.TemporaryDirectory() as root:
+            pointer = generate_strm(video, "整理", "http://old-nas", root)
+            db.reconcile_configured_strm_sources(sources, root)
+            verify = strm_adoption.verify_strm_adoption
+
+            def edit_after_verification(*args, **kwargs):
+                rows = verify(*args, **kwargs)
+                pointer.write_bytes(b"edited during calibration")
+                return rows
+
+            with patch.object(strm_adoption, "verify_strm_adoption", side_effect=edit_after_verification):
+                result = sync_strm(source, "http://new-nas", root,
+                                   client=cast(GuangYaClient, _TreeClient({source: [video]})),
+                                   rel_prefix=db.get_strm_source_prefixes(sources)[source])
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(pointer.read_bytes(), b"edited during calibration")
+
     def test_nested_selected_directory_uses_its_name_without_cloud_ancestors(self):
         self.enterContext(isolated_test_database())
         sources = [{"id": "nested-movies", "name": "电影"}]

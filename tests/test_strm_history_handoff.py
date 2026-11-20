@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app import database as db
 from app.repositories import strm as strm_repo
@@ -82,7 +85,7 @@ raise AssertionError("historical unlink window not reached")
         sync(self.root, "Current", on_refresh_paths=self.sink)
         self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
-    def historical(self, *, sink=None, sources=None):
+    def historical(self, *, sink=None, sources=None, all_sources=False):
         from app.modules.strm_recovery import reconcile_historical_strm
         from app.modules.scheduler import STRMScheduler
         from tests.test_strm_move_recovery import BASE_URL
@@ -93,9 +96,71 @@ raise AssertionError("historical unlink window not reached")
             BASE_URL,
             sources or [{"id": "source"}],
             stats,
+            all_sources=all_sources,
             on_refresh_paths=sink or self.sink,
         )
         return stats
+
+    def _configure_unadopted_source(self, prefix):
+        from app.modules import strm
+
+        sources = [{"id": "source", "name": prefix}]
+        # 先登记空配置，模拟已有磁盘目录的实例新增来源。
+        db.reconcile_configured_strm_sources([], str(self.root))
+        db.reconcile_configured_strm_sources(sources, str(self.root))
+        self.enterContext(patch.dict(os.environ, {"GY_STRM_SOURCE_DIRS": json.dumps(sources)}))
+        planned, error = strm.configured_strm_source_plans()
+        self.assertFalse(error)
+        self.assertEqual(
+            db.get_strm_adoption_prefix("source", str(self.root), planned[0]["rel_prefix"]),
+            prefix,
+        )
+        return planned
+
+    def test_unadopted_directory_keeps_mixed_pointers_and_prior_cleanup_receipts(self):
+        planned = self._configure_unadopted_source("Legacy  {metatube-123}")
+        payload = self.old.read_bytes()
+        matching = self.old.with_name("Matching.strm")
+        matching.write_bytes(payload)
+        unmatched = self.old.with_name("Unverified.strm")
+        unmatched.write_bytes(b"http://old.invalid/playgy/another-id")
+        ordinary = self.old.parent.with_name("Legacy-extra") / "Copy.strm"
+        ordinary.parent.mkdir()
+        ordinary.write_bytes(payload)
+        row = strm_repo.list_strm_index("guangya:source")[0]
+        strm_repo.enqueue_strm_path_cleanup([{
+            "source": row["source"], "file_id": row["file_id"],
+            "strm_path": str(self.old), "content_fingerprint": row["content_fingerprint"],
+        }])
+
+        stats = self.historical(sources=planned, all_sources=True)
+
+        self.assertEqual(self.old.read_bytes(), payload)
+        self.assertEqual(matching.read_bytes(), payload)
+        self.assertTrue(unmatched.is_file())
+        self.assertFalse(ordinary.exists())
+        self.assertEqual(stats["cleaned"], 1)
+        self.assertFalse(stats["clean_skipped"])
+        self.assertEqual(
+            [entry["strm_path"] for entry in strm_repo.list_strm_path_cleanup("guangya:source")],
+            [str(self.old)],
+        )
+
+    def test_empty_directory_cleanup_keeps_unadopted_directory_and_empty_descendants(self):
+        from app.modules import strm
+
+        candidate = self.old.parent
+        self.old.unlink()
+        nested = candidate / "Empty" / "Nested"
+        nested.mkdir(parents=True)
+        ordinary = candidate.with_name("Legacy-extra") / "Empty"
+        ordinary.mkdir(parents=True)
+        self._configure_unadopted_source("Legacy")
+        result = strm.clean_empty_strm_dirs(str(self.root))
+
+        self.assertTrue(nested.is_dir())
+        self.assertFalse(ordinary.parent.exists())
+        self.assertEqual(result["removed_dir_paths"], [str(ordinary), str(ordinary.parent)])
 
     def test_receipt_is_visible_from_another_connection_before_unlink(self):
         from unittest.mock import patch
@@ -112,7 +177,7 @@ raise AssertionError("historical unlink window not reached")
             return actual(path, *args, **kwargs)
 
         with patch.object(strm, "_delete_owned_file", side_effect=inspect):
-            stats = self.historical()
+            stats = self.historical(sources=[{"id": "source", "rel_prefix": "Legacy  {metatube-123}"}])
         self.assertEqual(observed, [[str(self.old)]])
         self.assertEqual(stats["cleaned"], 1)
         self.assertFalse(stats["clean_skipped"])

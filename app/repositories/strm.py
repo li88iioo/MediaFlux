@@ -6,6 +6,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -160,6 +161,7 @@ def upsert_strm_index(
 def upsert_strm_index_batch(
     source: str,
     items: list[dict[str, Any]],
+    *, connection: sqlite3.Connection | None = None,
 ) -> None:
     """批量写入 STRM 索引并在同一事务内清理冲突文件索引。
 
@@ -196,7 +198,7 @@ def upsert_strm_index_batch(
         if conflicts:
             all_conflicts.extend(conflicts)
 
-    with db.get_conn() as conn:
+    with (nullcontext(connection) if connection is not None else db.get_conn()) as conn:
         if len({record[1] for record in records}) == len(records):
             # 常见的唯一 ID 批次保持 executemany；不同 ID 之间没有读写依赖。
             conn.executemany(
@@ -928,11 +930,16 @@ def recover_stale_strm_metadata_jobs(
         return (cur.rowcount or 0)
 
 
-_CANCEL_METADATA_JOB = (
+_CANCEL_SOURCE_METADATA_JOBS = (
     "UPDATE strm_metadata_queue SET status='cancelled',dirty=0,revision=revision+1,"
     "lease_owner='',lease_until=0,last_error_type='Cancelled',last_error=?,updated_at=? "
-    "WHERE provider=? AND source_id=? AND file_id=? AND status<>'cancelled'"
+    "WHERE provider=? AND source_id=? AND status<>'cancelled'"
 )
+_CANCEL_METADATA_JOB = _CANCEL_SOURCE_METADATA_JOBS + " AND file_id=?"
+
+
+def cancel_strm_source_metadata_jobs(conn: sqlite3.Connection, source_id: str) -> None:
+    conn.execute(_CANCEL_SOURCE_METADATA_JOBS, ("STRM 来源已迁回原目录", db.now(), "guangya", source_id))
 
 
 def cancel_strm_metadata_job(

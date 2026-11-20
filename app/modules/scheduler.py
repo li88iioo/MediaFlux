@@ -49,7 +49,6 @@ from app.modules.strm import (
     configured_strm_source_plans,
     finalize_changed_paths,
     parse_strm_extensions,
-    safe_path_component,
     sync_strm,
     sync_strm_incremental,
     validate_strm_extensions,
@@ -61,7 +60,7 @@ from app.modules.strm_notifications import (
     cleanup_notice_lines,
     relative_change,
 )
-from app.modules.strm_recovery import reconcile_historical_strm
+from app.modules.strm_recovery import _source_dir_path, reconcile_historical_strm
 from app.notifier import NotificationEvent
 
 logger = get_logger(__name__)
@@ -77,11 +76,8 @@ class _ChangeOwnerOptions(TypedDict, total=False):
 
 def _source_local_dir(strm_root: str, source: dict[str, str]) -> str:
     """返回与 STRM 目标生成规则一致的来源本地根目录。"""
-    target = Path(strm_root).expanduser() / STRM_SUBDIR
-    rel_prefix = (source.get("rel_prefix") or "").strip()
-    if rel_prefix:
-        target /= safe_path_component(rel_prefix)
-    return str(target)
+    media_root = Path(strm_root).expanduser() / STRM_SUBDIR
+    return str(_source_dir_path(media_root, source.get("rel_prefix") or ""))
 
 
 def _normalize_selected_source_ids(value: Any) -> list[str]:
@@ -1637,6 +1633,7 @@ class STRMScheduler:
         refresh_policy: strm_repo.StrmRefreshPolicy | None = None,
     ) -> tuple[dict, list[dict], bool]:
         """执行全量来源扫描；局部来源模式禁止把未选来源判为退役。"""
+        sources = sources.copy()
         refresh_policy = refresh_policy or self._refresh_overflow_sink(strm_root)
         aggregate = self._empty_stats()
         source_results: list[dict] = []
@@ -1686,6 +1683,9 @@ class STRMScheduler:
                 on_refresh_paths=refresh_policy,
                 refresh_policy=refresh_policy,
             )
+            if adopted_prefix := current.get("adopted_prefix"):
+                source = {**source, "rel_prefix": adopted_prefix}
+                sources[source_index] = source
             completed_count = sum(int(current.get(key, 0) or 0) for key in (
                 "generated", "skipped", "failed", "metadata_generated",
                 "metadata_queued", "metadata_skipped", "metadata_failed",

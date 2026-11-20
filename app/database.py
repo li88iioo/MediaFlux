@@ -1988,9 +1988,15 @@ def _write_strm_source_snapshot(
         except (OSError, RuntimeError, ValueError):
             pass
     previous = _read_strm_source_snapshot(conn)
-    prefixes = previous.prefixes if previous is not None else _strm_source_prefixes(
-        sources if previous_sources is None else previous_sources
-    )
+    if previous is not None:
+        prefixes = previous.prefixes
+    elif previous_sources is not None:
+        prefixes = _strm_source_prefixes(previous_sources)
+    elif conn.execute("SELECT 1 FROM strm_index LIMIT 1").fetchone():
+        # 兼容旧数据库已有的索引布局。仅复制配置的新实例仍需核实磁盘目录。
+        prefixes = _strm_source_prefixes(sources)
+    else:
+        prefixes = {}
     output_roots = previous.output_roots if previous is not None else {}
 
     def remember_root(source_ids: Iterable[str], root: str) -> None:
@@ -2022,6 +2028,11 @@ def _write_strm_source_snapshot(
         prefixes=prefixes, occupied_prefixes=occupied,
     )
     prefixes.update({row["id"]: row["rel_prefix"] for row in planned})
+    _save_strm_source_snapshot(conn, _StrmSourceSnapshot(sources, current_root, prefixes, output_roots))
+
+
+def _save_strm_source_snapshot(conn: sqlite3.Connection, snapshot: _StrmSourceSnapshot) -> None:
+    sources, current_root, prefixes, output_roots = snapshot
     payload = json.dumps(
         {
             "version": 1,
@@ -2099,6 +2110,64 @@ def get_strm_source_prefixes(configured_sources: Iterable[object]) -> dict[str, 
     return snapshot.prefixes if snapshot is not None else _strm_source_prefixes(
         _normalize_strm_source_snapshot(configured_sources)
     )
+
+
+def _adoption_prefix(
+    snapshot: _StrmSourceSnapshot | None, source_id: str, strm_root: str, assigned_prefix: str,
+) -> str:
+    from app.modules.strm import source_directory_component
+
+    if (snapshot is None or source_id not in snapshot.sources
+            or snapshot.prefixes.get(source_id) != assigned_prefix
+            or snapshot.root != str(Path(strm_root).expanduser().resolve())):
+        return ""
+    match = re.fullmatch(rf"(.+) \[source {re.escape(source_id)}(?: #[0-9]+)?\]", assigned_prefix)
+    if not match:
+        return ""
+    preferred = match[1]
+    name = snapshot.sources[source_id]
+    if preferred not in (name, f"{name} ({source_id[-6:]})"):
+        return ""
+    component = source_directory_component(preferred)
+    if any(source_directory_component(value) == component
+           for key, value in snapshot.prefixes.items() if key != source_id):
+        return ""
+    return preferred
+
+
+def get_strm_adoption_prefix(source_id: str, strm_root: str, assigned_prefix: str) -> str:
+    if f" [source {source_id}" not in assigned_prefix:
+        return ""
+    with get_conn() as conn:
+        return _adoption_prefix(_read_strm_source_snapshot(conn), source_id, strm_root, assigned_prefix)
+
+
+def adopt_verified_strm_directory(
+    source_id: str, strm_root: str, assigned_prefix: str, preferred: str, entries: list[dict],
+) -> None:
+    """原子切换来源目录和已核实的指针索引，并撤销旧目标的元数据任务租约。"""
+    from app.modules.strm import STRM_SUBDIR, source_directory_component
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        snapshot = _read_strm_source_snapshot(conn)
+        if (not entries or not preferred or snapshot is None
+                or _adoption_prefix(snapshot, source_id, strm_root, assigned_prefix) != preferred):
+            raise ValueError("来源目录分配已变化")
+        source = f"guangya:{source_id}"
+        relative = Path(STRM_SUBDIR, source_directory_component(preferred))
+        for directory in (Path(snapshot.root) / relative, relative):
+            prefix = str(directory) + os.sep
+            if conn.execute(
+                "SELECT 1 FROM strm_index WHERE substr(strm_path,1,?)=? "
+                "AND source NOT IN (?,?) LIMIT 1",
+                (len(prefix), prefix, source, f"guangya-meta:{source_id}"),
+            ).fetchone():
+                raise ValueError("同名目录已有其他来源的索引")
+        strm_repo.upsert_strm_index_batch(source, entries, connection=conn)
+        strm_repo.cancel_strm_source_metadata_jobs(conn, source_id)
+        snapshot.prefixes[source_id] = preferred
+        _save_strm_source_snapshot(conn, snapshot)
 
 
 def get_strm_source_output_roots(source_id: str) -> list[str]:

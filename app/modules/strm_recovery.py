@@ -105,6 +105,31 @@ def _cleanup_location(value: object, roots: dict[Path, Path]) -> tuple[Path, Pat
     return None
 
 
+def _source_dir_path(media_root: Path, rel_prefix: str) -> Path:
+    """按 STRM 生成规则解析来源目录。"""
+    from app.modules import strm
+
+    return media_root / strm.source_directory_component(rel_prefix)
+
+
+def _protected_adoption_dirs(
+    media_root: Path, sources: list[dict[str, str]] | None = None,
+) -> set[Path]:
+    """返回尚未接管的旧目录，供各清理路径保护同一批候选。"""
+    from app.modules import strm
+
+    if sources is None:
+        sources, _ = strm.configured_strm_source_plans()
+    strm_root = str(media_root.parent)
+    return {
+        _source_dir_path(media_root, prefix)
+        for source in sources
+        if (prefix := db.get_strm_adoption_prefix(
+            source["id"], strm_root, source.get("rel_prefix", ""),
+        ))
+    }
+
+
 def recover_pending_paths(
     source_key: str,
     strm_root: str,
@@ -124,6 +149,7 @@ def recover_pending_paths(
     from app.modules import strm
 
     roots: dict[Path, Path] | None = None
+    protected_dirs: set[Path] = set()
     current = None
     reported_paths = set(stats.get("changed_strm_paths") or [])
     after_id = 0
@@ -136,6 +162,9 @@ def recover_pending_paths(
         after_id = int(batch[-1]["id"])
         if roots is None:
             roots = _cleanup_roots(source_key, strm_root)
+            if strm_root:
+                media_root = Path(strm_root).expanduser().resolve(strict=False) / strm.STRM_SUBDIR
+                protected_dirs = _protected_adoption_dirs(media_root)
         by_root: dict[Path, list[tuple[Path, sqlite3.Row]]] = {}
         for row in batch:
             location = _cleanup_location(row["strm_path"], roots)
@@ -145,6 +174,8 @@ def recover_pending_paths(
                 )
                 continue
             root, path = location
+            if protected_dirs and any(path.is_relative_to(item) for item in protected_dirs):
+                continue
             by_root.setdefault(root, []).append((path, row))
         for root in dict.fromkeys(roots.values()):
             items = by_root.get(root)
@@ -214,13 +245,15 @@ def _pointer(path: Path) -> bytes:
         return handle.read(MAX_POINTER_BYTES + 1)
 
 
-def _local_pointers(roots: list[Path], stats: dict, should_stop) -> Iterator[Path]:
+def _local_pointers(
+    roots: list[Path], stats: dict, should_stop, protected_dirs: set[Path],
+) -> Iterator[Path]:
     """每轮只遍历一次所属目录；条目、目录数、时间有界，不跟随符号链接。"""
     from app.modules import strm
 
     max_dirs, max_entries, _candidates, seconds = strm._scan_limits()
     deadline = time.monotonic() + seconds
-    pending = deque(roots)
+    pending = deque(root for root in roots if root not in protected_dirs)
     visited: set[Path] = set()
     entries = 0
     while pending and not _stopped(stats, should_stop):
@@ -253,6 +286,9 @@ def _local_pointers(roots: list[Path], stats: dict, should_stop) -> Iterator[Pat
                     if entry.is_symlink():
                         continue
                     if entry.is_dir(follow_symlinks=False):
+                        child = Path(entry.path)
+                        if child in protected_dirs:
+                            continue
                         if len(pending) + len(visited) >= max_dirs:
                             _blocked(
                                 stats,
@@ -260,7 +296,7 @@ def _local_pointers(roots: list[Path], stats: dict, should_stop) -> Iterator[Pat
                                 "历史 STRM 校准达到目录上限，未检查项已保留",
                             )
                             return
-                        pending.append(Path(entry.path))
+                        pending.append(child)
                     elif entry.is_file(
                         follow_symlinks=False
                     ) and entry.name.lower().endswith(".strm"):
@@ -329,14 +365,9 @@ def reconcile_historical_strm(
     if all_sources:
         roots = [root]
     else:
-        roots = list(
-            dict.fromkeys(
-                root / strm.safe_path_component(source["rel_prefix"])
-                if source.get("rel_prefix", "").strip()
-                else root
-                for source in sources
-            )
-        )
+        roots = list(dict.fromkeys(
+            _source_dir_path(root, source.get("rel_prefix") or "") for source in sources
+        ))
     pending: list[dict[str, str]] = []
 
     def persist_pending() -> bool:
@@ -351,7 +382,8 @@ def reconcile_historical_strm(
         pending.clear()
         return True
 
-    for candidate in _local_pointers(roots, stats, should_stop):
+    protected_dirs = _protected_adoption_dirs(root, sources)
+    for candidate in _local_pointers(roots, stats, should_stop, protected_dirs):
         try:
             path = _managed_path(candidate, strm_root)
             if path is None:
