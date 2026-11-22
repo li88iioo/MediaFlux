@@ -76,7 +76,7 @@
     background: var(--bg-input);
     border-radius: var(--radius-sm);
 }
-.gy-drive-search:focus-within { border-color: var(--accent); }
+.gy-drive-search:focus-within { border-color: var(--border-strong); }
 .gy-drive-search input {
     flex: 1;
     min-width: 0;
