@@ -57,7 +57,7 @@ from app.modules.strm_notifications import (
     ROUND_CLEANUP_BLOCKED_REASON,
     append_change,
     build_strm_detail_messages,
-    cleanup_notice_lines,
+    sync_notice_lines,
     relative_change,
 )
 from app.modules.strm_recovery import _source_dir_path, reconcile_historical_strm
@@ -2536,14 +2536,9 @@ class STRMScheduler:
                 f"多线程累计等待 {read_wait_seconds:.3f}s · "
                 f"最长单次 {read_wait_max_seconds:.3f}s",
             ),)
-        errors = tuple(
-            f"错误摘要：{str(item)[:300]}"
-            for item in (stats.get("error_samples") or [])[:3]
-            if item != ROUND_CLEANUP_BLOCKED_REASON
-        )
         return NotificationEvent(
             "⚠️ STRM 同步部分完成" if partial else "✅ STRM 同步完成",
-            fields=fields, lines=(*cleanup_notice_lines(stats), *errors), layout="relaxed",
+            fields=fields, lines=sync_notice_lines(stats), layout="relaxed",
         )
 
     def _foreground_notification_scopes(self, options: dict) -> list[dict]:

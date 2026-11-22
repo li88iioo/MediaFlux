@@ -12,25 +12,61 @@ from typing import Iterable, Mapping, Sequence
 from app.logger import redact_sensitive_text
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_OVERWRITE_CONFLICT = "覆盖 STRM：已停止，本地文件内容与 STRM 索引不一致"
+_CONFLICT_SUBJECT = re.compile(r"(?:(.+)/)?(?:生成 STRM|精准增量) (.+)")
+_CONFLICT_NOTICE = "本地 STRM 内容与索引不一致，已保留原文件。"
+_EPISODE_NAME = re.compile(
+    r"^(.+?)[. _]+((?:19|20)\d{2})[. _]+(S\d+E\d+(?:(?:[-~]E?|E)\d+)*)(?=[. _-]|$)", re.IGNORECASE
+)
 
 ROUND_CLEANUP_BLOCKED_REASON = (
     "整轮扫描未完整或存在异常，已跳过删除型清理、来源退役与空目录清理"
 )
 
 
-def cleanup_notice_lines(stats: Mapping[str, object]) -> tuple[str, ...]:
-    """说明本轮清理保护；只陈述已观测到的后续排队，不承诺自动重试。"""
-    if not stats.get("clean_skipped"):
-        return ()
-    if any(stats.get(key) for key in ("cleaned", "metadata_cleaned", "empty_dirs_cleaned")):
-        lines = ("为避免误删，本轮删除型清理有项目已保留。请查看运行记录中的原因。",)
-    else:
-        lines = (
-            "本轮扫描未完整或目录状态存在异常；为避免误删，已暂停本轮删除型清理（失效 STRM、来源退役及空目录）。",
-        )
-    if stats.get("organize_followup_queued"):
-        lines += ("截至本轮结束，另有整理联动已排队，将在当前任务结束后再次同步。",)
-    return lines
+def sync_notice_lines(stats: Mapping[str, object]) -> tuple[str, ...]:
+    """从有界错误样本生成通知，完整错误保留在运行记录和失败台账。"""
+    conflicts: list[tuple[str, str, str]] = []
+    other: list[str] = []
+    samples = stats.get("error_samples")
+    for sample in samples if isinstance(samples, (list, tuple)) else ():
+        text = _safe_text(sample, limit=600)
+        if not text or text.rsplit("/", 1)[-1] == ROUND_CLEANUP_BLOCKED_REASON:
+            continue
+        if len(conflicts) + len(other) == 3:
+            break
+        subject, marker, _ = text.partition("：" + _OVERWRITE_CONFLICT)
+        if marker and (match := _CONFLICT_SUBJECT.fullmatch(subject)):
+            source, filename = match[1] or "", match[2]
+            episode = _EPISODE_NAME.match(filename)
+            label = f"{episode[1]} ({episode[2]}) · {episode[3].upper()}" if episode else filename
+            conflicts.append((source, label, filename))
+        else:
+            other.append(text if len(text) <= 140 else text[:139] + "…")
+
+    blocks = []
+    if conflicts:
+        sources = {source for source, _, _ in conflicts}
+        heading = "⚠️ 需核对的文件"
+        if len(sources) == 1 and conflicts[0][0]:
+            heading += f" · {conflicts[0][0]}"
+        keys = [(source, label) for source, label, _ in conflicts]
+        items = [heading]
+        for source, label, filename in conflicts:
+            name = filename if keys.count((source, label)) > 1 else label
+            items.append(f"• {source} · {name}" if source and len(sources) > 1 else f"• {name}")
+        items.extend((_CONFLICT_NOTICE, "详情见「STRM 同步 → 索引诊断与台账 → 失败台账」。"))
+        blocks.append("\n".join(items))
+    if other:
+        blocks.append("\n".join(("异常摘要", *("• " + text for text in other))))
+    if stats.get("clean_skipped"):
+        if any(stats.get(key) for key in ("cleaned", "metadata_cleaned", "empty_dirs_cleaned")):
+            blocks.append("🧹 为避免误删，部分待清理项目已保留。")
+        else:
+            blocks.append("🧹 为避免误删，已暂停本轮删除型清理（失效 STRM、来源退役及空目录）。")
+        if stats.get("organize_followup_queued"):
+            blocks.append("另有整理联动已排队。")
+    return tuple(block if index == 0 else "\n" + block for index, block in enumerate(blocks))
 
 
 def _safe_text(value: object, *, limit: int, default: str = "") -> str:
@@ -146,7 +182,8 @@ def _render_page(
         lines.append(f"--- {_ACTIONS[action]} {directory}")
         for file_index, item in enumerate(files):
             branch = "└──" if file_index == len(files) - 1 else "├──"
-            suffix = f"（{item['error'][:180]}）" if item["error"] else ""
+            error = _CONFLICT_NOTICE if item["error"].startswith(_OVERWRITE_CONFLICT) else item["error"][:180]
+            suffix = f"（{error}）" if error else ""
             lines.append(f"      {branch} {item['filename']}{suffix}")
         if group_index != len(group_items) - 1:
             lines.append("")

@@ -10,7 +10,7 @@ import pytest
 from app.bot import handlers
 from app.bot.progress import TelegramProgress
 from app.modules.scheduler import STRMScheduler
-from app.modules.strm_notifications import cleanup_notice_lines
+from app.modules.strm_notifications import sync_notice_lines
 from app.notifier import TelegramSendResult, render_event
 from tests.support import isolated_test_database
 
@@ -189,7 +189,7 @@ def test_exceptions_remain_failures_even_when_text_matches_busy(sync_runtime, wi
 def test_summary_uses_shared_cleanup_notice_without_rewriting():
     stats = {"clean_skipped": True}
     notice = ("共享清理保护说明", "共享排队说明")
-    with patch.object(handlers, "cleanup_notice_lines", return_value=notice) as shared_notice:
+    with patch.object(handlers, "sync_notice_lines", return_value=notice) as shared_notice:
         event = handlers._strm_summary_event({"partial": True}, stats, 0)
     shared_notice.assert_called_once_with(stats)
     assert event.lines == notice
@@ -201,7 +201,7 @@ def test_cleanup_summary_describes_round_guard_and_only_observed_queue(queued):
     if queued:
         stats["organize_followup_queued"] = True
     event = handlers._strm_summary_event({"partial": True}, stats, 0)
-    assert event.lines == cleanup_notice_lines(stats)
+    assert event.lines == sync_notice_lines(stats)
     lines: list[str] = []
     for line in event.lines:
         assert isinstance(line, str)
@@ -217,4 +217,4 @@ def test_cleanup_summary_describes_round_guard_and_only_observed_queue(queued):
 def test_complete_summary_has_no_cleanup_guard_or_queue_promise():
     stats = {"organize_followup_queued": True}
     event = handlers._strm_summary_event({}, stats, 0)
-    assert event.lines == cleanup_notice_lines(stats) == ()
+    assert event.lines == sync_notice_lines(stats) == ()

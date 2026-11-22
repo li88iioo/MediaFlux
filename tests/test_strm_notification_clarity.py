@@ -11,7 +11,8 @@ from app.modules.scheduler import STRMScheduler
 from app.modules.strm import _directory_fingerprint, _source_snapshot_directories
 from app.modules.strm_notifications import (
     ROUND_CLEANUP_BLOCKED_REASON,
-    cleanup_notice_lines,
+    build_strm_detail_messages,
+    sync_notice_lines,
 )
 from tests.support import isolated_test_database
 
@@ -69,19 +70,58 @@ def test_round_guard_reason_is_not_repeated_with_source_prefixes():
         assert isinstance(line, str)
         lines.append(line)
     assert sum('为避免误删' in line for line in lines) == 1
-    errors = [line for line in lines if line.startswith('错误摘要：')]
+    errors = [line for line in lines if line.startswith('异常摘要')]
     assert len(errors) == 1
     assert '整理/扫描目录 source' in errors[0]
     assert not any('已排队' in line for line in lines)
 
 
+def test_sync_reports_group_real_overwrite_errors_without_losing_diagnostics(tmp_path):
+    from app.bot.handlers import _strm_summary_event
+    from app.modules.strm import _append_error_sample, _require_owned_file
+    from app.notifier import render_event
+
+    aggregate = STRMScheduler._empty_stats()
+    source = STRMScheduler._empty_stats()
+    source.update(clean_skipped=True, failed=2, omitted_count=21771)
+    for stem in ('大主宰.2023.S01E100', '择日飞升.2026.S01E21'):
+        filename = stem + '-WEB-DL.1080p.SDR.H.264.25fps.AAC.2.0.mkv'
+        pointer = tmp_path / (filename[:-4] + '.strm')
+        pointer.write_text('existing content')
+        with pytest.raises(RuntimeError) as exc:
+            _require_owned_file(pointer, [], '覆盖 STRM')
+        _append_error_sample(source, '生成 STRM', filename, exc.value)
+    STRMScheduler._merge_source_stats(aggregate, source, '整理')
+    assert str(tmp_path) in aggregate['error_samples'][0]
+
+    for event in (STRMScheduler._build_success_event(aggregate, {}, 1, 'manual', [], '/strm'),
+                  _strm_summary_event({'partial': True}, aggregate, 1)):
+        report = render_event(event)
+        assert '⚠️ 需核对的文件 · 整理\n• 大主宰 (2023) · S01E100\n• 择日飞升 (2026) · S01E21' in report
+        assert report.count('本地 STRM 内容与索引不一致') == 1
+        assert '失败台账' in report and '暂停本轮删除型清理' in report
+        assert str(tmp_path) not in report and 'WEB-DL' not in report
+
+
+def test_mixed_samples_keep_distinct_versions_and_hide_sensitive_urls():
+    reason = '覆盖 STRM：已停止，本地文件内容与 STRM 索引不一致，请人工核对 /data/strm/Example.strm'
+    names = ['Example.2026.S01E01-1080p.mkv', 'Example.2026.S01E01-2160p.mkv']
+    samples = [ROUND_CLEANUP_BLOCKED_REASON, *(f'精准增量 {name}：{reason}' for name in names),
+               '扫描目录 test：超时 https://example.invalid/?token=secret']
+    text = '\n'.join(sync_notice_lines({'error_samples': samples}))
+    assert all(name in text for name in names)
+    assert '超时' in text and 'secret' not in text and '/data/strm' not in text
+    pages = build_strm_detail_messages([{'action': 'failed', 'filename': names[0], 'error': reason}])
+    assert names[0] in pages[0] and '已保留原文件' in pages[0] and '/data/strm' not in pages[0]
+
+
 @pytest.mark.parametrize('queued', [False, True])
 def test_followup_notice_requires_observed_queue(queued):
-    notes = cleanup_notice_lines({'clean_skipped': True, 'organize_followup_queued': queued})
+    notes = sync_notice_lines({'clean_skipped': True, 'organize_followup_queued': queued})
     assert any('本轮删除型清理' in line for line in notes)
     assert any('另有整理联动已排队' in line for line in notes) is queued
     assert not any('自动重试' in line for line in notes)
-    assert cleanup_notice_lines({'organize_followup_queued': queued}) == ()
+    assert sync_notice_lines({'organize_followup_queued': queued}) == ()
 
 
 def test_snapshot_change_still_raises_with_clear_explanation():

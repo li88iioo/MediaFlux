@@ -36,7 +36,7 @@ from app.agent.owner_routes import normalize_delivery_route
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
 from app.logger import get_logger, log_throttled
-from app.modules.strm_notifications import cleanup_notice_lines
+from app.modules.strm_notifications import sync_notice_lines
 from app.notifier import (
     NotificationEvent,
     get_bot,
@@ -3316,7 +3316,7 @@ def _strm_summary_event(
     partial = bool(result.get("partial"))
     stopped = bool(result.get("stopped"))
 
-    lines = cleanup_notice_lines(stats)
+    lines = sync_notice_lines(stats)
     sources = [source for source in (source_results or []) if isinstance(source, dict)]
     source_overview = ""
     if sources:
