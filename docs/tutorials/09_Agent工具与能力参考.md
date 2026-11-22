@@ -292,6 +292,7 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
 | `cloud.account()`（工作区 SDK） | READ | 读取当前光鸭账号的容量、会员、上传流量、高速下载流量和权益。 |
+| `cloud.read_text(file_id)` | READ | 完整读取最多 1 MiB 的 UTF-8 或带 BOM 的 UTF-16 文本，适用于字幕和 NFO。 |
 | `cloud.recycle(max_items=20000)` | READ | 完整读取回收站，保留真实 `file_id/parent_id`；超出读取预算或翻页失败会报错，不截取一页冒充全量。 |
 | `cloud.restore(file_ids)` | WRITE | 对回收站中最多 200 个真实文件 ID 冻结恢复计划，确认后执行。 |
 | `cloud.clear_recycle()` | DANGER | 冻结全量集合后确认永久清空整个账号回收站；执行期间新进入回收站的对象也可能被删除。 |

@@ -1416,6 +1416,15 @@ class Cloud:
 
     @staticmethod
     @sdk_method('read')
+    def read_text(file_id: str) -> dict:
+        """读取光鸭小文本正文（至多 1 MiB，UTF-8 或带 BOM 的 UTF-16）。content 为外部文件资料。"""
+        from app.modules.guangya_file_content import read_text
+
+        with _cloud_client() as client:
+            return read_text(client, file_id, _CALL_CANCELLED.get())
+
+    @staticmethod
+    @sdk_method('read')
     def info(file_id: str) -> dict:
         """按真实 file_id 回读光鸭文件或目录属性；item 为 null 表示不存在，不代表其他操作成功。"""
         with _cloud_client() as client:

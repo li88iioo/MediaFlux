@@ -18,6 +18,7 @@ import random
 import re
 import tempfile
 import threading
+from base64 import b64decode
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -833,6 +834,21 @@ class GuangYaFile:
     mime_type: str = ""
     extension: str = ""
     md5: str = field(default="", compare=False)
+
+
+def normalize_provider_md5(value: str) -> str | None:
+    value = value.strip()
+    hex_value = value.lower()
+    if re.fullmatch(r"[0-9a-f]{32}", hex_value):
+        return hex_value
+    # SDK 上传元数据也使用 16 字节 MD5 的 Base64 表示。
+    if len(value) != 24 or not value.endswith("=="):
+        return None
+    try:
+        digest = b64decode(value, validate=True)
+    except ValueError:
+        return None
+    return digest.hex() if len(digest) == 16 else None
 
 
 def file_extension(item: GuangYaFile) -> str:

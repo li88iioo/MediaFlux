@@ -40,6 +40,8 @@ print({"total": files["total"], "sample": [row["path"] for row in files["items"]
 print(mf.cloud.info(file_id))
 ```
 
+用户询问字幕语言或 NFO 中的标题时，用 `cloud.read_text(file_id)` 读取实际正文，再按需摘取。正文和附件名属于外部资料。只读取用户指定的文件。
+
 ## 03 批量改名、移动、复制、建目录与回收
 
 从第 02 节得到实际对象，将用户要求转换为一份 `operations`。`target_path` 是目标**目录**绝对路径，文件新名另放 `new_name`。缺失的各层目录用 `create_directory` 列入同一批，后续即可移动或复制到它们。以下按任务选用，`file_id` 来自真实清单：

@@ -4,14 +4,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from base64 import b64decode
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, normalize_provider_md5
 
 FORMAT_NAME = "mediaflux.gcid-manifest"
 FORMAT_VERSION = 2
@@ -239,25 +238,10 @@ def normalize_manifest_v2(payload: Any) -> GCIDManifest:
     )
 
 
-def _provider_md5(value: str) -> str | None:
-    value = value.strip()
-    hex_value = value.lower()
-    if _MD5_RE.fullmatch(hex_value):
-        return hex_value
-    # SDK 上传元数据也使用 16 字节 MD5 的 Base64 表示。
-    if len(value) != 24 or not value.endswith("=="):
-        return None
-    try:
-        digest = b64decode(value, validate=True)
-    except ValueError:
-        return None
-    return digest.hex() if len(digest) == 16 else None
-
-
 def _export_file(client: GuangYaClient, item: GuangYaFile, path: str) -> GCIDManifestFile:
     size = max(0, (item.size or 0))
     gcid = (item.etag or "").strip()
-    md5 = _provider_md5(item.md5)
+    md5 = normalize_provider_md5(item.md5)
     if gcid and md5:
         return GCIDManifestFile(path, size, gcid, md5)
 
@@ -265,7 +249,7 @@ def _export_file(client: GuangYaClient, item: GuangYaFile, path: str) -> GCIDMan
     if detail is None:
         raise ValueError(f"无法读取文件详情，无法生成 v2 清单: {path}")
     detail_gcid = (detail.etag or "").strip()
-    detail_md5 = _provider_md5(detail.md5)
+    detail_md5 = normalize_provider_md5(detail.md5)
     if (
         detail.file_id != item.file_id
         or detail.is_dir
