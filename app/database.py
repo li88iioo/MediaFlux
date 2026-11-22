@@ -55,7 +55,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 44
+SCHEMA_VERSION = 46
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -591,6 +591,7 @@ def init_db() -> None:
                 )
                 if previous_schema_version == 0:
                     database_migrations._migrate_media_proxy_binding_upstream_v43(connection)
+                    database_migrations._migrate_gcid_import_metadata_v45(connection)
                 _sync_missing_schema_columns(connection)
                 database_migrations._migrate_agent_session_context_v2(connection)
                 # 未打版本的早期数据库不会进入正式迁移链；仍需同步清除
@@ -2899,10 +2900,13 @@ def create_gcid_import_task(
     target_dir_id: str,
     file_count: int,
     total_size: int,
+    target_account_key: str = "",
+    items: list[dict] | None = None,
 ) -> int:
     token = (operation_token or "").strip()
     digest = (manifest_digest or "").strip().lower()
     target = (target_dir_id or "").strip()
+    account_key = (target_account_key or "").strip()
     if not token or len(token) > 256:
         raise ValueError("operation_token 无效")
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
@@ -2915,29 +2919,34 @@ def create_gcid_import_task(
         raise ValueError("文件统计不能为负数")
     timestamp = now()
     with get_conn() as conn:
-        conn.execute(
+        created = conn.execute(
             "INSERT OR IGNORE INTO gcid_import_tasks("
-            "operation_token,manifest_digest,target_dir_id,status,file_count,total_size,"
+            "operation_token,manifest_digest,target_dir_id,target_account_key,status,file_count,total_size,"
             "success_count,failed_count,error,created_at,updated_at"
-            ") VALUES(?,?,?,'previewed',?,?,0,0,'',?,?)",
-            (token, digest, target, count, size, timestamp, timestamp),
-        )
+            ") SELECT ?,?,?,?,'previewed',?,?,0,0,'',?,? WHERE NOT EXISTS "
+            "(SELECT 1 FROM gcid_cleared_operations WHERE operation_token=?)",
+            (token, digest, target, account_key, count, size, timestamp, timestamp, token),
+        ).rowcount == 1
         row = conn.execute(
             "SELECT * FROM gcid_import_tasks WHERE operation_token=?", (token,)
         ).fetchone()
         if row is None:
-            raise RuntimeError("GCID 导入任务创建失败")
+            raise ValueError("这次导入的记录已清除，请重新预览后提交")
         if (
             row["manifest_digest"] != digest
             or row["target_dir_id"] != target
+            or row["target_account_key"] != account_key
             or int(row["file_count"] or 0) != count
             or int(row["total_size"] or 0) != size
         ):
             raise ValueError("operation_token 已绑定其他 GCID 导入任务")
-        return int(row["id"])
+        task_id = int(row["id"])
+        if created and items is not None:
+            _insert_gcid_import_items(conn, _normalize_gcid_import_items(task_id, items))
+        return task_id
 
 
-def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
+def _normalize_gcid_import_items(task_id: int, items: list[dict]) -> list[tuple]:
     if not isinstance(items, list) or len(items) > 10_000:
         raise ValueError("GCID 导入明细必须是最多 10000 项的数组")
     normalized: list[tuple] = []
@@ -2961,6 +2970,7 @@ def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
                 path,
                 size,
                 gcid,
+                str(item.get("md5") or "").strip(),
                 status,
                 str(item.get("remote_file_id") or "").strip(),
                 str(item.get("error") or "")[:1000],
@@ -2968,6 +2978,20 @@ def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
                 timestamp,
             )
         )
+    return normalized
+
+
+def _insert_gcid_import_items(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    conn.executemany(
+        "INSERT INTO gcid_import_items("
+        "task_id,path,size,gcid,md5,status,remote_file_id,error,created_at,updated_at"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+
+
+def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
+    normalized = _normalize_gcid_import_items(task_id, items)
     with get_conn() as conn:
         if (
             conn.execute(
@@ -2977,12 +3001,7 @@ def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
         ):
             raise ValueError("GCID 导入任务不存在")
         conn.execute("DELETE FROM gcid_import_items WHERE task_id=?", (task_id,))
-        conn.executemany(
-            "INSERT INTO gcid_import_items("
-            "task_id,path,size,gcid,status,remote_file_id,error,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?)",
-            normalized,
-        )
+        _insert_gcid_import_items(conn, normalized)
 
 
 def update_gcid_import_task(
@@ -2992,7 +3011,7 @@ def update_gcid_import_task(
     success_count: int | None = None,
     failed_count: int | None = None,
     error: str | None = None,
-) -> None:
+) -> sqlite3.Row | None:
     updates: list[str] = []
     params: list = []
     if status is not None:
@@ -3020,11 +3039,12 @@ def update_gcid_import_task(
     params.append(now())
     params.append(task_id)
     with get_conn() as conn:
-        cursor = conn.execute(
-            f"UPDATE gcid_import_tasks SET {', '.join(updates)} WHERE id=?", params
-        )
-        if cursor.rowcount != 1:
+        row = conn.execute(
+            f"UPDATE gcid_import_tasks SET {', '.join(updates)} WHERE id=? RETURNING *", params
+        ).fetchone()
+        if row is None:
             raise ValueError("GCID 导入任务不存在")
+        return row
 
 
 def get_gcid_import_task(task_id: int) -> sqlite3.Row | None:

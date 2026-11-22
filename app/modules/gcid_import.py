@@ -1,4 +1,4 @@
-"""GCID v2 导入预览、私有 importer 注入边界与任务编排。"""
+"""光鸭 GCID 清单的导入预览、账号绑定与任务执行。"""
 from __future__ import annotations
 
 import json
@@ -6,12 +6,15 @@ import re
 import secrets
 import threading
 from collections import OrderedDict
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from time import time
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Generator
 
 from app import database as db
 from app import notifier
+from app.clients.guangya import GuangYaClient
+from app.modules.guangya_gcid import GCIDImportItemResult, GuangyaGCIDImporter
 from app.modules.gcid_manifest import GCIDManifest, GCIDManifestFile, normalize_manifest_v2
 from app.logger import get_logger
 
@@ -23,7 +26,7 @@ class PreviewBindingError(ValueError):
 
 
 class ImportCapabilityUnavailable(RuntimeError):
-    """生产环境没有已验证的光鸭私有 GCID 导入实现。"""
+    """当前光鸭登录会话不能用于导入。"""
 
 
 class ImportTaskNotFound(ValueError):
@@ -34,30 +37,12 @@ class OperationTokenConflict(ValueError):
     """operation token 已绑定不同操作。"""
 
 
-class PrivateGCIDImporter(Protocol):
-    """Task 7 获得真实样本后实现的最小私有导入协议。"""
-
-    available: bool
-    unavailable_reason: str
-
-    def import_file(
-        self, *, target_dir_id: str, path: str, size: int, gcid: str
-    ) -> object:
-        """导入一个清单文件；不得返回值之外泄露私有响应。"""
-
-
-@dataclass(frozen=True, slots=True)
-class GCIDImportItemResult:
-    success: bool
-    remote_file_id: str = ""
-    error_code: str = ""
-
-
 @dataclass(frozen=True, slots=True)
 class GCIDImportPreview:
     preview_id: str
     owner_id: str
     target_dir_id: str
+    target_account_key: str
     manifest_digest: str
     manifest: GCIDManifest
     created_at: float
@@ -91,6 +76,7 @@ class GCIDImportPreviewStore:
         *,
         target_dir_id: str,
         owner_id: str = "",
+        target_account_key: str = "",
     ) -> str:
         normalized = manifest if isinstance(manifest, GCIDManifest) else normalize_manifest_v2(manifest)
         target = (target_dir_id or "").strip()
@@ -103,6 +89,7 @@ class GCIDImportPreviewStore:
             preview_id=preview_id,
             owner_id=owner,
             target_dir_id=target,
+            target_account_key=target_account_key,
             manifest_digest=normalized.digest,
             manifest=normalized,
             created_at=now,
@@ -147,8 +134,17 @@ _operation_lock = threading.RLock()
 _RETRY_REPLAY_KEY = "gcid_import.retry_replays:v1"
 _RETRY_REPLAY_LIMIT = 512
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
-_GENERIC_ITEM_ERROR = "私有 GCID 导入失败"
-_CAPABILITY_REASON = "光鸭私有 GCID 导入能力不可用：尚未配置经真实请求样本验证的 importer"
+_LOGIN_REQUIRED = "请先登录光鸭账号，再选择导入目标目录"
+_ITEM_ERRORS = {
+    "not_matched": "光鸭未命中该文件，无法秒传",
+    "name_conflict": "目标位置有同名文件或目录，内容不匹配",
+    "invalid_input": "文件路径或校验信息无效，请核对清单",
+    "invalid_target": "目标目录无效，请重新选择目录并预览",
+    "rate_limited": "光鸭请求过于频繁，请稍后重试",
+    "provider_rejected": "光鸭拒绝了本次请求，请检查账号状态和可用空间",
+    "cancel_failed": "文件未确认写入，未能取消云端上传任务，请检查目标目录",
+    "verify_failed": "未能核实目标文件，请检查后重试",
+}
 
 
 def reset_runtime_state() -> None:
@@ -158,50 +154,45 @@ def reset_runtime_state() -> None:
         _preview_store = GCIDImportPreviewStore()
 
 
-def get_private_importer() -> PrivateGCIDImporter | None:
-    """生产默认 fail closed；Task 7 只能在拿到真实样本后注入实现。"""
-    return None
+def importer_capability() -> dict[str, Any]:
+    with closing(GuangYaClient()) as client:
+        available = client.logged_in
+    return {"available": available, "reason": "" if available else _LOGIN_REQUIRED}
 
 
-def importer_capability(importer: PrivateGCIDImporter | None = None) -> dict[str, Any]:
-    candidate = get_private_importer() if importer is None else importer
-    available = bool(
-        candidate is not None
-        and getattr(candidate, "available", True)
-        and callable(getattr(candidate, "import_file", None))
-    )
-    reason = ""
-    if not available:
-        reason = str(getattr(candidate, "unavailable_reason", "") or _CAPABILITY_REASON)
-    return {"available": available, "reason": reason}
+def _account_key(client: GuangYaClient) -> str:
+    try:
+        return client.share_account_key()
+    except Exception as exc:
+        logger.warning("GCID 无法核对光鸭账号 type=%s", type(exc).__name__)
+        raise ImportCapabilityUnavailable("无法核对光鸭账号，请检查登录状态后重试") from exc
 
 
-def require_private_importer() -> PrivateGCIDImporter:
-    importer = get_private_importer()
-    capability = importer_capability(importer)
-    if not capability["available"] or importer is None:
-        raise ImportCapabilityUnavailable(capability["reason"])
-    return importer
+def _preview_account_key(target_dir_id: str) -> str:
+    with closing(GuangYaClient()) as client:
+        if not client.logged_in:
+            return ""
+        account_key = _account_key(client)
+        if target_dir_id != "0":
+            try:
+                directory = client.file_info(target_dir_id)
+            except Exception as exc:
+                raise ImportCapabilityUnavailable("暂时无法核对光鸭目标目录，请重试") from exc
+            if directory is None or not directory.is_dir or directory.file_id != target_dir_id:
+                raise PreviewBindingError("当前光鸭账号下的目标目录无效，请重新选择")
+        return account_key
+
+
+@contextmanager
+def _open_importer() -> Generator[tuple[GuangyaGCIDImporter, str], None, None]:
+    with closing(GuangYaClient()) as client:
+        if not client.logged_in:
+            raise ImportCapabilityUnavailable(_LOGIN_REQUIRED)
+        yield GuangyaGCIDImporter(client), _account_key(client)
 
 
 def _safe_remote_file_id(value: object) -> str:
     return _CONTROL_CHARS_RE.sub("", str(value or "").strip())[:256]
-
-
-def _result_from_private(value: object) -> GCIDImportItemResult:
-    if isinstance(value, GCIDImportItemResult):
-        return value
-    if isinstance(value, Mapping):
-        return GCIDImportItemResult(
-            success=value.get("success") is True,
-            remote_file_id=_safe_remote_file_id(value.get("remote_file_id")),
-            error_code=str(value.get("error_code") or "")[:80],
-        )
-    return GCIDImportItemResult(
-        success=getattr(value, "success", False) is True,
-        remote_file_id=_safe_remote_file_id(getattr(value, "remote_file_id", "")),
-        error_code=str(getattr(value, "error_code", "") or "")[:80],
-    )
 
 
 def _tree_for_files(files: tuple[GCIDManifestFile, ...]) -> list[dict[str, Any]]:
@@ -240,7 +231,8 @@ def _tree_for_files(files: tuple[GCIDManifestFile, ...]) -> list[dict[str, Any]]
 def create_preview(manifest: dict, *, target_dir_id: str, owner_id: str) -> dict[str, Any]:
     normalized = normalize_manifest_v2(manifest)
     preview_id = _preview_store.create(
-        normalized, target_dir_id=target_dir_id, owner_id=owner_id
+        normalized, target_dir_id=target_dir_id, owner_id=owner_id,
+        target_account_key=_preview_account_key(target_dir_id.strip()),
     )
     snapshot = _preview_store.consume(
         preview_id,
@@ -253,6 +245,7 @@ def create_preview(manifest: dict, *, target_dir_id: str, owner_id: str) -> dict
         "manifest_digest": normalized.digest,
         "target_dir_id": snapshot.target_dir_id,
         "file_count": normalized.file_count,
+        "missing_md5_count": sum(1 for item in normalized.files if not item.md5),
         "total_size": normalized.total_size,
         "tree": _tree_for_files(normalized.files),
         "expires_at": snapshot.expires_at,
@@ -315,7 +308,7 @@ def _retry_was_recorded(task_id: int, token: str) -> bool:
 
 
 def _claim_task_for_run(task_id: int, *, retry_token: str = "") -> bool:
-    """初次执行与重试共享任务 CAS；重试凭据必须先于私有写入持久化。"""
+    """初次执行与重试共享任务 CAS；重试凭据必须先于云端写入持久化。"""
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         replays = _read_retry_replays(conn) if retry_token else OrderedDict()
@@ -328,7 +321,7 @@ def _claim_task_for_run(task_id: int, *, retry_token: str = "") -> bool:
             if retry_token else "status='previewed'"
         )
         cursor = conn.execute(
-            "UPDATE gcid_import_tasks SET status='running',updated_at=? "
+            "UPDATE gcid_import_tasks SET status='running',error='',updated_at=? "
             f"WHERE id=? AND {condition}",
             (db.now(), task_id),
         )
@@ -351,18 +344,6 @@ def _update_item(
         )
 
 
-def _set_items_running(item_ids: list[int]) -> None:
-    if not item_ids:
-        return
-    placeholders = ",".join("?" for _ in item_ids)
-    with db.get_conn() as conn:
-        conn.execute(
-            f"UPDATE gcid_import_items SET status='running',error='',updated_at=? "
-            f"WHERE id IN ({placeholders})",
-            (db.now(), *item_ids),
-        )
-
-
 def _failed_samples(task_id: int, limit: int = 3) -> list[dict[str, Any]]:
     return [
         {"id": int(row["id"]), "path": row["path"], "error": row["error"]}
@@ -370,25 +351,38 @@ def _failed_samples(task_id: int, limit: int = 3) -> list[dict[str, Any]]:
     ]
 
 
-def serialize_task(row) -> dict[str, Any]:
+def _count_task_items(task_id: int) -> tuple[int, int, int]:
+    with db.get_conn() as conn:
+        counts = conn.execute(
+            "SELECT COUNT(*) AS total,SUM(status='success') AS succeeded,"
+            "SUM(status='failed') AS failed FROM gcid_import_items WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+    return int(counts["total"]), int(counts["succeeded"] or 0), int(counts["failed"] or 0)
+
+
+def serialize_task(row, *, failed_samples: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     task_id = int(row["id"])
+    status = row["status"]
+    if status == "running":
+        _, success_count, failed_count = _count_task_items(task_id)
+    else:
+        success_count = int(row["success_count"] or 0)
+        failed_count = int(row["failed_count"] or 0)
     return {
         "id": task_id,
         "manifest_digest": row["manifest_digest"],
         "target_dir_id": row["target_dir_id"],
-        "status": row["status"],
+        "status": status,
         "file_count": int(row["file_count"] or 0),
         "total_size": int(row["total_size"] or 0),
-        "success_count": int(row["success_count"] or 0),
-        "failed_count": int(row["failed_count"] or 0),
+        "success_count": success_count,
+        "failed_count": failed_count,
         "error": row["error"] or "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-        "can_retry": (
-            int(row["failed_count"] or 0) > 0
-            and row["status"] in {"failed", "partial_success"}
-        ),
-        "failed_samples": _failed_samples(task_id),
+        "can_retry": failed_count > 0 and status in {"failed", "partial_success"},
+        "failed_samples": _failed_samples(task_id) if failed_samples is None else failed_samples,
     }
 
 
@@ -396,16 +390,30 @@ def list_tasks(limit: int = 30) -> list[dict[str, Any]]:
     return [serialize_task(row) for row in db.list_gcid_import_tasks(limit)]
 
 
-def _finish_task(task_id: int) -> dict[str, Any]:
+def clear_finished_tasks() -> dict[str, int]:
+    finished = "status IN ('success','partial_success','failed')"
     with db.get_conn() as conn:
-        counts = conn.execute(
-            "SELECT COUNT(*) AS total,SUM(status='success') AS succeeded,"
-            "SUM(status='failed') AS failed FROM gcid_import_items WHERE task_id=?",
-            (task_id,),
-        ).fetchone()
-    success_count = int(counts["succeeded"] or 0)
-    failed_count = int(counts["failed"] or 0)
-    if counts["total"] and success_count == counts["total"]:
+        conn.execute("BEGIN IMMEDIATE")
+        # 仅保留提交凭据，防止另一标签页重放旧请求时重新写入云盘。
+        conn.execute(
+            "INSERT INTO gcid_cleared_operations(operation_token) "
+            f"SELECT operation_token FROM gcid_import_tasks WHERE {finished}"
+        )
+        deleted_ids = {row[0] for row in conn.execute(
+            f"DELETE FROM gcid_import_tasks WHERE {finished} RETURNING id"
+        )}
+        if deleted_ids:
+            replays = _read_retry_replays(conn)
+            remaining = OrderedDict((key, None) for key in replays if key[0] not in deleted_ids)
+            if len(remaining) != len(replays):
+                _write_retry_replays(conn, remaining)
+        retained = conn.execute("SELECT COUNT(*) FROM gcid_import_tasks").fetchone()[0]
+        return {"deleted": len(deleted_ids), "retained": retained}
+
+
+def _finish_task(task_id: int) -> dict[str, Any]:
+    total, success_count, failed_count = _count_task_items(task_id)
+    if total and success_count == total:
         status = "success"
         error = ""
     elif success_count:
@@ -414,29 +422,34 @@ def _finish_task(task_id: int) -> dict[str, Any]:
     else:
         status = "failed"
         error = "GCID 导入失败"
-    db.update_gcid_import_task(
+    # 发布终态前留存通知所需的失败样本，历史随后即可安全清除。
+    samples = _failed_samples(task_id)
+    row = db.update_gcid_import_task(
         task_id,
         status=status,
         success_count=success_count,
         failed_count=failed_count,
         error=error,
     )
-    row = db.get_gcid_import_task(task_id)
     if row is None:
         raise ImportTaskNotFound("GCID 导入任务不存在")
-    return serialize_task(row)
+    return serialize_task(row, failed_samples=samples)
 
 
 def _execute_items(
     task_id: int,
     items: list,
     *,
-    importer: PrivateGCIDImporter,
+    importer: GuangyaGCIDImporter,
     target_dir_id: str,
     retry: bool,
 ) -> dict[str, Any]:
-    _set_items_running([int(row["id"]) for row in items])
-    db.update_gcid_import_task(task_id, status="running", error="")
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE gcid_import_items SET status='running',error='',updated_at=? "
+            "WHERE task_id=? AND status=?",
+            (db.now(), task_id, "failed" if retry else "previewed"),
+        )
     notifier.notify_gcid_import_started(
         task_id=task_id,
         file_count=len(items),
@@ -445,12 +458,13 @@ def _execute_items(
     )
     for row in items:
         try:
-            outcome = _result_from_private(importer.import_file(
+            outcome = importer.import_file(
                 target_dir_id=target_dir_id,
                 path=row["path"],
                 size=int(row["size"] or 0),
                 gcid=row["gcid"],
-            ))
+                md5=row["md5"],
+            )
         except Exception as exc:
             logger.warning("GCID 导入单项失败 type=%s", type(exc).__name__)
             outcome = GCIDImportItemResult(False)
@@ -461,9 +475,11 @@ def _execute_items(
                 remote_file_id=_safe_remote_file_id(outcome.remote_file_id),
             )
         else:
-            _update_item(
-                int(row["id"]), status="failed", error=_GENERIC_ITEM_ERROR
-            )
+            if outcome.error_code == "not_matched" and not row["md5"]:
+                error = "清单缺少 MD5，光鸭仅按 GCID 未命中"
+            else:
+                error = _ITEM_ERRORS.get(outcome.error_code, "光鸭文件导入失败，请检查登录或稍后重试")
+            _update_item(int(row["id"]), status="failed", error=error)
     task = _finish_task(task_id)
     notifier.notify_gcid_import_finished(
         task_id=task_id,
@@ -506,43 +522,42 @@ def run_preview(
         if existing is not None:
             if (
                 existing["manifest_digest"] != snapshot.manifest_digest
+                or existing["target_account_key"] != snapshot.target_account_key
                 or existing["target_dir_id"] != snapshot.target_dir_id
                 or int(existing["file_count"] or 0) != snapshot.manifest.file_count
                 or int(existing["total_size"] or 0) != snapshot.manifest.total_size
             ):
                 raise OperationTokenConflict("operation_token 已绑定其他 GCID 导入任务")
-            return serialize_task(existing), True
+            if existing["status"] != "previewed":
+                return serialize_task(existing), True
 
-        importer = require_private_importer()
-        task_id = db.create_gcid_import_task(
-            operation_token=token,
-            manifest_digest=snapshot.manifest_digest,
-            target_dir_id=snapshot.target_dir_id,
-            file_count=snapshot.manifest.file_count,
-            total_size=snapshot.manifest.total_size,
-        )
-        if not _claim_task_for_run(task_id):
-            row = db.get_gcid_import_task(task_id)
-            if row is None:
-                raise ImportTaskNotFound("GCID 导入任务不存在")
-            return serialize_task(row), True
-        db.replace_gcid_import_items(task_id, [
-            {
-                "path": item.path,
-                "size": item.size,
-                "gcid": item.gcid,
-                "status": "previewed",
-            }
-            for item in snapshot.manifest.files
-        ])
-        task = _execute_items(
-            task_id,
-            db.list_gcid_import_items(task_id),
-            importer=importer,
-            target_dir_id=snapshot.target_dir_id,
-            retry=False,
-        )
-        return task, False
+        if not snapshot.manifest.file_count:
+            raise ValueError("清单中没有可导入的文件")
+        with _open_importer() as (importer, account_key):
+            if snapshot.target_account_key != account_key:
+                raise PreviewBindingError("光鸭登录账号已变化，请重新选择目标目录并预览")
+            task_id = db.create_gcid_import_task(
+                operation_token=token,
+                manifest_digest=snapshot.manifest_digest,
+                target_dir_id=snapshot.target_dir_id,
+                target_account_key=account_key,
+                file_count=snapshot.manifest.file_count,
+                total_size=snapshot.manifest.total_size,
+                items=[item.to_dict() for item in snapshot.manifest.files],
+            )
+            if not _claim_task_for_run(task_id):
+                row = db.get_gcid_import_task(task_id)
+                if row is None:
+                    raise ImportTaskNotFound("GCID 导入任务不存在")
+                return serialize_task(row), True
+            task = _execute_items(
+                task_id,
+                db.list_gcid_import_items(task_id),
+                importer=importer,
+                target_dir_id=snapshot.target_dir_id,
+                retry=False,
+            )
+            return task, False
 
 
 def retry_task(
@@ -561,19 +576,23 @@ def retry_task(
             return serialize_task(current), True
         if not db.list_gcid_import_items(normalized_task_id, "failed", limit=1):
             raise ValueError("任务没有可重试的失败项")
-        importer = require_private_importer()
-        if not _claim_task_for_run(normalized_task_id, retry_token=token):
-            current = db.get_gcid_import_task(normalized_task_id)
-            if current is None:
-                raise ImportTaskNotFound("GCID 导入任务不存在")
-            return serialize_task(current), True
-        # 领取后重读，不能使用另一个执行者完成前的失败项快照。
-        failed = db.list_gcid_import_items(normalized_task_id, "failed")
-        task = _execute_items(
-            normalized_task_id,
-            failed,
-            importer=importer,
-            target_dir_id=row["target_dir_id"],
-            retry=True,
-        )
-        return task, False
+        with _open_importer() as (importer, account_key):
+            if not row["target_account_key"]:
+                raise PreviewBindingError("旧任务未记录目标账号，请重新预览并导入清单")
+            if row["target_account_key"] != account_key:
+                raise PreviewBindingError("请切换回该任务的光鸭账号后重试")
+            if not _claim_task_for_run(normalized_task_id, retry_token=token):
+                current = db.get_gcid_import_task(normalized_task_id)
+                if current is None:
+                    raise ImportTaskNotFound("GCID 导入任务不存在")
+                return serialize_task(current), True
+            # 领取后重读，不能使用另一个执行者完成前的失败项快照。
+            failed = db.list_gcid_import_items(normalized_task_id, "failed")
+            task = _execute_items(
+                normalized_task_id,
+                failed,
+                importer=importer,
+                target_dir_id=row["target_dir_id"],
+                retry=True,
+            )
+            return task, False

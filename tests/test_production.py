@@ -124,8 +124,8 @@ class GCIDManifestTests(unittest.TestCase):
         self.tree = {
             "root": [file_type("dir", "剧集", True)],
             "dir": [
-                file_type("b", "B.mkv", False, 20, "gcid-b", "dir"),
-                file_type("a", "A.mkv", False, 10, "gcid-a", "dir"),
+                file_type("b", "B.mkv", False, 20, "gcid-b", "dir", md5="b" * 32),
+                file_type("a", "A.mkv", False, 10, "gcid-a", "dir", md5="a" * 32),
             ],
         }
         self.client = type(

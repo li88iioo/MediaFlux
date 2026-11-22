@@ -6362,21 +6362,27 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .gcid-message.is-error { color: var(--danger); }
 
 /* History in Side Column */
+.gcid-history-section .strm-section-head { flex-wrap: wrap; }
+.gcid-history-section .strm-section-head .title-group { flex-basis: 140px; }
 .gcid-history-actions {
     display: inline-flex;
     align-items: center;
     gap: 8px;
     flex-shrink: 0;
+    max-width: 100%;
+    margin-left: auto;
 }
 #gcidHistoryRefreshState {
     font-size: 11px;
     color: var(--text-muted);
-    max-width: 140px;
+    width: 7em;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 .gcid-history-actions .jump-btn {
+    flex-shrink: 0;
     min-width: 72px;
     height: 32px;
     min-height: 32px;
@@ -6420,8 +6426,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .gcid-main-section .strm-section-head .title-group,
     .gcid-section .strm-section-head .title-group { flex: 1 1 180px; }
     .gcid-main-section .strm-section-head .status-pill,
-    .gcid-section .strm-section-head .status-pill,
-    .gcid-history-actions { margin-left: auto; }
+    .gcid-section .strm-section-head .status-pill { margin-left: auto; }
 }
 
 /* Discovery indexer site selector */

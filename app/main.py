@@ -29,6 +29,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app import config, database
 from app.logger import get_logger
 from app.modules import first_run, web_secret
+from app.modules.gcid_exports import GCIDExports
 from app.security import SAFE_METHODS
 from app.web import APP_DIR, is_web_authenticated, render_template
 
@@ -832,6 +833,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
         # 正常启动和网页初装完成共享同一个服务生命周期，不启动第二套Web服务器。
         async with AsyncExitStack() as lifetime:
             lifetime.enter_context(runtime_lifecycle_guard(config.PATHS))
+            _app.state.gcid_exports = GCIDExports()
             activation_lock = asyncio.Lock()
 
             async def activate_runtime():
@@ -856,6 +858,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
             try:
                 yield
             finally:
+                _app.state.gcid_exports.close()
                 _app.state.activate_runtime = None
 
     try:

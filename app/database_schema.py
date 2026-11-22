@@ -18,7 +18,13 @@ CREATE TABLE IF NOT EXISTS media_proxy_bindings (
 );
 """
 
-_SCHEMA = """
+GCID_CLEARED_OPERATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS gcid_cleared_operations (
+    operation_token TEXT PRIMARY KEY
+) WITHOUT ROWID;
+"""
+
+_SCHEMA = GCID_CLEARED_OPERATIONS_TABLE + """
 CREATE TABLE IF NOT EXISTS organize_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,            -- guangya / 115 / 123
@@ -1264,7 +1270,8 @@ CREATE TABLE IF NOT EXISTS gcid_import_tasks (
     failed_count INTEGER NOT NULL DEFAULT 0,
     error TEXT DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    target_account_key TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_gcid_import_tasks_status_id
     ON gcid_import_tasks(status, id DESC);
@@ -1281,6 +1288,7 @@ CREATE TABLE IF NOT EXISTS gcid_import_items (
     error TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    md5 TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (task_id) REFERENCES gcid_import_tasks(id) ON DELETE CASCADE,
     UNIQUE(task_id, path)
 );

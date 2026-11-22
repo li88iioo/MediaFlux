@@ -4,12 +4,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from base64 import b64decode
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, GuangYaFile
 
 FORMAT_NAME = "mediaflux.gcid-manifest"
 FORMAT_VERSION = 2
@@ -21,9 +23,11 @@ _ROOT_KEYS_V2 = {
     "total_size", "files", "integrity",
 }
 _SOURCE_KEYS_V2 = {"provider", "directory_id", "directory_name"}
-_FILE_KEYS_V2 = {"path", "size", "gcid"}
+_FILE_REQUIRED_KEYS_V2 = {"path", "size", "gcid"}
+_FILE_KEYS_V2 = _FILE_REQUIRED_KEYS_V2 | {"md5"}
 _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:/")
 _GCID_RE = re.compile(r"^[A-Za-z0-9_:-]+$")
+_MD5_RE = re.compile(r"[0-9a-f]{32}")
 
 
 class ManifestValidationError(ValueError):
@@ -35,9 +39,13 @@ class GCIDManifestFile:
     path: str
     size: int
     gcid: str
+    md5: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"path": self.path, "size": self.size, "gcid": self.gcid}
+        entry = {"path": self.path, "size": self.size, "gcid": self.gcid}
+        if self.md5 is not None:
+            entry["md5"] = self.md5
+        return entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,8 +178,11 @@ def normalize_manifest_v2(payload: Any) -> GCIDManifest:
     normalized_files: list[GCIDManifestFile] = []
     seen: set[str] = set()
     for index, item in enumerate(files):
-        if not isinstance(item, dict) or set(item) != _FILE_KEYS_V2:
-            raise ManifestValidationError(f"files[{index}] 必须使用 path/size/gcid 标准字段")
+        if not isinstance(item, dict) or not _FILE_REQUIRED_KEYS_V2 <= item.keys() <= _FILE_KEYS_V2:
+            raise ManifestValidationError(f"files[{index}] 必须使用 path/size/gcid 标准字段，可附带 md5")
+        md5 = item.get("md5")
+        if "md5" in item and (not isinstance(md5, str) or not _MD5_RE.fullmatch(md5)):
+            raise ManifestValidationError(f"files[{index}] md5 必须是 32 位小写十六进制")
         path = _normalize_path(item.get("path"), index)
         path_key = path.casefold()
         if path_key in seen:
@@ -181,6 +192,7 @@ def normalize_manifest_v2(payload: Any) -> GCIDManifest:
             path=path,
             size=_normalize_size(item.get("size"), index),
             gcid=_normalize_gcid(item.get("gcid"), index),
+            md5=md5,
         ))
 
     # 路径虽不重复，文件仍不能同时成为另一个文件的父目录。
@@ -227,25 +239,72 @@ def normalize_manifest_v2(payload: Any) -> GCIDManifest:
     )
 
 
+def _provider_md5(value: str) -> str | None:
+    value = value.strip()
+    hex_value = value.lower()
+    if _MD5_RE.fullmatch(hex_value):
+        return hex_value
+    # SDK 上传元数据也使用 16 字节 MD5 的 Base64 表示。
+    if len(value) != 24 or not value.endswith("=="):
+        return None
+    try:
+        digest = b64decode(value, validate=True)
+    except ValueError:
+        return None
+    return digest.hex() if len(digest) == 16 else None
+
+
+def _export_file(client: GuangYaClient, item: GuangYaFile, path: str) -> GCIDManifestFile:
+    size = max(0, (item.size or 0))
+    gcid = (item.etag or "").strip()
+    md5 = _provider_md5(item.md5)
+    if gcid and md5:
+        return GCIDManifestFile(path, size, gcid, md5)
+
+    detail = client.file_info(item.file_id) if item.file_id else None
+    if detail is None:
+        raise ValueError(f"无法读取文件详情，无法生成 v2 清单: {path}")
+    detail_gcid = (detail.etag or "").strip()
+    detail_md5 = _provider_md5(detail.md5)
+    if (
+        detail.file_id != item.file_id
+        or detail.is_dir
+        or detail.size != size
+        or (gcid and detail_gcid and gcid != detail_gcid)
+        or (md5 and detail_md5 and md5 != detail_md5)
+    ):
+        raise ValueError(f"文件列表与详情的身份不一致，无法生成 v2 清单: {path}")
+    if not detail_gcid:
+        raise ValueError(f"文件详情缺少 GCID，无法生成 v2 清单: {path}")
+    return GCIDManifestFile(path, size, detail_gcid, detail_md5)
+
+
 def export_manifest(
     client: GuangYaClient,
     source_dir_id: str,
     source_name: str = "",
     max_files: int = MAX_MANIFEST_FILES,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """递归导出可直接进入 v2 预览的标准清单，不修改云端。"""
+    """递归导出 v2 清单，开始扫描目录或完成文件条目时报告累计计数。"""
     source_id = (source_dir_id or "").strip()
     if not source_id:
         raise ValueError("缺少源目录 ID")
     limit = max(1, min((max_files or MAX_MANIFEST_FILES), MAX_MANIFEST_FILES))
     entries: list[dict[str, Any]] = []
     visited_dirs: set[str] = set()
+    directory_count = 0
 
     def walk(dir_id: str, rel_dir: PurePosixPath) -> None:
+        nonlocal directory_count
         if dir_id in visited_dirs:
             raise RuntimeError(f"检测到目录循环: {dir_id}")
         visited_dirs.add(dir_id)
         try:
+            directory_count += 1
+            if on_progress is not None:
+                on_progress(directory_count, len(entries))
             for item in client.list_dir(dir_id):
                 name = _safe_component(item.name)
                 relative = rel_dir / name
@@ -254,17 +313,9 @@ def export_manifest(
                     continue
                 if len(entries) >= limit:
                     raise ValueError(f"文件数量超过安全上限 {limit}")
-                gcid = (item.etag or "").strip()
-                if not gcid:
-                    detail = client.file_info(item.file_id)
-                    gcid = (detail.etag if detail else "").strip()
-                if not gcid:
-                    raise ValueError(f"文件缺少 GCID，无法生成 v2 清单: {relative.as_posix()}")
-                entries.append({
-                    "path": relative.as_posix(),
-                    "size": max(0, (item.size or 0)),
-                    "gcid": gcid,
-                })
+                entries.append(_export_file(client, item, relative.as_posix()).to_dict())
+                if on_progress is not None:
+                    on_progress(directory_count, len(entries))
         finally:
             visited_dirs.discard(dir_id)
 

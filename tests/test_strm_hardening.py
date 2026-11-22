@@ -1913,10 +1913,9 @@ class StrmSnapshotOwnershipTests(IsolatedDatabaseTestCase):
             second_child.file_id: second_child,
         }
 
-        self.assertEqual(
-            strm_module._directory_fingerprint([child, second_child]),
-            strm_module._directory_fingerprint([second_child, child]),
-        )
+        observed = strm_module._directory_fingerprint([child, second_child])
+        child.md5 = "a" * 32
+        self.assertEqual(observed, strm_module._directory_fingerprint([second_child, child]))
         with self.assertRaises(RuntimeError):
             strm_module._source_snapshot_directories(
                 snapshot, "source", {"source": strm_module._directory_fingerprint([])},

@@ -11,7 +11,7 @@ from unittest.mock import patch
 from app import database as db
 from app.modules import gcid_import
 from tests.support import IsolatedDatabaseTestCase
-from tests.test_gcid_import_api import FakeImporter, FakeOutcome
+from tests.test_gcid_import_api import TEST_ACCOUNT_KEY, FakeImporter, FakeOutcome, mock_importer
 
 
 class _RetryProcessGates:
@@ -45,9 +45,6 @@ def _retry_in_process(
     # Spawn imports the tests package first (isolated runtime per process).
     # Only the scratch database is deliberately shared by both contenders.
     class Importer:
-        available = True
-        unavailable_reason = ""
-
         def import_file(self, **kwargs):
             with open(marker, "a", encoding="utf-8") as stream:
                 stream.write(token + "\n")
@@ -75,7 +72,7 @@ def _retry_in_process(
         with (
             patch.object(gcid_import, "_execute_items", side_effect=execute_after_gate),
             patch.object(gcid_import, "_claim_task_for_run", side_effect=claim_after_gate),
-            patch.object(gcid_import, "get_private_importer", return_value=Importer()),
+            mock_importer(Importer()),
             patch.object(gcid_import.notifier, "notify_gcid_import_started"),
             patch.object(gcid_import.notifier, "notify_gcid_import_finished"),
         ):
@@ -95,6 +92,10 @@ def _retry_in_process(
 class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
     def setUp(self):
         gcid_import.reset_runtime_state()
+        self.enterContext(patch.object(
+            gcid_import, "_open_importer",
+            side_effect=AssertionError("重放读取不得请求写入器"),
+        ))
         self.enterContext(patch.object(gcid_import.notifier, "notify_gcid_import_started"))
         self.enterContext(patch.object(gcid_import.notifier, "notify_gcid_import_finished"))
 
@@ -103,6 +104,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
             operation_token=self._testMethodName + suffix,
             manifest_digest="a" * 64,
             target_dir_id="target",
+            target_account_key=TEST_ACCOUNT_KEY,
             file_count=1,
             total_size=1,
         )
@@ -116,7 +118,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
     def test_retry_token_survives_runtime_reset_even_when_retry_failed(self):
         task_id = self._task()
         fake = FakeImporter({"Film.mkv": [FakeOutcome(False), FakeOutcome(False)]})
-        with patch.object(gcid_import, "get_private_importer", return_value=fake):
+        with mock_importer(fake):
             first, replayed = gcid_import.retry_task(
                 task_id, operation_token="retry-once"
             )
@@ -134,7 +136,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
         task_id = self._task()
         db.update_gcid_import_task(task_id, status="running")
         fake = FakeImporter()
-        with patch.object(gcid_import, "get_private_importer", return_value=fake):
+        with mock_importer(fake):
             current, replayed = gcid_import.retry_task(
                 task_id, operation_token="while-running"
             )
@@ -174,7 +176,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
             {"Film.mkv": [FakeOutcome(False), FakeOutcome(True), FakeOutcome(True)]}
         )
         before = db.list_gcid_import_items(first)[0]["id"]
-        with patch.object(gcid_import, "get_private_importer", return_value=fake):
+        with mock_importer(fake):
             gcid_import.retry_task(first, operation_token="old")
             done, replayed = gcid_import.retry_task(first, operation_token="new")
             other, other_replayed = gcid_import.retry_task(
@@ -188,7 +190,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
     def test_persistent_replay_lru_keeps_recent_hits_and_stays_bounded(self):
         task_id = self._task()
         fake = FakeImporter({"Film.mkv": [FakeOutcome(False), FakeOutcome(True)]})
-        with patch.object(gcid_import, "get_private_importer", return_value=fake):
+        with mock_importer(fake):
             gcid_import.retry_task(task_id, operation_token="keep-recent")
             ledger = json.loads(db.kv_get(gcid_import._RETRY_REPLAY_KEY))
             self.assertIn([task_id, "keep-recent"], ledger)
@@ -312,15 +314,11 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
                     ["success"],
                 )
                 gcid_import.reset_runtime_state()
-                with patch.object(
-                    gcid_import, "get_private_importer",
-                    side_effect=AssertionError("completed task requested an external writer"),
-                ):
-                    replay, replayed = gcid_import.retry_task(task_id, operation_token=winner)
-                    self.assertEqual(replay["status"], "success")
-                    self.assertTrue(replayed)
-                    with self.assertRaisesRegex(ValueError, "任务没有可重试的失败项"):
-                        gcid_import.retry_task(task_id, operation_token="fresh-after-success")
+                replay, replayed = gcid_import.retry_task(task_id, operation_token=winner)
+                self.assertEqual(replay["status"], "success")
+                self.assertTrue(replayed)
+                with self.assertRaisesRegex(ValueError, "任务没有可重试的失败项"):
+                    gcid_import.retry_task(task_id, operation_token="fresh-after-success")
                 self.assertEqual(Path(marker).read_text().splitlines(), calls)
             finally:
                 # A failed phase stays a failure; release only to clean up.

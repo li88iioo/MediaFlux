@@ -1,88 +1,831 @@
 <script>
-(function(){
-    const manifestSchema=JSON.parse(document.querySelector('[data-gcid-manifest-schema]').dataset.gcidManifestSchema);
-    const state={manifest:null,preview:null,runToken:'',historyLoaded:false,retryTokens:new Map(),importAvailable:false,importReason:'能力检查中'};
-    const byId=(id)=>document.getElementById(id);
-    function setMessage(id,text,ok=false){const el=byId(id);el.textContent=text;el.className='gcid-message '+(ok?'is-ok':text?'is-error':'');}
-    function formatBytes(n){const v=Number(n)||0;if(v<1024)return v+' B';if(v<1048576)return (v/1024).toFixed(1)+' KB';if(v<1073741824)return (v/1048576).toFixed(1)+' MB';return (v/1073741824).toFixed(2)+' GB';}
-    function setBusy(button,busy,busyLabel){if(!button.dataset.idleLabel)button.dataset.idleLabel=button.textContent;button.disabled=busy||button.dataset.forceDisabled==='1';button.textContent=busy?busyLabel:button.dataset.idleLabel;button.setAttribute('aria-busy',busy?'true':'false');}
-    function operationToken(){if(window.crypto&&typeof window.crypto.randomUUID==='function')return window.crypto.randomUUID();const bytes=new Uint8Array(16);window.crypto.getRandomValues(bytes);return Array.from(bytes,value=>value.toString(16).padStart(2,'0')).join('');}
-    async function jsonRequest(path,options={}){const response=await fetch(path,{headers:{'Content-Type':'application/json'},...options});let data={};try{data=await response.json();}catch(_error){}if(!response.ok)throw new Error(data.error||`请求失败 (${response.status})`);return data;}
-    function clearNode(node){node.replaceChildren();}
-    function appendText(parent,tag,text,className=''){const node=document.createElement(tag);if(className)node.className=className;node.textContent=text;parent.appendChild(node);return node;}
+(function () {
+    const manifestSchema = JSON.parse(document.querySelector('[data-gcid-manifest-schema]').dataset.gcidManifestSchema);
+    const byId = id => document.getElementById(id);
+    const state = {
+        manifest: null,
+        preview: null,
+        previewRequest: null,
+        runToken: '',
+        importing: false,
+        importAvailable: false,
+        exportAvailable: false,
+        importReason: '正在检查光鸭登录状态',
+        exportReason: '正在检查光鸭登录状态',
+        historyTasks: null,
+        historyRequest: null,
+        historyClearing: false,
+        historyQueued: false,
+        historyRecoveryUntil: 0,
+        historyTimer: null,
+        retryTokens: new Map(),
+    };
+    const exportEndpoint = '/api/tools/gcid/export';
+    const historyEndpoint = '/api/tools/gcid/import/tasks';
+    const exportSlot = {
+        task: null,
+        hasSnapshot: false,
+        action: '',
+        timer: null,
+        readError: null,
+        notice: null,
+        deliveredId: null,
+    };
 
-    byId('gcidChooseDir').addEventListener('click',()=>openGuangYaDirectoryPicker({modalId:'gcidDirModal',title:'选择 GCID 导出目录',onSelect:(directory)=>{
-        byId('gcidSourceId').value=directory.id;byId('gcidSourceName').value=directory.name;
-        const value=byId('gcidSourceValue');clearNode(value);appendText(value,'strong',directory.name);appendText(value,'span',directory.id);
-        byId('gcidExportBtn').disabled=false;setMessage('gcidExportMessage','');
-    }}));
-    byId('gcidExportBtn').addEventListener('click',async()=>{
-        const btn=byId('gcidExportBtn');setBusy(btn,true,'扫描中…');setMessage('gcidExportMessage','正在递归读取目录，文件较多时需要等待');
-        try{const response=await fetch('/api/tools/gcid/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_dir_id:byId('gcidSourceId').value,source_name:byId('gcidSourceName').value})});if(!response.ok){const data=await response.json();throw new Error(data.error||'导出失败');}
-        const blob=await response.blob();const disposition=response.headers.get('Content-Disposition')||'';const match=disposition.match(/filename\*?=(?:UTF-8''|"?)([^";]+)/i);const filename=match?decodeURIComponent(match[1].replace(/"/g,'')):'guangya-gcid.json';const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);setMessage('gcidExportMessage','清单已生成并开始下载',true);}catch(error){setMessage('gcidExportMessage',error.message);}finally{setBusy(btn,false,'');}
-    });
-    byId('gcidFile').addEventListener('change',event=>{const file=event.target.files[0];byId('gcidFileLabel').textContent=file?file.name:'选择 JSON 文件';byId('gcidValidateBtn').disabled=!file;setMessage('gcidValidateResult','');});
-    byId('gcidValidateBtn').addEventListener('click',async()=>{const file=byId('gcidFile').files[0];if(!file)return;const btn=byId('gcidValidateBtn');setBusy(btn,true,'校验中…');try{const data=JSON.parse(await file.text());const result=await jsonRequest('/api/tools/gcid/validate',{method:'POST',body:JSON.stringify(data)});if(!result.valid)throw new Error(result.error||'校验失败');setMessage('gcidValidateResult',`校验通过 · ${result.file_count||0} 个文件 · ${formatBytes(result.total_size||0)}`,true);}catch(error){setMessage('gcidValidateResult',error.message);}finally{setBusy(btn,false,'');}});
+    function setMessage(id, text, tone = '') {
+        const element = byId(id);
+        element.textContent = text;
+        element.classList.toggle('is-ok', tone === 'success');
+        element.classList.toggle('is-error', tone === 'error');
+    }
 
-    function invalidatePreview(message='清单或目标已变化，请重新生成预览'){
-        state.preview=null;state.runToken='';byId('gcidImportConfirm').value='';byId('gcidImportConfirm').disabled=true;byId('gcidImportRunBtn').disabled=true;
-        byId('gcidImportPreviewTitle').textContent='尚未生成预览';const counts=byId('gcidImportCounts');clearNode(counts);appendText(counts,'span','文件 —');appendText(counts,'span','体积 —');
-        const tree=byId('gcidImportTree');clearNode(tree);appendText(tree,'div',message,'gcid-empty-state');
+    function formatBytes(n) {
+        const value = Number(n) || 0;
+        if (value < 1024) return value + ' B';
+        if (value < 1048576) return (value / 1024).toFixed(1) + ' KB';
+        if (value < 1073741824) return (value / 1048576).toFixed(1) + ' MB';
+        return (value / 1073741824).toFixed(2) + ' GB';
     }
-    function syncPreviewButton(){byId('gcidImportPreviewBtn').disabled=!(state.importAvailable&&state.manifest&&byId('gcidImportTarget').value);}
-    function clientValidateManifest(data){if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('清单根节点必须是 JSON 对象');if(data.format!==manifestSchema.format||data.version!==manifestSchema.version)throw new Error(`仅接受 MediaFlux v${manifestSchema.version} GCID 清单`);if(!Array.isArray(data.files))throw new Error('files 必须是数组');if(data.files.length>manifestSchema.max_files)throw new Error(`文件数量超过 ${manifestSchema.max_files.toLocaleString('en-US')} 上限`);if(data.file_count!==data.files.length)throw new Error('file_count 与 files 数量不一致');return data;}
-    byId('gcidImportFile').addEventListener('change',async(event)=>{
-        const file=event.target.files[0];state.manifest=null;invalidatePreview(file?'文件已变化，请重新生成预览':'预览树将在这里稳定显示');
-        byId('gcidImportFileLabel').textContent=file?file.name:'选择 v2 JSON 清单';
-        if(!file){byId('gcidImportFileHint').textContent='本地先检查 JSON、版本和 10,000 文件上限';syncPreviewButton();return;}
-        try{state.manifest=clientValidateManifest(JSON.parse(await file.text()));byId('gcidImportFileHint').textContent=`结构初检通过 · ${state.manifest.file_count} 个文件 · ${formatBytes(state.manifest.total_size)}`;}catch(error){byId('gcidImportFileHint').textContent=error.message;}
-        syncPreviewButton();
-    });
-    byId('gcidImportChooseTarget').addEventListener('click',()=>openGuangYaDirectoryPicker({modalId:'gcidImportTargetModal',title:'选择 GCID 导入目标目录',onSelect:(directory)=>{
-        byId('gcidImportTarget').value=directory.id;const value=byId('gcidImportTargetValue');clearNode(value);appendText(value,'strong',directory.name);appendText(value,'span',directory.id);
-        invalidatePreview('目标目录已变化，请重新生成预览');syncPreviewButton();
-    }}));
 
-    function renderTree(nodes){const host=byId('gcidImportTree');clearNode(host);const list=document.createElement('ul');list.className='gcid-tree-root';let budget=600;
-        function addNodes(parent,items,depth){for(const item of items||[]){if(budget<=0)return;budget-=1;const row=document.createElement('li');row.className='gcid-tree-node';row.style.setProperty('--gcid-depth',String(depth));const icon=appendText(row,'span',item.type==='directory'?'DIR':'FILE','gcid-tree-type');const name=appendText(row,'span',item.name,'gcid-tree-name');icon.setAttribute('aria-hidden','true');if(item.type==='directory'){appendText(row,'span',`${item.file_count} 项 · ${formatBytes(item.total_size)}`,'gcid-tree-meta');parent.appendChild(row);addNodes(parent,item.children,depth+1);}else{appendText(row,'span',formatBytes(item.size),'gcid-tree-meta');parent.appendChild(row);}name.title=item.name;}}
-        addNodes(list,nodes,0);host.appendChild(list);if(budget<=0)appendText(host,'div','预览节点较多，界面仅展示前 600 个；服务端仍按完整清单执行','gcid-tree-truncated');
+    function setBusy(button, busy) {
+        button.disabled = busy;
+        button.setAttribute('aria-busy', String(busy));
     }
-    byId('gcidImportPreviewBtn').addEventListener('click',async()=>{if(!state.manifest||!byId('gcidImportTarget').value)return;const btn=byId('gcidImportPreviewBtn');setBusy(btn,true,'预览中…');byId('gcidImportStatus').textContent='正在服务端校验结构、摘要与目标绑定';
-        try{const preview=await jsonRequest('/api/tools/gcid/import/preview',{method:'POST',body:JSON.stringify({manifest:state.manifest,target_dir_id:byId('gcidImportTarget').value})});state.preview=preview;state.runToken=operationToken();state.manifest=null;byId('gcidImportPreviewTitle').textContent=`摘要 ${preview.manifest_digest.slice(0,12)}…`;const counts=byId('gcidImportCounts');clearNode(counts);appendText(counts,'span',`文件 ${preview.file_count}`);appendText(counts,'span',`体积 ${formatBytes(preview.total_size)}`);renderTree(preview.tree);byId('gcidImportConfirm').disabled=false;byId('gcidImportStatus').textContent='预览已绑定；核对后输入 GCID';byId('gcidImportFileHint').textContent='服务端已保存规范化短期快照，未保存原始 JSON';syncRunButton();}catch(error){invalidatePreview(error.message);byId('gcidImportStatus').textContent=error.message;}finally{setBusy(btn,false,'');syncPreviewButton();}
-    });
-    function syncRunButton(){byId('gcidImportRunBtn').disabled=!(state.importAvailable&&state.preview&&byId('gcidImportConfirm').value==='GCID');}
-    byId('gcidImportConfirm').addEventListener('input',syncRunButton);
-    function renderProgress(title,detail,status='idle'){const host=byId('gcidImportProgress');host.dataset.status=status;const marker=document.createElement('span');marker.className='gcid-progress-marker';marker.setAttribute('aria-hidden','true');const copy=document.createElement('div');appendText(copy,'strong',title);appendText(copy,'span',detail);host.replaceChildren(marker,copy);}
-    byId('gcidImportRunBtn').addEventListener('click',async()=>{if(!state.preview||byId('gcidImportConfirm').value!=='GCID')return;const btn=byId('gcidImportRunBtn');setBusy(btn,true,'导入中…');renderProgress('任务执行中',`共 ${state.preview.file_count} 个文件；请保持页面打开`,'running');
-        try{const result=await jsonRequest('/api/tools/gcid/import/run',{method:'POST',body:JSON.stringify({preview_id:state.preview.preview_id,target_dir_id:state.preview.target_dir_id,manifest_digest:state.preview.manifest_digest,confirm:'GCID',operation_token:state.runToken})});const task=result.task;const label=task.status==='success'?'导入成功':task.status==='partial_success'?'部分成功':'导入失败';renderProgress(label,`成功 ${task.success_count} · 失败 ${task.failed_count}`,task.status);byId('gcidImportStatus').textContent=result.replayed?'已返回同一 operation token 的既有结果':'任务已完成并写入历史';await loadHistory({initial:false});}catch(error){renderProgress('未执行或执行受阻',error.message,'failed');byId('gcidImportStatus').textContent=error.message;}finally{setBusy(btn,false,'');syncRunButton();}
+
+    function operationToken() {
+        if (typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+        const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+        return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function responseError(response, fallback) {
+        const data = await response.json().catch(() => null);
+        const message = response.status === 401
+            ? '网页登录已失效，请重新登录后重试'
+            : typeof data?.error === 'string' && data.error
+                ? data.error
+                : fallback + '（HTTP ' + response.status + '）';
+        const error = new Error(message);
+        error.status = response.status;
+        return error;
+    }
+
+    async function jsonRequest(path, options = {}) {
+        const response = await fetch(path, {headers: {'Content-Type': 'application/json'}, ...options});
+        if (!response.ok) throw await responseError(response, '请求失败，请重试');
+        return response.json().catch(() => {
+            throw new Error('未收到有效的服务端响应，请重试');
+        });
+    }
+
+    function appendText(parent, tag, text, className = '') {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        node.textContent = text;
+        parent.appendChild(node);
+        return node;
+    }
+
+    function clientValidateManifest(data) {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('清单根节点必须是 JSON 对象');
+        }
+        if (data.format !== manifestSchema.format || data.version !== manifestSchema.version) {
+            throw new Error('仅接受 MediaFlux v' + manifestSchema.version + ' GCID 清单');
+        }
+        if (!Array.isArray(data.files)) throw new Error('files 必须是数组');
+        if (data.files.length > manifestSchema.max_files) {
+            throw new Error('文件数量超过 ' + manifestSchema.max_files.toLocaleString('en-US') + ' 上限');
+        }
+        if (data.file_count !== data.files.length) throw new Error('file_count 与 files 数量不一致');
+        // 逐文件 MD5 可选。预览接口负责校验各项内容及完整性摘要。
+        return data;
+    }
+
+    async function readManifest(file) {
+        let text;
+        try {
+            text = await file.text();
+        } catch {
+            throw new Error('读取清单失败，请重新选择文件');
+        }
+        let manifest;
+        try {
+            manifest = JSON.parse(text);
+        } catch {
+            throw new Error('清单不是有效的 JSON');
+        }
+        return clientValidateManifest(manifest);
+    }
+
+    function setDirectoryLabel(id, directory) {
+        const element = byId(id);
+        element.replaceChildren();
+        appendText(element, 'strong', directory.name);
+        appendText(element, 'span', directory.id);
+    }
+
+    function hasActiveExport() {
+        return exportSlot.task?.status === 'running' || exportSlot.task?.status === 'ready';
+    }
+
+    function exportErrorMessage(error) {
+        return error instanceof TypeError ? '连接中断，请重试' : error.message;
+    }
+
+    function syncExportControls() {
+        const {task, action, hasSnapshot, readError, notice} = exportSlot;
+        const running = task?.status === 'running';
+        const ready = task?.status === 'ready';
+        const blocked = Boolean(action) || !hasSnapshot || readError?.status === 401;
+        const sourceId = byId('gcidSourceId').value;
+        const button = byId('gcidExportBtn');
+        const label = byId('gcidExportButtonLabel');
+        const nextLabel = ready ? (exportSlot.deliveredId === task.id ? '重试清理' : '下载 JSON') : '生成清单';
+        if (label.textContent !== nextLabel) label.textContent = nextLabel;
+        setBusy(button, Boolean(action) || running);
+        button.disabled = blocked || running || (!ready && (!state.exportAvailable || !sourceId));
+        byId('gcidChooseDir').disabled = blocked || hasActiveExport() || !state.exportAvailable;
+
+        const counts = task ? task.directory_count + ' 个目录 · ' + task.file_count + ' 个文件' : '';
+        const pendingMessages = {create: '正在提交导出任务…', download: '正在接收 JSON 清单…', cleanup: '下载已开始，正在清理结果…'};
+        let text = pendingMessages[action];
+        let tone = '';
+        if (!text) {
+            if (readError) {
+                text = '导出状态暂未更新 · ' + exportErrorMessage(readError);
+                if (counts) text += ' · ' + counts;
+                tone = 'error';
+            } else if (notice) {
+                ({text, tone} = notice);
+            } else if (running || ready) {
+                text = (running ? '正在扫描 · ' : '清单已就绪 · ') + counts;
+                tone = ready ? 'success' : '';
+            } else if (task?.status === 'failed' && task.source_dir_id === sourceId) {
+                text = '生成失败 · ' + counts + ' · ' + (task.error || '请重新生成');
+                tone = 'error';
+            } else {
+                text = hasSnapshot ? state.exportReason : '正在恢复导出任务…';
+            }
+        }
+        setMessage('gcidExportMessage', text, tone);
+    }
+
+    function setExportTask(task) {
+        if (task !== null && (!task?.id || !['running', 'ready', 'failed'].includes(task.status))) {
+            throw new Error('服务端未返回有效的导出状态');
+        }
+        const previous = exportSlot.task;
+        if (previous?.id !== task?.id) exportSlot.deliveredId = null;
+        if (previous?.id !== task?.id || previous?.status !== task?.status) exportSlot.notice = null;
+        exportSlot.task = task;
+        exportSlot.hasSnapshot = true;
+        exportSlot.readError = null;
+        const sourceId = byId('gcidSourceId');
+        const sourceName = byId('gcidSourceName');
+        if (task && (task.status !== 'failed' || !sourceId.value)) {
+            const name = task.source_name || task.source_dir_id;
+            if (sourceId.value !== task.source_dir_id || sourceName.value !== name) {
+                sourceId.value = task.source_dir_id;
+                sourceName.value = name;
+                setDirectoryLabel('gcidSourceValue', {id: task.source_dir_id, name});
+            }
+        }
+    }
+
+    async function readExportSlot() {
+        try {
+            const result = await jsonRequest(exportEndpoint, {cache: 'no-store'});
+            setExportTask(result.task);
+            return true;
+        } catch (error) {
+            exportSlot.readError = error;
+            return false;
+        }
+    }
+
+    function beginExportAction(action) {
+        window.clearTimeout(exportSlot.timer);
+        exportSlot.action = action;
+        syncExportControls();
+    }
+
+    function finishExportAction() {
+        exportSlot.action = '';
+        syncExportControls();
+        if (exportSlot.readError && exportSlot.readError.status !== 401) {
+            exportSlot.timer = window.setTimeout(refreshExportSlot, 5000);
+        } else if (!exportSlot.readError && exportSlot.task?.status === 'running') {
+            exportSlot.timer = window.setTimeout(refreshExportSlot, 2000);
+        }
+    }
+
+    async function refreshExportSlot() {
+        if (exportSlot.action) return;
+        beginExportAction('read');
+        await readExportSlot();
+        finishExportAction();
+    }
+
+    byId('gcidChooseDir').addEventListener('click', event => {
+        openGuangYaDirectoryPicker({
+            modalId: 'gcidDirModal',
+            title: '选择 GCID 导出目录',
+            trigger: event.currentTarget,
+            allowLogicalRoot: true,
+            preserveWhileLoading: true,
+            onSelect(directory) {
+                if (hasActiveExport() || !state.exportAvailable) return false;
+                byId('gcidSourceId').value = directory.id;
+                byId('gcidSourceName').value = directory.name;
+                setDirectoryLabel('gcidSourceValue', directory);
+                exportSlot.notice = null;
+                syncExportControls();
+            },
+        });
     });
 
-    function statusLabel(status){return {previewed:'已预览',running:'执行中',success:'成功',partial_success:'部分成功',failed:'失败'}[status]||status;}
-    function taskCard(task){const article=document.createElement('article');article.className='gcid-history-task';article.dataset.status=task.status;const head=document.createElement('div');head.className='gcid-history-task-head';const title=document.createElement('div');appendText(title,'span',`TASK ${String(task.id).padStart(4,'0')}`,'server-kicker');appendText(title,'strong',statusLabel(task.status));const badge=appendText(head,'span',statusLabel(task.status),'gcid-task-badge');head.prepend(title);article.appendChild(head);
-        const stats=document.createElement('div');stats.className='gcid-history-stats';[['文件',task.file_count],['成功',task.success_count],['失败',task.failed_count],['体积',formatBytes(task.total_size)]].forEach(([label,value])=>{const item=document.createElement('div');appendText(item,'span',label);appendText(item,'strong',String(value));stats.appendChild(item);});article.appendChild(stats);
-        if(task.failed_samples&&task.failed_samples.length){const samples=document.createElement('div');samples.className='gcid-failure-samples';task.failed_samples.forEach(sample=>appendText(samples,'div',`${sample.path} · ${sample.error}`));article.appendChild(samples);}
-        const foot=document.createElement('div');foot.className='gcid-history-foot';appendText(foot,'span',task.updated_at||'');if(task.can_retry){const button=appendText(foot,'button','重试失败项','jump-btn gcid-stable-button');button.type='button';button.disabled=!state.importAvailable;button.title=state.importAvailable?'':state.importReason;button.addEventListener('click',()=>retryTask(task,button));}article.appendChild(foot);return article;
+    function exportFilename(disposition) {
+        const encoded = disposition.match(/(?:^|;)\s*filename\*=UTF-8''([^;]+)/i);
+        if (encoded) {
+            try {
+                return decodeURIComponent(encoded[1].trim());
+            } catch {
+                // 扩展文件名损坏时仍可用普通文件名下载。
+            }
+        }
+        const plain = disposition.match(/(?:^|;)\s*filename=(?:"([^"]+)"|([^;]+))/i);
+        return plain?.[1] || plain?.[2]?.trim() || 'guangya-gcid.json';
     }
-    function renderHistory(tasks){const host=byId('gcidImportHistory');const fragment=document.createDocumentFragment();if(!tasks.length)appendText(fragment,'div','暂无导入任务；预览本身不会创建历史记录','gcid-empty-state');else tasks.forEach(task=>fragment.appendChild(taskCard(task)));host.replaceChildren(fragment);}
-    async function loadHistory({initial=false}={}){const refresh=byId('gcidImportRefresh');const indicator=byId('gcidHistoryRefreshState');if(initial&&!state.historyLoaded){indicator.textContent='初次加载';}else{indicator.textContent='后台刷新中…';setBusy(refresh,true,'刷新中…');}
-        try{const result=await jsonRequest('/api/tools/gcid/import/tasks');renderHistory(result.tasks||[]);state.historyLoaded=true;indicator.textContent=`已更新 · ${(result.tasks||[]).length} 条`;if((result.tasks||[]).some(task=>task.status==='running'))window.setTimeout(()=>loadHistory({initial:false}),5000);}catch(error){indicator.textContent=`刷新失败 · ${error.message}`;if(!state.historyLoaded){const host=byId('gcidImportHistory');clearNode(host);appendText(host,'div',error.message,'gcid-empty-state is-error');}}finally{setBusy(refresh,false,'');}
+
+    async function createExportTask() {
+        const oldTaskId = exportSlot.task?.id;
+        try {
+            const result = await jsonRequest(exportEndpoint, {
+                method: 'POST',
+                body: JSON.stringify({
+                    source_dir_id: byId('gcidSourceId').value,
+                    source_name: byId('gcidSourceName').value,
+                }),
+            });
+            if (!result.task) throw new Error('未收到导出任务');
+            setExportTask(result.task);
+        } catch (error) {
+            // 请求可能已经被服务器接受，或者当前槽位来自另一标签页。
+            exportSlot.hasSnapshot = false;
+            if (await readExportSlot() && (!exportSlot.task || exportSlot.task.id === oldTaskId) && !hasActiveExport()) {
+                exportSlot.notice = {text: '未能创建导出任务 · ' + exportErrorMessage(error), tone: 'error'};
+            }
+        }
     }
-    async function retryTask(task,button){let token=state.retryTokens.get(task.id);if(!token){token=operationToken();state.retryTokens.set(task.id,token);}setBusy(button,true,'重试中…');renderProgress(`任务 #${task.id} 重试中`,'仅重新提交失败项，已成功 item 保持不变','running');
-        try{const result=await jsonRequest(`/api/tools/gcid/import/${task.id}/retry`,{method:'POST',body:JSON.stringify({confirm:'GCID',operation_token:token})});const current=result.task;
-            // 明确终态允许下一次主动重试；网络错误或在途结果仍复用原 token。
-            if(['success','partial_success','failed'].includes(current.status))state.retryTokens.delete(task.id);
-            renderProgress(statusLabel(current.status),`成功 ${current.success_count} · 失败 ${current.failed_count}`,current.status);await loadHistory({initial:false});}catch(error){renderProgress('重试受阻',error.message,'failed');}finally{setBusy(button,false,'');}
+
+    function exportTaskUrl(id) {
+        return exportEndpoint + '/' + encodeURIComponent(id);
     }
-    byId('gcidImportRefresh').addEventListener('click',()=>loadHistory({initial:false}));
-    jsonRequest('/api/tools/gcid/capabilities').then(result=>{
-        state.importAvailable=Boolean(result.cloud_only_import);state.importReason=result.reason||'';
-        const badge=byId('gcidImportCapability');badge.textContent=state.importAvailable?'私有 importer 可用':'生产默认禁用';badge.className='status-pill '+(state.importAvailable?'running':'paused');badge.title=state.importReason;
-        byId('gcidImportConfirm').dataset.forceDisabled=state.importAvailable?'0':'1';
-        byId('gcidImportRunBtn').dataset.forceDisabled=state.importAvailable?'0':'1';
-        byId('gcidImportPreviewBtn').dataset.forceDisabled=state.importAvailable?'0':'1';
-        if(!state.importAvailable){byId('gcidImportStatus').textContent=state.importReason||'当前构建不提供 GCID 云端导入能力';}
-        syncPreviewButton();syncRunButton();loadHistory({initial:false});
-    }).catch(()=>{state.importAvailable=false;state.importReason='能力检查失败';byId('gcidImportCapability').textContent='能力未知';syncPreviewButton();syncRunButton();});
-    loadHistory({initial:true});
+
+    async function acknowledgeExport(id) {
+        beginExportAction('cleanup');
+        try {
+            const response = await fetch(exportTaskUrl(id), {method: 'DELETE'});
+            if (!response.ok) throw await responseError(response, '清理导出结果失败');
+            setExportTask(null);
+            exportSlot.hasSnapshot = false;
+        } catch (error) {
+            exportSlot.notice = {text: '下载已开始，清理失败 · ' + exportErrorMessage(error), tone: 'error'};
+        }
+        await readExportSlot();
+        if (exportSlot.hasSnapshot && !exportSlot.task) {
+            exportSlot.notice = {text: '下载已开始。', tone: 'success'};
+        }
+    }
+
+    async function downloadExport(id) {
+        try {
+            const response = await fetch(exportTaskUrl(id) + '/download', {cache: 'no-store'});
+            if (!response.ok) throw await responseError(response, '下载清单失败，请重试');
+            const disposition = response.headers.get('Content-Disposition') || '';
+            if (!/^attachment\b/i.test(disposition) ||
+                !/^application\/json\b/i.test(response.headers.get('Content-Type') || '')) {
+                throw new Error('服务端未返回 JSON 清单，请重试');
+            }
+            const blob = await response.blob();
+            if (!blob.size) throw new Error('未收到清单内容，请重试');
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = exportFilename(disposition);
+            document.body.appendChild(link);
+            try {
+                link.click();
+            } finally {
+                link.remove();
+                window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }
+        } catch (error) {
+            if ([404, 409, 410].includes(error.status)) await readExportSlot();
+            if (!exportSlot.task || exportSlot.task.id === id) {
+                exportSlot.notice = {text: '清单下载失败 · ' + exportErrorMessage(error), tone: 'error'};
+            }
+            return;
+        }
+        exportSlot.deliveredId = id;
+        await acknowledgeExport(id);
+    }
+
+    byId('gcidExportBtn').addEventListener('click', async () => {
+        if (byId('gcidExportBtn').disabled) return;
+        const task = exportSlot.task;
+        exportSlot.notice = null;
+        try {
+            if (task?.status !== 'ready') {
+                beginExportAction('create');
+                await createExportTask();
+            } else if (exportSlot.deliveredId === task.id) {
+                await acknowledgeExport(task.id);
+            } else {
+                beginExportAction('download');
+                await downloadExport(task.id);
+            }
+        } finally {
+            finishExportAction();
+        }
+    });
+
+    byId('gcidFile').addEventListener('change', event => {
+        const file = event.target.files[0];
+        byId('gcidFileLabel').textContent = file ? file.name : '选择 JSON 文件';
+        byId('gcidValidateBtn').disabled = !file;
+        setMessage('gcidValidateResult', '');
+    });
+
+    byId('gcidValidateBtn').addEventListener('click', async () => {
+        const input = byId('gcidFile');
+        const button = byId('gcidValidateBtn');
+        const file = input.files[0];
+        if (!file || button.disabled) return;
+        setBusy(button, true);
+        input.disabled = true;
+        setMessage('gcidValidateResult', '正在校验清单…');
+        try {
+            const manifest = await readManifest(file);
+            const result = await jsonRequest('/api/tools/gcid/validate', {
+                method: 'POST',
+                body: JSON.stringify(manifest),
+            });
+            if (!result.valid) throw new Error(result.error || '校验失败');
+            const summary = '校验通过 · ' + result.file_count + ' 个文件 · ' + formatBytes(result.total_size);
+            setMessage('gcidValidateResult', summary, 'success');
+        } catch (error) {
+            setMessage('gcidValidateResult', error.message, 'error');
+        } finally {
+            input.disabled = false;
+            setBusy(button, false);
+            button.disabled = !input.files.length;
+        }
+    });
+
+    const setImportStatus = text => { byId('gcidImportStatus').textContent = text; };
+
+    function syncImportControls() {
+        const preview = byId('gcidImportPreviewBtn');
+        const pending = Boolean(state.previewRequest);
+        setBusy(preview, pending);
+        preview.disabled = pending || !state.importAvailable || !state.manifest ||
+            !byId('gcidImportTarget').value || Boolean(state.runToken);
+        byId('gcidImportFile').disabled = state.importing;
+        byId('gcidImportChooseTarget').disabled = !state.importAvailable || state.importing;
+        const confirm = byId('gcidImportConfirm');
+        confirm.disabled = state.importing || !state.importAvailable || !(state.preview?.file_count > 0);
+        const run = byId('gcidImportRunBtn');
+        setBusy(run, state.importing);
+        run.disabled = confirm.disabled || confirm.value !== 'GCID';
+    }
+
+    function setPreviewCounts(fileCount, totalSize) {
+        const counts = byId('gcidImportCounts');
+        counts.replaceChildren();
+        appendText(counts, 'span', '文件 ' + fileCount);
+        appendText(counts, 'span', '体积 ' + totalSize);
+    }
+
+    function resetPreview(message) {
+        state.previewRequest?.abort();
+        state.previewRequest = null;
+        state.preview = null;
+        state.runToken = '';
+        byId('gcidImportConfirm').value = '';
+        byId('gcidImportPreviewTitle').textContent = '尚未生成预览';
+        setPreviewCounts('—', '—');
+        const tree = byId('gcidImportTree');
+        tree.replaceChildren();
+        appendText(tree, 'div', message, 'gcid-empty-state');
+        syncImportControls();
+    }
+
+    function showSelectionStatus() {
+        if (!state.importAvailable) setImportStatus(state.importReason);
+        else if (!state.manifest) setImportStatus('请选择 v2 JSON 清单');
+        else if (!byId('gcidImportTarget').value) setImportStatus('请选择导入目标目录');
+        else setImportStatus('清单和目标已就绪，可以生成预览');
+    }
+
+    byId('gcidImportFile').addEventListener('change', async event => {
+        const input = event.currentTarget;
+        const file = input.files[0];
+        const hint = byId('gcidImportFileHint');
+        state.manifest = null;
+        resetPreview(file ? '请根据所选清单生成预览' : '生成预览后可核对导入文件');
+        byId('gcidImportFileLabel').textContent = file ? file.name : '选择 v2 JSON 清单';
+        if (!file) {
+            hint.textContent = '支持带或不带 MD5 的 v2 清单';
+            showSelectionStatus();
+            return;
+        }
+        hint.textContent = '正在读取清单…';
+        showSelectionStatus();
+        try {
+            const manifest = await readManifest(file);
+            if (input.files[0] !== file) return;
+            state.manifest = manifest;
+            hint.textContent = '结构初检通过 · ' + manifest.file_count + ' 个文件';
+        } catch (error) {
+            if (input.files[0] !== file) return;
+            hint.textContent = error.message;
+        }
+        syncImportControls();
+        showSelectionStatus();
+    });
+
+    byId('gcidImportChooseTarget').addEventListener('click', event => {
+        openGuangYaDirectoryPicker({
+            modalId: 'gcidImportTargetModal',
+            title: '选择 GCID 导入目标目录',
+            trigger: event.currentTarget,
+            allowLogicalRoot: true,
+            preserveWhileLoading: true,
+            onSelect(directory) {
+                if (state.importing || !state.importAvailable) return false;
+                const target = byId('gcidImportTarget');
+                if (target.value === directory.id) return;
+                target.value = directory.id;
+                setDirectoryLabel('gcidImportTargetValue', directory);
+                resetPreview('请为当前目标目录生成预览');
+                showSelectionStatus();
+            },
+        });
+    });
+
+    function renderTree(nodes) {
+        const host = byId('gcidImportTree');
+        host.replaceChildren();
+        if (!nodes.length) {
+            appendText(host, 'div', '清单没有可导入的文件', 'gcid-empty-state');
+            return;
+        }
+        const list = appendText(host, 'ul', '', 'gcid-tree-root');
+        let budget = 600;
+        function addNodes(items, depth) {
+            for (const item of items) {
+                if (budget <= 0) return;
+                budget -= 1;
+                const row = appendText(list, 'li', '', 'gcid-tree-node');
+                row.style.setProperty('--gcid-depth', String(depth));
+                const isDirectory = item.type === 'directory';
+                const icon = appendText(row, 'span', isDirectory ? 'DIR' : 'FILE', 'gcid-tree-type');
+                icon.setAttribute('aria-hidden', 'true');
+                const name = appendText(row, 'span', item.name, 'gcid-tree-name');
+                name.title = item.name;
+                const size = isDirectory
+                    ? item.file_count + ' 项 · ' + formatBytes(item.total_size)
+                    : formatBytes(item.size);
+                appendText(row, 'span', size, 'gcid-tree-meta');
+                if (isDirectory) addNodes(item.children || [], depth + 1);
+            }
+        }
+        addNodes(nodes, 0);
+        if (budget <= 0) {
+            appendText(host, 'div', '界面仅展示前 600 个节点，导入按完整清单执行', 'gcid-tree-truncated');
+        }
+    }
+
+    byId('gcidImportPreviewBtn').addEventListener('click', async () => {
+        if (byId('gcidImportPreviewBtn').disabled) return;
+        const manifest = state.manifest;
+        const targetId = byId('gcidImportTarget').value;
+        resetPreview('正在生成预览…');
+        const request = new AbortController();
+        state.previewRequest = request;
+        syncImportControls();
+        setImportStatus('正在检查清单并绑定目标目录…');
+        try {
+            const preview = await jsonRequest('/api/tools/gcid/import/preview', {
+                method: 'POST',
+                body: JSON.stringify({manifest, target_dir_id: targetId}),
+                signal: request.signal,
+            });
+            if (state.previewRequest !== request) return;
+            if (!preview.preview_id || preview.target_dir_id !== targetId ||
+                !preview.manifest_digest || !Array.isArray(preview.tree)) {
+                throw new Error('未收到有效预览，请重新生成');
+            }
+            byId('gcidImportPreviewTitle').textContent = '摘要 ' + preview.manifest_digest.slice(0, 12) + '…';
+            setPreviewCounts(preview.file_count, formatBytes(preview.total_size));
+            renderTree(preview.tree);
+            state.preview = preview;
+            if (preview.file_count === 0) {
+                setImportStatus('清单没有文件，无法执行导入');
+            } else if (preview.missing_md5_count > 0) {
+                setImportStatus(preview.missing_md5_count + ' 个文件未带 MD5。GCID 未命中时，无法通过此清单恢复。');
+            } else {
+                setImportStatus('请核对预览并输入 GCID');
+            }
+        } catch (error) {
+            if (state.previewRequest !== request) return;
+            resetPreview('请重新生成预览');
+            setImportStatus(error.message);
+        } finally {
+            if (state.previewRequest === request) {
+                state.previewRequest = null;
+                syncImportControls();
+            }
+        }
+    });
+
+    byId('gcidImportConfirm').addEventListener('input', syncImportControls);
+
+    function renderProgress(title, detail, status = 'idle') {
+        const host = byId('gcidImportProgress');
+        host.dataset.status = status;
+        const copy = host.lastElementChild;
+        copy.replaceChildren();
+        appendText(copy, 'strong', title);
+        appendText(copy, 'span', detail);
+    }
+
+    byId('gcidImportRunBtn').addEventListener('click', async () => {
+        const preview = state.preview;
+        if (!preview || byId('gcidImportRunBtn').disabled) return;
+        if (preview.target_dir_id !== byId('gcidImportTarget').value) {
+            resetPreview('目标目录已变化，请重新生成预览');
+            showSelectionStatus();
+            return;
+        }
+        state.runToken = state.runToken || operationToken();
+        state.importing = true;
+        syncImportControls();
+        renderProgress('正在导入', '共 ' + preview.file_count + ' 个文件，任务历史会自动更新', 'running');
+        loadHistory();
+        let recover = false;
+        try {
+            const result = await jsonRequest('/api/tools/gcid/import/run', {
+                method: 'POST',
+                body: JSON.stringify({
+                    preview_id: preview.preview_id,
+                    target_dir_id: preview.target_dir_id,
+                    manifest_digest: preview.manifest_digest,
+                    confirm: 'GCID',
+                    operation_token: state.runToken,
+                }),
+            });
+            const task = result.task;
+            const labels = {success: '导入成功', partial_success: '部分成功', failed: '导入失败', running: '正在导入'};
+            const label = labels[task?.status];
+            if (!label) throw new Error('未收到可确认的任务结果');
+            const counts = '成功 ' + task.success_count + ' · 失败 ' + task.failed_count;
+            renderProgress(label, task.error ? counts + ' · ' + task.error : counts, task.status);
+            if (task.status === 'running') {
+                recover = true;
+                setImportStatus('任务仍在执行，任务历史会自动更新。');
+            } else {
+                state.preview = null;
+                state.runToken = '';
+                byId('gcidImportConfirm').value = '';
+                setImportStatus('任务已结束，可在历史中查看结果。');
+            }
+        } catch (error) {
+            if (error.status === 400 || error.status === 409) {
+                resetPreview('请重新生成预览');
+                setImportStatus(error.message);
+                renderProgress('导入请求受阻', error.message, 'failed');
+            } else {
+                recover = true;
+                setImportStatus('正在核对任务历史。可再次提交同一预览确认结果。');
+                renderProgress('导入结果待确认', error.message);
+            }
+        } finally {
+            state.importing = false;
+            syncImportControls();
+            loadHistory({recover});
+        }
+    });
+
+    function statusLabel(status) {
+        return {previewed: '已预览', running: '执行中', success: '成功', partial_success: '部分成功', failed: '失败'}[status] || status;
+    }
+
+    function taskCard(task) {
+        const article = document.createElement('article');
+        article.className = 'gcid-history-task';
+        article.dataset.status = task.status;
+        const head = appendText(article, 'div', '', 'gcid-history-task-head');
+        const title = appendText(head, 'div', '');
+        appendText(title, 'span', 'TASK ' + String(task.id).padStart(4, '0'), 'server-kicker');
+        appendText(title, 'strong', statusLabel(task.status));
+        appendText(head, 'span', statusLabel(task.status), 'gcid-task-badge');
+        const stats = appendText(article, 'div', '', 'gcid-history-stats');
+        const values = [
+            ['文件', task.file_count], ['成功', task.success_count],
+            ['失败', task.failed_count], ['体积', formatBytes(task.total_size)],
+        ];
+        for (const [label, value] of values) {
+            const item = appendText(stats, 'div', '');
+            appendText(item, 'span', label);
+            appendText(item, 'strong', String(value));
+        }
+        if (task.failed_samples?.length) {
+            const samples = appendText(article, 'div', '', 'gcid-failure-samples');
+            for (const sample of task.failed_samples) {
+                appendText(samples, 'div', sample.path + ' · ' + sample.error);
+            }
+        }
+        const foot = appendText(article, 'div', '', 'gcid-history-foot');
+        appendText(foot, 'span', task.updated_at || '');
+        if (task.can_retry) {
+            const button = appendText(foot, 'button', '重试失败项', 'jump-btn gcid-stable-button');
+            button.type = 'button';
+            button.disabled = !state.importAvailable || Boolean(state.retryTokens.get(task.id)?.pending);
+            button.title = state.importReason;
+            button.addEventListener('click', () => retryTask(task, button));
+        }
+        return article;
+    }
+
+    function syncHistoryClearButton() {
+        const button = byId('gcidImportClear');
+        setBusy(button, state.historyClearing);
+        button.disabled = state.historyClearing || !state.historyTasks?.length;
+    }
+
+    function renderHistory(tasks) {
+        const fragment = document.createDocumentFragment();
+        if (tasks?.length) tasks.forEach(task => fragment.appendChild(taskCard(task)));
+        else appendText(fragment, 'div', tasks ? '暂无导入任务' : '正在读取任务历史…', 'gcid-empty-state');
+        byId('gcidImportHistory').replaceChildren(fragment);
+        state.historyTasks = tasks;
+        syncHistoryClearButton();
+    }
+
+    async function loadHistory({recover = false} = {}) {
+        // 写请求没有给出结果时，给任务留出出现在历史中的时间。
+        if (recover) state.historyRecoveryUntil = Date.now() + 30000;
+        if (state.historyClearing) return;
+        if (state.historyRequest) {
+            state.historyQueued = true;
+            return;
+        }
+        window.clearTimeout(state.historyTimer);
+        const request = new AbortController();
+        state.historyRequest = request;
+        const timeout = window.setTimeout(() => request.abort(), 10000);
+        const button = byId('gcidImportRefresh');
+        const indicator = byId('gcidHistoryRefreshState');
+        setBusy(button, true);
+        indicator.textContent = '刷新中…';
+        try {
+            const {tasks} = await jsonRequest(historyEndpoint, {cache: 'no-store', signal: request.signal});
+            if (state.historyRequest !== request) return;
+            if (!Array.isArray(tasks)) throw new Error('未收到有效的任务历史');
+            renderHistory(tasks);
+            indicator.textContent = '已更新 · ' + tasks.length + ' 条';
+            indicator.title = '';
+        } catch (error) {
+            if (state.historyRequest !== request) return;
+            const detail = request.signal.aborted ? '历史刷新超时' : error.message;
+            indicator.textContent = request.signal.aborted ? '刷新超时' : '刷新失败';
+            indicator.title = detail;
+            if (state.historyTasks === null) {
+                const host = byId('gcidImportHistory');
+                host.replaceChildren();
+                appendText(host, 'div', detail, 'gcid-empty-state is-error');
+            }
+        } finally {
+            window.clearTimeout(timeout);
+            if (state.historyRequest === request) {
+                state.historyRequest = null;
+                setBusy(button, false);
+                if (state.historyQueued) {
+                    state.historyQueued = false;
+                    loadHistory();
+                } else if (state.importing || Array.from(state.retryTokens.values()).some(operation => operation.pending) ||
+                           state.historyTasks?.some(task => task.status === 'running') || Date.now() < state.historyRecoveryUntil) {
+                    state.historyTimer = window.setTimeout(loadHistory, 5000);
+                }
+            }
+        }
+    }
+
+    async function retryTask(task, button) {
+        let operation = state.retryTokens.get(task.id);
+        if (!operation) {
+            operation = {token: operationToken(), pending: false};
+            state.retryTokens.set(task.id, operation);
+        }
+        if (operation.pending) return;
+        operation.pending = true;
+        let recover = false;
+        setBusy(button, true);
+        renderProgress('正在重试任务 #' + task.id, '任务历史会自动更新', 'running');
+        loadHistory();
+        try {
+            const result = await jsonRequest('/api/tools/gcid/import/' + task.id + '/retry', {
+                method: 'POST',
+                body: JSON.stringify({confirm: 'GCID', operation_token: operation.token}),
+            });
+            const current = result.task;
+            // 已确认终态后，下次主动重试才创建新的操作令牌。
+            if (['success', 'partial_success', 'failed'].includes(current.status)) state.retryTokens.delete(task.id);
+            renderProgress(
+                statusLabel(current.status),
+                '成功 ' + current.success_count + ' · 失败 ' + current.failed_count,
+                current.status,
+            );
+            recover = current.status === 'running';
+        } catch (error) {
+            const rejected = error.status >= 400 && error.status < 500 && error.status !== 408;
+            renderProgress(rejected ? '重试受阻' : '重试结果待确认', error.message, rejected ? 'failed' : 'idle');
+            recover = !rejected;
+        } finally {
+            operation.pending = false;
+            setBusy(button, false);
+            loadHistory({recover});
+        }
+    }
+
+    byId('gcidImportRefresh').addEventListener('click', () => loadHistory());
+
+    byId('gcidImportClear').addEventListener('click', async event => {
+        if (state.historyClearing || !state.historyTasks?.length) return;
+        const confirmed = await appConfirm({
+            title: '清除 GCID 导入记录',
+            message: '将清除全部已结束的导入记录，包括未显示的记录。已预览和执行中的记录以及云盘文件会保留。',
+            confirmText: '清除记录',
+            danger: true,
+            trigger: event.currentTarget,
+        });
+        if (!confirmed || state.historyClearing) return;
+
+        state.historyClearing = true;
+        window.clearTimeout(state.historyTimer);
+        const request = state.historyRequest;
+        state.historyRequest = null;
+        state.historyQueued = false;
+        request?.abort();
+        syncHistoryClearButton();
+        setBusy(byId('gcidImportRefresh'), true);
+        const indicator = byId('gcidHistoryRefreshState');
+        indicator.textContent = '清除中…';
+        indicator.title = '';
+        try {
+            const {deleted, retained} = await jsonRequest(historyEndpoint, {method: 'DELETE'});
+            const active = retained ? state.historyTasks.filter(task => task.status === 'previewed' || task.status === 'running') : [];
+            renderHistory(retained && !active.length ? null : active);
+            window.showToast('已清除 ' + deleted + ' 条记录，保留 ' + retained + ' 条', 'success');
+        } catch (error) {
+            window.showToast('清除记录失败 · ' + error.message, 'error');
+        } finally {
+            state.historyClearing = false;
+            syncHistoryClearButton();
+            loadHistory();
+        }
+    });
+
+    async function checkCapabilities() {
+        const badge = byId('gcidImportCapability');
+        try {
+            const result = await jsonRequest('/api/tools/gcid/capabilities');
+            state.importAvailable = result.cloud_only_import === true;
+            state.exportAvailable = result.export === true;
+            state.importReason = state.importAvailable ? '' : result.reason || '暂时无法导入，请刷新页面重试';
+            state.exportReason = state.exportAvailable ? '' : result.reason || '暂时无法导出，请刷新页面重试';
+            badge.textContent = state.importAvailable ? '可导入' : '导入不可用';
+            badge.classList.toggle('running', state.importAvailable);
+            badge.classList.toggle('paused', !state.importAvailable);
+        } catch (error) {
+            badge.textContent = '状态检查失败';
+            state.importReason = error.message;
+            state.exportReason = error.message;
+        }
+        showSelectionStatus();
+        syncExportControls();
+        syncImportControls();
+        loadHistory();
+    }
+
+    window.addEventListener('focus', refreshExportSlot);
+    window.addEventListener('pageshow', event => {
+        if (event.persisted) refreshExportSlot();
+    });
+    refreshExportSlot();
+    checkCapabilities();
 })();
 </script>

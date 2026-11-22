@@ -27,7 +27,7 @@ from concurrent.futures import (
 )
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from enum import Enum
 from itertools import chain
 from pathlib import Path
@@ -2207,7 +2207,12 @@ def sync_strm_incremental(
 
 
 def _directory_fingerprint(files: list[GuangYaFile]) -> str:
-    payload = [vars(file) for file in sorted(files, key=lambda file: file.file_id)]
+    # 列表和快照可能分别带有或缺少秒传 MD5；按文件自身的比较字段判断目录变化。
+    keys = [field.name for field in fields(GuangYaFile) if field.compare]
+    payload = [
+        {key: getattr(file, key) for key in keys}
+        for file in sorted(files, key=lambda file: file.file_id)
+    ]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 

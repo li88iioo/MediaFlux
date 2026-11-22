@@ -6,10 +6,9 @@ import hashlib
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 import requests
@@ -22,7 +21,7 @@ from app.repositories import recognition as recognition_repo
 from app.concurrency import run_awaitable_sync
 from app.agent.model_catalog import fetch_ai_models
 from app.agent.rate_limit import agent_rate_limiter
-from app.clients.guangya import GuangYaClient, close_guangya_client
+from app.clients.guangya import GuangYaClient
 from app.clients.http import FixedHostHttpClient, HttpError
 from app.clients.openai_compatible import (
     PROTOCOLS,
@@ -46,6 +45,7 @@ from app.clients.openai_compatible import (
 )
 from app.logger import get_logger, redact_sensitive_text
 from app.modules import gcid_import, recognition_preprocess_rules, tmdb_regex_rules
+from app.modules.gcid_exports import ExportError
 from app.modules.gcid_manifest import ManifestValidationError, validate_manifest
 from app.modules.policy_config import POLICY_BY_KEY, policy_int
 from app.modules.scraper import (
@@ -686,46 +686,56 @@ def delete_tmdb_regex_rule_api(request: Request, rule_id: int = Path(...)):
 
 @router.post("/gcid/export")
 def export_gcid_manifest(request: Request, data: dict | None = Body(default=None)):
-    """递归扫描光鸭目录并下载版本化 GCID 清单。只读操作。"""
+    """提交只读的云盘扫描；离开页面后由服务器继续执行。"""
     require_api_login(request)
     data = data or {}
     source_dir_id = str(data.get("source_dir_id") or "").strip()
     source_name = str(data.get("source_name") or "").strip()[:200]
     if not source_dir_id or len(source_dir_id) > 128:
         return api_error("请选择有效的源目录", 400)
-    client = None
     try:
-        client = GuangYaClient()
-        if not client.logged_in:
-            return api_error("光鸭未登录", 503)
-        manifest = client.generate_gcid_json(source_dir_id, source_name)
-        payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-        safe_name = _safe_ascii_name(source_name or source_dir_id)[:80] or "guangya"
-        date = datetime.now().strftime("%Y%m%d-%H%M%S")
-        download_name = f"{safe_name}-gcid-{date}.json"
-        return Response(
-            content=payload,
-            media_type="application/json",
-            headers={
-                "Content-Disposition": f'attachment; filename="{download_name}"',
-                "Cache-Control": "no-cache, max-age=0",
-            },
-        )
-    except ValueError as exc:
-        return api_error(str(exc), 400)
-    except Exception as exc:
-        logger.error("GCID 清单导出失败 type=%s", type(exc).__name__)
-        return api_error("GCID 清单导出失败", 502)
-    finally:
-        close_guangya_client(client)
+        task = request.app.state.gcid_exports.start(csrf_token(request), source_dir_id, source_name, GuangYaClient)
+    except ExportError as exc:
+        return api_error(str(exc), exc.status_code)
+    return api_response({"task": task}, 202)
+
+
+@router.get("/gcid/export")
+def gcid_export_status(request: Request):
+    require_api_login(request)
+    return api_response({"task": request.app.state.gcid_exports.current(csrf_token(request))})
+
+
+@router.get("/gcid/export/{job_id}/download")
+def download_gcid_export(request: Request, job_id: str):
+    require_api_login(request)
+    try:
+        filename, payload = request.app.state.gcid_exports.download(csrf_token(request), job_id)
+    except ExportError as exc:
+        return api_error(str(exc), exc.status_code)
+    filename = re.sub(r'[/\\\x00-\x1f\x7f]', "_", filename)
+    fallback = _safe_ascii_name(filename)
+    return Response(payload, media_type="application/json", headers={
+        "Content-Disposition": f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}",
+        "Cache-Control": "no-store",
+    })
+
+
+@router.delete("/gcid/export/{job_id}")
+def acknowledge_gcid_export(request: Request, job_id: str):
+    require_api_login(request)
+    try:
+        request.app.state.gcid_exports.acknowledge(csrf_token(request), job_id)
+    except ExportError as exc:
+        return api_error(str(exc), exc.status_code)
+    return api_response({"ok": True})
 
 
 @router.post("/gcid/validate")
 def validate_gcid_manifest(request: Request, data: dict | None = Body(default=None)):
     """校验上传的 JSON 清单；不执行任何云端写操作。"""
     require_api_login(request)
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 20 * 1024 * 1024:
+    if _gcid_content_too_large(request):
         return api_error("清单不能超过 20 MB", 413)
     try:
         return api_response(validate_manifest(data))
@@ -769,13 +779,15 @@ def preview_gcid_import(request: Request, data: dict | None = Body(default=None)
             target_dir_id=target_dir_id,
             owner_id=_gcid_owner_id(request),
         ))
+    except gcid_import.ImportCapabilityUnavailable as exc:
+        return api_error(str(exc), 503)
     except (ManifestValidationError, gcid_import.PreviewBindingError) as exc:
         return api_error(str(exc), 400)
 
 
 @router.post("/gcid/import/run")
 def run_gcid_import(request: Request, data: dict | None = Body(default=None)):
-    """执行已确认预览；私有 importer 未配置时严格 503 fail closed。"""
+    """按已确认的清单和目标账号执行云端导入。"""
     require_api_login(request)
     data = data or {}
     if set(data) - {
@@ -796,6 +808,8 @@ def run_gcid_import(request: Request, data: dict | None = Body(default=None)):
         return api_response({"task": task, "replayed": replayed})
     except gcid_import.ImportCapabilityUnavailable as exc:
         return api_error(str(exc), 503)
+    except gcid_import.ImportTaskNotFound as exc:
+        return api_error(str(exc), 404)
     except gcid_import.PreviewBindingError as exc:
         return api_error(str(exc), 409)
     except gcid_import.OperationTokenConflict as exc:
@@ -823,6 +837,8 @@ def retry_gcid_import(
         return api_response({"task": task, "replayed": replayed})
     except gcid_import.ImportCapabilityUnavailable as exc:
         return api_error(str(exc), 503)
+    except gcid_import.PreviewBindingError as exc:
+        return api_error(str(exc), 409)
     except gcid_import.ImportTaskNotFound as exc:
         return api_error(str(exc), 404)
     except ValueError as exc:
@@ -837,12 +853,18 @@ def list_gcid_import_tasks_api(
     return api_response({"tasks": gcid_import.list_tasks(limit)})
 
 
+@router.delete("/gcid/import/tasks")
+def clear_gcid_import_tasks_api(request: Request):
+    require_api_login(request)
+    return api_response(gcid_import.clear_finished_tasks())
+
+
 @router.get("/gcid/capabilities")
 def gcid_capabilities(request: Request):
     require_api_login(request)
     capability = gcid_import.importer_capability()
     return api_response({
-        "export": True,
+        "export": capability["available"],
         "validate": True,
         "cloud_only_import": capability["available"],
         "reason": capability["reason"],

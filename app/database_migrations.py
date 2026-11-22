@@ -1845,6 +1845,23 @@ def _migrate_download_qb_save_path_v44(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE download_requests ADD COLUMN qb_save_path TEXT")
 
 
+def _migrate_gcid_import_metadata_v45(conn: sqlite3.Connection) -> None:
+    """保留历史任务和明细，以空字符串表示未知的账号或 MD5。"""
+    for table, column in (
+        ("gcid_import_tasks", "target_account_key"),
+        ("gcid_import_items", "md5"),
+    ):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if columns and column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_gcid_cleared_operations_v46(conn: sqlite3.Connection) -> None:
+    from app.database_schema import GCID_CLEARED_OPERATIONS_TABLE
+
+    conn.execute(GCID_CLEARED_OPERATIONS_TABLE)
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1890,4 +1907,6 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     41: _migrate_strm_refresh_intent_v42,
     42: _migrate_media_proxy_binding_upstream_v43,
     43: _migrate_download_qb_save_path_v44,
+    44: _migrate_gcid_import_metadata_v45,
+    45: _migrate_gcid_cleared_operations_v46,
 }

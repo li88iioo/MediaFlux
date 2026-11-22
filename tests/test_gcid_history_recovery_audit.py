@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
-from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
@@ -12,16 +11,31 @@ from app.modules import gcid_import
 from app.modules.backup import create_backup, recover_pending_restore, restore_backup
 from app.runtime_paths import RuntimePaths
 from tests.support import isolated_test_database
-from tests.test_gcid_import_api import FakeImporter, FakeOutcome
+from tests.test_gcid_import_api import (
+    TEST_ACCOUNT_KEY,
+    TEST_FILE_MD5,
+    FakeImporter,
+    FakeOutcome,
+    mock_importer,
+)
 
 
 class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(
+            gcid_import, "_open_importer",
+            side_effect=AssertionError("恢复历史的重放读取不得请求写入器"),
+        ))
+        self.enterContext(patch.object(gcid_import.notifier, "notify_gcid_import_started"))
+        self.enterContext(patch.object(gcid_import.notifier, "notify_gcid_import_finished"))
+
     @staticmethod
     def _task():
         task_id = db.create_gcid_import_task(
             operation_token="historical-initial",
             manifest_digest="a" * 64,
             target_dir_id="target",
+            target_account_key=TEST_ACCOUNT_KEY,
             file_count=2,
             total_size=2,
         )
@@ -35,28 +49,21 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
                     "status": "success",
                     "remote_file_id": "existing-a",
                 },
-                {"path": "Film/B.mkv", "size": 1, "gcid": "b", "status": "failed"},
+                {
+                    "path": "Film/B.mkv", "size": 1, "gcid": "b",
+                    "md5": TEST_FILE_MD5, "status": "failed",
+                },
             ],
         )
         gcid_import._finish_task(task_id)
         return task_id
-
-    @staticmethod
-    @contextmanager
-    def _using(importer):
-        with (
-            patch.object(gcid_import, "get_private_importer", return_value=importer),
-            patch.object(gcid_import.notifier, "notify_gcid_import_started"),
-            patch.object(gcid_import.notifier, "notify_gcid_import_finished"),
-        ):
-            yield
 
     def test_sqlite_zip_restore_keeps_retry_receipt_and_successful_item_identity(self):
         with isolated_test_database("mediaflux.db") as database_path:
             task_id = self._task()
             original_items = db.list_gcid_import_items(task_id)
             fake = FakeImporter({"Film/B.mkv": [FakeOutcome(False)]})
-            with self._using(fake):
+            with mock_importer(fake):
                 first, replayed = gcid_import.retry_task(
                     task_id, operation_token="saved-retry"
                 )
@@ -82,21 +89,21 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
             db.init_db()
             gcid_import.reset_runtime_state()
             self.assertFalse(recover_pending_restore(paths))
-            # 已发生的重复请求不要求重新启用私有能力，也不得再次调用 importer。
-            with self._using(None):
-                old, replayed = gcid_import.retry_task(
-                    task_id, operation_token="saved-retry"
-                )
+            # 恢复后的重放仅返回已保存的结果。
+            old, replayed = gcid_import.retry_task(task_id, operation_token="saved-retry")
             self.assertTrue(replayed)
             self.assertEqual(old["status"], "partial_success")
             success = FakeImporter()
-            with self._using(success):
+            with mock_importer(success):
                 final, replayed = gcid_import.retry_task(
                     task_id, operation_token="explicit-new-retry"
                 )
             self.assertFalse(replayed)
             self.assertEqual(final["status"], "success")
-            self.assertEqual([call["path"] for call in success.calls], ["Film/B.mkv"])
+            self.assertEqual(
+                [(call["path"], call["md5"]) for call in success.calls],
+                [("Film/B.mkv", TEST_FILE_MD5)],
+            )
             self.assertEqual(
                 [row["id"] for row in db.list_gcid_import_items(task_id)],
                 [row["id"] for row in original_items],
@@ -107,8 +114,6 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
 
     def test_interruption_after_private_call_keeps_unknown_running_without_replay(self):
         class InterruptedImporter:
-            available = True
-            unavailable_reason = ""
             calls = 0
 
             def import_file(self, **kwargs):
@@ -118,7 +123,7 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
         with isolated_test_database("mediaflux.db"):
             task_id = self._task()
             fake = InterruptedImporter()
-            with self._using(fake):
+            with mock_importer(fake):
                 with self.assertRaises(KeyboardInterrupt):
                     gcid_import.retry_task(task_id, operation_token="interrupted")
                 gcid_import.reset_runtime_state()
@@ -145,7 +150,7 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
             before = dict(get_gcid_import_task_result)
             before_ledger = db.kv_get(gcid_import._RETRY_REPLAY_KEY)
             fake = FakeImporter()
-            with self._using(fake):
+            with mock_importer(fake):
                 with patch.object(
                     gcid_import,
                     "_write_retry_replays",
@@ -179,7 +184,7 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
             before = dict(get_gcid_import_task_result_3)
             fake = FakeImporter()
             for raw in ('{"broken":', "{}", '[[true,"token"]]', '[[1,""]]'):
-                with self.subTest(raw=raw), self._using(fake):
+                with self.subTest(raw=raw), mock_importer(fake):
                     db.kv_set(gcid_import._RETRY_REPLAY_KEY, raw)
                     with self.assertRaisesRegex(ValueError, "凭据损坏"):
                         gcid_import.retry_task(task_id, operation_token="new")

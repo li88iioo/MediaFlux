@@ -41,7 +41,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         db.init_db()
 
         with db.get_conn() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 44)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
             request = conn.execute(
                 "SELECT id,qb_status,qb_save_path FROM download_requests WHERE id=?", (request_id,),
             ).fetchone()

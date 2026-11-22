@@ -832,6 +832,7 @@ class GuangYaFile:
     updated_at: int = 0
     mime_type: str = ""
     extension: str = ""
+    md5: str = field(default="", compare=False)
 
 
 def file_extension(item: GuangYaFile) -> str:
@@ -909,6 +910,7 @@ def _to_file(raw: dict, parent_id: str = "0") -> GuangYaFile:
     is_dir = res_type in (2, "2", "folder", "dir")
     if "isDir" in raw:
         is_dir = bool(raw["isDir"])
+    md5 = _first_value(raw, ("md5", "fileMd5", "fileMD5"))
     return GuangYaFile(
         file_id=str(raw.get("fileId") or raw.get("resID") or raw.get("file_id") or raw.get("id") or ""),
         name=str(raw.get("fileName") or raw.get("resName") or raw.get("name") or ""),
@@ -924,6 +926,7 @@ def _to_file(raw: dict, parent_id: str = "0") -> GuangYaFile:
         ))),
         mime_type=str(raw.get("mineType") or raw.get("mimeType") or raw.get("mime_type") or ""),
         extension=str(raw.get("ext") or raw.get("extension") or "").lstrip(".").lower(),
+        md5=md5 if isinstance(md5, str) else "",
     )
 
 
@@ -3023,11 +3026,17 @@ class GuangYaClient:
             attempt += 1
 
     # ===== 秒传 JSON =====
-    def generate_gcid_json(self, source_dir_id: str, source_name: str = "") -> dict:
+    def generate_gcid_json(
+        self,
+        source_dir_id: str,
+        source_name: str = "",
+        *,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> dict:
         """递归导出带版本和完整性校验的 GCID 清单。"""
         from app.modules.gcid_manifest import export_manifest
 
-        return export_manifest(self, source_dir_id, source_name=source_name)
+        return export_manifest(self, source_dir_id, source_name=source_name, on_progress=on_progress)
 
     # ===== 离线下载 =====
     def add_offline_task(self, url: str, target_dir_id: str = "0",

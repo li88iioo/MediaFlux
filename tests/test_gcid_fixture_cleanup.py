@@ -22,6 +22,8 @@ def test_failed_api_setup_restores_owned_resources():
     previous_db = db.DB_PATH
     previous_env = dict(os.environ)
     previous_notify = telegram_notification_center.send_event_result
+    previous_cloud_client = gcid_import.GuangYaClient
+    previous_importer = gcid_import.GuangyaGCIDImporter
     observed = []
 
     def fail_startup(*args, **kwargs):
@@ -51,6 +53,8 @@ def test_failed_api_setup_restores_owned_resources():
             assert dict(os.environ) == previous_env
             assert not observed[0].parent.exists()
             assert telegram_notification_center.send_event_result is previous_notify
+            assert gcid_import.GuangYaClient is previous_cloud_client
+            assert gcid_import.GuangyaGCIDImporter is previous_importer
             assert case.client_context.is_closed
             assert case.client_context.portal is None
             assert reset.call_count == 2
@@ -74,6 +78,7 @@ def test_durability_cleanup_preserves_foreign_patch():
 
     holder = SimpleNamespace(value="original")
     foreign = patch.object(holder, "value", "foreign-owned")
+    open_importer = gcid_import._open_importer
     started = gcid_import.notifier.notify_gcid_import_started
     finished = gcid_import.notifier.notify_gcid_import_finished
     foreign.start()
@@ -83,6 +88,7 @@ def test_durability_cleanup_preserves_foreign_patch():
         assert result.wasSuccessful(), result.errors + result.failures
         assert result.testsRun == 1
         assert holder.value == "foreign-owned"
+        assert gcid_import._open_importer is open_importer
         assert gcid_import.notifier.notify_gcid_import_started is started
         assert gcid_import.notifier.notify_gcid_import_finished is finished
     finally:
