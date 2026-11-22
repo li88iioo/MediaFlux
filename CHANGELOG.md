@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-11-22
+
+### Added
+
+- 光鸭目录浏览支持按名称搜索整个云盘，结果显示所在目录。文件和文件夹均可通过已有目录选择器复制或移动，也可在当前目录新建文件夹。[目录浏览](https://github.com/li88iioo/MediaFlux/commit/a22f1546) · [键盘焦点](https://github.com/li88iioo/MediaFlux/commit/47d95e84)
+- GCID 清单支持后台导出，切换页面后可回来下载 JSON。导入前可预览文件树，导入后可查看逐项结果、重试可重试的失败项或清除已结束记录。能否秒传取决于光鸭对每个文件的命中结果。[GCID 导入与导出](https://github.com/li88iioo/MediaFlux/commit/aa518840)
+- Web 和 Telegram 的 Agent 可列出光鸭离线链接或种子里的文件，按所选集数确认下载。Agent 也能读取光鸭字幕和 NFO 文本，并查询账号容量、会员权益与流量余额。[离线选文件](https://github.com/li88iioo/MediaFlux/commit/40ca12b5) · [读取文本](https://github.com/li88iioo/MediaFlux/commit/12847ec6) · [账号权益](https://github.com/li88iioo/MediaFlux/commit/454efb0f)
+
+### Changed
+
+- 新配置默认关闭地区二次分类和年份三次分类，版本优先级相同时默认保留较大的文件。STRM 小文件默认过滤阈值为 10 MB，显式设置的阈值和整理规则继续生效。[默认值调整](https://github.com/li88iioo/MediaFlux/commit/4eea64be)
+- STRM 同步通知按原因归并覆盖冲突，列出受影响文件，方便定位需要核对的指针。[通知摘要](https://github.com/li88iioo/MediaFlux/commit/ac97fc85)
+
+### Fixed
+
+- 换机复制 STRM 库后，完整校准会核对已有指针的文件 ID 和相对路径。匹配成功即可在原目录更新，Jellyfin 或 Emby 可沿用原媒体库路径。低于新阈值的小视频也参与目录归属核对，无法确认归属的目录会保留。[目录复用](https://github.com/li88iioo/MediaFlux/commit/b63c9507) · [小视频核验](https://github.com/li88iioo/MediaFlux/commit/0af381ba)
+- 综合索引改善了搜索结果的匹配与回退，分别显示站点读取失败、结果不完整和没有匹配资源，方便判断是否需要重试。[索引检索](https://github.com/li88iioo/MediaFlux/commit/9ce8dbd4)
+- 删除光鸭目录时，已被云盘明确删除的历史下载暂存目录不再阻止删除其他项目。正在使用的下载目录仍受保护。[目录占用检查](https://github.com/li88iioo/MediaFlux/commit/568e5ee2)
+
+### 升级说明
+
+- 从 v0.1.17 升级时，数据库由 schema 44 → 47。迁移为 GCID 导入记录补充目标账号、文件 MD5 和已清除任务的防重记录，并为下载请求保存光鸭离线文件选择。已有记录中的未知值保留为空。
+- 升级前请备份完整数据目录。回退时先停止服务，使用离线恢复还原升级前备份，再启动 v0.1.17。直接让 schema44 程序打开 schema47 数据库会被拒绝。[备份与回退指南](https://github.com/li88iioo/MediaFlux/blob/v0.1.18/docs/部署指南.md)
+
 ## [0.1.17] - 2026-11-19
 
 ### Added
@@ -492,7 +516,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/li88iioo/MediaFlux/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/li88iioo/MediaFlux/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/li88iioo/MediaFlux/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/li88iioo/MediaFlux/compare/v0.1.14...v0.1.15
