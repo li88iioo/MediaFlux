@@ -1572,7 +1572,6 @@ body.agent-page-body::after { display: none; }
 .agent-start-panel .agent-task-snapshot { width: 100%; margin: 0 0 8px; }
 .agent-composer { width: min(100%, var(--agent-reading-width, 980px)); position: relative; margin: 0 auto 28px; padding: 14px 16px 12px 18px; background: var(--bg-card); border: 1px solid var(--agent-glass-border); border-radius: 18px; box-shadow: 0 4px 20px -2px rgba(0,0,0,0.05), 0 1px 3px rgba(0,0,0,0.03); transition: box-shadow .2s ease, border-color .2s ease; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
 
-.agent-composer-input-wrap { width: 100%; min-width: 0; }
 .agent-composer textarea { display: block; width: 100%; min-height: 44px; max-height: 160px; padding: 2px 0 4px; resize: none; overflow-y: auto; color: var(--text-primary); background: transparent; border: 0 !important; box-shadow: none !important; outline: none !important; ring: 0 !important; font: inherit; font-size: 14.5px; line-height: 1.55; }
 .agent-composer textarea:focus { border: 0 !important; box-shadow: none !important; outline: none !important; }
 .agent-composer textarea::placeholder { color: var(--text-muted); opacity: 0.85; }
@@ -1582,7 +1581,6 @@ body.agent-page-body::after { display: none; }
 .agent-composer-tools-right { display: flex !important; align-items: center !important; gap: 6px; flex-shrink: 0; }
 .agent-console.is-empty .agent-composer { grid-row: 2; width: min(calc(100% - 40px), 680px); min-height: 54px; margin: 0 auto; padding: 6px 7px 6px 12px; flex-direction: row; align-items: center; gap: 7px; border-color: color-mix(in srgb, var(--border-strong) 54%, transparent); border-radius: 999px; box-shadow: none; }
 .agent-console.is-empty .agent-composer:focus-within { box-shadow: none; }
-.agent-console.is-empty .agent-composer-input-wrap { order: 0; flex: 1 1 auto; width: auto; }
 /* 中文 placeholder 的字形重心略偏上，非对称内边距做 1px 光学校正。 */
 .agent-console.is-empty .agent-composer textarea { min-height: 44px; max-height: 112px; padding: 9px 4px 7px; line-height: 22px; }
 .agent-console.is-empty .agent-composer-header { display: contents !important; }
@@ -1944,7 +1942,7 @@ body.agent-page-body::after { display: none; }
 /* 会话栏：主要聊天固定在上方，旁聊在下；宽屏常驻，窄屏收为抽屉。输入框单行，发送按钮靠右。 */
 /* +、文字、发送三者居中在同一条线上；多行时两侧图标相对整个输入框居中。 */
 .agent-composer { flex-direction: row; align-items: center; gap: 8px; padding: 6px 7px 6px 16px; border-radius: 24px; }
-.agent-composer-input-wrap { flex: 1 1 auto; width: auto; }
+.agent-composer-input-wrap { flex: 1 1 0; min-width: 0; }
 .agent-composer textarea, .agent-console.is-empty .agent-composer textarea { min-height: 44px; padding: 10px 4px; line-height: 24px; }
 .agent-session-heading { gap: 8px; }
 .agent-session-heading .agent-session-search { flex: 1 1 auto; margin-top: 0; }
@@ -2013,7 +2011,8 @@ body.agent-page-body::after { display: none; }
 
 /* + 添加种子：输入框左侧；下载卡片由用户选目标后提交，不经过模型。 */
 .agent-attach { flex: 0 0 36px; width: 36px; height: 36px; display: inline-grid; place-items: center; padding: 0; color: var(--text-secondary); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
-.agent-attach:hover { color: var(--accent); background: var(--accent-soft); }
+.agent-attach:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); }
+.agent-attach:disabled { opacity: .55; cursor: default; }
 
 .agent-attach svg { width: 18px; height: 18px; }
 .agent-console.is-empty .agent-composer { padding-left: 7px; }

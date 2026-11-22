@@ -501,6 +501,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "创建幂等下载请求并提交所选后端；已有活跃请求不会隐式补投失败目标。受理不等于下载或入库完成。",
         "reversibility": "取消确认不会提交下载；已发出请求需在对应下载器处理，未知受理不得自动重投。",
     },
+    "cloud.delete_offline_tasks": {
+        "action": "删除光鸭离线任务记录",
+        "object": "确认卡列出的已结束离线任务",
+        "impact": "移除所选离线记录，保留云盘文件和 MediaFlux 下载历史；仍在运行或跟踪中的任务须等待结束。",
+        "reversibility": "记录删除无法撤回，取消本确认卡会保留原记录。",
+    },
     "cloud.transfer_share": {
         "action": "转存光鸭分享", "object": "确认卡列出的真实文件与冻结的配置目标",
         "impact": "创建幂等转存请求；后续整理和STRM沿用现有配置，转存成功不等于已入库。",

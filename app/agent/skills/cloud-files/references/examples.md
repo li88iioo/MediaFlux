@@ -340,10 +340,43 @@ mf.cloud.clear_recycle()
 
 ## 10 光鸭下载与入库跟踪
 
-用户提供可下载的 `url` 并要求下载到光鸭时：
+只有用户接受按规则自动选择时，才省略选集提交：
 
 ```python
 mf.downloads.submit(url, target="guangya")
+```
+
+用户要求先看清单、只下部分或排除指定文件时，先只读解析。记录是真实索引，`selected` 是规则默认值，`locked` 表示光鸭不允许选中。先将用户的要求对应到文件名和索引，匹配不明确时先核对。
+
+```python
+manifest = mf.cloud.resolve_offline(url)
+print(manifest)
+```
+
+将用户同意下载的文件索引放入 `selected_indexes`。排除指定文件时，按用户要求从清单中算出剩余选集。可以手选未被光鸭锁定的文件，协议启停与链接级排除规则仍适用。若清单不可验证、命中项不明确或剩余选集为空，到此停止并说明原因。手选或排除时必须同时提交真实索引和同次解析的 `manifest_digest`，请勿改用省略选集的提交。
+
+```python
+mf.downloads.submit(
+    url, target="guangya", file_indexes=selected_indexes, manifest_digest=manifest["manifest_digest"],
+)
+```
+
+确认卡只列出选中的文件及光鸭接收目录。清单变化时重新解析并核对选择。选集随原下载请求保存，失败重试仍复验同一清单与索引。
+
+用户提交 `.torrent` 时，从当前会话提供的种子引用取得 `artifact_id`。解析和提交使用同一个 `artifact_id`。
+
+```python
+manifest = mf.cloud.resolve_offline(artifact_id=artifact_id)
+print(manifest)
+```
+
+核对文件并得到非空 `selected_indexes` 后提交。用户接受按规则自动选择时，可以同时省略索引和摘要。
+
+```python
+mf.downloads.submit(
+    artifact_id=artifact_id, target="guangya",
+    file_indexes=selected_indexes, manifest_digest=manifest["manifest_digest"],
+)
 ```
 
 确认执行后，使用回执顶层 `request_id` 跟踪，不通过全盘任务列表猜关联：
@@ -365,6 +398,8 @@ print({"total": len(tasks["items"]), "sample": tasks["items"][:10]})
 ```
 
 原生任务、下载请求、整理运行是不同编号。离线下载完成尚未证明入库；详情继续用原下载请求时间线，缺哪一阶段再处理哪一阶段。
+
+用户明确要求清理离线列表时，从 `tasks["items"]` 选择已结束记录的真实 `id`，用 `cloud.delete_offline_tasks(task_ids)` 生成确认卡。它保留云盘文件和原下载历史。运行中、终态不明或仍在被 MediaFlux 跟踪的任务会被拒绝。用户要取消下载时，不可用清理记录代替取消。受理后可用 `cloud.offline_tasks()` 核对。
 
 ## 11 STRM 与媒体库验收
 

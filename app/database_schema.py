@@ -284,6 +284,7 @@ CREATE TABLE IF NOT EXISTS download_requests (
     gy_isolated INTEGER NOT NULL DEFAULT 0,
     gy_requested_target_dir TEXT NOT NULL DEFAULT '',
     gy_requested_nsfw INTEGER NOT NULL DEFAULT 0,
+    gy_offline_selection TEXT NOT NULL DEFAULT '',
     gy_staging_parent_dir TEXT DEFAULT '',
     gy_staging_name TEXT DEFAULT '',
     gy_staging_cleanup_status TEXT DEFAULT '',

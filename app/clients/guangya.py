@@ -576,6 +576,7 @@ class _ValidationRefreshBlocked(RuntimeError):
 
 
 OFFLINE_CREATE_TASK_URL = "https://api.guangyapan.com/nd.bizcloudcollection.s/v1/create_task"
+OFFLINE_DELETE_TASK_URL = "https://api.guangyapan.com/cloudcollection/v2/delete_task"
 OFFLINE_FILE_INDEX_KEYS = (
     "fileIndex", "file_index", "fileIdx", "file_idx", "selectIndex", "select_index",
 )
@@ -3231,6 +3232,20 @@ class GuangYaClient:
                 "光鸭离线任务达到安全分页上限，列表不完整"
             )
         return tasks
+
+    def delete_offline_tasks(self, task_ids: list[str], *, cancel_check: Callable[[], None] | None = None) -> None:
+        """删除明确的离线记录。v2 接口的 taskIds 仅指任务，文件操作走独立接口。"""
+        if not task_ids or any(not isinstance(identity, str) or not identity.strip() for identity in task_ids):
+            raise ValueError("至少指定一个光鸭离线任务 ID")
+        raw = self.raw
+        if cancel_check is not None:
+            cancel_check()
+        response = raw.request(
+            OFFLINE_DELETE_TASK_URL, method="POST", json={"taskIds": task_ids}, timeout=15,
+        ).json()
+        _validate_write_response(response, operation="offline_task_delete")
+        if not isinstance(response, dict) or not _read_success_acknowledged(response):
+            raise RuntimeError("光鸭离线记录删除未返回明确受理回执")
 
     @staticmethod
     def _to_offline_task(raw: dict) -> dict:

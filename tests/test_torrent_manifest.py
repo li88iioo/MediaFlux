@@ -178,7 +178,7 @@ class UnifiedTorrentDecoderTests(unittest.TestCase):
 
     def test_both_entrypoints_enforce_the_input_size_bound(self):
         data = _torrent({b"name": b"Demo.mkv", b"length": 1})
-        with patch("app.modules.download_dispatcher._TORRENT_MAX_BYTES", 8):
+        with patch("app.modules.download_dispatcher.TORRENT_MAX_BYTES", 8):
             for parser in (parse_torrent_metadata, parse_torrent_manifest):
                 with self.subTest(parser=parser.__name__):
                     with self.assertRaisesRegex(BencodeError, "限制"):

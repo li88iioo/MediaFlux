@@ -18,6 +18,7 @@ import html
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from app.repositories.download_requests import download_display_title
@@ -1367,7 +1368,8 @@ def _ensure_command_menu(bot) -> bool:
 
 
 def _register_commands(bot, telebot):
-    from app.bot.agent_adapter import AGENT_EXECUTOR
+    from app.bot.agent_adapter import AGENT_EXECUTOR, telegram_agent_access
+    from app.bot.agent_attachments import receive_agent_torrent
 
     if not AGENT_EXECUTOR.start():
         raise RuntimeError("上一代 Telegram Agent 任务尚未结束")
@@ -1968,12 +1970,19 @@ def _register_commands(bot, telebot):
 
     @bot.message_handler(content_types=["document"])
     @require_write_auth
-    def receive_torrent(msg):
+    def receive_document(msg):
         document = msg.document
         filename = str(document.file_name or "")
-        mime = str(document.mime_type or "").lower()
-        if not filename.lower().endswith(".torrent") and "bittorrent" not in mime:
+        if Path(filename).suffix.lower() != ".torrent":
             _reply_to_source(bot, msg, "暂不支持该文件，仅可发送 .torrent 种子文件")
+            return
+        caption = str(getattr(msg, "caption", "") or "").strip().split(maxsplit=1)
+        if (
+            len(caption) == 2
+            and caption[0].casefold() == "/agent"
+            and telegram_agent_access(*_telegram_identity(msg)) == "allowed"
+        ):
+            submit_agent(receive_agent_torrent, bot, telebot, msg, caption[1], source=msg)
             return
         try:
             from app.modules.download_dispatcher import (

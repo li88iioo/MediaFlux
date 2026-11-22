@@ -39,8 +39,8 @@
                     <div class="agent-reply-bar-text"><small>正在回复</small><p id="agentReplyText"></p></div>
                     <button type="button" class="agent-reply-cancel" id="agentReplyCancel" aria-label="取消回复" title="取消回复"><i data-lucide="x"></i></button>
                 </div>
-                <button type="button" class="agent-attach" id="agentAttach" aria-label="添加种子文件" title="添加种子文件（也可直接粘贴磁力链接）"><i data-lucide="plus"></i></button>
-                <input type="file" id="agentAttachFile" accept=".torrent,application/x-bittorrent" hidden>
+                <button type="button" class="agent-attach" id="agentAttach" aria-label="添加种子文件" title="添加 .torrent 种子（也可直接粘贴磁力链接）" disabled><i data-lucide="plus"></i></button>
+                <input type="file" id="agentAttachFile" accept=".torrent" hidden>
                 <div class="agent-composer-input-wrap">
                     <label class="sr-only" for="agentPrompt">输入要交给 Agent 的任务</label>
                     <textarea id="agentPrompt" aria-describedby="agentDraftHelp" rows="1" maxlength="1000" placeholder="询问 MediaFlux" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务" autocomplete="off"></textarea>

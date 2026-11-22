@@ -645,6 +645,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                             content_type: str = "",
                             display_title: str = "",
                             initial_targets: str = "",
+                            gy_offline_selection: str = "",
                             qb_save_path: str = "",
                             retry_source_request_id: int | None = None,
                             retry_source_status: str = "",
@@ -665,6 +666,18 @@ def create_download_request(request_key: str, kind: str, title: str = "",
     primary_key = keys[0]
     timestamp = db.now()
     with db.get_conn() as conn:
+        def insert_request() -> int:
+            cursor = conn.execute(
+                "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,display_title,"
+                "source_value,torrent_data,content_type,gy_offline_selection,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (primary_key, origin, chat_id, user_id, message_id, kind, title, display_title, source_value,
+                 torrent_data, (content_type or ""), gy_offline_selection, "pending", timestamp, timestamp),
+            )
+            assert cursor.lastrowid is not None
+            _register_request_keys(conn, cursor.lastrowid, keys, timestamp)
+            return cursor.lastrowid
+
         def finish(
             request_id: int, created: bool,
             admission_source_ids: tuple[int, ...] = (),
@@ -672,9 +685,9 @@ def create_download_request(request_key: str, kind: str, title: str = "",
             if created and retry_source_request_id is not None:
                 # 重试继承用户路由，不继承旧隔离子目录。早期记录仅能从已知父目录恢复。
                 conn.execute(
-                    "UPDATE download_requests SET (gy_requested_target_dir,gy_requested_nsfw) = "
+                    "UPDATE download_requests SET (gy_requested_target_dir,gy_requested_nsfw,gy_offline_selection) = "
                     "(SELECT COALESCE(NULLIF(gy_requested_target_dir,''),gy_staging_parent_dir,''), "
-                    "gy_requested_nsfw FROM download_requests WHERE id=?) WHERE id=?",
+                    "gy_requested_nsfw,gy_offline_selection FROM download_requests WHERE id=?) WHERE id=?",
                     (retry_source_request_id, request_id),
                 )
             if created and initial_targets and not _claim_download_request_conn(
@@ -759,16 +772,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
             columns="id,status,kind,request_key",
         )
         if not rows:
-            created = conn.execute(
-                "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,display_title,"
-                "source_value,torrent_data,content_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (primary_key, origin, chat_id, user_id, message_id, kind, title, display_title, source_value,
-                 torrent_data, (content_type or ""), "pending", timestamp, timestamp),
-            )
-            assert created.lastrowid is not None
-            request_id = created.lastrowid
-            _register_request_keys(conn, request_id, keys, timestamp)
-            return finish(request_id, True)
+            return finish(insert_request(), True)
 
         explicit_row = None
         if supersede_request_id is not None:
@@ -840,15 +844,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                     return finish(int(existing["id"]), False)
                 raise RuntimeError("下载请求重试认领失败")
 
-        created = conn.execute(
-            "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,display_title,"
-            "source_value,torrent_data,content_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (primary_key, origin, chat_id, user_id, message_id, kind, title, display_title, source_value,
-             torrent_data, (content_type or ""), "pending", timestamp, timestamp),
-        )
-        assert created.lastrowid is not None
-        request_id = created.lastrowid
-        _register_request_keys(conn, request_id, keys, timestamp)
+        request_id = insert_request()
         admission_source_ids = ()
         if retry_source_request_id is not None:
             admission_source_ids = tuple(dict.fromkeys((
@@ -1200,13 +1196,16 @@ def claim_download_request_targets(request_id: int, targets: str, *, qb_save_pat
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT id,origin,status,targets,qb_status,gy_status,qb_save_path FROM download_requests WHERE id=?",
+            "SELECT id,origin,status,targets,qb_status,gy_status,qb_save_path,gy_offline_selection "
+            "FROM download_requests WHERE id=?",
             (request_id,),
         ).fetchone()
         # 在同一事务内阻止已取消/已交接的请求被迟到认领重新激活。
         if not row or str(row["status"] or "") in {
             "pending", "completed", "failed", "cancelled", "resubmitted",
         }:
+            return ()
+        if row["gy_offline_selection"] and targets != "guangya":
             return ()
         qb_status = str(row["qb_status"] or "")
         gy_status = str(row["gy_status"] or "")
@@ -2060,6 +2059,20 @@ def _active_download_request_predicate(*, include_local_import: bool = False) ->
             "(qb_status='completed' AND COALESCE(local_import_status,'') IN ('','pending'))"
         )
     return f"(status!='cancelled' AND ({' OR '.join(clauses)}))"
+
+
+def has_tracked_guangya_task(task_ids: list[str]) -> bool:
+    """判断指定离线任务是否仍被下载跟踪器用作终态证据。"""
+    with db.get_conn() as conn:
+        return conn.execute(
+            "WITH selected AS (SELECT value FROM json_each(?)) "
+            "SELECT 1 FROM download_requests "
+            "WHERE gy_status IN ('submitting','submitted','downloading','outcome_unknown') "
+            "AND (gy_task_id IN (SELECT value FROM selected) OR EXISTS ("
+            "SELECT 1 FROM json_each(CASE WHEN json_valid(gy_task_ids) THEN gy_task_ids ELSE '[]' END) "
+            "WHERE value IN (SELECT value FROM selected))) LIMIT 1",
+            (json.dumps(task_ids),),
+        ).fetchone() is not None
 
 
 def list_active_download_requests(

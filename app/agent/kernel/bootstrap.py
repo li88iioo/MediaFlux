@@ -149,6 +149,8 @@ def build_tool_catalog() -> ToolCatalog:
     catalog.register(share_transfer_tool())
     catalog.register(download_submit_tool())
     catalog.register(download_retry_tool())
+    from .ports.sdk_effects import offline_task_delete_tool
+    catalog.register(offline_task_delete_tool())
     from .ports.sdk_effects import download_diagnose_tool
     catalog.register(download_diagnose_tool())
     for tool in qb_control_tools():

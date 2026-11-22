@@ -10,7 +10,7 @@ import re
 import unicodedata
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -24,7 +24,7 @@ from app.clients.qbittorrent import (
 from app.config import get
 from app.indexers.providers.base import augment_public_magnet, magnet_infohash
 from app.logger import get_logger
-from app.modules.offline import analyze_offline_url, detect_protocol, submit_offline
+from app.modules.offline import OfflineFileSelection, analyze_offline_url, detect_protocol, submit_offline
 from app.modules.qb_control import qb_control_write_lease, qb_submission_write_lease
 from app.repositories.download_requests import (
     download_display_title,
@@ -76,6 +76,9 @@ class DownloadInput:
     content_type: str = ""
     # 仅用于日志/通知/列表，不能替代用于路由与整理的title。
     display_title: str = ""
+    offline_selection: OfflineFileSelection | None = None
+    # 会话附件身份只用于确认绑定，持久下载请求仍保存种子的内容身份和原字节。
+    artifact_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +219,32 @@ def torrent_download_input(filename: str, data: bytes) -> DownloadInput:
     return DownloadInput(kind="torrent", title=title, source_value=magnet, torrent_data=data)
 
 
+def torrent_artifact_input(artifact_id: str, *, owner: str, session_id: str) -> DownloadInput:
+    """以已鉴权的会话身份读取原种子附件，返回本次校验的同一份字节。"""
+    from app.modules.agent_files import open_file
+
+    if not isinstance(artifact_id, str):
+        raise ValueError("会话文件编号无效")
+    try:
+        artifact, source = open_file(owner, session_id, artifact_id)
+        with source:
+            name, size = artifact.get("name"), artifact.get("size")
+            if artifact.get("id") != artifact_id:
+                raise ValueError("会话种子附件身份已变化")
+            if not isinstance(name, str) or not name.lower().endswith(".torrent"):
+                raise ValueError("请选择当前会话的 .torrent 附件")
+            if type(size) is not int or not 0 < size <= TORRENT_MAX_BYTES:
+                raise ValueError("种子附件为空或超过 10MB 限制")
+            data = source.read(size + 1)
+            if len(data) != size:
+                raise ValueError("会话种子附件大小已变化")
+    except FileNotFoundError:
+        raise ValueError("当前会话没有这个种子附件") from None
+    except OSError:
+        raise ValueError("暂时无法读取当前会话的种子附件") from None
+    return replace(torrent_download_input(name, data), artifact_id=artifact_id)
+
+
 _BTIH_HEX_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _BTIH_BASE32_RE = re.compile(r"^[A-Z2-7]{32}$", re.IGNORECASE)
 _BTMH_SHA256_RE = re.compile(r"^1220[0-9a-fA-F]{64}$")
@@ -345,6 +374,10 @@ def request_key(item: DownloadInput) -> str:
     return request_keys(item)[0]
 
 
+def _offline_selection_json(selection: OfflineFileSelection | None) -> str:
+    return json.dumps(asdict(selection)) if selection is not None else ""
+
+
 def create_request(
     item: DownloadInput,
     chat_id: str | int,
@@ -375,6 +408,7 @@ def create_request(
         retry_source_request_id=retry_source_request_id,
         retry_source_status=retry_source_status,
         verification_targets=verification_targets, verification_owner=verification_owner,
+        gy_offline_selection=_offline_selection_json(item.offline_selection),
     )
     row = download_requests_repo.get_download_request(req_id)
     return {"id": req_id, "created": created, "status": row["status"] if row else ""}
@@ -463,6 +497,8 @@ def _public_guangya_failure(error: str) -> str:
         ("光鸭资源解析请求超时", "光鸭资源解析请求超时"),
         ("光鸭资源解析网络异常", "光鸭资源解析网络异常"),
         ("光鸭资源解析响应无效", "光鸭资源解析响应无效"),
+        ("光鸭离线文件清单已变化", "光鸭离线文件清单已变化，请重新解析并选择"),
+        ("光鸭离线选集无法读取", "光鸭离线选集无法读取，请重新解析并选择"),
         ("光鸭未登录", "光鸭未登录"),
         ("资源中没有符合下载规则的文件", "光鸭未找到符合下载规则的文件"),
         ("种子文件未解析到可验证文件列表", "光鸭种子未解析到有效文件列表"),
@@ -590,6 +626,11 @@ class _GuangYaSubmissionOptions(TypedDict, total=False):
     target_dir_name: str
     qb_runtime_config: dict[str, Any]
     can_proceed: Callable[[], bool]
+
+
+class _OfflineSubmitOptions(TypedDict, total=False):
+    client: GuangYaClient
+    selection: OfflineFileSelection
 
 
 def _qb_client_options(runtime_config: dict[str, Any] | None) -> dict[str, Any]:
@@ -795,8 +836,14 @@ def download_resubmit_capabilities(
             gy_enabled = False
             gy_reason = "qBittorrent 任务仍在处理或提交结果待确认，不能接管原下载请求"
 
+    selected_offline = bool(dict(row).get("gy_offline_selection"))
+    if selected_offline:
+        qb_enabled = False
+        qb_reason = "该请求选择了光鸭离线文件，仅可重试光鸭"
     both_enabled = qb_enabled and gy_enabled
-    if both_enabled:
+    if selected_offline:
+        both_reason = qb_reason
+    elif both_enabled:
         both_reason = ""
     elif qb_status in _ACTIVE_BACKEND_STATUSES or gy_status in _ACTIVE_BACKEND_STATUSES:
         both_reason = "已有下载目标仍在处理或提交结果待确认，不能同时重复提交"
@@ -869,6 +916,7 @@ def _download_retry_snapshot(row, target: str) -> tuple[dict[str, Any], int | No
         **{key: hashlib.sha256(bytes(row[key]) if isinstance(row[key], (bytes, bytearray, memoryview))
                               else str(row[key] or "").encode()).hexdigest()
            for key in ("request_key", "title", "source_value", "torrent_data")},
+        "offline_selection": str(dict(row).get("gy_offline_selection") or ""),
         "runtime_config": {key: get(key, "") for key in _RETRY_CONFIG_KEYS},
         **({"guangya_credential_generation": generation} if generation is not None else {}),
     }
@@ -1004,7 +1052,8 @@ def resubmit_download_request(
         )
     item_kind = source_kind
     item_torrent_data = source_torrent_data
-    if source_kind == "magnet" and targets in {"guangya", "both"}:
+    if (source_kind == "magnet" and targets in {"guangya", "both"}
+            and not dict(source_row).get("gy_offline_selection")):
         recovered = _recover_guangya_magnet_torrent(source_row, qb_runtime_config=qb_runtime_config)
         if recovered is not None:
             item_kind = "torrent"
@@ -1235,12 +1284,16 @@ def dispatch_request(
     log_path: str | None = None,
     check_cancelled: Callable[[], None] | None = None,
     guangya_credential_generation: int | None = None,
+    offline_selection: OfflineFileSelection | None = None,
 ) -> dict[str, Any]:
     if targets not in DOWNLOAD_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     row = download_requests_repo.get_download_request(request_id)
     if not row:
         return {"ok": False, "error": "下载请求不存在"}
+    if ((dict(row).get("gy_offline_selection") or "") != _offline_selection_json(offline_selection)
+            or (offline_selection is not None and targets != "guangya")):
+        return {"ok": False, "duplicate": True, "error": "该请求已经绑定下载选集"}
     if check_cancelled is not None:
         check_cancelled()
     if not download_requests_repo.claim_download_request(
@@ -1482,7 +1535,7 @@ def parse_torrent_metadata(data: bytes) -> tuple[str, str]:
     return name, torrent_id
 
 
-_TORRENT_MAX_BYTES = 10 * 1024 * 1024
+TORRENT_MAX_BYTES = 10 * 1024 * 1024
 _BENCODE_MAX_DEPTH = 64
 _BENCODE_MAX_VALUES = 250_000
 _TORRENT_MANIFEST_MAX_FILES = 100_000
@@ -1494,7 +1547,7 @@ class _BencodeDecoder:
     def __init__(self, data: bytes):
         if not isinstance(data, bytes) or not data:
             raise BencodeError("种子文件为空")
-        if len(data) > _TORRENT_MAX_BYTES:
+        if len(data) > TORRENT_MAX_BYTES:
             raise BencodeError("种子文件超过 10MB 限制")
         self.data = data
         self.values = 0
@@ -1785,6 +1838,14 @@ def _submit_guangya(
     from app.modules.organize_sources import list_nsfw_download_sources
 
     saved = dict(row)
+    selection = None
+    if saved.get("gy_offline_selection"):
+        try:
+            selection = OfflineFileSelection.from_args(**json.loads(saved["gy_offline_selection"]))
+        except (TypeError, ValueError):
+            pass
+        if selection is None:
+            return {"ok": False, "error": "光鸭离线选集无法读取，请重新解析并选择"}
     requested = str(saved.get("gy_requested_target_dir") or saved.get("gy_staging_parent_dir") or "")
     target_dir_id = (target_dir_id or requested)
     nsfw_sources = {source["id"]: source["name"] for source in list_nsfw_download_sources()}
@@ -1797,7 +1858,7 @@ def _submit_guangya(
                                    gy_requested_nsfw=int(nsfw))
         target_dir_name = target_dir_name or nsfw_sources.get(target_dir_id, "")
     torrent_data = (
-        row["torrent_data"] if row["kind"] in {"torrent", "http"}
+        row["torrent_data"] if row["kind"] in {"torrent", "http"} or selection is not None
         else _recover_guangya_magnet_torrent(row, qb_runtime_config=qb_runtime_config)
     )
     if row["kind"] == "http":
@@ -1849,10 +1910,14 @@ def _submit_guangya(
             return {"ok": False, "error": "光鸭登录凭据已变化，未提交下载，请重新预检",
                     "failure_code": "guangya_credentials_changed", "retryable": False}
         # 使用刚复验的同一客户端，不能在写入时重新加载另一个账号的凭据。
+        options: _OfflineSubmitOptions = {}
+        if client is not None:
+            options["client"] = client
+        if selection is not None:
+            options["selection"] = selection
         result = submit_offline(
             str(row["source_value"] or ""),
             title=str(row["title"] or ""),
-            **({"client": client} if client is not None else {}),
             target_dir_id=target_dir_id,
             target_dir_name=target_dir_name,
             isolate_task=True,
@@ -1861,6 +1926,7 @@ def _submit_guangya(
             on_staging_created=persist_staging,
             public_magnet_title=_public_magnet_title(row),
             can_proceed=can_proceed,
+            **options,
         )
     finally:
         close_guangya_client(client)

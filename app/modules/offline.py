@@ -1,15 +1,18 @@
 """光鸭离线转存规则与提交入口。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
+from types import EllipsisType
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
-from app.clients.guangya import GuangYaClient, close_guangya_client, single_bt_root_file
+from app.clients.guangya import GuangYaClient, close_guangya_client, guangya_offline_task_state, single_bt_root_file
 from app.config import get, get_bool, get_int
 from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB
 from app.indexers.providers.base import augment_public_magnet
@@ -92,6 +95,38 @@ class OfflineManifestResolution:
     attempts: int
     diagnostic: str
     single_file: bool = False
+
+
+class OfflineSelectionChanged(ValueError):
+    """上次读取的文件索引不能再用于本次提交。"""
+
+
+@dataclass(frozen=True)
+class OfflineFileSelection:
+    file_indexes: tuple[int, ...]
+    manifest_digest: str
+
+    @classmethod
+    def from_args(
+        cls, file_indexes: list[int] | EllipsisType = ..., manifest_digest: str | EllipsisType = ...,
+    ) -> OfflineFileSelection | None:
+        if file_indexes is Ellipsis and manifest_digest is Ellipsis:
+            return None
+        if not isinstance(file_indexes, list) or not file_indexes or any(
+            type(index) is not int or index < 0 for index in file_indexes
+        ):
+            raise ValueError("请传入非空的真实文件索引列表")
+        if not isinstance(manifest_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", manifest_digest):
+            raise ValueError("请传入本次离线解析返回的 manifest_digest")
+        return cls(tuple(sorted(set(file_indexes))), manifest_digest)
+
+    def files(self, choices: list[dict], digest: str) -> list[dict]:
+        if digest != self.manifest_digest:
+            raise OfflineSelectionChanged("光鸭离线文件清单已变化，请重新解析并选择")
+        available = {item["index"]: item for item in choices if not item["locked"]}
+        if any(index not in available for index in self.file_indexes):
+            raise ValueError("选中的文件索引不存在或被光鸭解析器排除")
+        return [available[index] for index in self.file_indexes]
 
 
 class TorrentPreparationError(ValueError):
@@ -368,6 +403,69 @@ def _prepare_offline_resource(
     return item.source_value, torrent_data
 
 
+def _resolve_submission_resource(
+    client: GuangYaClient, url: str, protocol: str, *,
+    torrent_data: bytes | None = None, public_magnet_title: str | None = None,
+) -> tuple[str, bytes | None, OfflineManifestResolution]:
+    url, torrent_data = _prepare_offline_resource(url, torrent_data)
+    # 路由先基于原始输入决定；仅传输增强，原始种子（包括 private）保持不变。
+    if public_magnet_title is not None and torrent_data is None:
+        url = augment_public_magnet(url, public_magnet_title)
+    return url, torrent_data, _resolve_offline_manifest(client, url, protocol, torrent_data=torrent_data)
+
+
+def _offline_manifest_digest(
+    url: str, resolution: OfflineManifestResolution, *, attached_torrent: bytes | None = None,
+) -> str:
+    files = sorted((item["index"], item["name"], item["size"], item["excluded"]) for item in resolution.files)
+    source = [url, resolution.single_file, files]
+    if attached_torrent is not None:
+        # infohash 只覆盖 info 字典，整份附件摘要还绑定 tracker 等外层数据。
+        source.append(hashlib.sha256(attached_torrent).hexdigest())
+    payload = json.dumps(source, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def inspect_offline_resource(
+    url: str, title: str, *, torrent_data: bytes | None = None, selection: OfflineFileSelection | None = None,
+) -> dict:
+    """用正式离线解析器读取文件索引及规则默认选择，不创建下载请求或目录。"""
+    from app.repositories.download_requests import safe_download_text
+
+    rules = OfflineRules.from_config()
+    decision = analyze_offline_url(
+        url, title, rules, content_type="application/x-bittorrent" if torrent_data is not None else "",
+    )
+    if selection is not None and not decision.allowed:
+        raise ValueError(decision.reason)
+    client = GuangYaClient()
+    try:
+        if not client.logged_in:
+            raise ValueError("光鸭未登录")
+        try:
+            prepared_url, _, resolution = _resolve_submission_resource(
+                client, url, decision.protocol, torrent_data=torrent_data,
+            )
+        except Exception as exc:
+            raise ValueError(_manifest_failure(exc)["error"]) from exc
+    finally:
+        close_guangya_client(client)
+    if not resolution.files or _resolver_excluded_only(resolution.files):
+        raise ValueError("光鸭未解析到可验证的离线文件清单，请稍后重试")
+    choices = build_offline_file_choices(resolution.files, rules)
+    attached_torrent = torrent_data if detect_protocol(url) == "magnet" else None
+    digest = _offline_manifest_digest(prepared_url, resolution, attached_torrent=attached_torrent)
+    if selection is not None:
+        choices = selection.files(choices, digest)
+    return {
+        "decision": {key: value for key, value in decision.as_dict().items() if key != "matched_keyword"},
+        "single_file": resolution.single_file,
+        "manifest_digest": digest,
+        "files": [{**item, "name": safe_download_text(item["name"], fallback="未命名文件"),
+                   "exclude_reason": safe_download_text(item["exclude_reason"], fallback="")} for item in choices],
+    }
+
+
 def analyze_offline_url(
     url: str, title: str = "", rules: OfflineRules | None = None, *, content_type: str = "",
 ) -> OfflineDecision:
@@ -490,6 +588,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                    target_dir_id: str = "", target_dir_name: str = "", *,
                    isolate_task: bool = False, task_key: str = "",
                    torrent_data: bytes | None = None,
+                   selection: OfflineFileSelection | None = None,
                    public_magnet_title: str | None = None,
                    on_staging_created: Callable[[dict], None] | None = None,
                    can_proceed: Callable[[], bool] | None = None) -> dict:
@@ -515,6 +614,8 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
         return {"ok": False, "decision": decision.as_dict(), "error": decision.reason}
     owned_client = client is None
     client = client or GuangYaClient()
+    # 附件请求持久保存 magnet 和原种子字节，HTTP 种子继续沿用原链接清单摘要。
+    attached_torrent = torrent_data if selection is not None and detect_protocol(url) == "magnet" else None
     try:
         if not client.logged_in:
             return {
@@ -523,15 +624,9 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             }
 
         try:
-            url, torrent_data = _prepare_offline_resource(url, torrent_data)
-            # 路由先基于原始输入决定；仅传输增强，原始种子（包括private）保持不变。
-            if public_magnet_title is not None and torrent_data is None:
-                url = augment_public_magnet(url, public_magnet_title)
-            resolution = _resolve_offline_manifest(
-                client,
-                url,
-                decision.protocol,
-                torrent_data=torrent_data,
+            url, torrent_data, resolution = _resolve_submission_resource(
+                client, url, decision.protocol, torrent_data=torrent_data,
+                public_magnet_title=public_magnet_title,
             )
             files = resolution.files
             choices = build_offline_file_choices(files, rules)
@@ -559,7 +654,15 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 "failure_code": "guangya_manifest_unavailable", "retryable": True,
             }
 
-        selected = [int(item["index"]) for item in choices if item.get("selected")]
+        if selection is None:
+            selected = [item["index"] for item in choices if item.get("selected")]
+        else:
+            try:
+                digest = _offline_manifest_digest(url, resolution, attached_torrent=attached_torrent)
+                selected = [item["index"] for item in selection.files(choices, digest)]
+            except ValueError as exc:
+                return {"ok": False, "decision": decision.as_dict(), "error": str(exc),
+                        "failure_code": "guangya_offline_selection_changed", "retryable": False}
         if not selected:
             detail = "；".join(
                 f"{item.get('name') or item.get('index')}: {item.get('exclude_reason') or '不符合规则'}"
@@ -649,6 +752,41 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
     finally:
         if owned_client:
             close_guangya_client(client)
+
+
+def prepare_offline_task_deletion(client: GuangYaClient, task_ids: list[str]) -> dict:
+    """冻结选定任务的身份与终态，先给 MF 下载跟踪器留存结果的机会。"""
+    from app.repositories.download_requests import has_tracked_guangya_task
+
+    if not isinstance(task_ids, list) or not task_ids or any(
+        not isinstance(value, str) or not value.strip() for value in task_ids
+    ):
+        raise ValueError("请选择光鸭离线列表中的真实任务 ID")
+    if not client.logged_in:
+        raise ValueError("光鸭未登录")
+    selected = sorted({value.strip() for value in task_ids})
+    generation = client.credential_generation
+    items = {}
+    for task in client.list_offline_tasks():
+        raw = task["raw"]
+        identity = str(raw.get("taskId") or raw.get("taskID") or raw.get("id") or "").strip()
+        if identity in selected:
+            items[identity] = task
+    if client.credential_generation != generation or len(items) != len(selected):
+        raise ValueError("光鸭账号或离线任务已变化，请重新读取列表")
+    for task in items.values():
+        # 旧接口的数字 3、4 也可能出现在重试或进行中，需有明确的失败证据。
+        if guangya_offline_task_state(task["status"]) == "downloading" or (
+            str(task["status"]).strip() in {"3", "4"} and not task["error"]
+        ):
+            raise ValueError("所选任务仍在运行或终态尚未确认，删除记录不能用于取消任务")
+    if has_tracked_guangya_task(selected):
+        raise ValueError("所选离线任务仍在被 MediaFlux 跟踪，请等待原下载请求记录终态")
+    return {
+        "credential_generation": generation,
+        "items": [{**{key: items[identity][key] for key in ("name", "status", "created_at", "target_dir", "size")},
+                   "id": identity} for identity in selected],
+    }
 
 
 def rules_summary(rules: OfflineRules | None = None) -> dict:

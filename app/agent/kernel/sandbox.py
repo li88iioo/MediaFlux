@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import os
@@ -22,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from app import sdk
 from app.agent.errors import ToolPipelineError, ToolRateLimitError, _ReadPermitRejected
 from app.agent.public_safety import public_tool_label, sanitize_public_text
+from app.modules.agent_files import workspace_path
 from app.modules.process_lock import CrossProcessLock
 from app.runtime_paths import get_runtime_paths
 from app.sdk import METHODS, call_owner, describe_methods, describe_namespaces
@@ -124,7 +124,7 @@ def _adopt_legacy_work(directory: int) -> None:
 def _prepare_workspace(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    # 只做旧文件数据迁移，不保留旧执行后端；work/output 原路径和内容均保持。
+    # 旧版工作区迁移保留工作文件、输出和会话输入。
     if (root / ".version").exists():
         directory = os.open(root / "work", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -132,7 +132,7 @@ def _prepare_workspace(root: Path) -> None:
         finally:
             os.close(directory)
         for entry in root.iterdir():
-            if entry.name in {"work", "output"}:
+            if entry.name in {"work", "output", "media-inputs"}:
                 continue
             if entry.is_dir() and not entry.is_symlink():
                 shutil.rmtree(entry)
@@ -375,7 +375,7 @@ class _SDKRequests:
                     finally:
                         if observation:
                             observation["completed_at"] = datetime.now(timezone.utc).isoformat()
-                with call_owner(self.context.owner, publication_check=self.check_publication,
+                with call_owner(self.context.owner, session_id=self.context.session_id, publication_check=self.check_publication,
                                 cancelled=cancelled, read_checkpoint=remember, delivery_route=self.context.delivery_route,
                                 resource_candidates=snapshot, session_call=session_call):
                     result = await asyncio.to_thread(invoke)
@@ -582,10 +582,9 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
 
 
 def _workspace_location(owner: str, session_id: str) -> tuple[Path, CrossProcessLock]:
-    scope = hashlib.sha256(json.dumps([owner, session_id]).encode()).hexdigest()
     paths = get_runtime_paths()
-    return (paths.runtime_dir / "agent-workspaces" / scope,
-            CrossProcessLock("agent-workspace-" + scope, directory=paths.data_dir))
+    root = workspace_path(paths.runtime_dir, owner, session_id)
+    return root, CrossProcessLock("agent-workspace-" + root.name, directory=paths.data_dir)
 
 
 def workspace_output_available(owner: str, session_id: str, path: str) -> bool:

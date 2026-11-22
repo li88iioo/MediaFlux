@@ -31,7 +31,7 @@
 
 ## 下载到入库
 
-候选回执取 `data.items[].request_id`，直链 `downloads.submit` 取顶层 request_id；普通网页/分享不用 submit。`activity.timeline("download", request_id)` 查持久 stages/gaps；忘记编号查 `downloads.requests` 的 request_number/next_offset。实时队列用 `downloads.tasks` / `cloud.offline_tasks` 按真实后端身份关联；补库用 `resources.missing_workflows`。明确可重试失败才调 `downloads.retry`，未知受理不重投。
+候选回执取 `data.items[].request_id`，直链 `downloads.submit` 取顶层 request_id；普通网页/分享不用 submit。光鸭直链需要只选或排除文件时，先用 `cloud.resolve_offline` 取清单，再提交非空 `file_indexes` 与同次 `manifest_digest`。没有剩余项就停下，不能退回默认规则下载。详见 `/skills/cloud-files/references/examples.md` 第 10 节。`activity.timeline("download", request_id)` 查持久 stages/gaps；忘记编号查 `downloads.requests` 的 request_number/next_offset。实时队列用 `downloads.tasks` / `cloud.offline_tasks` 按真实后端身份关联；补库用 `resources.missing_workflows`。明确可重试失败才调 `downloads.retry`，未知受理不重投。
 
 光鸭整理/STRM 见 cloud-files；qB 从 timeline 的 `data.activities` 中 local_media 取 id → `local.task`，待人工/失败先 `local.preview` 再按需 `local.retry`。归档用 `local.verify_library`，需精准刷新则 `local.refresh_library` 后再验。其他电影用 `library.presence`、剧用 `library.audit(..., refresh=True)` 核原目标。受理/阶段结束不等于入库；partial/unknown 保留未覆盖范围，索引可见不证明可播放。
 

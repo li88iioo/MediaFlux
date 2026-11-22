@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from app.agent.kernel.tool_calls import RUN_CODE_TOOL
-from app.agent.kernel.ports.sdk_effects import activity_confirm_organize_tool, cloud_organize_tools
 
 import asyncio
 import json
@@ -18,13 +17,13 @@ import pytest
 from app import config, sdk
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
+from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.effects import ConfirmationEffectPlanStore, EffectExecutor
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.sdk_effects import indexer_configuration_tool, library_audit_job_tools, playback_tools, media_user_tools, library_patrol_tool, media_mapping_tool, release_format_save_tool, media_refresh_tools, activity_reorganize_tool, activity_undo_tool, activity_follow_tools, schedule_policy_tools, strm_run_tool, strm_failure_tools, share_transfer_tool, strm_metadata_tools, directory_scrape_tool, cloud_change_tool, cloud_recycle_tools, cloud_share_tools, download_submit_tool, download_retry_tool, preferences_tools, qb_control_tools, resource_download_tool, watchlist_tools
+from app.agent.kernel.ports.sdk_effects import download_submit_tool, indexer_configuration_tool, resource_download_tool
 from app.agent.kernel.ports.mediaflux_policy import MediaFluxAuthorizationPolicy
-from app.agent.kernel.ports.sdk_effects import subscription_tools, notification_test_tool, policy_config_tool, feature_config_tool, local_task_tools, automation_tools, rss_delivery_tools, recognition_rule_tool, rss_configuration_tools, local_source_tools, recognition_knowledge_tools, media_path_mapping_tools
 from app.agent.kernel import sandbox
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
@@ -87,9 +86,7 @@ async def context_for(store, owner="sdk-owner", session="sdk-session"):
 
 
 def executor(store, *, authorization=None):
-    catalog = ToolCatalog([*subscription_tools(), notification_test_tool(), policy_config_tool(), *cloud_organize_tools(), feature_config_tool(), *local_task_tools(), *automation_tools(), indexer_configuration_tool(), *library_audit_job_tools(), recognition_rule_tool(), *rss_configuration_tools(), *rss_delivery_tools(), *local_source_tools(), *media_path_mapping_tools(), *playback_tools(), *recognition_knowledge_tools(), *media_user_tools(), library_patrol_tool(), media_mapping_tool(), release_format_save_tool(), *media_refresh_tools(), activity_undo_tool(), activity_reorganize_tool(), *activity_follow_tools(), *schedule_policy_tools(), strm_run_tool(), *strm_failure_tools(), share_transfer_tool(), *strm_metadata_tools(), directory_scrape_tool(), resource_download_tool(), download_submit_tool(), download_retry_tool(), cloud_change_tool(), *qb_control_tools(), *cloud_recycle_tools(), *cloud_share_tools(), *watchlist_tools(), *preferences_tools()])
-    catalog.register(activity_confirm_organize_tool())
-    return EffectExecutor(catalog=catalog, state_store=store, reference_store=store,
+    return EffectExecutor(catalog=build_tool_catalog(), state_store=store, reference_store=store,
                           effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()), authorization=authorization)
 
 
@@ -242,7 +239,6 @@ def retry_backend(monkeypatch):
 
 def test_native_retry_rpc_freezes_plan_and_confirmation_survives_restart_once(retry_backend, tmp_path):
     async def check():
-        from app.agent.kernel.bootstrap import build_tool_catalog
         from app.agent.kernel.capabilities import ToolEffect
 
         assert "downloads.retry_submission" not in {tool.name for tool in build_tool_catalog().visible()}

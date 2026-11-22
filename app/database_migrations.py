@@ -1862,6 +1862,12 @@ def _migrate_gcid_cleared_operations_v46(conn: sqlite3.Connection) -> None:
     conn.execute(GCID_CLEARED_OPERATIONS_TABLE)
 
 
+def _migrate_download_offline_selection_v47(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(download_requests)")}
+    if columns and "gy_offline_selection" not in columns:
+        conn.execute("ALTER TABLE download_requests ADD COLUMN gy_offline_selection TEXT NOT NULL DEFAULT ''")
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1909,4 +1915,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     43: _migrate_download_qb_save_path_v44,
     44: _migrate_gcid_import_metadata_v45,
     45: _migrate_gcid_cleared_operations_v46,
+    46: _migrate_download_offline_selection_v47,
 }

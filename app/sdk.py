@@ -49,6 +49,7 @@ def _collect_methods(namespaces: Mapping[str, Any]):
 
 _SESSION_CALL: ContextVar[Callable[[str, dict], dict] | None] = ContextVar("mediaflux_sdk_session_call", default=None)
 _CALL_OWNER: ContextVar[str] = ContextVar("mediaflux_sdk_owner", default="")
+_CALL_SESSION: ContextVar[str] = ContextVar("mediaflux_sdk_session", default="")
 _CALL_DELIVERY_ROUTE: ContextVar[Mapping[str, Any] | None] = ContextVar("mediaflux_sdk_delivery_route", default=None)
 _PUBLICATION_CHECK: ContextVar[Callable | None] = ContextVar("mediaflux_sdk_publication_check", default=None)
 _CALL_CANCELLED: ContextVar[Callable[[], bool] | None] = ContextVar("mediaflux_sdk_cancelled", default=None)
@@ -57,13 +58,14 @@ _RESOURCE_CANDIDATES: ContextVar[Mapping[str, Any] | None] = ContextVar("mediafl
 
 
 @contextmanager
-def call_owner(owner: str, *, publication_check: Callable | None = None,
+def call_owner(owner: str, *, session_id: str = "", publication_check: Callable | None = None,
                cancelled: Callable[[], bool] | None = None, read_checkpoint: Callable[[dict], None] | None = None,
                delivery_route: Mapping[str, Any] | None = None, resource_candidates: Mapping[str, Any] | None = None,
                session_call: Callable[[str, dict], dict] | None = None):
     """服务端绑定已鉴权身份；不导出为工作区可调用方法或模型参数。"""
     session_token = _SESSION_CALL.set(session_call)
     token = _CALL_OWNER.set(owner)
+    session_id_token = _CALL_SESSION.set(session_id)
     route_token = _CALL_DELIVERY_ROUTE.set(dict(delivery_route or {}))
     publication_token = _PUBLICATION_CHECK.set(publication_check)
     cancellation_token = _CALL_CANCELLED.set(cancelled)
@@ -78,6 +80,7 @@ def call_owner(owner: str, *, publication_check: Callable | None = None,
         _PUBLICATION_CHECK.reset(publication_token)
         _CALL_CANCELLED.reset(cancellation_token)
         _CALL_OWNER.reset(token)
+        _CALL_SESSION.reset(session_id_token)
         _SESSION_CALL.reset(session_token)
 
 
@@ -86,6 +89,13 @@ def _owner() -> str:
     if not owner:
         raise ValueError("该方法需要服务端绑定调用身份")
     return owner
+
+
+def _session_id() -> str:
+    session = _CALL_SESSION.get()
+    if not session:
+        raise ValueError("该方法需要宿主绑定当前会话")
+    return session
 
 
 class Session:
@@ -1467,6 +1477,28 @@ class Cloud:
 
     @staticmethod
     @sdk_method('read')
+    def resolve_offline(url: str | EllipsisType = ..., *, artifact_id: str | EllipsisType = ...) -> dict:
+        """解析光鸭离线链接或当前会话的 .torrent 附件，url 与 artifact_id 二选一。artifact_id 取自会话提供的种子引用。返回真实文件 index、名称、大小、规则默认 selected、光鸭 locked 及 manifest_digest，不创建下载请求。"""
+        from app.indexers.downloads import inspect_offline_download
+        from app.modules.download_dispatcher import torrent_artifact_input
+
+        if artifact_id is not Ellipsis:
+            if url is not Ellipsis:
+                raise ValueError("url 与 artifact_id 只能提供其中一个")
+            item = torrent_artifact_input(artifact_id, owner=_owner(), session_id=_session_id())
+            return inspect_offline_download(item)
+        if url is Ellipsis:
+            raise ValueError("请选择下载链接或当前会话的种子附件")
+        return inspect_offline_download(url)
+
+    @staticmethod
+    @sdk_method('write')
+    def delete_offline_tasks(task_ids: builtins.list[str]) -> dict:
+        """确认后删除光鸭已结束的指定离线任务记录，保留文件及 MF 下载历史。task_ids 来自 cloud.offline_tasks；仍在运行或正在被 MF 跟踪的任务不可删除，此方法不用于取消。"""
+        raise ValueError("删除光鸭离线记录须通过工作区的确认执行器调用")
+
+    @staticmethod
+    @sdk_method('read')
     def task(task_id: str) -> dict:
         """读取复制、移动等云盘后台任务的原生回执；任务类型与实际状态由返回值说明。"""
         with _cloud_client() as client:
@@ -1578,21 +1610,36 @@ class Downloads:
 
     @staticmethod
     @sdk_method('write')
-    def submit(url: str, target: str = "preferred") -> dict:
-        """确认后提交 magnet/ed2k/torrent/HTTP 下载直链；普通网页和光鸭分享不可用。
+    def submit(url: str | EllipsisType = ..., target: str = "preferred", *,
+               artifact_id: str | EllipsisType = ...,
+               file_indexes: builtins.list[int] | EllipsisType = ...,
+               manifest_digest: str | EllipsisType = ...) -> dict:
+        """确认后提交 magnet/ed2k/torrent/HTTP 下载直链或当前会话的 .torrent 附件，url 与 artifact_id 二选一。
 
         preferred 只在预检时按当前用户偏好解析，确认冻结实际目标 qb/guangya/both。
+        光鸭手选时，用同一链接或附件通过 cloud.resolve_offline 读取清单，并传入非空 file_indexes 和同次 manifest_digest。
+        排除文件时提交剩余索引；无剩余项就停止。只有同时省略两参数才按规则默认选择。
         回执含 request_id/created/target/kind/status/duplicate/succeeded/failed；
         可用 activity.timeline("download", request_id) 跟踪。受理不代表下载或入库完成。
         已有活跃请求不会再次写后端；补投失败目标需明确调用 downloads.retry，未知受理不可重投。
         """
         from app.indexers.downloads import submit_download_url
         from app.modules.media_preferences import resolve_download_target
+        from app.modules.offline import OfflineFileSelection
 
+        if artifact_id is not Ellipsis:
+            if url is not Ellipsis:
+                raise ValueError("url 与 artifact_id 只能提供其中一个")
+            raise ValueError("提交会话种子附件须通过工作区的确认执行器调用")
+        if url is Ellipsis:
+            raise ValueError("请选择下载链接或当前会话的种子附件")
         owner = _owner()
         if target == "preferred":
             target, _ = resolve_download_target(owner)
-        return submit_download_url(url, target, origin="agent")
+        selection = OfflineFileSelection.from_args(file_indexes, manifest_digest)
+        if selection is None:
+            return submit_download_url(url, target, origin="agent")
+        return submit_download_url(url, target, origin="agent", offline_selection=selection)
 
     @staticmethod
     @sdk_method('read')

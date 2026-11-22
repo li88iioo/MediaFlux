@@ -764,8 +764,18 @@ def _execute_query(
     chat_id: str,
     user_id: str,
     text: str,
+    torrent: tuple[str, dict[str, Any]] | None = None,
 ) -> TurnView:
     owner, session_id, thread_id = _session_for_source(chat_id, user_id, source)
+    if torrent is not None:
+        stored_session, file = torrent
+        if stored_session != session_id:
+            raise SelectionInvalidError("会话路由已变更，请重新发送种子。")
+        reference = {"artifact_id": file["id"], "name": file["name"], "size": file["size"]}
+        text += (
+            "\n\n可用 mf.cloud.resolve_offline(artifact_id=...) 读取当前会话的种子文件清单。\n"
+            + json.dumps(reference, ensure_ascii=False)
+        )
     if not agent_rate_limiter.allow(
         f"{owner}:telegram-kernel-query",
         limit=_QUERY_LIMIT_PER_MINUTE,
@@ -852,7 +862,11 @@ def _execute_query(
         raise
 
 
-def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
+def handle_agent_message(
+    bot: Any, telebot_module: Any, message: Any,
+    *, torrent: tuple[str, dict[str, Any]] | None = None,
+    instruction: str | None = None,
+) -> bool:
     chat_id, user_id = _identity(message)
     access = telegram_agent_access(chat_id, user_id)
     if access == "disabled":
@@ -860,7 +874,7 @@ def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
     if access != "allowed":
         bot.reply_to(message, "当前身份未获准使用 Media Agent。", **_thread_kwargs(message))
         return True
-    text = str(getattr(message, "text", "") or "").strip()
+    text = instruction if instruction is not None else str(getattr(message, "text", "") or "").strip()
     if not text:
         return False
     try:
@@ -871,6 +885,7 @@ def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
             chat_id=chat_id,
             user_id=user_id,
             text=text,
+            torrent=torrent,
         )
         if view.status in {"success", "partial", "approval_required"} and str(getattr(message.chat, "type", "")) == "private":
             # 正文/确认卡已经送达，标题失败不能改写本轮真实结果。
@@ -1163,15 +1178,17 @@ def handle_agent_guide(
     if telegram_agent_control_access(chat_id, user_id) != "allowed":
         bot.reply_to(message, "当前身份未获准管理 Media Agent。", **_thread_kwargs(message))
         return
-    global_status = "已开启" if is_agent_enabled() else "已关闭"
-    telegram_status = (
-        "已开启" if config.get_bool("TG_AGENT_ENABLED", False) else "已关闭"
-    )
+    enabled = is_agent_enabled()
+    telegram_enabled = config.get_bool("TG_AGENT_ENABLED", False)
+    global_status = "已开启" if enabled else "已关闭"
+    telegram_status = "已开启" if telegram_enabled else "已关闭"
     text = (
         "<b>Media Agent</b>\n"
         f"全局：{global_status}\nTelegram：{telegram_status}\n\n"
         "直接发送自然语言即可查询和规划；真实写操作会先显示预览并等待按钮确认。"
     )
+    if enabled and telegram_enabled:
+        text += "\n\n要让 Agent 选集，请在 .torrent 文件的附言中写 /agent 加处理说明。"
     markup = (
         _control_markup(
             telebot_module,

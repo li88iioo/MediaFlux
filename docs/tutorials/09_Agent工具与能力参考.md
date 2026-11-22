@@ -175,7 +175,9 @@
 | `cloud.inspect_share(url)`（SDK） | READ | 完整读取分享顶层文件列表，返回真实文件 ID、数量与覆盖范围；分页无法完成时明确失败，不截取前 200 项冒充完整。 |
 | `cloud.transfer_share(url, file_ids)`（SDK） | DANGER | 明确选择真实文件 ID，冻结所选文件及配置目标；冷确认重新读取并核对后进入既有持久转存任务。结果未知时不得重新转存。 |
 | `resources.download(result_ids, target="preferred", verification_targets=None)`（SDK） | WRITE | 按真实资源 ID 批量预检和确认，沿用 owner 偏好或显式目标；缺集复核目标经服务端审计后随原请求持久化。 |
-| `downloads.submit(url, target="preferred")`（SDK） | DANGER | 只读预检 Magnet、ED2K 或明确 HTTP(S) 下载直链，冻结实际目标后由唯一 EffectExecutor 确认提交。活跃请求不隐式补投；request_id 可交给 activity.timeline("download", request_id) 跟踪。 |
+| `cloud.resolve_offline(url)` / `cloud.resolve_offline(artifact_id=…)` | READ | 解析链接或当前会话的种子附件。可选文件带有索引、名称、大小和规则默认选择，同时返回本次清单摘要。 |
+| `downloads.submit(url, target="preferred", …)`（SDK） | DANGER | 提交 Magnet、ED2K 或 HTTP(S) 下载直链。手选光鸭文件时指定 `target="guangya"`，同时传入非空 `file_indexes` 和原清单的 `manifest_digest`。本地种子用会话的 `artifact_id` 指定来源。省略这两项时沿用既有筛选规则。 |
+| `cloud.delete_offline_tasks(task_ids)` | WRITE | 从光鸭离线列表选择已结束且 MF 已停止跟踪的任务。确认后删除这些云端任务记录，保留已下载文件和 MF 下载历史。 |
 | `activity.timeline("download", request_id)`（SDK） | READ | 按原请求编号续查下载、转存、整理与 STRM 状态；受理或转存完成不等于全部后处理成功。 |
 
 原生资源提交使用实际 `result_ids`；候选卡仍保留签名批次与展示序号，提交前转换为同批真实 ID，集号或质量排名不能替代 ID。待核对资源不会自动推荐，但用户明确选择后可以生成预检卡；候选仍需确认才能提交。单次候选卡和确认的业务容量为 50 项，完整搜索观察不因展示容量而截断；推荐摘要和模型上下文预算不裁剪快照、确认范围或批量结果。默认搜索返回 20 项时，可在一次预检和人工确认中提交全部 20 项，无需为尾项再次发指令。
@@ -469,7 +471,6 @@ SDK预览不保存目录TTL、序号或OBS/OBJ句柄。普通操作直接使用�
 | 停止回合与停止任务 | 停止模型不撤销已经发生的业务写入，需查询并使用对应任务控制 |
 | 关闭元数据同步与取消积压 | `strm.set_metadata_enabled` 与 `strm.cancel_metadata_pending` 是不同操作 |
 | 清空回收站 | `cloud.clear_recycle` 为全账号永久清空，不是当前页/选中项删除 |
-| 本地上传到光鸭 | 不向 Agent 开放；不能从 SDK 存在上传方法推断 Agent 有权限 |
 | 宿主 Shell、任意配置或内网 Fetch | 不开放宿主执行或任意网络访问；Python/Shell 仅在隔离工作区运行，业务访问沿 SDK 声明的字段、来源与操作 |
 | 媒体详情链接 | 条件满足时返回已校验的打开链接，不保证唤起 App 或提供永久直链 |
 | 识别主动复核 | 单独授权、有限案例工具及结构化审计，不放开聊天 Agent 的全部写权限 |

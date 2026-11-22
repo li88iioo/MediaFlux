@@ -6,11 +6,12 @@ Web、Telegram、Agent 与订阅统一复用同一套解析、幂等准入、
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 import weakref
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
@@ -26,6 +27,7 @@ from app.indexers.models import ResolvedDownload
 from app.logger import get_logger
 from app.modules import episode_audit
 from app.modules.media_identity import normalize_episode_verification
+from app.modules.offline import OfflineFileSelection, inspect_offline_resource
 from app.modules.download_dispatcher import (
     DownloadInput,
     create_request,
@@ -210,6 +212,11 @@ class _DownloadDestination(TypedDict, total=False):
     qb_category: str
 
 
+class _DirectDispatchOptions(TypedDict, total=False):
+    guangya_credential_generation: int
+    offline_selection: OfflineFileSelection
+
+
 class _RequestOptions(TypedDict, total=False):
     admission_id: int
     verification_targets: list[dict]
@@ -312,6 +319,8 @@ def download_target_destination(
         item.source_value, item.title,
         content_type="application/x-bittorrent" if item.torrent_data is not None else item.content_type,
     )
+    if item.offline_selection is not None and not decision.allowed:
+        raise DirectDownloadPreconditionError(decision.reason)
     if expected_gy_target_dir is not None and expected_gy_target_dir != decision.target_dir_id:
         raise DirectDownloadTargetChanged()
     return {
@@ -904,14 +913,25 @@ def direct_download_details(item: DownloadInput) -> dict:
 
 def preview_direct_download(item: DownloadInput, target: str) -> tuple[dict, dict]:
     """直接链接或种子的只读预检；共享协议身份与后端就绪事实，不创建请求。"""
+    if item.offline_selection is not None and target != "guangya":
+        raise DirectDownloadPreconditionError("指定离线文件索引时请选择光鸭目标")
     readiness = require_download_target_ready(target)
     preview = {
         "source_type": "direct_url", **direct_download_details(item), "target": target, "backends": readiness,
         "effects": ["创建幂等下载请求", "提交到所选下载后端", "保留后续整理与 STRM 跟踪"],
     }
     snapshot: dict[str, Any] = {"identity": request_key(item), "target": target, "backends": readiness}
+    if item.artifact_id:
+        assert item.torrent_data is not None
+        snapshot["artifact"] = {
+            "id": item.artifact_id, "size": len(item.torrent_data),
+            "sha256": hashlib.sha256(item.torrent_data).hexdigest(),
+        }
     if target in {"guangya", "both"}:
         snapshot["guangya_credential_generation"] = guangya_download_credential_generation()
+    if item.offline_selection is not None:
+        snapshot["offline_selection"] = asdict(item.offline_selection)
+        snapshot["offline_destination"] = download_target_destination(item, target)
     return preview, snapshot
 
 
@@ -933,14 +953,27 @@ def submit_direct_download(item: DownloadInput, target: str, *, origin: str,
         raise DirectDownloadPreconditionError(str(exc)) from exc
     if expected_snapshot is not None and snapshot != expected_snapshot:
         raise DownloadSnapshotChanged()
+    if item.offline_selection is not None:
+        if snapshot["offline_destination"] != destination:
+            raise DownloadSnapshotChanged()
+        # 同一 HTTP 种子的内容等价 key 在创建请求前建立，与默认入口全局去重。
+        item = prepare_download_input(item, target)
     if check_cancelled is not None:
         check_cancelled()
     created = create_request(item, "", "", origin=origin)
     request_id = int(created["id"])
     try:
-        credentials = ({"guangya_credential_generation": snapshot["guangya_credential_generation"]}
-                       if target in {"guangya", "both"} else {})
-        dispatch = dispatch_request(request_id, target, check_cancelled=check_cancelled, **credentials, **destination)
+        if item.offline_selection is not None and not created["created"]:
+            dispatch = {"duplicate": True, "existing_status": created["status"]}
+        else:
+            options: _DirectDispatchOptions = {}
+            if target in {"guangya", "both"}:
+                options["guangya_credential_generation"] = snapshot["guangya_credential_generation"]
+            if item.offline_selection is not None:
+                options["offline_selection"] = item.offline_selection
+            dispatch = dispatch_request(
+                request_id, target, check_cancelled=check_cancelled, **destination, **options,
+            )
     except asyncio.CancelledError:
         if created["created"]:
             download_requests_repo.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
@@ -956,14 +989,26 @@ def submit_direct_download(item: DownloadInput, target: str, *, origin: str,
             "summary": f"下载请求 #{request_id} {message}"}
 
 
-def preview_download_url(url: str, target: str) -> tuple[dict, dict]:
-    return preview_direct_download(direct_url_input(url), target)
+def inspect_offline_download(source: str | DownloadInput, *, selection: OfflineFileSelection | None = None) -> dict:
+    item = source if isinstance(source, DownloadInput) else direct_url_input(source)
+    return inspect_offline_resource(
+        item.source_value, item.title, torrent_data=item.torrent_data, selection=selection,
+    )
+
+
+def preview_download_url(
+    url: str, target: str, *, offline_selection: OfflineFileSelection | None = None,
+) -> tuple[dict, dict]:
+    item = replace(direct_url_input(url), offline_selection=offline_selection)
+    return preview_direct_download(item, target)
 
 
 def submit_download_url(url: str, target: str, *, origin: str,
                         expected_snapshot: dict | None = None,
-                        check_cancelled: Callable[[], None] | None = None) -> dict:
-    return submit_direct_download(direct_url_input(url), target, origin=origin,
+                        check_cancelled: Callable[[], None] | None = None,
+                        offline_selection: OfflineFileSelection | None = None) -> dict:
+    item = replace(direct_url_input(url), offline_selection=offline_selection)
+    return submit_direct_download(item, target, origin=origin,
                                   expected_snapshot=expected_snapshot, check_cancelled=check_cancelled)
 
 

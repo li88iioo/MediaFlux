@@ -12,8 +12,9 @@ from unittest import mock
 
 import httpx
 
-from app.agent.kernel.bootstrap import build_tool_catalog
 from app import sdk
+from app.agent.kernel.bootstrap import build_tool_catalog
+from app.agent.public_safety import public_tool_label
 from app.clients.guangya import GuangYaShareError, _extract_created_share
 from app.modules import guangya_account
 from app.modules import guangya_recycle as recycle
@@ -172,15 +173,29 @@ class GuangYaSdkClientTests(unittest.TestCase):
                 with self.assertRaises(GuangYaWriteRejected):
                     _Client(raw).create_user_share(["file-1"], title="Probe")
 
-    def test_agent_catalog_keeps_local_upload_disabled(self) -> None:
-        cloud = {name for name in sdk.METHODS if name.startswith("cloud.")}
-        registered = {spec.name for spec in build_tool_catalog().visible()}
-        self.assertIn("cloud.change", cloud & registered)
-        self.assertFalse(any("upload" in name for name in cloud | registered))
+    def test_agent_catalog_exposes_text_and_torrent_without_gcid_or_generic_transfer(self) -> None:
+        catalog = build_tool_catalog()
+        registered = {spec.name for spec in catalog.visible()}
+        advertised = {spec["name"] for spec in sdk.describe_methods()}
+        self.assertTrue({"cloud.read_text", "cloud.resolve_offline"} <= advertised)
+        self.assertTrue({"cloud.change", "downloads.submit"} <= advertised & registered)
+        self.assertFalse(any(name.startswith(("cloud.upload", "cloud.gcid_")) for name in advertised | registered))
         self.assertFalse(any(name.startswith("guangya.") for name in registered))
-        self.assertFalse(hasattr(sdk.cloud, "upload_local_file"))
-        with self.assertRaises(KeyError):
-            sdk.prepare_sdk_method("cloud.upload_local_file", {}, owner="sdk-owner")
+        removed = (
+            "upload", "download", "upload_local_file", "files",
+            "gcid_export", "gcid_export_status", "gcid_export_file",
+            "gcid_validate", "gcid_preview", "gcid_import", "gcid_import_status",
+        )
+        for method in removed:
+            name = f"cloud.{method}"
+            with self.subTest(method=method):
+                self.assertNotIn(name, advertised | sdk.METHOD_EFFECTS.keys())
+                self.assertFalse(hasattr(sdk.cloud, method))
+                with self.assertRaises(KeyError):
+                    sdk.prepare_sdk_method(name, {}, owner="sdk-owner")
+                for alias in (name, name.replace(".", "__")):
+                    self.assertFalse(catalog.has(alias))
+                    self.assertEqual(public_tool_label(alias), "MediaFlux 检查")
 
 
 class GuangYaLocalUploadTests(unittest.TestCase):

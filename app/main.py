@@ -5,6 +5,7 @@ import asyncio
 import atexit
 import hmac
 import os
+import re
 import secrets
 import threading
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
@@ -37,6 +38,7 @@ logger = get_logger(__name__)
 
 
 _AGENT_REQUEST_BODY_LIMIT = 64 * 1024
+_AGENT_TORRENT_UPLOAD_PATH = re.compile(r"/api/agent/sessions/[A-Za-z0-9_-]{16,64}/torrent")
 _STATIC_COMPRESSIBLE_SUFFIXES = (".css", ".js", ".svg")
 _STATIC_CACHE_CONTROL = "public, max-age=3600, must-revalidate"
 
@@ -85,17 +87,20 @@ class StaticTextGZipMiddleware:
 
 
 class AgentBodyLimitMiddleware:
-    """在 FastAPI 解析 JSON 前限制 Agent 写请求的真实请求体大小。"""
+    """在 FastAPI 解析前限制 Agent 写请求的真实请求体大小。"""
 
     def __init__(self, app: ASGIApp, *, max_bytes: int = _AGENT_REQUEST_BODY_LIMIT) -> None:
         self.app = app
         self.max_bytes = max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = str(scope.get("path") or "")
+        method = str(scope.get("method") or "GET").upper()
         if (
             scope["type"] != "http"
-            or not str(scope.get("path") or "").startswith("/api/agent/")
-            or str(scope.get("method") or "GET").upper() in SAFE_METHODS
+            or not path.startswith("/api/agent/")
+            or method in SAFE_METHODS
+            or (method == "POST" and _AGENT_TORRENT_UPLOAD_PATH.fullmatch(path))
         ):
             await self.app(scope, receive, send)
             return

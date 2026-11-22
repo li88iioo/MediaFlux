@@ -132,6 +132,7 @@ _TOOL_LABELS = {
     "guangya.recycle.restore": "光鸭回收站恢复",
     "guangya.recycle.clear": "光鸭回收站清空",
     "cloud.restore": "光鸭回收站恢复",
+    "cloud.delete_offline_tasks": "删除光鸭离线任务记录",
     "cloud.clear_recycle": "光鸭回收站清空",
     "cloud.share": "光鸭分享创建",
     "cloud.revoke_share": "光鸭分享撤销",

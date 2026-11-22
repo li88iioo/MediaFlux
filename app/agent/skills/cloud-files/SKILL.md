@@ -17,7 +17,7 @@ Python 片段执行前 `import json, mf`。未定义的输入变量取自所在�
 | 已配置来源整理、停止、定时策略 | 07 |
 | 创建/撤销分享、检查/转存分享 | 08 |
 | 回收站恢复或清空 | 09 |
-| 光鸭离线下载与入库进度 | 10；搜资源先读 `/skills/media-research/SKILL.md` |
+| 光鸭离线解析、选文件下载、清理任务记录与入库进度 | 10，搜资源先读 `/skills/media-research/SKILL.md` |
 | STRM 同步、失败重试、入库验收 | 11 |
 | 检查或执行有凭据的撤销 | 12 |
 
@@ -49,4 +49,4 @@ sed -n '/^## 06 /,/^## 07 /p' /skills/cloud-files/references/examples.md
 
 ## 当前能力边界
 
-SDK 尚未开放本地文件上传、播放直链/画质地址导出、光鸭离线任务暂停/恢复/删除。`downloads.pause/resume/remove` 控制的是 qBittorrent。历史撤销仅限 `activity.inspect_undo` 检查通过的有效凭据；回收站恢复则走 `cloud.restore`。
+光鸭已结束的离线任务记录用 `cloud.delete_offline_tasks` 清理。播放直链或画质地址导出、光鸭离线任务暂停、恢复和取消暂未开放。`downloads.pause/resume/remove` 控制 qBittorrent。历史撤销使用经 `activity.inspect_undo` 核实的凭据，回收站恢复用 `cloud.restore`。

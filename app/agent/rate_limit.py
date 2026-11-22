@@ -99,6 +99,8 @@ _TOOL_RATE_LIMITS = {
     "cloud.scrape": 3,
     "cloud.restore": 3,
     "cloud.clear_recycle": 2,
+    "cloud.resolve_offline": 6,
+    "cloud.delete_offline_tasks": 3,
     "cloud.shares": 8,
     "cloud.share": 3,
     "cloud.revoke_share": 3,

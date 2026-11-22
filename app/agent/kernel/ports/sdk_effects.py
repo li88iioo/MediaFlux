@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -24,7 +25,7 @@ from app.discovery.service import DiscoveryService, get_discovery_service, watch
 from app.indexers import downloads
 from app.indexers.errors import IndexerResultExpired, IndexerResultNotFound
 from app.indexers.runtime import get_indexer_service, run_indexer_awaitable_sync
-from app.modules import download_dispatcher, guangya_fs_change, guangya_recycle, share_transfer
+from app.modules import download_dispatcher, guangya_fs_change, guangya_recycle, offline, share_transfer
 from app.modules.web_secret import signed_context_fingerprint
 from app.modules.media_preferences import (
     PREFERENCE_PROPERTIES, apply_media_preferences_change, media_preferences_preview,
@@ -1070,6 +1071,18 @@ def download_diagnose_tool() -> KernelToolSpec:
 
 
 def download_submit_tool() -> KernelToolSpec:
+    def source_input(arguments, context):
+        selection = offline.OfflineFileSelection.from_args(
+            arguments.get("file_indexes", ...), arguments.get("manifest_digest", ...),
+        )
+        if "artifact_id" in arguments:
+            item = download_dispatcher.torrent_artifact_input(
+                arguments["artifact_id"], owner=context.owner, session_id=context.session_id,
+            )
+        else:
+            item = downloads.direct_url_input(arguments["url"])
+        return replace(item, offline_selection=selection)
+
     def prepare(arguments, context):
         try:
             with confirmation_runtime(context) as prefix:
@@ -1077,14 +1090,27 @@ def download_submit_tool() -> KernelToolSpec:
                 target = arguments.get("target", "preferred")
                 if target == "preferred":
                     target, _ = resolve_download_target(context.owner)
-                data, snapshot = downloads.preview_download_url(arguments["url"], target)
+                item = source_input(arguments, context)
+                data, snapshot = downloads.preview_direct_download(item, target)
+                frozen = {key: arguments[key] for key in ("url", "artifact_id") if key in arguments}
+                frozen["target"] = target
+                if (selection := item.offline_selection) is not None:
+                    inspected = downloads.inspect_offline_download(item, selection=selection)
+                    files = inspected["files"]
+                    data.update(
+                        count=len(files), resources=[{"title": item["name"], "count": 1} for item in files],
+                        receiving_folders=[inspected["decision"]["target_dir_name"]],
+                        effects=["只提交卡中列出的文件", "沿用下载请求、整理与 STRM 跟踪"],
+                    )
+                    frozen.update(file_indexes=list(selection.file_indexes), manifest_digest=selection.manifest_digest)
+                context.cancellation.raise_if_cancelled()
         except (AgentRuntimeDisabled, RuntimeFenceError) as exc:
             raise ToolPipelineError("Media Agent 授权或运行状态已变化", code="agent_disabled") from exc
         except ValueError as exc:
             raise ToolPipelineError(str(exc), code="precondition_failed") from exc
         preview = ToolResult(True, "confirmation_required", "确认后将把该资源提交到所选下载目标", data=data)
         return PreparedEffect(preview=preview.to_dict(), snapshot_fingerprint=prefix + _fingerprint(snapshot),
-            arguments={"url": arguments["url"], "target": target},
+            arguments=frozen,
             metadata={"risk": "danger", "source_kind": "direct_url",
                       "confirmation": build_confirmation_contract(
                           tool_name="downloads.submit", risk=RiskLevel.DANGER, preview=preview)})
@@ -1095,14 +1121,19 @@ def download_submit_tool() -> KernelToolSpec:
                 if not expected_snapshot.startswith(prefix) or arguments.get("target") not in DOWNLOAD_TARGETS:
                     raise downloads.DownloadSnapshotChanged()
                 try:
-                    _, snapshot = downloads.preview_download_url(arguments["url"], arguments["target"])
+                    item = source_input(arguments, context)
+                    _, snapshot = downloads.preview_direct_download(item, arguments["target"])
                 except ValueError as exc:
                     raise downloads.DownloadSnapshotChanged() from exc
                 if prefix + _fingerprint(snapshot) != expected_snapshot:
                     raise downloads.DownloadSnapshotChanged()
                 context.cancellation.raise_if_cancelled()
-                public = downloads.submit_download_url(arguments["url"], arguments["target"], origin="agent",
+                public = downloads.submit_direct_download(item, arguments["target"], origin="agent",
                     expected_snapshot=snapshot, check_cancelled=context.cancellation.raise_if_cancelled)
+        except offline.TorrentPreparationError as exc:
+            error = ToolPipelineError(str(exc), code="precondition_failed")
+            error.mark_execution_started(False)
+            raise error from exc
         except (AgentRuntimeDisabled, RuntimeFenceError, downloads.DownloadSnapshotChanged) as exc:
             if isinstance(exc, (AgentRuntimeDisabled, RuntimeFenceError)):
                 message, code = "Media Agent 授权或运行状态已变化", "agent_disabled"
@@ -1118,10 +1149,16 @@ def download_submit_tool() -> KernelToolSpec:
 
     return KernelToolSpec(name="downloads.submit", domain="downloads", effect=ToolEffect.DANGER,
         description=sdk_downloads.submit.__doc__ or "",
-        input_schema={"type": "object", "required": ["url"], "additionalProperties": False,
+        input_schema={"type": "object", "oneOf": [{"required": ["url"]}, {"required": ["artifact_id"]}],
+                      "additionalProperties": False,
                       "properties": {"url": {"type": "string", "minLength": 1, "maxLength": 8192, "writeOnly": True},
+                                     "artifact_id": {"type": "string", "pattern": "^[a-f0-9]{32}$", "writeOnly": True},
                                      "target": {"type": "string", "enum": ["preferred", "qb", "guangya", "both"],
-                                                "default": "preferred"}}},
+                                                "default": "preferred"},
+                                     "file_indexes": {"type": "array", "minItems": 1, "writeOnly": True,
+                                                      "items": {"type": "integer", "minimum": 0}},
+                                     "manifest_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$",
+                                                         "writeOnly": True}}},
         prepare=prepare, execute_confirmed=execute, metadata={"risk": "danger", "source_kind": "direct_url"})
 
 
@@ -1169,6 +1206,92 @@ def download_retry_tool() -> KernelToolSpec:
                       "properties": {"request_id": {"type": "integer", "minimum": 1},
                                      "target": {"type": "string", "enum": ["qb", "guangya", "both"]}}},
         prepare=prepare, execute_confirmed=execute, metadata={"risk": "danger", "source_kind": "download_request"})
+
+
+def offline_task_delete_tool() -> KernelToolSpec:
+    method = "cloud.delete_offline_tasks"
+
+    def failure(message, code):
+        error = ToolPipelineError(message, code=code)
+        error.mark_execution_started(False)
+        return error
+
+    def snapshot(client, arguments, context, *, confirming=False):
+        context.cancellation.raise_if_cancelled()
+        try:
+            return offline.prepare_offline_task_deletion(client, arguments["task_ids"])
+        except ValueError as exc:
+            raise failure(str(exc), "confirmation_stale" if confirming else "precondition_failed") from exc
+        except Exception as exc:
+            raise failure("光鸭离线任务列表暂不可核对", "unavailable") from exc
+
+    def prepare(arguments, context):
+        try:
+            with confirmation_runtime(context) as prefix:
+                client = GuangYaClient()
+                try:
+                    observed = snapshot(client, arguments, context)
+                finally:
+                    close_guangya_client(client)
+                context.cancellation.raise_if_cancelled()
+        except (AgentRuntimeDisabled, RuntimeFenceError) as exc:
+            raise failure("Media Agent 授权或运行状态已变化", "agent_disabled") from exc
+        items = observed["items"]
+        preview = ToolResult(True, "confirmation_required", f"确认后删除 {len(items)} 条光鸭离线记录",
+            data={"count": len(items), "resources": [
+                {"title": sanitize_resource_title(item["name"]) or "未命名任务", "count": 1}
+                for item in items],
+                "effects": ["仅移除所列已结束任务的离线记录", "保留云盘文件及 MediaFlux 下载历史"]})
+        return PreparedEffect(preview=preview.to_dict(), snapshot_fingerprint=prefix + _fingerprint(observed),
+            arguments={"task_ids": [item["id"] for item in items]},
+            metadata={"risk": "danger", "confirmation": build_confirmation_contract(
+                tool_name=method, risk=RiskLevel.DANGER, preview=preview)})
+
+    def execute(arguments, expected_snapshot, context):
+        try:
+            with confirmation_runtime(context) as prefix:
+                client = GuangYaClient()
+                try:
+                    observed = snapshot(client, arguments, context, confirming=True)
+                    if prefix + _fingerprint(observed) != expected_snapshot:
+                        raise failure("光鸭账号或所选离线记录已变化，请重新预检", "confirmation_stale")
+                    data = {"count": len(arguments["task_ids"]), "retains_files": True, "verified": False}
+
+                    def before_delete():
+                        context.cancellation.raise_if_cancelled()
+                        if client.credential_generation != observed["credential_generation"]:
+                            raise failure("光鸭登录凭据已变化，请重新预检", "confirmation_stale")
+
+                    try:
+                        client.delete_offline_tasks(arguments["task_ids"], cancel_check=before_delete)
+                    except ToolPipelineError:
+                        raise
+                    except GuangYaWriteRejected as exc:
+                        raise failure("光鸭拒绝删除离线任务记录", "provider_rejected") from exc
+                    except Exception:
+                        message = "光鸭离线记录删除结果未知，请先查离线任务列表"
+                        return ToolResult(False, "outcome_unknown", message, data=data, error=message)
+                    try:
+                        remaining = client.list_offline_tasks()
+                        selected = set(arguments["task_ids"])
+                        data["verified"] = (client.credential_generation == observed["credential_generation"]
+                                            and all(task["id"] and task["id"] not in selected for task in remaining))
+                    except Exception:
+                        pass  # 已受理，重读失败不能当作删除完成。
+                finally:
+                    close_guangya_client(client)
+        except (AgentRuntimeDisabled, RuntimeFenceError) as exc:
+            raise failure("Media Agent 授权或运行状态已变化", "agent_disabled") from exc
+        if data["verified"]:
+            return ToolResult(True, "completed", "已核实所选光鸭离线记录已移除，云盘文件保留", data=data)
+        return ToolResult(True, "accepted", "光鸭已受理记录删除，请在离线任务列表核对结果", data=data)
+
+    return KernelToolSpec(name=method, domain="guangya", effect=ToolEffect.DANGER,
+        description=cloud.delete_offline_tasks.__doc__ or "",
+        input_schema={"type": "object", "required": ["task_ids"], "additionalProperties": False,
+                      "properties": {"task_ids": {"type": "array", "minItems": 1, "items": {
+                          "type": "string", "minLength": 1, "maxLength": 256}}}},
+        prepare=prepare, execute_confirmed=execute, metadata={"risk": "danger"})
 
 
 def cloud_change_tool() -> KernelToolSpec:

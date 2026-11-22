@@ -12,6 +12,7 @@
     const sendButton = document.getElementById('agentSend');
     const sessionStopButton = document.getElementById('agentStopSession');
     const submitSlot = sessionStopButton?.parentElement;
+    const attachButton = document.getElementById('agentAttach');
     const newSessionButton = document.getElementById('agentNewSession');
     const mainChatButton = document.getElementById('agentMainChat');
     const replyBar = document.getElementById('agentReplyBar');
@@ -692,6 +693,7 @@
         const card = element('section', 'agent-download-card');
         const heading = element('strong', 'agent-download-title', source.file ? source.file.name : '磁力链接');
         const meta = element('p', 'agent-download-meta', '正在解析…');
+        meta.setAttribute('role', 'status');
         card.append(heading, meta);
         view.body.append(card);
         let preview;
@@ -751,6 +753,45 @@
         }
         renderTargets(preview.targets);
         const setChoicesDisabled = disabled => radios.forEach((input, index) => { input.disabled = disabled || !targets[index].ready; });
+        const selectFiles = source.file ? element('button', 'agent-download-cancel', '用 Agent 选文件') : null;
+        if (selectFiles) {
+            const summary = meta.textContent;
+            let savedTorrent = null;
+            selectFiles.type = 'button';
+            actions.insertBefore(selectFiles, cancel);
+            selectFiles.addEventListener('click', async () => {
+                submit.disabled = selectFiles.disabled = cancel.disabled = true;
+                setChoicesDisabled(true);
+                card.classList.remove('is-error');
+                meta.textContent = '正在添加种子…';
+                try {
+                    if (!savedTorrent) {
+                        rememberSession(sessionId);
+                        const {file} = await fetchJSON(`/api/agent/sessions/${encodeURIComponent(sessionId)}/torrent`, {
+                            method: 'POST', body: source.file, signal: controller.signal,
+                            headers: {'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(source.file.name)},
+                        });
+                        if (!alive()) return;
+                        if (!file?.id || !file.name) throw new Error('未收到种子添加结果，请重试。');
+                        savedTorrent = file;
+                    }
+                    const draft = `请列出种子「${savedTorrent.name}」（种子编号 ${savedTorrent.id}）在光鸭可选的文件。`;
+                    fillDraft(draft);
+                    if (promptInput.value === draft) dismissDownloadCard(view.item);
+                    else meta.textContent = summary;
+                } catch (error) {
+                    if (!alive()) return;
+                    meta.textContent = `未能添加种子。${error.message}`;
+                    card.classList.add('is-error');
+                } finally {
+                    if (alive()) {
+                        setChoicesDisabled(false);
+                        submit.disabled = !chosen();
+                        selectFiles.disabled = cancel.disabled = false;
+                    }
+                }
+            });
+        }
         const showRecovery = (retryable) => {
             group.hidden = submit.hidden = !retryable;
             submit.disabled = !retryable;
@@ -765,6 +806,7 @@
         submit.addEventListener('click', async () => {
             const option = chosen();
             if (!option) return;
+            if (selectFiles) selectFiles.hidden = true;
             submit.disabled = cancel.disabled = true;
             setChoicesDisabled(true);
             submit.textContent = '正在提交…';
@@ -2666,6 +2708,7 @@
             sessionStopButton.disabled = initialRestore || stopping;
             sessionStopButton.setAttribute('aria-busy', String(stopping));
         }
+        if (attachButton) attachButton.disabled = initialRestore || Boolean(startupController);
         nextActions?.querySelectorAll('[data-agent-action-key]').forEach(button => { button.disabled = inputBlocked || initialRestore; });
     }
 
@@ -3979,6 +4022,7 @@
         startupController?.abort();
         const controller = new AbortController();
         startupController = controller;
+        syncSend();
         hideRestoreNotice();
         if (restoreText) restoreText.textContent = '正在恢复上次对话…';
         consoleNode?.setAttribute('aria-busy', initialRestore ? 'true' : 'false');
@@ -4077,11 +4121,16 @@
     document.getElementById('agentRestoreNew')?.addEventListener('click', startNewSession);
     mainChatButton?.addEventListener('click', openMainChat);
     const attachFile = document.getElementById('agentAttachFile');
-    document.getElementById('agentAttach')?.addEventListener('click', () => attachFile?.click());
+    attachButton?.addEventListener('click', () => attachFile?.click());
     attachFile?.addEventListener('change', () => {
         const file = attachFile.files?.[0];
         attachFile.value = '';
-        if (file) createDownloadCard({file});
+        if (!file || attachButton?.disabled || viewingChannel) return;
+        if (!/.+\.torrent$/i.test(file.name)) {
+            window.showToast?.('请选择 .torrent 种子文件。', 'warning');
+            return;
+        }
+        void createDownloadCard({file});
     });
     promptInput?.addEventListener('paste', (event) => {
         const text = String(event.clipboardData?.getData('text') || '').trim();

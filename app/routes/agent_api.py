@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import logging
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Annotated, Any
+from urllib.parse import unquote
 
+from anyio import from_thread
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 from app import config
 from app.agent.domains.resources.selection import (
@@ -627,6 +631,51 @@ async def search_messages(request: Request, q: str = ""):
         response.headers["Cache-Control"] = "private, no-store"
         return response
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
+        return _error(exc)
+
+
+@router.post("/sessions/{session_id}/torrent")
+async def upload_session_torrent(request: Request, session_id: str):
+    require_api_login(request)
+    try:
+        from app.modules.agent_files import store_chunks
+
+        _require_enabled()
+        owner, normalized = _owner(), _session_id(session_id)
+        if request.headers.get("content-type", "").partition(";")[0] != "application/octet-stream":
+            return api_error("种子上传格式无效", 415)
+        try:
+            filename = unquote(request.headers.get("X-File-Name", ""), errors="strict")
+        except UnicodeDecodeError:
+            return api_error("种子文件名无效")
+        if not filename:
+            return api_error("请选择 .torrent 种子")
+        source = request.stream()
+
+        async def next_chunk() -> bytes | None:
+            return await anext(source, None)
+
+        def chunks() -> Iterator[bytes]:
+            while (chunk := from_thread.run(next_chunk)) is not None:
+                if chunk:
+                    yield chunk
+
+        try:
+            stored = await run_in_threadpool(store_chunks, owner, normalized, filename, chunks())
+        except ValueError as exc:
+            return api_error(str(exc))
+        response = api_response({"file": stored}, 201)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+    except ClientDisconnect:
+        return api_error("附件上传中断，请重新选择文件")
+    except FileNotFoundError:
+        return api_error("上传期间会话文件已清除，请重新选择文件", 409)
+    except OSError as exc:
+        if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+            return api_error("服务器磁盘空间不足，清理空间后可重新上传", 507)
+        return _error(exc)
+    except Exception as exc:
         return _error(exc)
 
 

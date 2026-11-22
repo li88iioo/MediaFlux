@@ -23,6 +23,23 @@ from tests.support import seed_rss_entry_state
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    def test_v46_downloads_keep_receipts_and_default_to_rule_selection(self):
+        request_id, _ = download_requests_repo.create_download_request("historical-offline", "magnet")
+        download_requests_repo.update_download_request(
+            request_id, status="completed", gy_status="completed", gy_task_id="provider-task",
+        )
+        with db.get_conn() as conn:
+            conn.execute("ALTER TABLE download_requests DROP COLUMN gy_offline_selection")
+            conn.execute("PRAGMA user_version=46")
+
+        db.init_db()
+
+        with db.get_conn() as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        assert (row["gy_offline_selection"], row["gy_task_id"], row["gy_status"]) == ("", "provider-task", "completed")
+
     def test_v43_downloads_keep_existing_receipts_and_unknown_qb_directory(self):
         subscription_id = rss_repo.add_rss_subscription(
             "旧订阅", "https://feed.invalid/rss", download_method="qb", qb_save_path="/current/rss",
