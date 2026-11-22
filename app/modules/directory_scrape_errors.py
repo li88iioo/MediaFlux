@@ -26,6 +26,10 @@ class DirectoryScrapeStateError(ValueError, DirectoryScrapePublicError):
     status_code = 409
 
 
+class OrganizeWriteOutcomeUnknown(DirectoryScrapeStateError):
+    """云端写入结果需人工核对，可公开展示核对提示。"""
+
+
 class DirectoryScrapeGoneError(KeyError, DirectoryScrapePublicError):
     """短期检查/预览记录已不存在。"""
 

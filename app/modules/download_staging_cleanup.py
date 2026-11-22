@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from app.clients.guangya import GuangYaReadRejected
 from app.repositories import download_requests as download_requests_repo
@@ -426,8 +426,10 @@ def source_inside_protected_staging(client, source_id: str, protected: set[str],
     return False
 
 
-def assert_guangya_download_delete_allowed(client, item) -> None:
-    """在手动删除的 Writer 回调内检查下载占用；不改变自动整理的自有清理权限。"""
+def assert_guangya_download_delete_allowed(
+    client, item, *, action: Literal["删除", "移动"] = "删除",
+) -> None:
+    """在手动删除或移动的 Writer 回调内检查下载占用。"""
     from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 
     try:
@@ -446,19 +448,19 @@ def assert_guangya_download_delete_allowed(client, item) -> None:
             )
             if inside or contains:
                 raise DirectoryScrapeConflictError(
-                    f"此项目或其目录正被下载请求 #{row['id']} 使用，请等待下载和整理结束后再删除"
+                    f"此项目或其目录正被下载请求 #{row['id']} 使用，请等待下载和整理结束后再{action}"
                 )
         # 父链读取可能耗时，期间新入队确认/新认领下载不能沿用旧的空闲结论。
         before = {(row['id'], row['gy_target_dir']) for row in requests}
         after = {(row['id'], row['gy_target_dir'])
                  for row in list_staging_cleanup_requests(active_only=True)}
         if before != after:
-            raise DirectoryScrapeConflictError('下载任务占用已变化，未删除项目，请重新确认')
+            raise DirectoryScrapeConflictError(f'下载任务占用已变化，未{action}项目，请重新确认')
     except DirectoryScrapeConflictError:
         raise
     except Exception as exc:  # 安全状态/云盘父链读取失败，不执行破坏性操作。
         raise DirectoryScrapeConflictError(
-            '暂时无法确认目录与下载任务的关联，已取消删除，请稍后重试'
+            f'暂时无法确认目录与下载任务的关联，已取消{action}，请稍后重试'
         ) from exc
 
 

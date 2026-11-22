@@ -126,6 +126,7 @@
         action.setAttribute('aria-description', title);
         if (value === 'loading') setButtonContent(action, 'loader-circle', '检查中', true);
         else if (value === 'deleting') setButtonContent(action, 'loader-circle', '删除中', true);
+        else if (value === 'changing') setButtonContent(action, 'loader-circle', '处理中', true);
         else if (value === 'queued') setButtonContent(action, 'clock-3', '排队中');
         else if (value === 'running') setButtonContent(action, 'loader-circle', '整理中', true);
         else if (value === 'syncing') setButtonContent(action, 'rotate-cw', '同步中');
@@ -220,7 +221,9 @@
     function openMenu(item, row, action, event, anchorToButton) {
         event.preventDefault();
         event.stopPropagation();
-        if (action.disabled) return;
+        if (action.disabled || action.hasAttribute('aria-busy') || [...taskPollEntries.values()].some(entry =>
+            entry.fileId === String(item.file_id) && fileChangeLabels[entry.kind]
+        )) return;
         closeMenu();
         state.activeItem = item;
         state.activeRow = row;
@@ -240,7 +243,7 @@
         if (tracked) {
             tracked.row = row;
             tracked.action = action;
-            setRowState(row, action, 'running', '正在同步任务状态');
+            setRowState(row, action, fileChangeLabels[tracked.kind] ? 'changing' : 'running', '正在同步任务状态');
         }
         action.addEventListener('click', (event) => openMenu(
             item, row, action, event, true,
@@ -1055,6 +1058,11 @@
     const TASK_POLL_RETRY_MS = 2500;
     const TASK_POLL_TIMEOUT_MS = 8000;
     const TASK_POLL_MAX_ATTEMPTS = 1800;
+    const fileChangeLabels = {copy: '复制', move: '移动', mkdir: '新建文件夹'};
+    function taskProgressLabel(kind, itemLabel = '项目') {
+        if (fileChangeLabels[kind]) return `正在${fileChangeLabels[kind]}`;
+        return kind === 'delete' ? `正在删除${itemLabel}` : '目录刮削任务执行中';
+    }
     const ACTIVE_SCRAPE_TASKS_KEY = 'mediaflux.directory-scrape.active-tasks';
     const taskPollEntries = new Map();
     let taskPollTimer = null;
@@ -1065,8 +1073,9 @@
 
     function saveTrackedScrapes() {
         const active = [...taskPollEntries.values()]
-            .filter((entry) => entry.kind === 'scrape')
-            .map(({taskId, fileId, parentId}) => ({taskId, fileId, parentId}));
+            .filter(entry => entry.kind === 'scrape' || fileChangeLabels[entry.kind])
+            .map(({taskId, fileId, parentId, targetId, sourceParentId, kind}) =>
+                ({taskId, fileId, parentId, targetId, sourceParentId, kind}));
         try {
             if (active.length) sessionStorage.setItem(ACTIVE_SCRAPE_TASKS_KEY, JSON.stringify(active));
             else sessionStorage.removeItem(ACTIVE_SCRAPE_TASKS_KEY);
@@ -1079,8 +1088,9 @@
         try {
             const active = JSON.parse(sessionStorage.getItem(ACTIVE_SCRAPE_TASKS_KEY) || '[]');
             for (const entry of active.slice(-32)) {
-                if (typeof entry.taskId === 'string' && entry.taskId) {
-                    taskPollEntries.set(entry.taskId, {...entry, kind: 'scrape', attempts: 0});
+                const kind = entry.kind || 'scrape';
+                if (typeof entry.taskId === 'string' && entry.taskId && (kind === 'scrape' || Object.hasOwn(fileChangeLabels, kind))) {
+                    taskPollEntries.set(entry.taskId, {...entry, kind, attempts: 0});
                 }
             }
         } catch (_error) {
@@ -1132,6 +1142,7 @@
 
     async function applyTaskPollStatus(entry, task) {
         const {row, action} = entry;
+        const fileChange = fileChangeLabels[entry.kind];
         if (!task) {
             setRowState(row, action, 'syncing', '暂未取得任务回执，正在重试');
             return false;
@@ -1150,12 +1161,19 @@
             setRowState(
                 row,
                 action,
-                'running',
-                entry.kind === 'delete' ? `正在删除${entry.itemLabel}` : '目录刮削任务执行中',
+                fileChange ? 'changing' : 'running',
+                taskProgressLabel(entry.kind, entry.itemLabel),
             );
             return false;
         }
         if (['completed', 'partial'].includes(task.status)) {
+            if (fileChange) {
+                const partial = task.status === 'partial';
+                const message = task.result?.message || task.error || `${fileChange}${partial ? '部分完成' : '完成'}`;
+                setRowState(row, action, partial ? 'attention' : 'done', message);
+                window.showToast?.(message, partial ? 'warning' : 'success');
+                return true;
+            }
             if (entry.kind === 'delete') {
                 setRowState(row, action, 'done', `${entry.itemLabel}已删除`);
                 try {
@@ -1209,7 +1227,7 @@
             if (!row?.isConnected) window.showToast?.('目录刮削完成');
             return true;
         }
-        const label = entry.kind === 'delete' ? `${entry.itemLabel}删除` : '目录刮削';
+        const label = fileChange || (entry.kind === 'delete' ? `${entry.itemLabel}删除` : '目录刮削');
         if (task.status === 'failed') {
             const message = task.error || task.message || `${label}失败`;
             setRowState(row, action, 'error', message);
@@ -1251,6 +1269,8 @@
                     taskPollEntries.delete(taskId);
                     if (entry.kind !== 'delete' && ['completed', 'partial'].includes(task.status)) {
                         refreshParents.add(entry.parentId);
+                        if (entry.targetId) refreshParents.add(entry.targetId);
+                        if (entry.sourceParentId) refreshParents.add(entry.sourceParentId);
                     }
                 } else if (entry.attempts >= TASK_POLL_MAX_ATTEMPTS) {
                     setRowState(
@@ -1260,6 +1280,7 @@
                         '尚未收到任务结果，请到整理日志核对',
                     );
                     taskPollEntries.delete(taskId);
+                    if (fileChangeLabels[entry.kind]) window.showToast?.('暂未取得操作结果，请刷新目录核对', 'warning');
                 }
             }
             for (const parentId of refreshParents) {
@@ -1295,8 +1316,8 @@
             setRowState(
                 row,
                 action,
-                'running',
-                options.kind === 'delete' ? `正在删除${options.itemLabel || '项目'}` : '目录刮削任务执行中',
+                fileChangeLabels[options.kind] ? 'changing' : 'running',
+                taskProgressLabel(options.kind, options.itemLabel),
             );
         }
         const current = taskPollEntries.get(normalizedTaskId);
@@ -1306,6 +1327,8 @@
             row,
             action,
             parentId,
+            targetId: options.targetId,
+            sourceParentId: directory?.parent_id,
             kind: options.kind || current?.kind || 'scrape',
             itemLabel: options.itemLabel || current?.itemLabel || '项目',
             itemName: options.itemName || current?.itemName || directory?.name || '',
@@ -1484,6 +1507,43 @@
         }
     }
 
+    async function submitFileChange(payload, {item, row, action, parentId}) {
+        const data = await window.gyApi('/file-change', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+        if (!data.task_id) throw new Error('操作未返回任务编号，请刷新目录核对');
+        window.showToast?.(`${fileChangeLabels[payload.operation]}${data.queued ? '已排队' : '已提交'}`, 'info');
+        pollTask(data.task_id, item, row, action, parentId, {
+            kind: payload.operation, targetId: payload.target_dir_id,
+        });
+    }
+
+    function pickTransferTarget(operation, item, parentId, row, action) {
+        const label = fileChangeLabels[operation];
+        window.openGuangYaDirectoryPicker({
+            modalId: 'gyTransferTarget', title: `${label}到…`, allowRoot: true, allowLogicalRoot: true,
+            trigger: action, preserveWhileLoading: true,
+            onSelect(target) {
+                if (target.id === item.parent_id) {
+                    window.showToast('请选择其他目录', 'warning');
+                    return false;
+                }
+                if (item.is_dir && (target.id === item.file_id || target.path.some(node => node.id === item.file_id))) {
+                    window.showToast('请选择此文件夹及其子目录以外的位置', 'warning');
+                    return false;
+                }
+                action.setAttribute('aria-busy', 'true');
+                submitFileChange({
+                    operation, file_id: item.file_id, expected_name: item.name,
+                    expected_parent_id: item.parent_id, target_dir_id: target.id,
+                }, {item, row, action, parentId}).catch(error => {
+                    window.showToast(error.message, 'error');
+                }).finally(() => { action.removeAttribute('aria-busy'); });
+            },
+        });
+    }
+
     menu.addEventListener('click', (event) => {
         const button = event.target.closest('[data-scrape-action], [data-browser-action]');
         if (!button || !state.activeItem) return;
@@ -1498,6 +1558,8 @@
             runAuto(item, row, action).catch(() => {});
         } else if (button.dataset.browserAction === 'delete-item') {
             deleteItem(item, parentId, row, action).catch(() => {});
+        } else if (['copy', 'move'].includes(button.dataset.browserAction)) {
+            pickTransferTarget(button.dataset.browserAction, item, parentId, row, action);
         }
     });
     document.addEventListener('click', (event) => {
@@ -1536,6 +1598,7 @@
     window.GuangYaDirectoryScrapeUI = {
         bindMediaRow,
         closeMenu,
+        submitFileChange,
     };
     restoreTrackedScrapes();
     renderIcons(menu);

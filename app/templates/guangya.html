@@ -342,6 +342,10 @@
             <div class="dir-browser-header">
                 <div class="section-title">目录浏览</div>
                 <div class="dir-browser-actions">
+                    <form id="gyDriveSearchForm" class="gy-drive-search" role="search">
+                        <input type="search" id="gyDriveSearch" aria-label="搜索云盘文件" placeholder="搜索云盘文件" autocomplete="off" enterkeyhint="search">
+                        <button type="submit" aria-label="搜索" title="搜索"><i data-lucide="search"></i></button>
+                    </form>
                     <label class="dir-sort-control" title="调整当前目录排序方式">
                         <i data-lucide="arrow-up-down"></i>
                         <select id="gySortSelect" aria-label="目录排序方式" onchange="gySetSortMode(this.value)">
@@ -366,14 +370,27 @@
                     </div>
                 </div>
             </div>
-            <div class="dir-browser-toolbar">
+            <div class="dir-browser-toolbar gy-drive-toolbar">
+                <button type="button" class="jump-btn dir-browser-up" id="gyNewFolderBtn" disabled aria-expanded="false" aria-controls="gyNewFolderForm">
+                    <i data-lucide="folder-plus"></i>新建文件夹
+                </button>
                 <button type="button" class="jump-btn dir-browser-up" id="gyUpBtn" disabled title="返回上一级">
                     <i data-lucide="arrow-up"></i>
                     上一级
                 </button>
                 <nav id="gyBreadcrumb" class="dir-breadcrumb" aria-label="当前目录路径"></nav>
             </div>
+            <form id="gyNewFolderForm" class="gy-new-folder" hidden>
+                <input class="form-input" id="gyFolderName" aria-label="文件夹名称" placeholder="文件夹名称" required pattern=".*\S.*" title="请输入文件夹名称" autocomplete="off">
+                <button class="btn btn-primary" type="submit">创建</button>
+                <button class="jump-btn" id="gyCancelNewFolder" type="button">取消</button>
+            </form>
             <div id="gyDirList"><div class="empty-state"><p>等待凭证校验...</p></div></div>
+            <nav id="gySearchPages" class="gy-search-pages" aria-label="搜索结果分页" hidden>
+                <button type="button" class="jump-btn" id="gyPrevSearchPage">上一页</button>
+                <span id="gySearchPageLabel"></span>
+                <button type="button" class="jump-btn" id="gyNextSearchPage">下一页</button>
+            </nav>
         </div>
     </div>
     
@@ -510,6 +527,12 @@
         <i data-lucide="wand-sparkles"></i>
         <span><strong>自动匹配并刮削</strong><small>可靠命中后直接归档</small></span>
     </button>
+    <button type="button" role="menuitem" data-browser-action="copy">
+        <i data-lucide="copy"></i><span><strong>复制到…</strong></span>
+    </button>
+    <button type="button" role="menuitem" data-browser-action="move">
+        <i data-lucide="folder-input"></i><span><strong>移动到…</strong></span>
+    </button>
     <button type="button" role="menuitem" data-browser-action="delete-item" hidden>
         <i data-lucide="trash-2"></i>
         <span><strong data-delete-title>删除项目</strong><small data-delete-hint>可在光鸭回收站恢复</small></span>
@@ -615,6 +638,9 @@ function renderGyTokenStatus(data, directoryReadVersion=gyDirectoryReadVersion){
     if(!hasToken){
         if(hadToken){
             gyNavigator.cancel();
+            gySearchInput.value='';
+            gyRequestedId='';
+            gySetFolderForm(false);
             gyDirectoryFailed=false;
             gyRenderItems([]);
         }
@@ -732,6 +758,23 @@ function gyLogin(){
 const gyDirList = document.getElementById('gyDirList');
 const gyUpBtn = document.getElementById('gyUpBtn');
 const gyBreadcrumb = document.getElementById('gyBreadcrumb');
+const gySearchInput = document.getElementById('gyDriveSearch');
+const gyNewFolderBtn = document.getElementById('gyNewFolderBtn');
+const gyFolderForm = document.getElementById('gyNewFolderForm');
+const gyFolderName = document.getElementById('gyFolderName');
+const GY_SEARCH_PREFIX = 'search:';
+const gySearchPages = document.getElementById('gySearchPages');
+const gyPrevSearchPage = document.getElementById('gyPrevSearchPage');
+const gyNextSearchPage = document.getElementById('gyNextSearchPage');
+let gySearchHasMore = false;
+let gyRequestedId = '';
+
+function gySetFolderForm(open){
+    gyFolderForm.hidden = !open;
+    gyNewFolderBtn.setAttribute('aria-expanded', String(open));
+    if(open) gyFolderName.focus();
+    else gyFolderForm.reset();
+}
 
 function gyEmptyState(message){
     const box = document.createElement('div');
@@ -979,6 +1022,10 @@ function gyMediaRow(item, isDirectory){
     const sub = document.createElement('div');
     sub.className = 'gy-dir-sub';
     sub.textContent = gyItemMeta(item, isDirectory);
+    if(item.parent_name){
+        sub.textContent += ' · '+item.parent_name;
+        sub.title = '所在目录：'+item.parent_name;
+    }
     info.appendChild(sub);
 
     let summary;
@@ -1039,7 +1086,13 @@ function gyRenderItems(items){
     gyDirList.replaceChildren();
     if(!gyDirectoryItems.length){
         gyOrderedDirectoryItems = [];
-        gyDirList.appendChild(gyEmptyState('空目录'));
+        const id = gyNavigator.state().id;
+        let message = '空目录';
+        if(id.startsWith(GY_SEARCH_PREFIX)){
+            const query = new URLSearchParams(id.slice(GY_SEARCH_PREFIX.length));
+            message = query.has('page') ? '本页没有更多结果' : '没有找到匹配的文件或目录';
+        }
+        gyDirList.appendChild(gyEmptyState(message));
         return;
     }
     const dirs = gyDirectoryItems.filter(item=>item.is_dir).sort(gyCompareItems);
@@ -1054,21 +1107,58 @@ function gyRenderItems(items){
 
 const gyNavigator = createGuangYaDirectoryNavigator({
     rootId: '0',
-    fetchDirectory: (id,{signal}={})=>gyApi('/dirs?parent_id='+encodeURIComponent(id),{signal}),
-    onLoading: ()=>{
+    fetchDirectory: (id,{signal}={})=>{
+        if(id.startsWith(GY_SEARCH_PREFIX)){
+            return gyApi('/search?'+id.slice(GY_SEARCH_PREFIX.length), {signal}).then(result=>{
+                if(!signal.aborted) gySearchHasMore = result.has_more === true;
+                return result.items;
+            });
+        }
+        return gyApi('/dirs?parent_id='+encodeURIComponent(id),{signal});
+    },
+    onLoading: ({id})=>{
+        if(id !== gyRequestedId){
+            if(id.startsWith(GY_SEARCH_PREFIX)){
+                gySearchInput.value = new URLSearchParams(id.slice(GY_SEARCH_PREFIX.length)).get('keyword') || '';
+            } else if(gyRequestedId.startsWith(GY_SEARCH_PREFIX)){
+                gySearchInput.value = '';
+            }
+        }
+        gyRequestedId=id;
         gyDirectoryFailed=false;
-        gyDirList.replaceChildren(gyEmptyState('加载中...'));
+        gySetFolderForm(false);
+        gyNewFolderBtn.disabled=true;
+        gyDirList.setAttribute('aria-busy','true');
+        gyDirList.inert=true;
+        gySearchPages.inert=true;
+        if(!gyDirectoryItems.length) gyDirList.replaceChildren(gyEmptyState('加载中...'));
     },
     onPathChange: (state)=>{
         renderDirectoryBreadcrumb(gyBreadcrumb, state.path, index=>gyNavigator.goTo(index));
         gyUpBtn.disabled = state.isRoot;
+        const searching = state.id.startsWith(GY_SEARCH_PREFIX);
+        const query = new URLSearchParams(state.id.slice(GY_SEARCH_PREFIX.length));
+        const page = Number(query.get('page') || 1);
+        gySearchPages.hidden = !searching || (page === 1 && !gySearchHasMore);
+        document.getElementById('gySearchPageLabel').textContent = '第 '+page+' 页';
+        gyPrevSearchPage.disabled = page <= 1;
+        gyNextSearchPage.disabled = !gySearchHasMore;
+        gySearchPages.inert=false;
+        gyNewFolderBtn.disabled = searching;
+        gyNewFolderBtn.title = searching ? '请进入目标目录后新建文件夹' : '在当前目录新建文件夹';
     },
     onLoaded: (items)=>{
+        gyDirList.inert=false;
+        gyDirList.removeAttribute('aria-busy');
         gyDirectoryReadVersion+=1;
         renderGyTokenBadge('valid');
         gyRenderItems(items);
     },
     onError: (error)=>{
+        gyDirList.inert=false;
+        gyDirList.removeAttribute('aria-busy');
+        gyDirectoryItems=[];
+        gySearchPages.hidden=true;
         gyDirectoryFailed=true;
         gyDirList.replaceChildren(gyEmptyState(error.message || '加载失败'));
         if(document.getElementById('gyTokenBadge').classList.contains('online')) gyLoadStatus();
@@ -1076,6 +1166,59 @@ const gyNavigator = createGuangYaDirectoryNavigator({
 });
 window.gyNavigator = gyNavigator;
 
+function gyExitSearch(){
+    const state=gyNavigator.state();
+    if(state.id.startsWith(GY_SEARCH_PREFIX)) return gyNavigator.up();
+    if(gyRequestedId.startsWith(GY_SEARCH_PREFIX)) return gyNavigator.reload();
+}
+function gyOpenSearch(term, page=1){
+    const state=gyNavigator.state();
+    const origin=state.id.startsWith(GY_SEARCH_PREFIX) ? state.path.slice(0,-1) : state.path;
+    const query=new URLSearchParams({keyword:term});
+    if(page>1) query.set('page',String(page));
+    const id=GY_SEARCH_PREFIX+query;
+    gyNavigator.load(id,[...origin,{id,name:'搜索「'+term+'」'}]);
+}
+document.getElementById('gyDriveSearchForm').addEventListener('submit', event=>{
+    event.preventDefault();
+    const term=gySearchInput.value.trim();
+    if(term) gyOpenSearch(term);
+    else gyExitSearch();
+});
+function gyChangeSearchPage(offset){
+    const query=new URLSearchParams(gyNavigator.state().id.slice(GY_SEARCH_PREFIX.length));
+    gyOpenSearch(query.get('keyword'), Number(query.get('page')||1)+offset);
+}
+gyPrevSearchPage.addEventListener('click', ()=>gyChangeSearchPage(-1));
+gyNextSearchPage.addEventListener('click', ()=>gyChangeSearchPage(1));
+gySearchInput.addEventListener('input', ()=>{
+    if(!gySearchInput.value) gyExitSearch();
+});
+gyNewFolderBtn.addEventListener('click', ()=>gySetFolderForm(gyFolderForm.hidden));
+function gyCancelFolder(){
+    gySetFolderForm(false);
+    gyNewFolderBtn.focus();
+}
+document.getElementById('gyCancelNewFolder').addEventListener('click', gyCancelFolder);
+gyFolderName.addEventListener('keydown', event=>{
+    if(event.key==='Escape') gyCancelFolder();
+});
+gyFolderForm.addEventListener('submit', async event=>{
+    event.preventDefault();
+    const submit=gyFolderForm.querySelector('[type="submit"]');
+    const name=gyFolderName.value.trim();
+    if(submit.disabled || !name || gyNewFolderBtn.disabled) return;
+    const parentId=gyNavigator.state().id;
+    submit.disabled=true;
+    try {
+        await window.GuangYaDirectoryScrapeUI.submitFileChange({operation:'mkdir', name, target_dir_id:parentId}, {parentId});
+        if(gyNavigator.state().id===parentId) gyCancelFolder();
+    } catch(error){
+        window.showToast(error.message,'error');
+    } finally {
+        submit.disabled=false;
+    }
+});
 gyUpBtn.addEventListener('click', ()=>gyNavigator.up());
 renderDirectoryBreadcrumb(gyBreadcrumb, [], index=>gyNavigator.goTo(index));
 

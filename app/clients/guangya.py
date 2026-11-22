@@ -705,11 +705,12 @@ def _read_success_acknowledged(response: dict) -> bool:
     )
 
 
-def _read_page_has_more(response: object, *, count: int, seen: int, page_size: int) -> bool:
-    """优先采用服务端分页证据，不能仅因服务端限流缩页就认为已读完。"""
+def _read_page_has_more(response: object, *, count: int, seen: int, page_size: int | None) -> bool:
+    """优先采用服务端分页证据。page_size=None 时以空页作为结束标志。"""
+    fallback = bool(count) if page_size is None else count >= page_size
     payload = response.get("data", response) if isinstance(response, dict) else {}
     if not isinstance(payload, dict):
-        return count >= page_size
+        return fallback
     total = payload.get("total")
     if isinstance(total, int) and not isinstance(total, bool) and total > seen:
         return True
@@ -717,7 +718,7 @@ def _read_page_has_more(response: object, *, count: int, seen: int, page_size: i
         return payload["hasMore"]
     if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
         return False
-    return count >= page_size
+    return fallback
 
 
 def _validate_write_response(response, *, operation: str) -> None:
@@ -835,6 +836,12 @@ class GuangYaFile:
     mime_type: str = ""
     extension: str = ""
     md5: str = field(default="", compare=False)
+
+
+@dataclass
+class GuangYaSearchHit:
+    file: GuangYaFile
+    parent_name: str
 
 
 def normalize_provider_md5(value: str) -> str | None:
@@ -2270,6 +2277,46 @@ class GuangYaClient:
     def list_dir(self, parent_id: str = "0") -> list[GuangYaFile]:
         """完整读取目录全部分页，适合需要完整快照的调用方。"""
         return list(self.iter_dir(parent_id))
+
+    def search_files(
+        self, keyword: str, *, page: int = 0, page_size: int = 20,
+    ) -> tuple[list[GuangYaSearchHit], bool]:
+        """按名称搜索整个账号，页码从 0 开始。"""
+        response = self._call_read(
+            "search_files",
+            lambda: self.raw.request(
+                "https://api.guangyapan.com/userres/v1/file/search_files",
+                method="POST",
+                json={"name": keyword, "page": page, "pageSize": page_size},
+                timeout=10,
+            ).json(),
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        # 实测无结果时成功响应只回传 keyword，没有 list。
+        if (
+            isinstance(data, dict)
+            and data.keys() == {"keyword"}
+            and isinstance(data["keyword"], str)
+            and _read_success_acknowledged(response)
+        ):
+            return [], False
+
+        rows = self._extract_list(response)
+        # 后续页可能省略 total，收到空页才能确认结束。
+        has_more = _read_page_has_more(
+            response, count=len(rows), seen=page * page_size + len(rows), page_size=None,
+        )
+        if has_more and not rows:
+            raise RuntimeError("光鸭搜索分页未推进")
+
+        hits = []
+        for row in rows:
+            file = _to_file(row)
+            if not file.file_id or not file.name:
+                raise RuntimeError("光鸭搜索结果缺少项目标识或名称")
+            parent_name = row.get("parentName")
+            hits.append(GuangYaSearchHit(file, parent_name if isinstance(parent_name, str) else ""))
+        return hits, has_more
 
     def close(self) -> bool:
         """幂等释放 SDK 底层 httpx 连接池。"""

@@ -1,7 +1,9 @@
 """光鸭云盘 API 路由：登录态、短信两步登录、目录浏览。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Request
+import json
+
+from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 
 from app import config
@@ -9,6 +11,7 @@ from app.clients.guangya import (
     TOKEN_EXPIRY_MAX,
     TOKEN_EXPIRY_MIN,
     GuangYaClient,
+    GuangYaFile,
     close_guangya_client,
 )
 from app.logger import get_logger
@@ -20,7 +23,7 @@ from app.modules.directory_scrape_errors import (
     public_error_message,
 )
 from app.modules.scheduler import get_scheduler
-from app.web import require_api_login
+from app.web import api_error, require_api_login
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/guangya")
@@ -189,6 +192,51 @@ def login(request: Request, data: dict | None = Body(default=None)):
         close_guangya_client(c)
 
 
+def _browser_video_extensions() -> set[str]:
+    from app.modules.organize import Organizer, OrganizeRules
+
+    return Organizer.video_exts(OrganizeRules.from_config())
+
+
+def _browser_item(file: GuangYaFile, video_exts: set[str]) -> dict:
+    name_ext = file.name.rsplit(".", 1)[-1].lower() if not file.is_dir and "." in file.name else ""
+    return {
+        "file_id": file.file_id, "name": file.name, "is_dir": file.is_dir,
+        "is_video": bool(name_ext) and name_ext in video_exts,
+        "size": file.size, "etag": file.etag, "parent_id": file.parent_id,
+        "created_at": file.created_at, "updated_at": file.updated_at,
+        "mime_type": file.mime_type, "extension": file.extension or name_ext,
+    }
+
+
+@router.get("/search")
+def search_files(
+    request: Request, keyword: str = "", page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """按名称分页搜索整个光鸭账号下的文件和目录。"""
+    require_api_login(request)
+    keyword = keyword.strip()
+    if not keyword:
+        return api_error("请输入搜索关键词")
+    client = GuangYaClient()
+    try:
+        if not client.logged_in:
+            return api_error("光鸭未登录", 503)
+        hits, has_more = client.search_files(keyword, page=page - 1, page_size=page_size)
+        video_exts = _browser_video_extensions()
+        return {
+            "items": [dict(_browser_item(hit.file, video_exts), parent_name=hit.parent_name) for hit in hits],
+            "page": page, "page_size": page_size, "has_more": has_more,
+            "next_page": page + 1 if has_more else None,
+        }
+    except Exception as exc:
+        logger.error("光鸭搜索失败 type=%s", type(exc).__name__)
+        return api_error("光鸭搜索失败", 502)
+    finally:
+        close_guangya_client(client)
+
+
 @router.get("/dirs")
 def list_dirs(request: Request, parent_id: str = "0"):
     """目录浏览（给选择器用）。?parent_id=xxx，默认根目录。"""
@@ -197,38 +245,9 @@ def list_dirs(request: Request, parent_id: str = "0"):
     try:
         if not c.logged_in:
             return JSONResponse({"error": "光鸭未登录"}, status_code=503)
-        from app.modules.organize import Organizer, OrganizeRules
-
-        rules = OrganizeRules.from_config()
-        organizer = Organizer(client=c)
-        try:
-            video_exts = organizer.video_exts(rules)
-        finally:
-            organizer.close()
+        video_exts = _browser_video_extensions()
         files = c.list_dir(parent_id)
-        return [
-            {
-                "file_id": f.file_id,
-                "name": f.name,
-                "is_dir": f.is_dir,
-                "is_video": (
-                    not f.is_dir
-                    and "." in f.name
-                    and f.name.rsplit(".", 1)[-1].lower() in video_exts
-                ),
-                "size": f.size,
-                "etag": f.etag,
-                "parent_id": f.parent_id,
-                "created_at": f.created_at,
-                "updated_at": f.updated_at,
-                "mime_type": f.mime_type,
-                "extension": (
-                    f.extension
-                    or (f.name.rsplit(".", 1)[-1].lower() if not f.is_dir and "." in f.name else "")
-                ),
-            }
-            for f in files
-        ]
+        return [_browser_item(file, video_exts) for file in files]
     except Exception as exc:
         logger.error(f"光鸭目录读取失败: {type(exc).__name__}")
         return JSONResponse({"error": "光鸭目录读取失败"}, status_code=500)
@@ -331,6 +350,66 @@ def delete_item(request: Request, data: dict | None = Body(default=None)):
             status_code=409,
         )
     return JSONResponse(result, status_code=202)
+
+
+@router.post("/file-change")
+def file_change(request: Request, data: dict | None = None):
+    """把浏览器的单项复制、移动或新建目录提交到光鸭 Writer。"""
+    require_api_login(request)
+    from app.modules.guangya_fs_change import (
+        GuangYaFSChangeError,
+        execute_browser_file_change,
+        validate_fs_change_name,
+    )
+    from app.modules.organize_tasks import get_organize_manager
+
+    payload = data or {}
+    operation = payload.get("operation")
+    labels = {"copy": "复制光鸭目录项", "move": "移动光鸭目录项", "mkdir": "新建光鸭目录"}
+    if not isinstance(operation, str) or operation not in labels:
+        return JSONResponse({"error": "请选择复制、移动或新建目录"}, status_code=400)
+    target_dir_id = payload.get("target_dir_id")
+    if not isinstance(target_dir_id, str) or not target_dir_id.strip():
+        return JSONResponse({"error": "请选择目标目录"}, status_code=400)
+    target_dir_id = target_dir_id.strip()
+    file_id = expected_parent_id = expected_name = name = ""
+    if operation == "mkdir":
+        try:
+            name = validate_fs_change_name(payload.get("name"))
+        except GuangYaFSChangeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+    else:
+        file_id = payload.get("file_id")
+        if not isinstance(file_id, str) or not file_id.strip() or file_id.strip() == "0":
+            return JSONResponse({"error": "请选择具体文件或目录作为源项目"}, status_code=400)
+        file_id = file_id.strip()
+        if file_id == target_dir_id:
+            return JSONResponse({"error": "不能把项目复制或移动到自身"}, status_code=400)
+        expected_parent_id = payload.get("expected_parent_id")
+        expected_name = payload.get("expected_name")
+        if (
+            not isinstance(expected_parent_id, str) or not expected_parent_id.strip()
+            or not isinstance(expected_name, str) or not expected_name.strip()
+        ):
+            return JSONResponse({"error": "缺少源项目的父目录或名称，请刷新后重试"}, status_code=400)
+        expected_parent_id = expected_parent_id.strip()
+
+    def execute() -> dict:
+        client = GuangYaClient()
+        try:
+            return execute_browser_file_change(
+                client, operation, target_dir_id=target_dir_id, name=name,
+                file_id=file_id, expected_parent_id=expected_parent_id, expected_name=expected_name,
+            )
+        finally:
+            close_guangya_client(client)
+
+    identity = json.dumps([operation, target_dir_id, file_id, expected_parent_id, expected_name, name])
+    result = get_organize_manager().start_operation(
+        labels[operation], name or expected_name, execute,
+        dedupe_key=f"guangya-browser-file-change:{identity}",
+    )
+    return JSONResponse(result, status_code=202 if result.get("ok") else 409)
 
 
 def _normalize_sources(data: dict) -> list[dict[str, str]]:

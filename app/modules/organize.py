@@ -510,8 +510,9 @@ class Organizer:
         }
         return parsed or set(defaults)
 
-    def video_exts(self, rules: OrganizeRules) -> set[str]:
-        return self._parse_exts(rules.video_exts, VIDEO_EXTS)
+    @classmethod
+    def video_exts(cls, rules: OrganizeRules) -> set[str]:
+        return cls._parse_exts(rules.video_exts, VIDEO_EXTS)
 
     def metadata_exts(self, rules: OrganizeRules) -> set[str]:
         return self._parse_exts(rules.metadata_exts, METADATA_EXTS)

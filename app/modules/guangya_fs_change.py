@@ -20,11 +20,19 @@ from typing import Any
 from app.clients.guangya import (
     GuangYaClient,
     GuangYaFile,
+    GuangYaReadRejected,
     GuangYaWriteRejected,
     guangya_provider_task_state,
     verify_guangya_write,
 )
 from app.config import PATHS
+from app.modules.directory_scrape_errors import (
+    DirectoryScrapeConflictError,
+    DirectoryScrapeGoneError,
+    DirectoryScrapeStateError,
+    OrganizeWriteOutcomeUnknown,
+)
+from app.modules.download_staging_cleanup import assert_guangya_download_delete_allowed
 from app.modules.guangya_journal import append_guangya_journal
 from app.modules.guangya_workspace import (
     GuangYaWorkspaceError,
@@ -761,7 +769,7 @@ def _normalize_path(value: object, *, allow_root: bool = True) -> str:
     return "/" + "/".join(parts)
 
 
-def _validate_name(value: object) -> str:
+def validate_fs_change_name(value: object) -> str:
     if not isinstance(value, str):
         raise GuangYaFSChangeError("目标名称格式无效")
     name = value.strip()
@@ -944,7 +952,7 @@ def _compile_operations(
         source = _full_path(parent, str(observed["name"]))
         destination = _full_path(
             parent if op == "rename" else _normalize_path(raw.get("target_path")),
-            _validate_name(raw.get("new_name")) if op != "move" else str(observed["name"]),
+            validate_fs_change_name(raw.get("new_name")) if op != "move" else str(observed["name"]),
         )
         if destination == source:
             continue
@@ -1072,7 +1080,7 @@ def _batch_unique_name(name: str, parent_path: str, used: set[str], siblings: se
         candidate = base + tag + suffix
         if candidate.casefold() not in blocked:
             used.add(candidate.casefold())
-            return _validate_name(candidate)
+            return validate_fs_change_name(candidate)
         number += 1
 
 
@@ -1301,7 +1309,7 @@ def build_fs_change_plan(
             raise GuangYaFSChangeError("不支持的光鸭变更操作")
         if op == "create_directory":
             parent_path = raw["parent_path"]
-            name = _validate_name(raw.get("name"))
+            name = validate_fs_change_name(raw.get("name"))
             pending_parent = pending_targets.get(parent_path)
             parent_id, parent_snapshot = (
                 ("", None) if pending_parent is not None
@@ -1369,7 +1377,7 @@ def build_fs_change_plan(
         if raw.get("require_empty") and client.list_dir(current.file_id):
             raise GuangYaFSChangeStale("目录已不为空，不能作为真空目录回收")
         if op in {"rename", "relocate"} or op == "copy" and "new_name" in raw:
-            new_name = _validate_name(raw.get("new_name"))
+            new_name = validate_fs_change_name(raw.get("new_name"))
             if op == "rename" and new_name == current.name:
                 unchanged += 1
                 continue
@@ -1869,17 +1877,20 @@ def _verify_after(
     return False
 
 
+def _copy_task_completed(client: GuangYaClient, task_id: str) -> bool:
+    state = guangya_provider_task_state(client.task_status(task_id))
+    if state == "failed":
+        raise GuangYaWriteRejected("copy", code="task_failed")
+    if state == "running":
+        raise GuangYaFSCopyPending()
+    return state == "completed"
+
+
 def _verified_copy(client, item, created_targets, task_id, cancel_check, *, name, copied_id="",
                    cache=None, directory_cache=None):
     """Provider终态和完整副本共同核验，返回副本身份供同计划的后续改名使用。"""
-    if task_id:
-        state = guangya_provider_task_state(client.task_status(task_id))
-        if state == "failed":
-            raise GuangYaWriteRejected("copy", code="task_failed")
-        if state == "running":
-            raise GuangYaFSCopyPending()
-        if state != "completed":
-            return None
+    if task_id and not _copy_task_completed(client, task_id):
+        return None
     source = item["source"]
     if not _snapshot_matches(_find_current(client, source, cache=cache, directory_cache=directory_cache), source):
         return None
@@ -1892,26 +1903,38 @@ def _verified_copy(client, item, created_targets, task_id, cancel_check, *, name
 
 def _copy_output(client, item, created_targets, cancel_check, *, name, copied_id="", directory_cache=None):
     """按冻结内容核对副本；已完成复制的源可以被同一计划后续合法修改。"""
-    source = item["source"]
     target_id = _directory_id(item, created_targets)
+    copied = _copy_target_entry(client, target_id, item["source"], name, copied_id=copied_id,
+                                directory_cache=directory_cache)
+    if copied is None or not copied.is_dir:
+        return copied
+    expected = item.get("copy_snapshot")
+    if isinstance(expected, dict) and _copy_tree_snapshot(client, copied.file_id, cancel_check)["content"] == expected["content"]:
+        return copied
+    return None
+
+
+def _copy_target_entry(
+    client: GuangYaClient, target_id: str, source: dict[str, Any], name: str, *,
+    copied_id: str = "", directory_cache: dict[str, dict[str, GuangYaFile]] | None = None,
+) -> GuangYaFile | None:
     rows = client.list_dir(target_id)
     if directory_cache is not None:
         directory_cache[target_id] = {row.file_id: row for row in rows}
     matches = [row for row in rows
                if row.name == name and row.is_dir == bool(source["is_dir"])]
-    if len(matches) != 1 or matches[0].file_id == source["file_id"]:
+    if len(matches) != 1:
         return None
     copied = matches[0]
-    if copied_id and str(copied.file_id) != copied_id:
+    if copied.file_id in {"", "0", source["file_id"]} or copied.parent_id != target_id:
+        return None
+    if copied_id and copied.file_id != copied_id:
         return None
     if copied.is_dir:
-        expected = item.get("copy_snapshot")
-        valid = (isinstance(expected, dict)
-                 and _copy_tree_snapshot(client, copied.file_id, cancel_check)["content"] == expected["content"])
-    else:
-        size = max(0, int(source.get("size") or 0))
-        valid = ((not size or int(copied.size or 0) == size)
-                 and (not source.get("etag") or str(copied.etag or "") in {"", str(source["etag"])}))
+        return copied
+    size = max(0, int(source.get("size") or 0))
+    valid = ((not size or (copied.size or 0) == size)
+             and (not source.get("etag") or (copied.etag or "") in {"", str(source["etag"])}))
     return copied if valid else None
 
 
@@ -1978,23 +2001,16 @@ def _operation_actions(item: dict[str, Any]) -> tuple[str, ...]:
     return ("move", "rename") if item.get("move_first") else ("rename", "move")
 
 
-def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check, copy_task_id, stage_source=None):
-    """复用同一次写后读取：返回阶段核验与可用于续行的中间版本，不额外查询。"""
-    intermediate = action != _operation_actions(item)[-1]
-    observed = None
+def _wait_for_fs_verification(
+    check: Callable[[], bool], *, copy_task_id: str = "", cancel_check: Callable[[], None] | None = None,
+) -> bool:
     copy_pending = False
 
-    def verify():
-        nonlocal observed, copy_pending
+    def verify() -> bool:
+        nonlocal copy_pending
         copy_pending = False
         try:
-            if intermediate:
-                observed = (_verified_copy(client, item, created_targets, copy_task_id, cancel_check,
-                                           name=item["source"]["name"]) if action == "copy" else
-                            _written_source(client, {**item, "op": action}, created_targets))
-                return observed is not None
-            return _verify_after(client, item, created_id, created_targets=created_targets,
-                                 copy_task_id=copy_task_id, cancel_check=cancel_check, stage_source=stage_source)
+            return check()
         except GuangYaFSCopyPending:
             copy_pending = True
             return False
@@ -2003,6 +2019,25 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
     verified = verify_guangya_write(verify, cancel_check=cancel_check, attempts=attempts)
     if not verified and copy_pending:
         raise GuangYaFSCopyPending()
+    return verified
+
+
+def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check, copy_task_id, stage_source=None):
+    """复用同一次写后读取：返回阶段核验与可用于续行的中间版本，不额外查询。"""
+    intermediate = action != _operation_actions(item)[-1]
+    observed = None
+
+    def verify() -> bool:
+        nonlocal observed
+        if intermediate:
+            observed = (_verified_copy(client, item, created_targets, copy_task_id, cancel_check,
+                                       name=item["source"]["name"]) if action == "copy" else
+                        _written_source(client, {**item, "op": action}, created_targets))
+            return observed is not None
+        return _verify_after(client, item, created_id, created_targets=created_targets,
+                             copy_task_id=copy_task_id, cancel_check=cancel_check, stage_source=stage_source)
+
+    verified = _wait_for_fs_verification(verify, copy_task_id=copy_task_id, cancel_check=cancel_check)
     if verified and observed is not None:
         if action == "copy":
             return True, file_snapshot(observed)
@@ -2013,6 +2048,112 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
         if _snapshot_matches(observed, expected):
             return True, file_snapshot(observed)
     return verified, None
+
+
+def _browser_file_info(client: GuangYaClient, file_id: str) -> GuangYaFile | None:
+    try:
+        return client.file_info(file_id)
+    except GuangYaReadRejected as exc:
+        if exc.operation == "file_info" and exc.code == "149":
+            return None
+        raise
+
+
+def _validate_browser_target(client: GuangYaClient, target_dir_id: str, source_dir_id: str) -> None:
+    """沿真实目录 ID 核对目标，目录复制和移动还需排除循环和子目录。"""
+    current_id = target_dir_id
+    seen: set[str] = set()
+    while current_id != "0":
+        if not current_id or current_id in seen or len(seen) >= 64:
+            raise DirectoryScrapeConflictError("无法确认目标目录的父链，请刷新目录")
+        if current_id == source_dir_id:
+            raise DirectoryScrapeConflictError("不能把目录复制或移动到自身或其子目录")
+        folder = _browser_file_info(client, current_id)
+        if folder is None or folder.file_id != current_id:
+            raise DirectoryScrapeGoneError("目标目录或其父目录已不存在，请刷新目录")
+        if not folder.is_dir:
+            raise DirectoryScrapeConflictError("所选目标或其父级不是目录，请重新选择")
+        if not source_dir_id:
+            return
+        seen.add(current_id)
+        current_id = folder.parent_id
+
+
+def execute_browser_file_change(
+    client: GuangYaClient,
+    operation: str,
+    *,
+    target_dir_id: str,
+    name: str,
+    file_id: str,
+    expected_parent_id: str,
+    expected_name: str,
+) -> dict[str, Any]:
+    """持有统一 Writer 时复核浏览器选中的 ID，并执行和核验单步写入。"""
+    if not client.logged_in:
+        raise DirectoryScrapeStateError("光鸭未登录，请重新登录后再试")
+
+    source = None
+    source_dir_id = ""
+    if operation == "mkdir":
+        item: dict[str, Any] = {"op": "create_directory", "parent_id": target_dir_id, "name": name}
+    else:
+        source = _browser_file_info(client, file_id)
+        if source is None or source.file_id != file_id:
+            raise DirectoryScrapeGoneError("源项目已不存在，请刷新目录")
+        if source.name != expected_name:
+            raise DirectoryScrapeConflictError("源项目名称已变化，请刷新后重新选择")
+        if source.parent_id != expected_parent_id:
+            raise DirectoryScrapeConflictError("源项目所在目录已变化，请刷新后重新选择")
+        if operation == "copy" and target_dir_id == source.parent_id:
+            raise DirectoryScrapeConflictError("复制目标与当前目录相同，请选择其他目录")
+        name = source.name
+        source_dir_id = source.file_id if source.is_dir else ""
+        item = {"op": operation, "source": file_snapshot(source), "target_id": target_dir_id}
+
+    _validate_browser_target(client, target_dir_id, source_dir_id)
+    receipt = {"ok": True, "operation": operation, "target_dir_id": target_dir_id, "name": name}
+    if operation == "move" and target_dir_id == expected_parent_id:
+        return {**receipt, "stats": {"moved": 0, "unchanged": 1}}
+    if _name_conflict(_list_map(client, target_dir_id, {}), name):
+        raise DirectoryScrapeConflictError("目标目录中已有同名文件或目录，请刷新后重新选择")
+
+    if operation == "move" and source is not None:
+        assert_guangya_download_delete_allowed(client, source, action="移动")
+
+    unknown = "光鸭写入结果暂未确认，请核对目标目录后再试"
+    try:
+        if operation == "copy":
+            copy_task_id = client.copy([file_id], target_dir_id)
+
+            def verify_copy() -> bool:
+                if copy_task_id and not _copy_task_completed(client, copy_task_id):
+                    return False
+                return _copy_target_entry(client, target_dir_id, item["source"], name) is not None
+
+            # 目录复制的终态由 Provider 证明，浏览器只回读目标目录项。
+            verified = (bool(copy_task_id) or not source_dir_id) and _wait_for_fs_verification(
+                verify_copy, copy_task_id=copy_task_id,
+            )
+        else:
+            created_id = ""
+            if operation == "mkdir":
+                created_id = client.create_dir(name, target_dir_id)
+            else:
+                client.move([file_id], target_dir_id)
+            verified = verify_guangya_write(lambda: _verify_after(client, item, created_id))
+    except GuangYaWriteRejected as exc:
+        if exc.code == "task_failed":
+            raise DirectoryScrapeStateError("光鸭复制任务失败，请核对目标目录后再试") from exc
+        raise DirectoryScrapeStateError("光鸭拒绝了写入，请刷新目录并检查目标权限或同名占用") from exc
+    except GuangYaFSCopyPending as exc:
+        raise OrganizeWriteOutcomeUnknown("光鸭已受理复制，云端仍在处理中，请稍后核对目标目录") from exc
+    except Exception as exc:  # noqa: BLE001 - SDK异常无法区分写入前后。
+        logger.warning("光鸭浏览器写入未能核验 operation=%s type=%s", operation, type(exc).__name__)
+        raise OrganizeWriteOutcomeUnknown(unknown) from exc
+    if not verified:
+        raise OrganizeWriteOutcomeUnknown(unknown)
+    return {**receipt, "stats": {_operation_stat_key(item["op"]): 1}}
 
 
 def _apply_fs_operation(

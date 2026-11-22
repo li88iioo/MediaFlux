@@ -25,6 +25,7 @@ from app.logger import get_logger
 from app.modules.directory_scrape import PreviewSnapshotGuangYaClient
 from app.modules.directory_scrape_errors import (
     DirectoryScrapePublicError,
+    OrganizeWriteOutcomeUnknown,
     public_error_message,
 )
 from app.modules.download_staging_cleanup import (
@@ -1575,6 +1576,7 @@ class OrganizeTaskManager:
                     self._remember_task_locked(self._task)
                     self._remember_operation_locked(self._task)
         except Exception as exc:
+            manual_review = isinstance(exc, OrganizeWriteOutcomeUnknown)
             error = (
                 public_error_message(exc)
                 if isinstance(exc, DirectoryScrapePublicError)
@@ -1587,7 +1589,9 @@ class OrganizeTaskManager:
             with self._state_lock:
                 if self._task.get("id") == task_id:
                     self._task.update({
-                        "status": "failed", "message": f"{operation}失败", "error": error,
+                        "status": "manual_review" if manual_review else "failed",
+                        "message": f"{operation}{'需要人工核验' if manual_review else '失败'}",
+                        "error": error,
                         "current_source": "",
                         "group_progress": {},
                         "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
