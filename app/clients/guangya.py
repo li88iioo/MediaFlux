@@ -2643,8 +2643,8 @@ class GuangYaClient:
         }
 
     @staticmethod
-    def _validate_account_read_response(response: object, *, storage: bool = False) -> dict:
-        """账号/容量读取不能把 HTTP 200 中的业务错误当作成功资料。"""
+    def _validate_account_read_response(response: object, *, require_data: bool = False) -> dict:
+        """账号资料与权益读取不能把 HTTP 200 中的业务错误当作成功资料。"""
         if not isinstance(response, dict) or not response:
             raise RuntimeError("光鸭账号接口返回无效响应")
         payloads = [response]
@@ -2652,12 +2652,12 @@ class GuangYaClient:
             if not isinstance(response["data"], dict):
                 raise RuntimeError("光鸭账号接口返回无效数据")
             payloads.append(response["data"])
-        elif storage:
-            raise RuntimeError("光鸭容量接口未返回资料")
+        elif require_data:
+            raise RuntimeError("光鸭账号接口未返回资料")
         _validate_read_response(response)
         acknowledged = "code" in response or response.get("success") is True
-        if storage and not acknowledged:
-            raise RuntimeError("光鸭容量接口未确认读取成功")
+        if require_data and not _read_success_acknowledged(response):
+            raise RuntimeError("光鸭账号接口未确认读取成功")
         identity_keys = (
             "sub", "userId", "user_id", "nickname", "nickName", "username",
             "userName", "name", "phone_number", "phone", "email",
@@ -2666,7 +2666,7 @@ class GuangYaClient:
             isinstance(payload.get(key), str) and payload[key].strip()
             for payload in payloads for key in identity_keys
         )
-        if not storage and not acknowledged and not has_identity:
+        if not require_data and not acknowledged and not has_identity:
             raise RuntimeError("光鸭账号接口未返回资料")
         return response
 
@@ -2692,17 +2692,30 @@ class GuangYaClient:
         return hashlib.sha256(f"guangya-account\0{value}".encode()).hexdigest()
 
     def account_storage_info(self) -> dict:
-        """读取官网同源容量接口；totalSpaceSize/usedSpaceSize 原单位为字节。"""
+        """读取容量、会员状态和实际回报的流量账本，容量单位为字节。"""
         def fetch():
             response = self.raw.request(
                 "https://api.guangyapan.com/assets/v1/get_assets",
                 method="POST",
+                json={"needRights": True, "needTrafficData": True},
+                timeout=15,
+            )
+            return self._validate_account_read_response(response.json(), require_data=True)
+
+        return self._call_read("account_storage_info", fetch)
+
+    def account_rights_info(self) -> dict:
+        """通过当前账号会话读取可用权益和操作上限。"""
+        def fetch():
+            response = self.raw.request(
+                "https://api.guangyapan.com/nd.bizassets.s/v1/get_user_rights",
+                method="POST",
                 json={},
                 timeout=15,
             )
-            return self._validate_account_read_response(response.json(), storage=True)
+            return self._validate_account_read_response(response.json(), require_data=True)
 
-        return self._call_read("account_storage_info", fetch)
+        return self._call_read("account_rights_info", fetch)
 
     def list_user_shares(self, *, max_items: int = 2_000) -> list[dict]:
         """完整读取当前账号创建的分享，保留原始结构供领域层私有解析。"""

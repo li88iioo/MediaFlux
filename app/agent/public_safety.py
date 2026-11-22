@@ -91,7 +91,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "cloud.organize_status": "光鸭整理进度",
     "cloud.episodes": "核对云盘季集",
     "cloud.preview_episodes": "预览云盘季集命名",
-    "cloud.account": "云盘账户与容量",
+    "cloud.account": "云盘账户、容量与权益",
     "cloud.connection": "云盘连接检查",
     "cloud.offline_tasks": "云盘离线任务",
     "cloud.operation": "云盘操作进度",

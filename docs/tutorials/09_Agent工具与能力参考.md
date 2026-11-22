@@ -285,13 +285,13 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 
 ### 2.13 光鸭账号、回收站与分享
 
-账号容量、回收站恢复/全局清空、异步操作状态及分享管理；不开放本地上传。
+账号容量与权益、回收站、异步任务和分享管理。
 
 定义：[`app/sdk.py`](../../app/sdk.py) 与 [`sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `cloud.account()`（工作区 SDK） | READ | 读取当前光鸭账号连接状态与容量摘要；返回总量、已用、可用字节及部分成功状态。 |
+| `cloud.account()`（工作区 SDK） | READ | 读取当前光鸭账号的容量、会员、上传流量、高速下载流量和权益。 |
 | `cloud.recycle(max_items=20000)` | READ | 完整读取回收站，保留真实 `file_id/parent_id`；超出读取预算或翻页失败会报错，不截取一页冒充全量。 |
 | `cloud.restore(file_ids)` | WRITE | 对回收站中最多 200 个真实文件 ID 冻结恢复计划，确认后执行。 |
 | `cloud.clear_recycle()` | DANGER | 冻结全量集合后确认永久清空整个账号回收站；执行期间新进入回收站的对象也可能被删除。 |
@@ -300,6 +300,10 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | `cloud.shares()`（SDK） | READ | 完整读取当前账号自建分享；返回真实管理 `share_id`，不返回访问码。分页失败或超预算显式报错。 |
 | `cloud.share(file_ids, ...)`（SDK） | WRITE | 按 1–100 个真实 `file_id` 冻结对象、凭据与分享策略，确认后创建；链接和访问码只返回当前用户。 |
 | `cloud.revoke_share(share_ids)`（SDK） | WRITE | 按列表返回的真实管理 `share_id` 冻结撤销计划；确认后只撤销分享链接，不改动原文件。受理仍待验证，结果未知时先查询，不重复提交。 |
+
+`cloud.account()` 在现有光鸭会话上读取账号资料、资产和权益。`storage` 返回总量、已用和可用字节，`membership` 返回 VIP/SVIP 状态和已取得的 VIP 到期信息。`upload_traffic` 是本月非秒传上传流量，`high_speed_download_traffic` 给出高速下载总量、剩余字节和服务端提供的平台用量。`direct_link_traffic`、`share_guest_traffic` 给出直链和分享访客流量，`capabilities` 给出批量上传文件数、单文件大小上限、播放倍速、直链和分享提取码能力。
+
+`null` 表示字段未知，明确返回的 `0` 和 `false` 分别表示零和未开通。会员有效而流量字段缺失时，流量仍是未知。若容量不完整或部分来源读取失败，整体返回 `partial` 并保留已取得的数据。各组的 `status` 可区分已取得字段（`ok` 或 `partial`）、服务端未报值（`not_reported`）及读取失败（`unavailable`）。
 
 ### 2.14 本地媒体整理
 

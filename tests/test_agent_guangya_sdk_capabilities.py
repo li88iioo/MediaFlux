@@ -529,12 +529,15 @@ class _AccountClient:
     def account_storage_info(self):
         return {"code": 0, "data": {"totalSpaceSize": 1000, "usedSpaceSize": 250}}
 
+    def account_rights_info(self):
+        return {"code": 0, "data": {"shareCodeFeature": True, "token": "must-not-leak"}}
+
     def close(self):
         return True
 
 
 class GuangYaAccountActionTests(unittest.TestCase):
-    def test_account_projection_masks_identity_and_whitelists_capacity(self) -> None:
+    def test_account_projection_masks_identity_and_whitelists_capacity_and_rights(self) -> None:
         with mock.patch.object(
             guangya_account, "GuangYaClient", return_value=_AccountClient()
         ):
@@ -542,6 +545,7 @@ class GuangYaAccountActionTests(unittest.TestCase):
         self.assertEqual(result["masked_phone"], "138****8000")
         self.assertEqual(result["masked_email"], "a***@example.com")
         self.assertEqual(result["storage"]["available_bytes"], 750)
+        self.assertIs(result["capabilities"]["share_code"], True)
         rendered = str(result)
         self.assertNotIn("must-not-leak", rendered)
         self.assertNotIn("13800138000", rendered)

@@ -2,16 +2,16 @@
 
 每节独立使用。Python 片段执行时先 `import json, mf`；片段中的 `file_id`、`log_id`、`candidate` 等输入须取自当前任务的真实查询结果，所在节说明来源。名称、路径、季集按用户任务调整。跨命令变量不保留，需先从 `/work` 中保存的 JSON 重新加载；写后的跟踪编号来自实际执行回执，不能从示例猜造。
 
-## 01 连接与容量
+## 01 连接、容量与账号权益
 
-“光鸭连得上吗？还剩多少空间？”在同一脚本分别读取：
+“光鸭连得上吗？会员还剩多久，本月还能上传多少？”在同一脚本分别读取：
 
 ```python
 print(mf.cloud.connection())
 print(mf.cloud.account())
 ```
 
-容量字段单位为 byte；未知值保留未知，不换成 0。连接诊断不需要遍历目录。
+`cloud.account()` 的 `storage`、`membership`、`upload_traffic`、`high_speed_download_traffic` 和 `capabilities` 分别提供已查到的容量、会员、非秒传上传流量、高速下载流量和权益。字节数为 `None` 时报告未知，明确返回的 `0` 是零。收到 `partial` 时保留已经查到的分组，并查看各组的 `status`。连接诊断无需遍历目录。
 
 ## 02 定位目录、找文件、保存事实
 

@@ -1343,7 +1343,7 @@ class Cloud:
     @staticmethod
     @sdk_method('read')
     def account() -> dict:
-        """只读账号掩码与容量；总量、已用、可用以 byte 返回，未知为 null，部分失败保留 partial。"""
+        """只读当前光鸭账号掩码、容量、会员、流量和权益。容量及流量单位为字节，未知为 null，部分成功返回 partial。"""
         from app.modules.guangya_account import account_status
 
         return account_status()

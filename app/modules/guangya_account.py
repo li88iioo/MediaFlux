@@ -1,4 +1,4 @@
-"""光鸭账号与容量的公共只读查询，保留部分成功，不返回原始凭据。"""
+"""光鸭账号、容量和权益的只读查询，保留各来源的部分成功。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.sensitive_data import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+_MEMBERSHIP_STATES = {1: "none", 2: "active", 3: "expired"}
 
 
 def connection_status() -> dict[str, Any]:
@@ -77,6 +79,79 @@ def _bytes(payloads: list[dict[str, Any]], *keys: str) -> int | None:
     return None
 
 
+def _reported(fields: dict[str, Any], *, available: bool) -> dict[str, Any]:
+    known = sum(value is not None for value in fields.values())
+    if not available:
+        status = "unavailable"
+    elif not known:
+        status = "not_reported"
+    else:
+        status = "ok" if known == len(fields) else "partial"
+    return {**fields, "reported": bool(known), "status": status}
+
+
+def _remaining(total: int | None, used: int | None) -> int | None:
+    return max(0, total - used) if total is not None and used is not None else None
+
+
+def _entitlements(assets: dict | None, rights: dict | None) -> dict[str, Any]:
+    asset = assets.get("data", {}) if assets is not None else {}
+    rights_data = rights.get("data", {}) if rights is not None else {}
+    sources = [asset]
+    available = assets is not None
+
+    vip = _bytes(sources, "vipStatus")
+    svip = _bytes(sources, "svipStatus")
+    expires_at = _bytes(sources, "vipExpireTime")
+    server_time = _bytes(sources, "systemTime")
+    upload_total = _bytes(sources, "monthNonFlashUploadLimitSize")
+    upload_used = _bytes(sources, "monthNonFlashUploadSize")
+    traffic = asset.get("highSpeedTraffic")
+    traffic = traffic if isinstance(traffic, dict) else {}
+    details = traffic.get("details")
+    speed = _bytes([rights_data], "playbackSpeed")
+    return {
+        "membership": {
+            **_reported({"vip_status": vip, "svip_status": svip, "vip_expires_at": expires_at}, available=available),
+            "vip_status_text": _MEMBERSHIP_STATES.get(vip or 0, "unknown"),
+            "svip_status_text": _MEMBERSHIP_STATES.get(svip or 0, "unknown"),
+            "server_time": server_time,
+            "vip_remaining_seconds": _remaining(expires_at, server_time),
+        },
+        "upload_traffic": {
+            **_reported({"total_bytes": upload_total, "used_bytes": upload_used}, available=available),
+            "remaining_bytes": _remaining(upload_total, upload_used),
+        },
+        "high_speed_download_traffic": _reported({
+            "total_bytes": _bytes([traffic], "total"),
+            "remaining_bytes": _bytes([traffic], "remained"),
+            "details": [
+                {"platform": _bytes([entry], "platform"), "used_bytes": _bytes([entry], "used")}
+                for entry in details if isinstance(entry, dict)
+            ] if isinstance(details, list) else None,
+        }, available=available),
+        "direct_link_traffic": _reported({
+            "total_bytes": _bytes(sources, "totalDirectLinkTraffic"),
+            "remaining_bytes": _bytes(sources, "freeDirectLinkTraffic"),
+            "expires_at": _bytes(sources, "directLinkTrafficExpireTime"),
+        }, available=available),
+        "share_guest_traffic": _reported({
+            "total_bytes": _bytes(sources, "totalShareGuestTraffic"),
+            "remaining_bytes": _bytes(sources, "freeShareGuestTraffic"),
+        }, available=available),
+        "capabilities": {
+            **_reported({
+                "batch_upload_files": _bytes([rights_data], "batchUploadFiles"),
+                "big_file_size_bytes": _bytes([rights_data], "bigFileSize"),
+                "playback_speed": speed,
+                "direct_link": rights_data.get("directLinkFeature") if isinstance(rights_data.get("directLinkFeature"), bool) else None,
+                "share_code": rights_data.get("shareCodeFeature") if isinstance(rights_data.get("shareCodeFeature"), bool) else None,
+            }, available=rights is not None),
+            "playback_speed_rate": speed / 100 if speed is not None else None,
+        },
+    }
+
+
 def _mask_phone(value: object) -> str:
     raw = "".join(character for character in str(value or "") if character.isdigit())
     if len(raw) < 7:
@@ -94,10 +169,7 @@ def _mask_email(value: object) -> str:
 
 def account_status() -> dict[str, Any]:
     client: GuangYaClient | None = None
-    payloads: list[dict[str, Any]] = []
-    storage_payloads: list[dict[str, Any]] = []
-    profile_available = False
-    storage_available = False
+    snapshots: dict[str, dict] = {}
     try:
         try:
             client = GuangYaClient()
@@ -107,22 +179,22 @@ def account_status() -> dict[str, Any]:
             raise RuntimeError("光鸭账号状态当前不可用") from exc
         if not connected:
             raise RuntimeError("光鸭账号尚未连接")
-        # 容量与身份是两个独立接口。身份读取失败不应丢弃已取得的真实容量。
-        try:
-            storage_payloads = list(_payloads(client.account_storage_info()))
-            storage_available = True
-        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-            logger.warning("光鸭容量读取失败 type=%s", type(exc).__name__)
-        try:
-            payloads = list(_payloads(client.account_info()))
-            profile_available = True
-        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-            logger.warning("光鸭账号资料读取失败 type=%s", type(exc).__name__)
-        if not storage_available and not profile_available:
-            raise RuntimeError("光鸭账号及容量信息读取失败，当前连接状态无法确认")
+        for source, read in (
+            ("assets", client.account_storage_info),
+            ("profile", client.account_info),
+            ("rights", client.account_rights_info),
+        ):
+            try:
+                snapshots[source] = read()
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+                logger.warning("光鸭账号读取失败 source=%s type=%s", source, type(exc).__name__)
+        if not snapshots:
+            raise RuntimeError("光鸭账号信息读取失败，当前连接状态无法确认")
     finally:
         close_guangya_client(client)
 
+    payloads = list(_payloads(snapshots.get("profile")))
+    storage_payloads = list(_payloads(snapshots.get("assets")))
     display_name = " ".join(redact_sensitive_text(
         _first(payloads, "nickname", "nickName", "username", "userName", "name"),
     ).split())[:80]
@@ -157,8 +229,8 @@ def account_status() -> dict[str, Any]:
         "available_capacity",
         "remainSpace",
     )
-    if available is None and total is not None and used is not None:
-        available = max(0, total - used)
+    if available is None:
+        available = _remaining(total, used)
     if used is None and total is not None and available is not None and available <= total:
         used = total - available
     utilization = (
@@ -166,35 +238,27 @@ def account_status() -> dict[str, Any]:
         if total and used is not None
         else None
     )
-    reported = any(value is not None for value in (total, used, available))
-    complete = all(value is not None for value in (total, used, available))
-    if not storage_available:
-        storage_status = "unavailable"
+    storage = _reported({"total_bytes": total, "used_bytes": used, "available_bytes": available},
+                        available="assets" in snapshots)
+    storage["utilization"] = utilization
+    if storage["status"] == "unavailable":
         summary = "光鸭账号已连接，但容量接口读取失败，暂时无法确认剩余空间"
-    elif not reported:
-        storage_status = "not_reported"
+    elif storage["status"] == "not_reported":
         summary = "光鸭容量接口已响应，但本次未取得有效容量字段"
     else:
-        storage_status = "ok" if complete else "partial"
-        summary = "光鸭账号已连接，并已读取容量信息" if complete else "光鸭账号已连接，仅取得部分容量信息"
-    data = {
+        summary = "光鸭账号已连接，并已读取容量信息" if storage["status"] == "ok" else "光鸭账号已连接，仅取得部分容量信息"
+    for source, label in (("profile", "账号资料"), ("rights", "权益接口")):
+        if source not in snapshots:
+            summary += f"，{label}读取失败"
+    return {
         "connected": True,
-        "profile_available": profile_available,
+        "profile_available": "profile" in snapshots,
         "display_name": display_name,
         "masked_phone": phone,
         "masked_email": email,
-        "storage": {
-            "total_bytes": total,
-            "used_bytes": used,
-            "available_bytes": available,
-            "utilization": utilization,
-            "reported": reported,
-            "status": storage_status,
-        },
-    }
-    return {
-        **data,
-        "status": "ok" if complete else "partial",
+        "storage": storage,
+        **_entitlements(snapshots.get("assets"), snapshots.get("rights")),
+        "status": "ok" if len(snapshots) == 3 and storage["status"] == "ok" else "partial",
         "summary": summary,
         "sampled_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }

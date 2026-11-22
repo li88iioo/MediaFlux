@@ -1,4 +1,4 @@
-"""官网 assets 容量契约、真实请求边界与共用账号查询。"""
+"""官网账号资产与权益契约及工作区 SDK 入口回归。"""
 from __future__ import annotations
 
 import asyncio
@@ -24,9 +24,27 @@ ASSETS = {
         "usedSpaceSize": 40 * 1024**4,
         "freeDirectLinkTraffic": 123,
         "totalDirectLinkTraffic": 456,
+        "directLinkTrafficExpireTime": 1_234_570_000,
         "freeShareGuestTraffic": 789,
+        "totalShareGuestTraffic": 1000,
         "vipStatus": 2,
+        "svipStatus": 3,
+        "vipExpireTime": 1_234_567_990,
         "systemTime": 1_234_567_890,
+        "monthNonFlashUploadLimitSize": "9007199254740993",
+        "monthNonFlashUploadSize": "0",
+        "highSpeedTraffic": {"total": "1000", "remained": "0", "details": [{"platform": 2, "used": 1000}]},
+    },
+}
+RIGHTS = {
+    "code": 0,
+    "data": {
+        "batchUploadFiles": 0,
+        "bigFileSize": "109951162777600",
+        "playbackSpeed": 500,
+        "directLinkFeature": False,
+        "shareCodeFeature": True,
+        "token": "private-rights-token",
     },
 }
 
@@ -34,11 +52,12 @@ ASSETS = {
 class AccountClient(GuangYaClient):
     """真实包装方法 + mock HTTP 传输，不读取账号凭据。"""
 
-    def __init__(self, *, assets=None, profile=None, status_code=200):
+    def __init__(self, *, assets=None, profile=None, rights=None, status_code=200):
         self.calls = []
         self.closed = False
         self.assets = ASSETS if assets is None else assets
         self.profile = PROFILE if profile is None else profile
+        self.rights = RIGHTS if rights is None else rights
         self.status_code = status_code
         self._raw = mock.Mock()
         self._refresh_after_unauthorized = mock.Mock(return_value={})
@@ -57,6 +76,8 @@ class AccountClient(GuangYaClient):
         self.calls.append((url, method, kwargs))
         if url == "https://api.guangyapan.com/assets/v1/get_assets":
             payload = self.assets
+        elif url == "https://api.guangyapan.com/nd.bizassets.s/v1/get_user_rights":
+            payload = self.rights
         elif url == "https://account.guangyapan.com/v1/user/me":
             payload = self.profile
         else:
@@ -90,7 +111,7 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "账号标识"):
             AccountClient(profile={"name": "Before"}).share_account_key()
 
-    def test_actual_assets_schema_is_read_from_separate_endpoint(self):
+    def test_official_assets_and_rights_contracts_are_read_by_the_same_client(self):
         client = AccountClient()
         result = read_status(client)
         storage = result["storage"]
@@ -100,13 +121,15 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
         self.assertEqual(storage["utilization"], 0.08)
         self.assertTrue(storage["reported"])
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(len(client.calls), 2)
-        self.assertEqual(client.calls[0][0], "https://api.guangyapan.com/assets/v1/get_assets")
-        for _url, method, kwargs in client.calls:
-            self.assertEqual(method, "GET" if "/v1/user/me" in _url else "POST")
-            self.assertEqual(kwargs["timeout"], 15)
-        self.assertEqual(client.calls[0][2]["json"], {})
-        self.assertEqual(client.calls[1][2]["headers"], {"x-client-id": "test-client"})
+        self.assertEqual(client.calls, [
+            ("https://api.guangyapan.com/assets/v1/get_assets", "POST", {
+                "json": {"needRights": True, "needTrafficData": True}, "timeout": 15,
+            }),
+            ("https://account.guangyapan.com/v1/user/me", "GET", {
+                "headers": {"x-client-id": "test-client"}, "timeout": 15,
+            }),
+            ("https://api.guangyapan.com/nd.bizassets.s/v1/get_user_rights", "POST", {"json": {}, "timeout": 15}),
+        ])
         assert client._raw is not None
         client._raw.user_info.assert_not_called()
         self.assertTrue(client.closed)
@@ -174,9 +197,15 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
                 self.assertTrue(result["connected"])
                 self.assertFalse(result["profile_available"])
                 self.assertTrue(result["storage"]["reported"])
+                self.assertEqual(result["status"], "partial")
                 self.assertNotIn("private-", json.dumps(result))
 
     def test_assets_failure_is_not_described_as_provider_omitting_fields(self):
+        for getter, data in (("account_storage_info", ASSETS["data"]), ("account_rights_info", RIGHTS["data"])):
+            envelope = {"msg": "success", "data": data}
+            client = AccountClient(assets=envelope, rights=envelope)
+            with self.subTest(getter=getter):
+                self.assertEqual(getattr(client, getter)(), envelope)
         for assets in (
             {"error": "private-error"},
             {"code": 157, "msg": "private-error", "data": ASSETS["data"]},
@@ -204,7 +233,7 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
 
     def test_no_remote_success_never_claims_connected(self):
         for profile in ({"error": "invalid_token"}, {"data": {}}, {"success": 0, "data": {}}, {"name": ""}):
-            client = AccountClient(assets={"code": 401}, profile=profile)
+            client = AccountClient(assets={"code": 401}, profile=profile, rights={"code": 401})
             with self.subTest(profile=profile), self.assertRaises(RuntimeError) as caught:
                 read_status(client)
             self.assertIn("无法确认", str(caught.exception))
@@ -212,7 +241,7 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
 
     def test_http_errors_use_existing_bounded_retry_and_no_raw_message(self):
         for status in (401, 403, 500):
-            for method in ("account_info", "account_storage_info"):
+            for method in ("account_info", "account_storage_info", "account_rights_info"):
                 client = AccountClient(status_code=status)
                 with (
                     self.subTest(status=status, method=method),
@@ -228,7 +257,7 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
         result = read_status(AccountClient())
         self.assertEqual(result["masked_phone"], "138****8000")
         public = json.dumps(result)
-        for sensitive in ("private-account", "13800138000", "totalDirectLinkTraffic", "vipStatus"):
+        for sensitive in ("private-account", "private-rights-token", "13800138000", "totalDirectLinkTraffic", "vipStatus"):
             self.assertNotIn(sensitive, public)
         self.assertEqual(result["display_name"], "Alice")
 
@@ -249,6 +278,28 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
         self.assertTrue(client.closed)
         with mock.patch.object(client, "close", side_effect=RuntimeError("close-failed")):
             self.assertTrue(read_status(client)["storage"]["reported"])
+
+    def test_missing_asset_fields_are_unknown_and_explicit_zero_is_reported(self):
+        result = read_status(AccountClient(assets={"code": 0, "data": {
+            "totalSpaceSize": 1000, "usedSpaceSize": 0, "vipStatus": 2,
+            "monthNonFlashUploadLimitSize": "0", "monthNonFlashUploadSize": False,
+        }}, rights={"code": 0, "data": {
+            "batchUploadFiles": True, "playbackSpeed": 0, "shareCodeFeature": False,
+        }}))
+        self.assertEqual(result["storage"]["available_bytes"], 1000)
+        self.assertEqual(result["membership"]["vip_status_text"], "active")
+        self.assertEqual(result["membership"]["svip_status_text"], "unknown")
+        self.assertIsNone(result["membership"]["vip_remaining_seconds"])
+        self.assertEqual(result["upload_traffic"], {
+            "total_bytes": 0, "used_bytes": None, "remaining_bytes": None, "reported": True, "status": "partial",
+        })
+        self.assertEqual(result["high_speed_download_traffic"], {
+            "total_bytes": None, "remaining_bytes": None, "details": None, "reported": False, "status": "not_reported",
+        })
+        self.assertIsNone(result["capabilities"]["batch_upload_files"])
+        self.assertEqual(result["capabilities"]["playback_speed_rate"], 0)
+        self.assertIs(result["capabilities"]["share_code"], False)
+        self.assertEqual(result["capabilities"]["status"], "partial")
 
     def test_workspace_account_read_preserves_partial_results_and_errors(self):
         from app.agent.kernel.capabilities import ToolCatalog
@@ -274,11 +325,13 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
             finally:
                 await rpc.close()
 
-        for assets, profile, expected in (
-            (ASSETS, PROFILE, "ok"), ({"code": 401}, PROFILE, "partial"),
-            ({"code": 401}, {"error": "private-token"}, "error"),
+        for assets, profile, rights, expected in (
+            (ASSETS, PROFILE, RIGHTS, "ok"),
+            (ASSETS, PROFILE, {**RIGHTS, "code": 157}, "partial"),
+            ({"code": 401}, {"error": "private-token"}, RIGHTS, "partial"),
+            ({"code": 401}, {"error": "private-token"}, {"code": 401}, "error"),
         ):
-            client = AccountClient(assets=assets, profile=profile)
+            client = AccountClient(assets=assets, profile=profile, rights=rights)
             with self.subTest(status=expected), TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "run").mkdir()
@@ -289,9 +342,34 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
                     self.assertEqual(reply["error"]["code"], "RuntimeError")
                     self.assertNotIn("private-token", json.dumps(reply))
                 else:
-                    self.assertEqual(reply["result"]["status"], expected)
-                    self.assertEqual(reply["result"]["masked_phone"], "138****8000")
+                    result = reply["result"]
+                    self.assertEqual(result["status"], expected)
+                    self.assertEqual(result["masked_phone"], "138****8000" if profile is PROFILE else "")
+                    if assets is ASSETS:
+                        self.assertEqual(result["membership"]["vip_status_text"], "active")
+                        self.assertEqual(result["membership"]["svip_status_text"], "expired")
+                        self.assertEqual(result["membership"]["vip_remaining_seconds"], 100)
+                        self.assertEqual(result["upload_traffic"]["total_bytes"], 9007199254740993)
+                        self.assertEqual(result["upload_traffic"]["used_bytes"], 0)
+                        self.assertEqual(result["high_speed_download_traffic"]["remaining_bytes"], 0)
+                        self.assertEqual(result["high_speed_download_traffic"]["details"], [
+                            {"platform": 2, "used_bytes": 1000},
+                        ])
+                        self.assertEqual(result["direct_link_traffic"]["remaining_bytes"], 123)
+                        self.assertEqual(result["share_guest_traffic"]["total_bytes"], 1000)
+                    else:
+                        self.assertEqual(result["upload_traffic"]["status"], "unavailable")
+                        self.assertIsNone(result["membership"]["vip_status"])
+                    if rights is RIGHTS:
+                        self.assertEqual(result["capabilities"]["batch_upload_files"], 0)
+                        self.assertEqual(result["capabilities"]["big_file_size_bytes"], 109951162777600)
+                        self.assertEqual(result["capabilities"]["playback_speed_rate"], 5)
+                        self.assertIs(result["capabilities"]["direct_link"], False)
+                    else:
+                        self.assertEqual(result["capabilities"]["status"], "unavailable")
+                        self.assertIsNone(result["capabilities"]["direct_link"])
                 self.assertNotIn("private-account", json.dumps(reply))
+                self.assertNotIn("private-rights-token", json.dumps(reply))
                 self.assertTrue(client.closed)
 
 
