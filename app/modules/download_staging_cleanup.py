@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from app.clients.guangya import GuangYaReadRejected
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import organize_history as organize_history_repo
 from app.modules.organize_delete_audit import (
@@ -390,12 +391,14 @@ def staging_roots_in_source(client, rows: list[dict], source_id: str) -> list[di
 
 
 def source_inside_protected_staging(client, source_id: str, protected: set[str],
-                                    *, info_cache: dict | None = None) -> bool:
+                                    *, info_cache: dict | None = None, allow_deleted_root: bool = False) -> bool:
     """直接选中活动隔离根内部的子目录，也不能绕过下载写保护。"""
     if not protected:
         return False
     if not source_id:
         raise RuntimeError('来源目录身份无法确认，已停止清理')
+    if info_cache is None:
+        info_cache = {}
     current = source_id
     seen: set[str] = set()
     while current:
@@ -406,12 +409,15 @@ def source_inside_protected_staging(client, source_id: str, protected: set[str],
         if current in seen or len(seen) >= 64:
             raise RuntimeError('来源目录父链异常，已停止清理')
         seen.add(current)
-        if info_cache is None:
-            info = client.file_info(current)
-        else:
-            if current not in info_cache:
+        if current not in info_cache:
+            try:
                 info_cache[current] = client.file_info(current)
-            info = info_cache[current]
+            except GuangYaReadRejected as exc:
+                # 只忽略已删除的下载隔离根；祖先不可读时仍无法判断包含关系。
+                if allow_deleted_root and current == source_id and exc.operation == 'file_info' and exc.code == '149':
+                    return False
+                raise
+        info = info_cache[current]
         if info is None or not bool(getattr(info, 'is_dir', False)):
             raise RuntimeError('来源目录身份无法确认，已停止清理')
         current = str(getattr(info, 'parent_id', '') or '')
@@ -436,7 +442,7 @@ def assert_guangya_download_delete_allowed(client, item) -> None:
                 info_cache=info_cache,
             )
             contains = not inside and item.is_dir and source_inside_protected_staging(
-                client, root_id, {str(item.file_id)}, info_cache=info_cache,
+                client, root_id, {str(item.file_id)}, info_cache=info_cache, allow_deleted_root=True,
             )
             if inside or contains:
                 raise DirectoryScrapeConflictError(

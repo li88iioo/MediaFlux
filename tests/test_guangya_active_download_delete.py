@@ -9,7 +9,7 @@ import pytest
 from app import database as db
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
-from app.clients.guangya import GuangYaFile
+from app.clients.guangya import GuangYaFile, GuangYaReadRejected
 from app.modules import download_staging_cleanup as cleanup
 from app.modules.directory_scrape_errors import (
     DirectoryScrapeConflictError,
@@ -198,6 +198,40 @@ def test_active_confirmation_protects_even_with_terminal_organize_and_negative_m
 def test_active_download_does_not_block_unrelated_items(delete_case, file_id):
     delete_case.request()
     delete_case.allowed(delete_case.schedule(file_id), file_id)
+
+
+@pytest.mark.parametrize("file_id", ("ordinary-dir", "source"))
+def test_deleted_staging_root_does_not_hide_other_downloads(delete_case, file_id):
+    delete_case.request(gy_status="manual_review", gy_target_dir="old-stage")
+    active_id = delete_case.request()
+
+    def lookup(identity):
+        if identity == "old-stage":
+            raise GuangYaReadRejected("file_info", code="149", message="文件已删除")
+        return delete_case.nodes.get(identity)
+
+    delete_case.provider.file_info.side_effect = lookup
+    callback = delete_case.schedule(file_id)
+    if file_id == "source":
+        delete_case.blocked(callback, file_id, request_id=active_id)
+    else:
+        delete_case.allowed(callback, file_id)
+
+
+@pytest.mark.parametrize(("failed_id", "code"), (
+    ("stage", "403"), ("staging-parent", "149"), ("source", "149"),
+))
+def test_unverified_staging_root_or_broken_ancestor_still_blocks(delete_case, failed_id, code):
+    delete_case.request()
+    delete_case.nodes["stage"].parent_id = "staging-parent"
+
+    def lookup(identity):
+        if identity == failed_id:
+            raise GuangYaReadRejected("file_info", code=code)
+        return delete_case.nodes.get(identity)
+
+    delete_case.provider.file_info.side_effect = lookup
+    delete_case.blocked(delete_case.schedule("ordinary-dir"), "ordinary-dir")
 
 
 @pytest.mark.parametrize("file_id", ("stage", "video", "source"))
