@@ -421,7 +421,7 @@ def indexer_site_status(result, site_id: str, count: int) -> str | None:
     if sources and failed and any(row.status in {"success", "empty", "partial"} for row in sources):
         return "partial"
     if failed:
-        return "partial" if all(error.code == "coverage_limited" for error in errors) else "error"
+        return "partial" if count or all(error.code == "coverage_limited" for error in errors) else "error"
     if succeeded:
         return "success" if count else "empty"
     if site_id in result.sites_attempted:

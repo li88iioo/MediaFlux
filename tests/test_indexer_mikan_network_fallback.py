@@ -1,4 +1,4 @@
-"""Mikan 为每个端点保留完整读取预算，超时回落仍保持串行与取消安全。"""
+"""Mikan 的端点读取预算、回落行为和验证页上报。"""
 from __future__ import annotations
 
 import asyncio
@@ -7,8 +7,8 @@ import unittest
 
 import httpx
 
-from app.clients.http import FixedHostHttpClient, HttpResponse, HttpSecurityError
-from app.indexers.errors import IndexerTimeout, IndexerUnavailable
+from app.clients.http import FixedHostHttpClient, HttpInvalidResponse, HttpResponse, HttpSecurityError
+from app.indexers.errors import IndexerRateLimited, IndexerTimeout, IndexerUnavailable
 from app.indexers.models import IndexerSearchRequest
 from app.indexers.providers.mikan import MikanAdapter
 from app.indexers.registry import IndexerRegistry
@@ -19,20 +19,29 @@ _HTML = b'''<table><tbody><tr class="js-search-results-row">
 <td><input data-magnet="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"></td>
 <td><a href="/Home/Episode/fixture">Fixture Episode</a></td>
 </tr></tbody></table>'''
+_SEARCH_FORM = '<form action="/Home/Search"><input name="searchstr"></form>'
+
+
+def _search_response(body: str, *, status: int = 200, headers: dict[str, str] | None = None) -> HttpResponse:
+    return HttpResponse(
+        url="https://mikanani.me/Home/Search", status_code=status,
+        headers={"content-type": "text/html; charset=utf-8", **(headers or {})},
+        body=body.encode("utf-8"),
+    )
 
 
 class _Transport:
-    def __init__(self, primary_error, mirror_error=None):
-        self.primary_error = primary_error
-        self.mirror_error = mirror_error
+    def __init__(self, primary, mirror=None):
+        self.primary = primary
+        self.mirror = mirror
         self.calls = []
 
     async def get(self, url, **kwargs):
         self.calls.append(url)
-        error = self.primary_error if len(self.calls) == 1 else self.mirror_error
-        if error is not None:
-            raise error
-        return HttpResponse(
+        response = self.primary if len(self.calls) == 1 else self.mirror
+        if isinstance(response, Exception):
+            raise response
+        return response or HttpResponse(
             url=url, status_code=200, headers={"content-type": "text/html; charset=utf-8"}, body=_HTML,
         )
 
@@ -174,6 +183,80 @@ class MikanNetworkFallbackTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(expected):
                     await MikanAdapter(http=http).search(IndexerSearchRequest.create("Fixture"))
                 self.assertEqual(len(http.calls), 2)
+
+    async def test_confirmed_interstitial_is_reported_without_mirror_fallback(self):
+        for status, headers, body in (
+            (200, {}, "<title>Just a moment...</title><table><tr><td>Verify you are human</td></tr></table>"),
+            (200, {}, "<title>Attention Required! | Cloudflare</title><table></table>"),
+            (403, {"cf-mitigated": "challenge"}, "<table></table>"),
+            (403, {}, "<title>Attention Required! | Cloudflare</title><h1>Sorry, you have been blocked</h1>"),
+            (503, {}, "<title>Just a moment...</title><h1>Performing security verification</h1>"),
+        ):
+            with self.subTest(status=status, body=body):
+                response = _search_response(body, status=status, headers=headers)
+                http = _Transport(response)
+                service = IndexerService(
+                    registry=IndexerRegistry({"mikan": MikanAdapter(http=http)}),
+                    result_store=IndexerResultStore(),
+                )
+                self.addAsyncCleanup(service.aclose)
+
+                result = await service.search("Fixture", site_ids=("mikan",))
+
+                self.assertEqual(result.items, [])
+                self.assertEqual(result.sites_succeeded, ())
+                self.assertEqual([(error.site_id, error.code) for error in result.errors], [
+                    ("mikan", "challenge_required"),
+                ])
+                self.assertEqual(http.calls, [response.url])
+
+    async def test_ordinary_http_failures_keep_mirror_fallback_and_error_types(self):
+        for status, body, headers, error in (
+            (429, "<title>Too Many Requests</title>", {}, IndexerRateLimited),
+            (503, "<title>Service Unavailable</title>", {}, IndexerUnavailable),
+            (503, '{"error": "Service unavailable"}', {"content-type": "application/json"}, IndexerUnavailable),
+        ):
+            with self.subTest(status=status, headers=headers):
+                response = _search_response(body, status=status, headers=headers)
+                http = _Transport(response, response)
+
+                with self.assertRaises(error):
+                    await MikanAdapter(http=http).search(IndexerSearchRequest.create("Fixture"))
+
+                self.assertEqual(http.calls, [response.url, "https://mikanime.tv/Home/Search"])
+
+    async def test_ordinary_empty_search_pages_succeed_without_mirror_fallback(self):
+        title = "<title>Mikan Project - 搜索结果</title>"
+        for body in (
+            title + _SEARCH_FORM * 3
+            + '<p>"MFAuditNoMatch83051" 找不到对应结果 &gt;_&lt; 试试别的关键词吧。</p>'
+            + "<p>找不到对应结果 &gt;_&lt; 这个结果是禁止说明的事项</p>",
+            title + _SEARCH_FORM + "<table><thead><tr><th>标题</th></tr></thead><tbody></tbody></table>",
+            "<p>没有找到相关结果</p>",
+            "<p>No results found</p>",
+        ):
+            with self.subTest(body=body):
+                response = _search_response(body)
+                http = _Transport(response)
+
+                page = await MikanAdapter(http=http).search(IndexerSearchRequest.create("Fixture"))
+
+                self.assertEqual(page.items, [])
+                self.assertEqual(http.calls, [response.url])
+
+    async def test_unrelated_table_and_login_page_are_invalid_search_responses(self):
+        for body in (
+            "<title>Welcome</title><table><tbody></tbody></table>",
+            "<title>Mikan Project - 登录</title>" + _SEARCH_FORM + "<a>还没有账号？赶紧来注册一个吧~</a>",
+        ):
+            with self.subTest(body=body):
+                response = _search_response(body)
+                http = _Transport(response, response)
+
+                with self.assertRaises(HttpInvalidResponse):
+                    await MikanAdapter(http=http).search(IndexerSearchRequest.create("Fixture"))
+
+                self.assertEqual(http.calls, [response.url, "https://mikanime.tv/Home/Search"])
 
     async def test_caller_cancellation_does_not_start_another_network_request(self):
         primary, mirror = _ResponseBody(), _ResponseBody(delay=0)

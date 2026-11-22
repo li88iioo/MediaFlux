@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import html
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import batched, groupby
+from operator import itemgetter
 from time import monotonic
 from urllib.parse import parse_qs, quote_from_bytes, urlsplit
 
@@ -23,11 +26,13 @@ from ..errors import (
 from ..models import (
     IndexerCapabilities,
     IndexerItem,
+    IndexerMediaSearchRequest,
     IndexerPage,
     IndexerProviderError,
     IndexerSearchRequest,
 )
 from ..query_plan import encode_empire_keyword
+from ..ranking import match_order, rank_item
 from .base import (
     DirectResultAdapter,
     is_likely_challenge_page,
@@ -126,11 +131,12 @@ class EmpireAdapter(DirectResultAdapter):
         seen_infohashes: set[str] = set()
         stop_detail_search = False
 
-        for offset in range(0, len(results), _DETAIL_CONCURRENCY):
-            batch = results[offset : offset + _DETAIL_CONCURRENCY]
+        checked = 0
+        for batch in self._detail_batches(results, request):
             if loop.time() >= detail_deadline:
                 errors.append(self._detail_error(IndexerTimeout("detail budget exhausted")))
                 break
+            checked += len(batch)
             tasks = [
                 asyncio.create_task(self._fetch_detail(result, result_url))
                 for result in batch
@@ -171,14 +177,40 @@ class EmpireAdapter(DirectResultAdapter):
 
             if items or stop_detail_search or batch_timed_out:
                 break
-
+        if checked < len(results) and not errors:
+            errors.append(IndexerProviderError(
+                self.site_id, "coverage_limited",
+                f"本轮仅检查搜索页中 {checked}/{len(results)} 个作品候选",
+            ))
         return IndexerPage(
             items=items,
             page=1,
             has_more=False,
             pagination_supported=False,
             errors=tuple(errors),
+            complete=not errors,
         )
+
+    def _detail_batches(
+        self, results: list[_SearchResult], request: IndexerSearchRequest,
+    ) -> Iterator[tuple[_SearchResult, ...]]:
+        media = IndexerMediaSearchRequest.create(
+            title=request.query, year=request.year, media_type=request.media_type,
+            season=request.season, episode=request.episode,
+        )
+        ranked = []
+        for result in results:
+            probe = rank_item(
+                IndexerItem(self.site_id, self.site_name, result.title),
+                media=media, fallback_query=request.query,
+            )
+            title_matches = {"title_exact", "title_contains", "title_similar"}.intersection(probe.match_reasons)
+            priority = (not title_matches, *match_order(probe), "title_exact" not in probe.match_reasons)
+            ranked.append((priority, result))
+        # 先比较整页标题，再分配详情请求。同一批只查同级候选；无磁力再查下一档。
+        ranked.sort(key=itemgetter(0))
+        for _, group in groupby(ranked[:_DETAIL_CANDIDATE_LIMIT], key=itemgetter(0)):
+            yield from batched((result for _, result in group), _DETAIL_CONCURRENCY)
 
     def _form_body(self, keyword: str) -> bytes:
         submit = "Submit" if self.site_id == "dygang" else "submit"
@@ -232,8 +264,6 @@ class EmpireAdapter(DirectResultAdapter):
                 continue
             seen_urls.add(detail_url)
             results.append(_SearchResult(title=title, detail_url=detail_url))
-            if len(results) == _DETAIL_CANDIDATE_LIMIT:
-                break
 
         if results:
             return results

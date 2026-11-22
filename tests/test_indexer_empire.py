@@ -394,6 +394,36 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(page.errors), 1)
         self.assertEqual(page.errors[0].code, "unavailable")
 
+    async def test_exact_movie_precedes_sequels_before_applying_detail_budget(self):
+        titles = ["流浪地球2：再次冒险", "豆瓣2023年度电影榜单", "流浪地球2",
+                  "2023年04月佳片推荐", "流浪地球2特辑", "幕后花絮", "流浪地球"]
+        for site_id in ("dygang", "ys5266"):
+            for original_has_magnet in (True, False):
+                with self.subTest(site=site_id, original_has_magnet=original_has_magnet):
+                    adapter = _adapter(site_id, None)
+                    rows, details = [], {}
+                    original_url = f"{adapter.base_url}ys/2019/{len(titles)}.htm"
+                    for n, title in enumerate(titles, 1):
+                        path = f"/ys/2019/{n}.htm"
+                        url = adapter.base_url.rstrip("/") + path
+                        rows.append(f'<h3><a class="classlinkclass" href="{path}">{title}</a></h3>')
+                        body = f'<a href="magnet:?xt=urn:btih:{n:040x}">{title}</a>'
+                        if url == original_url and not original_has_magnet:
+                            body = "<p>影片介绍</p>"
+                        details[url] = _response(url, body)
+                    http = _EmpireHttp(_response(adapter.base_url, "".join(rows)), details)
+                    adapter.http = http
+                    page = await adapter.search(IndexerSearchRequest.create("流浪地球", year=2019, media_type="movie"))
+                    self.assertEqual(http.get_calls[0][0], original_url)
+                    if original_has_magnet:
+                        self.assertEqual([i.detail_url for i in page.items], [original_url])
+                        self.assertEqual(len(http.get_calls), 1)
+                    else:
+                        self.assertTrue(page.items)
+                        self.assertLessEqual(len(http.get_calls), 6)
+                    self.assertEqual([e.code for e in page.errors], ["coverage_limited"])
+                    self.assertFalse(page.complete)
+
     async def test_successful_first_batch_does_not_fetch_later_candidates(self):
         search_url = "https://www.dygang.tv/e/search/result.html"
         paths = [f"/ys/2025/{index}.htm" for index in range(1, 5)]
@@ -418,6 +448,19 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(http.get_calls), 3)
         self.assertEqual(len(page.items), 1)
+
+    async def test_an_unrelated_season_number_does_not_outrank_the_requested_series(self):
+        base = "https://www.5266ys.net"
+        search = ('<h3><a href="/movie/1.html">另一部作品 S02</a></h3>'
+                  '<h3><a href="/movie/2.html">凡人修仙传</a></h3>')
+        detail = f'<a href="magnet:?xt=urn:btih:{_VALID_HASH}">资源</a>'
+        url = f"{base}/movie/2.html"
+        http = _EmpireHttp(_response(base, search), {url: _response(url, detail)})
+        page = await _adapter("ys5266", http).search(
+            IndexerSearchRequest.create("凡人修仙传", media_type="tv", season=2),
+        )
+        self.assertEqual([item.detail_url for item in page.items], [url])
+        self.assertEqual([requested for requested, _ in http.get_calls], [url])
 
     async def test_expired_shared_deadline_prevents_creating_next_batch(self):
         search_url = "https://www.dygang.tv/e/search/result.html"

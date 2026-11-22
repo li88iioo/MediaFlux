@@ -17,7 +17,7 @@ from app.clients.http import HttpError, HttpInvalidResponse, HttpSecurityError
 from app.concurrency import CrossLoopAsyncLock
 
 from ..config import BTBTLA_MIRROR_URL, BTBTLA_URL
-from ..errors import IndexerRateLimited, IndexerResultExpired, IndexerUnavailable
+from ..errors import IndexerRateLimited, IndexerResultExpired, IndexerTimeout, IndexerUnavailable
 from ..models import (
     IndexerCapabilities,
     IndexerItem,
@@ -550,10 +550,15 @@ class BTBtlaAdapter(IndexerAdapter):
         return (0, -len(normalized_title))
 
     async def _get(self, url: str):
+        from curl_cffi.requests.exceptions import Timeout as CurlTimeout
+
         # 下游浏览器传输也会排队；串行覆盖发送，防止已放行请求积压后突发。
         async with self._request_lock:
             await self._request_pacer.wait()
-            return await self.http.get(url)
+            try:
+                return await self.http.get(url)
+            except CurlTimeout as exc:
+                raise IndexerTimeout("BTBtla request timed out") from exc
 
     def _select_download_url(self, soup: BeautifulSoup, *, base_url: str) -> str:
         candidates: list[str] = []

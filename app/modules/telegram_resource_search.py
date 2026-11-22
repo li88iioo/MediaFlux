@@ -368,14 +368,14 @@ def _search_snapshot(service, result) -> dict[str, Any]:
             continue
         adapter = service.registry.get(site_id)
         code = errors.get(site_id, "")
-        status = indexer_site_status(result, site_id, counts.get(site_id, 0)) or "error"
+        count = result.site_item_counts.get(site_id, counts.get(site_id, 0))
+        status = indexer_site_status(result, site_id, count) or "error"
         message = ""
-        if status == "partial":
-            message = (_SITE_ERROR_MESSAGES[code] if code == "coverage_limited"
-                       else "本轮未找到匹配资源，部分来源未完成")
+        if status == "partial" and not count and code != "coverage_limited":
+            message = "本轮未找到匹配资源，部分来源未完成"
         elif status == "searching":
             message = "正在补充检索"
-        elif status == "error":
+        elif status in {"error", "partial"}:
             message = _SITE_ERROR_MESSAGES.get(code, "未返回有效状态")
         sites.append(
             {

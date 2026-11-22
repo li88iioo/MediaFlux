@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from app.clients.http import HttpInvalidResponse, HttpSecurityError
 
 from ..config import MIKAN_MIRROR_URL, MIKAN_URL
-from ..errors import IndexerRateLimited, IndexerTimeout, IndexerUnavailable
+from ..errors import IndexerChallengeRequired, IndexerRateLimited, IndexerTimeout, IndexerUnavailable
 from ..models import (
     IndexerCapabilities,
     IndexerItem,
@@ -32,6 +32,18 @@ _MIKAN_DATE_FORMATS = (
     "%Y/%m/%d",
     "%Y-%m-%d",
 )
+_EMPTY_SEARCH_NOTICES = {
+    "找不到对应结果",
+    "没有搜索结果",
+    "没有找到结果",
+    "没有找到相关结果",
+    "没有结果",
+    "无搜索结果",
+    "无结果",
+    "no result",
+    "no results",
+    "no results found",
+}
 
 
 class MikanAdapter(DirectResultAdapter):
@@ -93,18 +105,46 @@ class MikanAdapter(DirectResultAdapter):
             params={"searchstr": request.query},
             headers={"Referer": base_url},
         )
-        self._validate_status(response.status_code)
-        require_html_response(response)
-        response_base_url = self._base_for_url(response.url)
+        if response.headers.get("cf-mitigated", "").strip().lower() == "challenge":
+            raise IndexerChallengeRequired("Mikan returned a verification challenge")
+        status = response.status_code
+        if status not in (200, 403, 503):
+            self._validate_status(status)
+        try:
+            require_html_response(response)
+        except HttpInvalidResponse:
+            # 非 HTML 响应沿用 HTTP 状态的错误类型。
+            self._validate_status(status)
+            raise
+
         soup = BeautifulSoup(response.body, "lxml")
         rows = soup.select("tr.js-search-results-row")
-        text = soup.get_text(" ", strip=True).lower()
-        if (
-            not rows
-            and not soup.select_one("table")
-            and not any(marker in text for marker in ("没有", "无结果", "no result"))
+        title = soup.title.get_text(" ", strip=True).lower().rstrip(".…") if soup.title else ""
+        text = (soup.body or soup).get_text(" ", strip=True).lower() if not rows else ""
+        if not rows and (
+            title in {"access denied", "attention required! | cloudflare", "sorry, you have been blocked"}
+            or (
+                title == "just a moment"
+                and (
+                    "verify you are human" in text
+                    or "performing security verification" in text
+                    or b"/cdn-cgi/challenge-platform/" in response.body
+                )
+            )
+        ):
+            raise IndexerChallengeRequired("Mikan returned a verification or access block page")
+
+        self._validate_status(status)
+        response_base_url = self._base_for_url(response.url)
+        if not rows and not (
+            (
+                title == "mikan project - 搜索结果"
+                and soup.select_one('form[action="/Home/Search"] input[name="searchstr"]')
+            )
+            or text.rstrip(".。!！") in _EMPTY_SEARCH_NOTICES
         ):
             raise HttpInvalidResponse("Mikan search page structure is invalid")
+
         items: list[IndexerItem] = []
         for row in rows:
             item = self._parse_row(row, base_url=response_base_url)

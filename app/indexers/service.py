@@ -1501,6 +1501,9 @@ def search_site_statuses(service, result) -> list[dict[str, Any]]:
         elif status == "partial":
             if site_id in errors and errors[site_id].code == "coverage_limited":
                 code, message, retryable = _safe_site_error(errors[site_id])
+            elif counts.get(site_id, 0) and site_id in errors:
+                code, reason, retryable = _safe_site_error(errors[site_id])
+                message = f"已保留取得的资源。{reason}"
             else:
                 message, retryable = "本轮未找到匹配资源，部分来源未完成", True
         elif status == "error":

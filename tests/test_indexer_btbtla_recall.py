@@ -8,14 +8,15 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup
+from curl_cffi.requests.exceptions import CertificateVerifyError, Timeout as CurlTimeout
 
 from app.clients.http import HttpSecurityError
-from app.indexers.errors import IndexerResultExpired, IndexerUnavailable
+from app.indexers.errors import IndexerResultExpired, IndexerTimeout, IndexerUnavailable
 from app.indexers.models import IndexerMediaSearchRequest, IndexerSearchRequest
 from app.indexers.providers.btbtla import BTBtlaAdapter
 from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
-from app.indexers.service import IndexerService
+from app.indexers.service import IndexerService, search_site_statuses
 from tests.test_indexer_providers import FakeHttpClient
 
 _FIXTURES = Path(__file__).parent / 'fixtures' / 'indexers'
@@ -130,13 +131,80 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
         return search.encode(), ('<div id="download-list">' + rows + '</div>').encode()
 
     @classmethod
-    def partial_detail_http(cls, status):
+    def partial_detail_http(cls, status_or_error):
         search, detail = cls.catalog_html(3)
         search += b'<div class="module-item"><a class="module-item-title" href="/detail/bad.html">Demo</a></div>'
         http = FakeHttpClient(_EMPTY)
         http.responses = [search, detail, b'private upstream detail failed']
-        http.status_codes = [200, 200, status]
+        if isinstance(status_or_error, BaseException):
+            cls.fail_request(http, '/detail/bad.html', status_or_error)
+        else:
+            http.status_codes = [200, 200, status_or_error]
         return http, search, detail
+
+    @staticmethod
+    def fail_request(http, path, failure):
+        original_get = http.get
+
+        async def get(url, **kwargs):
+            response = await original_get(url, **kwargs)
+            if urlsplit(url).path == path:
+                raise failure
+            return response
+
+        http.get = get
+
+    async def test_timeout_before_results_is_reported_without_retry(self):
+        search, detail = self.catalog_html(1)
+        for paths in (('/search/Demo',), ('/search/Demo', '/detail/demo.html')):
+            with self.subTest(path=paths[-1]):
+                http = FakeHttpClient(_EMPTY)
+                http.responses = [search, detail]
+                self.fail_request(http, paths[-1], CurlTimeout('private upstream request timed out'))
+                service = IndexerService(
+                    registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http)}),
+                    result_store=IndexerResultStore(),
+                )
+                self.addAsyncCleanup(service.aclose)
+
+                result = await service.search('Demo', site_ids=('btbtla',))
+
+                self.assertEqual(result.items, [])
+                self.assertEqual(
+                    [(error.site_id, error.code) for error in result.errors],
+                    [('btbtla', 'timeout')],
+                )
+                self.assertEqual(result.errors[0].message, IndexerTimeout.default_public_message)
+                self.assertEqual(
+                    [call['url'] for call in http.calls],
+                    [BTBtlaAdapter.base_url.rstrip('/') + path for path in paths],
+                )
+
+    async def test_resolve_distinguishes_timeout_from_certificate_failure(self):
+        search, detail = self.catalog_html(1)
+        for failure, expected in (
+            (CurlTimeout('private upstream download timed out'), IndexerTimeout),
+            (CertificateVerifyError('private upstream certificate failed'), IndexerUnavailable),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                http = FakeHttpClient(_EMPTY)
+                http.responses = [search, detail]
+                self.fail_request(http, '/tdown/1.html', failure)
+                service = IndexerService(
+                    registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http)}),
+                    result_store=IndexerResultStore(),
+                )
+                self.addAsyncCleanup(service.aclose)
+                result = await service.search('Demo', site_ids=('btbtla',))
+                result_id = result.items[0].result_id
+                assert result_id is not None
+                http.calls.clear()
+
+                with self.assertRaises(expected) as raised:
+                    await service.resolve(result_id)
+
+                self.assertEqual(raised.exception.public_message, expected.default_public_message)
+                self.assertEqual([call['url'] for call in http.calls], [result.items[0].detail_url])
 
     async def test_same_page_details_continue_after_request_budget_without_losing_candidates(self):
         search = ''.join(
@@ -182,9 +250,13 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(http.calls[-3]['url'].endswith('/search/Demo/2'))
 
     async def test_partial_details_keep_candidates_and_errors_in_later_windows(self):
-        for status, code in ((404, 'result_expired'), (503, 'unavailable')):
-            with self.subTest(status=status):
-                http, _search, _detail = self.partial_detail_http(status)
+        for status_or_error, code in (
+            (404, 'result_expired'),
+            (503, 'unavailable'),
+            (CurlTimeout('private upstream detail timed out'), 'timeout'),
+        ):
+            with self.subTest(code=code):
+                http, _search, _detail = self.partial_detail_http(status_or_error)
                 service = IndexerService(
                     registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http, page_size=2)}),
                     result_store=IndexerResultStore(), max_results_per_site=2,
@@ -197,6 +269,10 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
                 for page in pages:
                     self.assertTrue(page.partial)
                     self.assertEqual([(error.site_id, error.code) for error in page.errors], [('btbtla', code)])
+                    status, = search_site_statuses(service, page)
+                    self.assertEqual((status['status'], status['code']), ('partial', code))
+                    self.assertEqual(status['count'], len(page.items))
+                    self.assertIn('已保留', status['message'])
                     self.assertNotIn('private', page.errors[0].message)
                     for item in page.items:
                         assert item.result_id is not None
@@ -251,14 +327,7 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
     async def test_security_and_cancellation_block_partial_catalog_publication(self):
         for failure in (HttpSecurityError('unsafe detail'), asyncio.CancelledError()):
             with self.subTest(failure=type(failure).__name__):
-                http, _search, _detail = self.partial_detail_http(200)
-                original_get = http.get
-                async def get(url, *, original_get=original_get, failure=failure, **kwargs):
-                    response = await original_get(url, **kwargs)
-                    if '/detail/bad.html' in url:
-                        raise failure
-                    return response
-                http.get = get
+                http, _, _ = self.partial_detail_http(failure)
                 adapter = BTBtlaAdapter(http=http)
                 with self.assertRaises(type(failure)):
                     await adapter.search(IndexerSearchRequest.create('Demo'))
