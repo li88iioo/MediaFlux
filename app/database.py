@@ -560,7 +560,7 @@ def row_value(row, key: str, default=None):
         return default
 
 
-def init_db() -> None:
+def init_db(*, default_notification_chat_id: str = "") -> None:
     """初始化首个正式数据库基线，并恢复上次异常中断的运行状态。"""
     from app.repositories import (
         agent_download_verification,
@@ -651,7 +651,7 @@ def init_db() -> None:
             # 初始化事务提交/回滚，避免恢复尚未提交时新 writer 抢先进入。
             local_media_recovery_lock = _try_acquire_local_media_recovery_lock()
             local_media._recover_after_restart(conn, timestamp, writer_available=local_media_recovery_lock is not None)
-            download_requests._recover_after_restart(conn, timestamp)
+            download_requests._recover_after_restart(conn, timestamp, default_notification_chat_id)
             agent_download_verification._recover_after_restart(conn, timestamp)
             agent_library_patrol._recover_after_restart(conn, timestamp)
             agent_jobs._recover_after_restart(conn, timestamp)

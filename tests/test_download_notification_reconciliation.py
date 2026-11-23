@@ -55,19 +55,24 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result['status'], 'cancelled')
 
-    def test_restart_settles_skipped_strm_and_edits_existing_download_message_once(self):
+    def request_with_skipped_strm_receipt(self, request_key, *, chat_id=''):
         request_id, _ = download_requests_repo.create_download_request(
-            'share-same-version', 'share', title='同版本分享', chat_id='100',
+            request_key, 'share', title='同版本分享', chat_id=chat_id,
         )
+        task_id = 'organize-' + request_key
         run_id = db.add_task_run('guangya_organize', 'download')
-        receipt = {'task_id': 'organize-share', 'stats': {'strm': {'ok': True, 'skipped': True, 'reason': '无变更'}}}
+        receipt = {'task_id': task_id, 'stats': {'strm': {'ok': True, 'skipped': True, 'reason': '无变更'}}}
         organized_at = db.now()
         db.finish_task_run(run_id, 'success', json.dumps(receipt))
         download_requests_repo.update_download_request(
             request_id, targets='guangya', status='completed', gy_status='completed',
             organize_started=1, organize_status='completed', organize_run_id=run_id,
-            organize_task_id='organize-share', organize_finished_at=organized_at, strm_status='pending',
+            organize_task_id=task_id, organize_finished_at=organized_at, strm_status='pending',
         )
+        return request_id
+
+    def test_restart_settles_skipped_strm_and_edits_existing_download_message_once(self):
+        request_id = self.request_with_skipped_strm_receipt('share-same-version', chat_id='100')
         published = publish_download_lifecycle(request_id, media_refresh='未触发')
         self.assertTrue(published.accepted)
         self.assertEqual(self.sender.call_args.args[0].state, 'processing')
@@ -88,6 +93,47 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         self.assertNotIn(request_id, [r['id'] for r in download_requests_repo.list_active_download_requests()])
         self.sender.assert_called_once()
         self.editor.assert_called_once()
+
+    def test_restart_requeues_skipped_strm_notification_only_in_supplied_default_chat(self):
+        default_chat, other_chat = '100', '200'
+        matching = self.request_with_skipped_strm_receipt('legacy-share-default')
+        nonmatching = self.request_with_skipped_strm_receipt('legacy-share-other')
+        self.enterContext(patch('app.notifier._init'))
+        old_outbox = {}
+        for request_id, chat_id in ((matching, default_chat), (matching, other_chat), (nonmatching, other_chat)):
+            with patch('app.notifier._chat_id', chat_id):
+                published = publish_download_lifecycle(request_id)
+            self.assertTrue(published.accepted)
+            notification = get_notification(published.event_key)
+            assert notification is not None
+            self.assertEqual((notification['chat_id'], notification['status']), (chat_id, 'sent'))
+            old_outbox[published.event_key] = notification
+
+        with patch('app.config.get', side_effect=AssertionError('数据库恢复不得读取配置')) as read_config, patch(
+            'app.config._ensure_loaded', side_effect=AssertionError('数据库恢复不得加载配置'),
+        ) as load_config:
+            db.init_db(default_notification_chat_id=default_chat)
+        read_config.assert_not_called()
+        load_config.assert_not_called()
+
+        for request_id, delivery in ((matching, 'pending'), (nonmatching, '')):
+            row = download_requests_repo.get_download_request(request_id)
+            assert row is not None
+            self.assertEqual((row['chat_id'], row['notification_payload_json']), ('', ''))
+            self.assertEqual((row['strm_status'], row['notification_delivery_status']), ('skipped', delivery))
+
+        active = download_requests_repo.list_active_download_requests()
+        self.assertEqual([row['id'] for row in active], [matching])
+        with patch('app.notifier._chat_id', default_chat):
+            DownloadTracker()._update_request(active[0], [], [])
+            center.drain_telegram_notifications()
+        self.assertEqual(self.sender.call_count, len(old_outbox))
+        self.editor.assert_called_once()
+        self.assertEqual(self.editor.call_args.kwargs, {'chat_id': default_chat, 'message_id': 81})
+        self.assertEqual(self.editor.call_args.args[0].state, 'completed')
+        for event_key, notification in old_outbox.items():
+            if notification['chat_id'] == other_chat:
+                self.assertEqual(get_notification(event_key), notification)
 
     def test_old_interruption_is_repaired_only_for_its_unclaimed_skipped_run(self):
         from app.repositories.strm_request_ownership import INTERRUPTED_ERROR

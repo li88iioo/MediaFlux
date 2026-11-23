@@ -21,8 +21,8 @@ def _scope_action(cut):
         if cut in ('db_fsync', 'db_fsync_unsupported') and directory == paths.database_path.parent and paths.database_path.exists():
             raise OSError(errno.EINVAL if cut == 'db_fsync_unsupported' else errno.EIO, 'injected strict DB directory fsync failure')
         original_sync(directory)
-    def initialize_stage():
-        original_init()
+    def initialize_stage(*, default_notification_chat_id: str = ""):
+        original_init(default_notification_chat_id=default_notification_chat_id)
         if cut == 'env_cas_late':
             paths.env_file.write_bytes(b'KEEP=competitor\n')
         elif cut == 'checkpoint_busy':

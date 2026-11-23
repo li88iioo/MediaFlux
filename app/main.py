@@ -318,7 +318,7 @@ def _initialize_runtime_storage() -> None:
             established = bool(tables and conn.execute("SELECT 1 FROM settings_kv WHERE key=?", (RUNTIME_FENCE_KEY,)).fetchone())
             if established:
                 verify_startup_runtime_fence(read_runtime_fence(conn), config.capture_runtime_config_snapshot())
-        database.init_db()
+        database.init_db(default_notification_chat_id=config.get("TG_CHAT_ID").strip())
         if not established:
             # 旧版允许只用部署环境变量。首次建立 fence 前补齐空文件，
             # 不复制环境凭据；已有 fence 丢失配置仍由上面的校验拒绝。

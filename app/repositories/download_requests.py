@@ -2100,7 +2100,7 @@ def list_active_download_requests(
         return rows
 
 
-def _recover_after_restart(conn, timestamp: str) -> None:
+def _recover_after_restart(conn, timestamp: str, default_notification_chat_id: str) -> None:
     """同事务恢复请求、STRM 归属凭据、提交意图与通知租约。"""
     # manager 必须先持久化 running 才启动执行线程；starting 尚未执行云端整理，
     # 只重排仍有准入的交接，保留后端身份与重试次数。running 仍需人工核验。
@@ -2119,7 +2119,6 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "WHERE organize_status='running'",
         (timestamp, timestamp),
     )
-    from app import config
     from app.repositories.strm_request_ownership import (
         _INTERRUPTION_PROOF,
         INTERRUPTED_ERROR,
@@ -2148,7 +2147,7 @@ def _recover_after_restart(conn, timestamp: str) -> None:
           AND COALESCE(json_extract(t.result, '$.stats.need_confirm'), 0)=0
           AND NOT EXISTS (SELECT 1 FROM strm_request_work w WHERE w.request_id=d.id)
         """,
-        (config.get("TG_CHAT_ID").strip(), INTERRUPTED_ERROR),
+        (default_notification_chat_id, INTERRUPTED_ERROR),
     ).fetchall()
     for row in skipped:
         fields = {
