@@ -359,7 +359,6 @@ def build_download_lifecycle_event(
             )
         ),
     )
-    lines = media_blocks or (previous.lines if previous is not None else ())
     errors: list[str] = []
     for key in ("error", "local_import_error", "organize_error", "strm_error"):
         value = str(_value(row, key, "") or "").strip()
@@ -405,7 +404,9 @@ def build_download_lifecycle_event(
     event = _merge_probe_progress(
         event, _load_probe_progress(row) if probe_progress is None else probe_progress,
     )
-    return attach_bounded_media_details(event, lines)
+    return attach_bounded_media_details(
+        event, media_blocks or (previous.lines if previous is not None else ()),
+    )
 
 
 def download_notification_obsolescence(thread_key: str, event: NotificationEvent) -> str:

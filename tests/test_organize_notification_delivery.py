@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -369,6 +370,9 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertTrue(any(
             "暂不生成最终缺集结论" in str(line) for line in previous.lines
         ))
+        previous = replace(previous, lines=(
+            f"---\n\n---\n\n{previous.lines[0]}\n\n---\n\n---",
+        ))
 
         published = []
         with patch(
@@ -396,6 +400,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
             "暂不生成最终缺集结论" in str(line) for line in event.lines
         ))
         self.assertTrue(any("将夜" in line for line in event.lines))
+        self.assertEqual(render_event(event).splitlines().count("---"), 1)
 
     def test_rollup_rewrites_media_status_to_only_remaining_skip_reason(self) -> None:
         stats = _stats_with_confirmation()
@@ -946,6 +951,7 @@ class OrganizeConfirmationMediaRollupTests(IsolatedDatabaseTestCase):
         self.assertEqual(final.revision, initial.revision + 1)
         self.assertEqual(dict(final.event.fields)["整理"], "视频 7 · 入库 7")
         self.assertEqual(len(final.event.lines), 2)
+        self.assertEqual(render_event(final.event).splitlines().count("---"), 2)
         first_season, second_season = map(str, final.event.lines)
         self.assertIn("批次剧集 (2026) · S01", first_season)
         self.assertIn("本次更新：E30-E35", first_season)

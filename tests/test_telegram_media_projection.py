@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from app.modules.telegram_media_projection import (
     attach_bounded_media_details,
     build_media_detail_blocks,
 )
 from app.modules.telegram_organize_lifecycle import build_organize_lifecycle_event
-from app.notifier import NotificationEvent, render_event, split_message
+from app.notifier import NotificationEvent, render_event, split_message, telegram_text_length
 
 
 def _episode_item(**overrides) -> dict:
@@ -62,8 +64,42 @@ def test_media_projection_marks_complete_season_and_separates_media_blocks() -> 
     assert "- 📊 本季进度：1 / 1 集（全） ✅" in rendered
     assert "\n\n---\n\n📺 面包超人" in rendered
     assert "\n\n---\n\n📺 第二部作品" in rendered
-    assert rendered.rstrip().endswith("---")
-    assert rendered.count("---") == 3
+    assert rendered.splitlines().count("---") == 2
+    assert rendered.rstrip().splitlines()[-1] != "---"
+
+
+def test_media_projection_unwraps_legacy_details_and_keeps_omitted_count() -> None:
+    summary = NotificationEvent("整理完成", layout="relaxed")
+    legacy = (
+        "---\n\n---\n\n 🎬 第一部作品\n\n---\n\n---",
+        "---\n\n---\n\n…另有 7 项媒体详情未展开，完整记录见 Web 整理日志\n\n---\n\n---",
+    )
+
+    event = attach_bounded_media_details(summary, legacy)
+    rendered = render_event(event)
+
+    assert rendered.splitlines().count("---") == 1
+    assert "🎬 第一部作品" in rendered
+    assert rendered.splitlines()[-1] == "…另有 7 项媒体详情未展开，完整记录见 Web 整理日志"
+    assert attach_bounded_media_details(event, event.lines) == event
+
+
+def test_media_projection_adds_newly_omitted_groups_to_saved_count() -> None:
+    summary = NotificationEvent("整理完成", layout="relaxed")
+    blocks = tuple("📺 " + "🎞️" * 600 for _ in range(4))
+    first = attach_bounded_media_details(summary, blocks)
+    # 一次后续更新变长，至少再省略一个已展示的作品。
+    expanded = replace(first, fields=(("媒体库", "示例" * 950),))
+
+    updated = attach_bounded_media_details(expanded, first.lines)
+    rendered = render_event(updated)
+
+    assert telegram_text_length(rendered) <= 3800
+    assert len(split_message(rendered)) == 1
+    shown = rendered.count("📺 🎞️")
+    assert shown < render_event(first).count("📺 🎞️")
+    assert rendered.splitlines()[-1] == f"…另有 {len(blocks) - shown} 项媒体详情未展开，完整记录见 Web 整理日志"
+    assert attach_bounded_media_details(updated, updated.lines) == updated
 
 
 def test_partial_organize_projection_keeps_progress_without_final_missing_list() -> None:
@@ -105,6 +141,6 @@ def test_media_projection_stays_editable_and_reports_omitted_groups() -> None:
     rendered = render_event(event)
 
     assert len(split_message(rendered)) == 1
-    assert len(rendered) <= 3800
+    assert telegram_text_length(rendered) <= 3800
     assert "项媒体详情未展开" in rendered
     assert "完整记录见 Web 整理日志" in rendered

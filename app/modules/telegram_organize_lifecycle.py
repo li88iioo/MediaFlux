@@ -567,9 +567,6 @@ def update_organize_lifecycle_confirmations(
     event = NotificationEvent(
         title,
         fields=fields,
-        lines=_confirmation_media_lines(
-            previous.lines, inventory_status=inventory_status,
-        ),
         footer=footer,
         actions=previous.actions,
         layout=previous.layout,
@@ -586,14 +583,15 @@ def update_organize_lifecycle_confirmations(
             "importance": "error" if parent_attention else "result",
         }},
     )
+    blocks = previous.lines
     if media_items:
         # 落库快照能证明批次内的正向结果，无法证明归档目录当前仍缺哪些集。
         blocks = build_media_detail_blocks(
             media_items, inventory_final=False, verified_only=True,
         )
-        event = attach_bounded_media_details(
-            event, _confirmation_media_lines(blocks, inventory_status=inventory_status),
-        )
+    event = attach_bounded_media_details(
+        event, _confirmation_media_lines(blocks, inventory_status=inventory_status),
+    )
     return publish_notification_thread(
         thread_key,
         event,
@@ -734,9 +732,9 @@ def _project_downstream(
         previous,
         title="⚠️ 光鸭整理链路部分完成" if failed and state != "stopped" else parent["title"],
         footer=downstream_error[:260] if downstream_error else parent["footer"], fields=fields,
-        state=state, lifecycle=lifecycle,
+        lines=(), state=state, lifecycle=lifecycle,
     )
-    return event, "error" if failed else parent["importance"]
+    return attach_bounded_media_details(event, previous.lines), "error" if failed else parent["importance"]
 
 
 def reconcile_organize_refresh_notifications() -> int:

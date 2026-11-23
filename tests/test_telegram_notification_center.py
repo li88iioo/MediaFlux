@@ -1585,6 +1585,15 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertIn(("媒体库", "Jellyfin 已刷新"), final_event.fields)
         self.assertIn(("入库复核", "目标剧集已在媒体库中可见"), final_event.fields)
         self.assertTrue(any("S01E03" in line for line in final_event.lines))
+        self.assertEqual(render_event(final_event).splitlines().count("---"), 1)
+
+        snapshot = get_notification_thread_snapshot("download:" + str(request_id), topic="download", chat_id="100")
+        assert snapshot is not None
+        self.assertTrue(publish_download_lifecycle(request_id).delivered)
+        self.assertEqual(get_notification_thread_snapshot(
+            "download:" + str(request_id), topic="download", chat_id="100",
+        ), snapshot)
+        editor.assert_called_once()
 
 
 class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):

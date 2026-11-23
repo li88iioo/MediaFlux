@@ -1,6 +1,7 @@
 """把整理媒体明细投影为可原位更新的 Telegram 文本块。"""
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
@@ -17,6 +18,8 @@ from app.notifier import (
 # STRM、媒体库和复核终态，因此提前保留一小段增长空间，确保仍可原位编辑。
 _EDIT_SAFE_LIMIT = 3800
 _DETAIL_SEPARATOR = "---"
+_OMITTED_DETAIL_SUFFIX = " 项媒体详情未展开，完整记录见 Web 整理日志"
+_OMITTED_DETAIL_RE = re.compile(r"…另有 ([0-9]+)" + re.escape(_OMITTED_DETAIL_SUFFIX))
 _MEDIA_TITLE_PREFIXES = (
     ("📺 剧集入库：", "📺"),
     ("🎬 新片入库：", "🎬"),
@@ -153,18 +156,35 @@ def _event_block(event: NotificationEvent) -> str:
     return "\n".join(lines)
 
 
-def _separated_blocks(
-    blocks: Sequence[str], *, omitted: int = 0,
-) -> tuple[str, ...]:
-    lines = [f"{_DETAIL_SEPARATOR}\n\n{block}\n" for block in blocks]
+def _read_media_details(blocks: Sequence[object]) -> tuple[list[str], int]:
+    """还原旧消息中的作品块和已省略数量，支持重复包裹的分隔线。"""
+    details: list[str] = []
+    omitted = 0
+    for block in blocks:
+        if block is None:
+            continue
+        lines = str(block).splitlines()
+        start, end = 0, len(lines)
+        while start < end and lines[start].strip() in ("", _DETAIL_SEPARATOR):
+            start += 1
+        while start < end and lines[end - 1].strip() in ("", _DETAIL_SEPARATOR):
+            end -= 1
+        if start == end:
+            continue
+        detail = "\n".join(lines[start:end])
+        match = _OMITTED_DETAIL_RE.fullmatch(detail)
+        if match:
+            omitted = max(omitted, safe_int(match[1], 0, minimum=0))
+        else:
+            details.append(detail)
+    return details, omitted
+
+
+def _separated_blocks(blocks: Sequence[str], *, omitted: int = 0) -> tuple[str, ...]:
+    lines = [f"{_DETAIL_SEPARATOR}\n\n{block}" for block in blocks]
     if omitted:
-        lines.append(
-            f"{_DETAIL_SEPARATOR}\n\n"
-            f"…另有 {omitted} 项媒体详情未展开，完整记录见 Web 整理日志\n"
-        )
-    if lines:
-        lines[-1] = f"{lines[-1]}\n{_DETAIL_SEPARATOR}"
-    return tuple(lines)
+        lines.append(f"…另有 {omitted}{_OMITTED_DETAIL_SUFFIX}")
+    return tuple(f"{line}\n" for line in lines[:-1]) + tuple(lines[-1:])
 
 
 def build_media_detail_blocks(
@@ -193,18 +213,18 @@ def attach_bounded_media_details(
     event: NotificationEvent, blocks: Sequence[object],
 ) -> NotificationEvent:
     """把媒体详情装入生命周期消息，超长时明确提示而不破坏原位更新。"""
-    normalized = tuple(str(block) for block in blocks if block not in (None, ""))
-    if not normalized:
+    details, already_omitted = _read_media_details(blocks)
+    if not details and not already_omitted:
         return event
 
-    full = replace(event, lines=_separated_blocks(normalized))
+    full = replace(event, lines=_separated_blocks(details, omitted=already_omitted))
     if telegram_text_length(render_event(full)) <= _EDIT_SAFE_LIMIT:
         return full
 
-    total = len(normalized)
+    total = len(details) + already_omitted
     best: NotificationEvent | None = None
     low = 0
-    high = total - 1
+    high = len(details) - 1
     # 保留块数越少，渲染结果越短。用二分定位最大可保留前缀，避免大批量
     # 整理结果逐项重渲染形成 O(n²) 开销。
     while low <= high:
@@ -212,7 +232,7 @@ def attach_bounded_media_details(
         omitted = total - keep
         candidate = replace(
             event,
-            lines=_separated_blocks(normalized[:keep], omitted=omitted),
+            lines=_separated_blocks(details[:keep], omitted=omitted),
         )
         if telegram_text_length(render_event(candidate)) <= _EDIT_SAFE_LIMIT:
             best = candidate
@@ -220,4 +240,4 @@ def attach_bounded_media_details(
         else:
             high = keep - 1
 
-    return best or event
+    return best if best is not None else replace(event, lines=())
