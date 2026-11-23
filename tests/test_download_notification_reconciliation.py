@@ -1,6 +1,7 @@
 """下载撤销/后端状态变化必须收口独立通知队列；不调用真实下载器或 Telegram。"""
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -53,6 +54,79 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result['status'], 'cancelled')
+
+    def test_restart_settles_skipped_strm_and_edits_existing_download_message_once(self):
+        request_id, _ = download_requests_repo.create_download_request(
+            'share-same-version', 'share', title='同版本分享', chat_id='100',
+        )
+        run_id = db.add_task_run('guangya_organize', 'download')
+        receipt = {'task_id': 'organize-share', 'stats': {'strm': {'ok': True, 'skipped': True, 'reason': '无变更'}}}
+        organized_at = db.now()
+        db.finish_task_run(run_id, 'success', json.dumps(receipt))
+        download_requests_repo.update_download_request(
+            request_id, targets='guangya', status='completed', gy_status='completed',
+            organize_started=1, organize_status='completed', organize_run_id=run_id,
+            organize_task_id='organize-share', organize_finished_at=organized_at, strm_status='pending',
+        )
+        published = publish_download_lifecycle(request_id, media_refresh='未触发')
+        self.assertTrue(published.accepted)
+        self.assertEqual(self.sender.call_args.args[0].state, 'processing')
+
+        db.init_db()
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row['strm_status'], row['strm_error']), ('skipped', '无变更'))
+        self.assertTrue(row['strm_finished_at'])
+        self.assertIsNone(row['strm_run_id'])
+        DownloadTracker()._update_request(row, [], [])
+        center.drain_telegram_notifications(event_key=published.event_key)
+        event = self.editor.call_args.args[0]
+        self.assertEqual(event.state, 'completed')
+        self.assertIn('已跳过', dict(event.fields)['STRM'])
+        self.assertEqual(dict(event.fields)['媒体库'], '未触发')
+        db.init_db()
+        self.assertNotIn(request_id, [r['id'] for r in download_requests_repo.list_active_download_requests()])
+        self.sender.assert_called_once()
+        self.editor.assert_called_once()
+
+    def test_old_interruption_is_repaired_only_for_its_unclaimed_skipped_run(self):
+        from app.repositories.strm_request_ownership import INTERRUPTED_ERROR
+
+        request_ids = {}
+        for case in (
+            'skipped', 'different_task', 'owned_work', 'new_generation', 'independent_failure',
+            'started', 'manual_confirmation', 'invalid_receipt',
+        ):
+            request_id, _ = download_requests_repo.create_download_request(case, 'share')
+            task_id = 'organize-' + case
+            handoff = {'ok': True, 'skipped': True, 'reason': '未启用'} if case != 'started' else {'ok': True}
+            receipt = {'task_id': task_id, 'stats': {'strm': handoff, 'need_confirm': int(case == 'manual_confirmation')}}
+            run_id = db.add_task_run('guangya_organize', 'download')
+            organized_at = db.now()
+            db.finish_task_run(run_id, 'success', 'invalid' if case == 'invalid_receipt' else json.dumps(receipt))
+            download_requests_repo.update_download_request(
+                request_id, targets='guangya', status='completed', gy_status='completed',
+                organize_status='completed', organize_started=1, organize_run_id=run_id, organize_finished_at=organized_at,
+                organize_task_id='another-task' if case == 'different_task' else task_id,
+                strm_status='failed', strm_error='独立失败' if case == 'independent_failure' else INTERRUPTED_ERROR,
+            )
+            if case == 'owned_work':
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "INSERT INTO strm_request_work(request_id,generation,organize_task_id,kind,work_key) "
+                        "VALUES(?,0,?,'change','file')", (request_id, task_id),
+                    )
+            elif case == 'new_generation':
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE download_requests SET strm_generation=1 WHERE id=?", (request_id,))
+            request_ids[case] = request_id
+        db.init_db()
+        for case, request_id in request_ids.items():
+            with self.subTest(case=case):
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual(row['strm_status'], 'skipped' if case == 'skipped' else 'failed')
+                self.assertEqual(row['notification_delivery_status'], '')
 
     def test_other_backend_failure_is_preserved_but_old_qb_alert_is_not_sent(self):
         request_id, event_key = self.request(gy='failed')

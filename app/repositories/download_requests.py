@@ -2119,10 +2119,47 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "WHERE organize_status='running'",
         (timestamp, timestamp),
     )
-    # 与置失败同事务授予启动凭据，兼容旧 work 的默认 -1。
-    # 只处理当前仍 active 的真实归属；已 failed 的同文本独立失败绝不补发。
-    from app.repositories.strm_request_ownership import _INTERRUPTION_PROOF
+    from app import config
+    from app.repositories.strm_request_ownership import (
+        _INTERRUPTION_PROOF,
+        INTERRUPTED_ERROR,
+    )
 
+    # 旧版把 ok + skipped 当作已交接。仅修复由原运行直接收尾的请求。
+    # 后续人工确认可能已经移动文件，或已为 STRM 建立新代次，首次扫描回执不能代替这些结果。
+    skipped = conn.execute(
+        """
+        SELECT d.id, t.finished_at, json_extract(t.result, '$.stats.strm.reason') AS reason,
+               EXISTS (
+                   SELECT 1 FROM telegram_notification_outbox n
+                   WHERE n.thread_key='download:' || d.id AND n.topic='download'
+                     AND n.status IN ('pending','sending','retry_wait','sent') AND n.chat_id=COALESCE(
+                         NULLIF(json_extract(CASE WHEN json_valid(d.notification_payload_json)
+                             THEN d.notification_payload_json END, '$.chat_id'), ''), NULLIF(d.chat_id, ''), ?
+                     )
+               ) AS has_notification
+        FROM download_requests d JOIN task_runs t ON t.id=d.organize_run_id
+        WHERE d.gy_status='completed' AND d.status='completed' AND d.organize_status='completed'
+          AND d.organize_started=1 AND d.strm_generation=0 AND d.strm_run_id IS NULL
+          AND (d.strm_status='pending' OR (d.strm_status='failed' AND d.strm_error=?))
+          AND t.task_name='guangya_organize' AND t.status='success' AND d.organize_finished_at<=t.finished_at
+          AND d.organize_task_id<>'' AND json_valid(t.result) AND json_extract(t.result, '$.task_id')=d.organize_task_id
+          AND json_extract(t.result, '$.stats.strm.ok')=1 AND json_extract(t.result, '$.stats.strm.skipped')=1
+          AND COALESCE(json_extract(t.result, '$.stats.need_confirm'), 0)=0
+          AND NOT EXISTS (SELECT 1 FROM strm_request_work w WHERE w.request_id=d.id)
+        """,
+        (config.get("TG_CHAT_ID").strip(), INTERRUPTED_ERROR),
+    ).fetchall()
+    for row in skipped:
+        fields = {
+            "strm_status": "skipped", "strm_error": str(row["reason"] or "")[:500],
+            "strm_finished_at": row["finished_at"],
+        }
+        if row["has_notification"]:
+            fields.update(_download_notification_refresh_fields("completed", timestamp))
+        _update_download_request_conn(conn, row["id"], fields, timestamp)
+
+    # 为仍在队列中的工作记录中断和重试凭据。
     conn.execute(
         "UPDATE strm_request_work SET failed_lease_generation=? "
         "WHERE EXISTS(SELECT 1 FROM download_requests r "
@@ -2136,10 +2173,10 @@ def _recover_after_restart(conn, timestamp: str) -> None:
     conn.execute(
         "UPDATE download_requests SET strm_status='failed',"
         "strm_error=CASE WHEN COALESCE(strm_error,'')='' "
-        "THEN '上次进程在 STRM 同步或排队期间中断' ELSE strm_error END,"
+        "THEN ? ELSE strm_error END,"
         "strm_finished_at=COALESCE(strm_finished_at,?),updated_at=? "
         "WHERE strm_status IN ('pending','queued','running')",
-        (timestamp, timestamp),
+        (INTERRUPTED_ERROR, timestamp, timestamp),
     )
     _recover_interrupted_download_submissions_conn(conn, timestamp)
     conn.execute(

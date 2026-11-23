@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import media_subscriptions as media_subscriptions_repo
+from app.repositories import strm as strm_repo
 from app.modules.media_subscriptions import MediaSubscriptionService, _ExpectedMedia
 from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules.organize_execution import execute_organize_plans
@@ -108,12 +109,12 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             for i in range(count)
         ]
 
-    def execute(self, sources, requests, *, cloud=None, isolated=False, clean_empty=None):
+    def execute(self, sources, requests, *, cloud=None, isolated=False, clean_empty=None, link_strm=False):
         cloud = cloud or Mock()
         organizer = Organizer(client=cloud, scraper=Mock())
         rules = OrganizeRules(
             target_dir_id="archive",
-            link_strm=False,
+            link_strm=link_strm,
             notify_enabled=False,
             clean_empty=isolated if clean_empty is None else clean_empty,
         )
@@ -163,6 +164,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(Organizer, "_schedule_agent_recognition_reviews")
             )
+            stack.enter_context(patch("app.modules.scheduler._publish_linked_notification_threads"))
             manager._run(
                 "test-task",
                 run_id,
@@ -307,6 +309,11 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         self.assertEqual(
             get_download_request_result["organize_status"], "completed"
         )
+        self.assertEqual(
+            (get_download_request_result["strm_status"], get_download_request_result["strm_error"]),
+            ("skipped", "未启用"),
+        )
+        self.assertTrue(get_download_request_result["strm_finished_at"])
         media_subscriptions_repo.reconcile_media_download_admissions(
             self.subscription, {key}, expected_revision=1
         )
@@ -318,10 +325,12 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         cloud.add_dir('leaf', 'stage')
         manager = self.execute({'stage': ([], self.stats(
             total=1, skipped=1, duplicate_recycled=1, duplicate_cleanup_parent_ids=['leaf', 'leaf'],
-        ))}, [request], cloud=cloud, clean_empty=False)
+        ))}, [request], cloud=cloud, clean_empty=False, link_strm=True)
         row = download_requests_repo.get_download_request(request)
         assert row is not None
         self.assertEqual((row['organize_status'], row['gy_staging_cleanup_status']), ('completed', 'completed'))
+        self.assertEqual((row['strm_status'], row['strm_error']), ('skipped', '无变更'))
+        self.assertTrue(row['strm_finished_at'])
         self.assertEqual(cloud.deleted, ['leaf', 'stage'])
         task = manager.task_status()
         self.assertEqual(task['stats']['duplicate_recycled'], 1)
@@ -346,25 +355,49 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
 
     def test_empty_source_without_recognition_failure_keeps_completion(self):
         request, _, _ = self.seed()
-        self.execute({"incoming": ([], self.stats())}, [request])
-        get_download_request_result_2 = download_requests_repo.get_download_request(request)
-        assert get_download_request_result_2 is not None
-        self.assertEqual(
-            get_download_request_result_2["organize_status"], "completed"
-        )
+        self.execute({"incoming": ([], self.stats())}, [request], link_strm=True)
+        row = assert_present(download_requests_repo.get_download_request(request))
+        self.assertEqual(row["organize_status"], "completed")
+        self.assertEqual((row["strm_status"], row["strm_error"]), ("skipped", "无变更"))
+        self.assertTrue(row["strm_finished_at"])
 
-    def test_pending_confirmation_keeps_manual_state(self):
+    def test_pending_confirmation_skips_this_round_until_linked_strm_enqueue(self):
         request, admission, _ = self.seed()
         plans = self.plans(match=MatchResult(error="待用户确认", need_confirm=True))
         self.execute(
-            {"incoming": (plans, self.stats(total=1, need_confirm=1))}, [request]
+            {"incoming": (plans, self.stats(total=1, need_confirm=1))}, [request], link_strm=True,
         )
-        get_download_request_result_3 = download_requests_repo.get_download_request(request)
-        assert get_download_request_result_3 is not None
-        self.assertEqual(
-            get_download_request_result_3["organize_status"], "requires_manual"
-        )
+        row = assert_present(download_requests_repo.get_download_request(request))
+        self.assertEqual(row["organize_status"], "requires_manual")
+        self.assertIsNone(row["organize_finished_at"])
+        self.assertEqual((row["strm_status"], row["strm_error"]), ("skipped", "无变更"))
+        self.assertTrue(row["strm_finished_at"])
         self.assertEqual(self.admission_status(admission), "processing")
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 0)
+
+        changes = [{
+            "source_id": "archive", "kind": "video", "action": "upsert",
+            "file_id": plans[0].file_id, "parent_id": "archive-season",
+            "rel_dir": "Test series/Season 1", "name": plans[0].original_name,
+        }]
+        self.assertEqual(strm_repo.enqueue_strm_change_targets(changes), 1)
+        unlinked = assert_present(download_requests_repo.get_download_request(request))
+        self.assertEqual(
+            (unlinked["strm_status"], unlinked["strm_generation"]), ("skipped", row["strm_generation"]),
+        )
+
+        count, owners = strm_repo.enqueue_strm_change_targets(
+            changes, download_request_ids=[request], with_owners=True,
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(owners, [{
+            "request_id": request, "organize_task_id": row["organize_task_id"],
+            "generation": int(row["strm_generation"]) + 1,
+        }])
+        queued = assert_present(download_requests_repo.get_download_request(request))
+        self.assertEqual((queued["strm_status"], queued["strm_error"]), ("queued", ""))
+        self.assertEqual(queued["strm_generation"], owners[0]["generation"])
+        self.assertIsNone(queued["strm_finished_at"])
 
     def test_pending_probe_is_not_misclassified_as_terminal_failure(self):
         request, _, _ = self.seed()

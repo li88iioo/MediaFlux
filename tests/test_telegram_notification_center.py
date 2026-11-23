@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import unittest
 from contextlib import contextmanager
@@ -1461,6 +1462,85 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertIn(("下载", "qB 完成"), event.fields)
         self.assertIn(("本地整理", "已跳过"), event.fields)
         self.assertEqual(event.footer, reason)
+
+    def test_download_skipped_strm_projects_persisted_reason_and_only_no_change_renames_title(self) -> None:
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        request_id, _ = download_requests_repo.create_download_request(
+            "tg-strm-skipped-reason", "magnet", title="测试剧", chat_id="100",
+        )
+        cases = (
+            ("skipped", "无变更", "completed", "✅ 下载与整理完成", "已跳过（无变更）"),
+            ("skipped", "整理未产生需要同步的媒体变更", "completed", "✅ 下载与整理完成", "已跳过（无变更）"),
+            ("skipped", "未启用", "completed", "✅ 下载与入库完成", "已跳过（未启用）"),
+            ("skipped", "", "completed", "✅ 下载与入库完成", "已跳过"),
+            ("completed", "无变更", "completed", "✅ 下载与入库完成", "完成"),
+            ("skipped", "无变更", "failed", "⚠️ 下载入库部分完成", "已跳过（无变更）"),
+        )
+        for strm_status, reason, organize_status, title, label in cases:
+            with self.subTest(strm_status=strm_status, reason=reason, organize_status=organize_status):
+                download_requests_repo.update_download_request(
+                    request_id, status="completed", gy_status="completed",
+                    organize_status=organize_status, strm_status=strm_status, strm_error=reason,
+                    organize_error="整理失败" if organize_status == "failed" else "",
+                )
+                event = build_download_lifecycle_event(
+                    download_requests_repo.get_download_request(request_id), probe_progress={},
+                )
+                self.assertEqual(event.title, title)
+                self.assertEqual(dict(event.fields)["STRM"], label)
+                self.assertEqual(dict(event.fields)["下载"], "光鸭 完成")
+                if organize_status == "failed":
+                    self.assertEqual(event.footer, "整理失败")
+
+    def test_download_no_change_uses_current_organize_source_facts(self) -> None:
+        from app.modules.organize_results import build_organize_result
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        request_id, _ = download_requests_repo.create_download_request(
+            "tg-strm-skipped-source-facts", "magnet", title="测试剧", chat_id="100",
+        )
+        task_id = "organize-download-sources"
+        run_id = db.add_task_run("guangya_organize", "download")
+        result = build_organize_result(
+            {"duplicate_recycled": 3, "moved": 2}, status="completed", task_id=task_id,
+            source_results=[
+                {"id": "recycled", "stats": {"moved": 0, "duplicate_recycled": 2}},
+                {"id": "empty", "stats": {"moved": 0}},
+                {"id": "moved", "stats": {"moved": 1}},
+                {"id": "mixed", "stats": {"moved": 1, "duplicate_recycled": 1}},
+            ],
+        )
+        db.finish_task_run(run_id, "success", result=json.dumps(result))
+        run = db.get_task_run(run_id)
+        assert run is not None
+        finished_at = run["finished_at"]
+        reorganized_at = (datetime.fromisoformat(finished_at) + timedelta(seconds=1)).isoformat(sep=" ")
+        organized_title = "✅ 下载与整理完成"
+        imported_title = "✅ 下载与入库完成"
+        cases = (
+            ("recycled", task_id, finished_at, organized_title, "完成（本轮该来源回收 2 项同版本媒体，保留已有版本）"),
+            ("empty", task_id, finished_at, organized_title, "完成"),
+            ("unrelated", task_id, finished_at, organized_title, "完成"),
+            ("recycled", task_id, reorganized_at, organized_title, "完成"),
+            ("recycled", "other-task", finished_at, organized_title, "完成"),
+            ("moved", task_id, finished_at, imported_title, "完成"),
+            ("mixed", task_id, finished_at, imported_title, "完成（本轮该来源回收 1 项同版本媒体，保留已有版本）"),
+        )
+        for source, organizer_task, request_finished_at, title, archive in cases:
+            with self.subTest(source=source, task=organizer_task, finished_at=request_finished_at):
+                download_requests_repo.update_download_request(
+                    request_id, status="completed", gy_status="completed", gy_target_dir=source,
+                    organize_started=1, organize_status="completed", organize_task_id=organizer_task,
+                    organize_run_id=run_id, organize_finished_at=request_finished_at,
+                    strm_status="skipped", strm_error="无变更",
+                )
+                event = build_download_lifecycle_event(
+                    download_requests_repo.get_download_request(request_id), probe_progress={},
+                )
+                self.assertEqual(event.title, title)
+                self.assertIn(("光鸭整理", archive), event.fields)
+                self.assertIn(("STRM", "已跳过（无变更）"), event.fields)
 
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")

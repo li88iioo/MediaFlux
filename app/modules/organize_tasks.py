@@ -2137,6 +2137,9 @@ class OrganizeTaskManager:
             )
             if delivery_route:
                 structured_result["delivery_route"] = dict(delivery_route)
+            strm_result = aggregate.get("strm")
+            if not isinstance(strm_result, dict):
+                strm_result = {}
             request_updates = {}
             for request_id in download_request_ids or []:
                 fields: dict[str, Any] = {
@@ -2175,17 +2178,15 @@ class OrganizeTaskManager:
                             "请核对整理日志后人工处理"
                         ),
                     })
-                strm_result = aggregate.get("strm") or {}
-                # started/queued 状态由 scheduler 在启动线程或入队之前写入；
-                # 这里不得再覆盖可能已经完成的 STRM 终态。
-                if not (isinstance(strm_result, dict) and strm_result.get("ok")):
+                # 显式跳过由整理结算，已接管的请求由 STRM 调度器回写。
+                if not strm_result.get("ok") or strm_result.get("skipped"):
                     if stopped:
                         strm_status = "skipped"
                         strm_error = "整理任务已停止，未执行后续 STRM 同步"
-                    elif isinstance(strm_result, dict) and strm_result.get("skipped"):
+                    elif strm_result.get("skipped"):
                         strm_status = "skipped"
-                        strm_error = str(strm_result.get("error") or "")
-                    elif isinstance(strm_result, dict) and strm_result:
+                        strm_error = str(strm_result.get("error") or strm_result.get("reason") or "")
+                    elif strm_result:
                         strm_status = "failed"
                         strm_error = str(strm_result.get("error") or "STRM 联动失败")
                     else:

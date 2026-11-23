@@ -67,6 +67,10 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
         self.worker_started.set()
         return [], {"total": 1, "moved": 1, "failed": 0}
 
+    @staticmethod
+    def _skipped_strm_receipt(stats, *_args, **_kwargs):
+        stats["strm"] = {"ok": True, "skipped": True, "reason": "未启用"}
+
     def _request(self, name):
         request_id, _ = download_requests_repo.create_download_request(name, "magnet")
         download_requests_repo.update_download_request(request_id, status="completed", gy_status="completed",
@@ -123,12 +127,20 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
                 f"WHEN NEW.id={first} AND NEW.organize_status='completed' "
                 "BEGIN SELECT RAISE(FAIL, 'settlement sentinel'); END"
             )
-        accepted = self._start([first, second])
-        self._join()
+        with patch(
+            "app.modules.organize_tasks.Organizer.trigger_post_actions",
+            side_effect=self._skipped_strm_receipt,
+        ):
+            accepted = self._start([first, second])
+            self._join()
         run = self._run_row(accepted["run_id"])
         self.assertEqual(run["status"], "partial")
         self.assertEqual(self._request_row(first)["organize_status"], "running")
-        self.assertEqual(self._request_row(second)["organize_status"], "completed")
+        self.assertEqual(self._request_row(first)["strm_status"], "pending")
+        second_row = self._request_row(second)
+        self.assertEqual(second_row["organize_status"], "completed")
+        self.assertEqual((second_row["strm_status"], second_row["strm_error"]), ("skipped", "未启用"))
+        self.assertTrue(second_row["strm_finished_at"])
         self.assertEqual(self.manager.task_status()["status"], "partial")
         self.assertEqual(json.loads(run["result"])["counters"]["moved"], 1)
         with db.get_conn() as conn:
@@ -136,7 +148,10 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
         db.init_db()
         self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
         for request in (first, second):
-            self.assertEqual(self._request_row(request)["organize_status"], "completed")
+            row = self._request_row(request)
+            self.assertEqual(row["organize_status"], "completed")
+            self.assertEqual((row["strm_status"], row["strm_error"]), ("skipped", "未启用"))
+            self.assertTrue(row["strm_finished_at"])
         self.organizer.organize.assert_called_once()
 
     def test_late_settlement_updates_history_without_replacing_new_task(self):
@@ -420,6 +435,12 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
                 if not changed:
                     self.assertIsNone(row["organize_finished_at"])
                     self.assertIn("1 项媒体等待人工确认", row["organize_error"])
+                    self.assertEqual((row["strm_status"], row["strm_error"]),
+                                     ("skipped", "整理未产生需要同步的媒体变更"))
+                    self.assertTrue(row["strm_finished_at"])
+                else:
+                    self.assertEqual(row["strm_status"], "pending")
+                    self.assertIsNone(row["strm_finished_at"])
 
     def _request_with_qb_successor(self, name):
         request = self._request(name)
@@ -438,6 +459,9 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
         self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
         row = self._request_row(request)
         self.assertEqual(row["organize_status"], "completed")
+        self.assertEqual((row["strm_status"], row["strm_error"]),
+                         ("skipped", "未启用或未配置整理联动 STRM"))
+        self.assertTrue(row["strm_finished_at"])
         self.assertEqual((row["status"], row["qb_status"], row["gy_status"]),
                          ("resubmitted", "resubmitted", "completed"))
         self.assertNotIn("request_settlement", json.loads(self._run_row(accepted["run_id"])["result"]))
@@ -455,9 +479,16 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
                 f"WHEN NEW.id={request} AND NEW.organize_status='completed' "
                 "BEGIN SELECT RAISE(FAIL,'request settlement fault'); END"
             )
-        accepted = self._start([request])
-        self._join()
-        self.assertEqual(self._run_row(accepted["run_id"])["status"], "partial")
+        with patch(
+            "app.modules.organize_tasks.Organizer.trigger_post_actions",
+            side_effect=self._skipped_strm_receipt,
+        ):
+            accepted = self._start([request])
+            self._join()
+        run = self._run_row(accepted["run_id"])
+        self.assertEqual(run["status"], "partial")
+        fields = json.loads(run["result"])["request_settlement"]["requests"][str(request)]
+        self.assertEqual((fields["strm_status"], fields["strm_error"]), ("skipped", "未启用"))
         with db.get_conn() as conn:
             conn.execute("DROP TRIGGER reject_qb_only_settlement")
             conn.execute(

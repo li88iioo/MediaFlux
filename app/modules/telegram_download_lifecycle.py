@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from app import config
+from app.database import get_task_run
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app.repositories import agent_download_verification as agent_download_verification_repo
@@ -21,6 +22,7 @@ from app.modules.local_media_outcomes import (
     local_media_refresh_status,
     local_media_task_outcome,
 )
+from app.modules.organize_results import read_organize_result
 from app.modules.telegram_media_projection import (
     attach_bounded_media_details,
     build_media_detail_blocks,
@@ -39,6 +41,7 @@ from app.notifier import NotificationEvent, notification_target_chat_id, safe_in
 from app.repositories.download_requests import download_postprocess_issues
 from app.repositories.download_requests import (
     download_display_title,
+    safe_download_text,
     usable_download_title,
 )
 
@@ -129,6 +132,36 @@ def _archive_stage(row, task, downloads: set[str]) -> tuple[str, str, str]:
         return "自动整理", "", "未启动（需核对下载状态）" if "manual_review" in downloads else "未启动（下载已停止）"
     detail = "尚无入库完成记录" if _status(_value(row, "status")) in {"completed", "success"} else "等待下载完成"
     return "自动整理", "", detail
+
+
+def _current_organize_source_stats(row) -> dict[str, Any]:
+    task_id = _value(row, "organize_task_id")
+    run_id = _value(row, "organize_run_id")
+    source_id = _value(row, "gy_target_dir")
+    finished_at = _value(row, "organize_finished_at")
+    if (
+        not task_id or not finished_at or source_id in (None, "", "0")
+        or type(run_id) is not int or run_id <= 0
+    ):
+        return {}
+    run = get_task_run(run_id)
+    if run is None or run["task_name"] != "guangya_organize" or run["status"] not in {"success", "partial"}:
+        return {}
+    # 人工重新整理可能更新请求完成时间，同时保留旧的运行关联。
+    if not run["started_at"] <= finished_at <= (run["finished_at"] or ""):
+        return {}
+    try:
+        result = read_organize_result(json.loads(run["result"] or "{}"))
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    sources = result.get("sources")
+    if result.get("task_id") != task_id or not isinstance(sources, list):
+        return {}
+    matches = [
+        source.get("stats") for source in sources
+        if isinstance(source, dict) and source.get("id") == source_id
+    ]
+    return matches[0] if len(matches) == 1 and isinstance(matches[0], dict) else {}
 
 
 def _overall_state(row, *, archive_status: str, verification_status: str = "", local_issue: bool = False) -> str:
@@ -249,6 +282,12 @@ def build_download_lifecycle_event(
         row, archive_status=archive_status, verification_status=verification_status,
         local_issue=qb_cleanup_pending or refresh_status == "failed",
     )
+    strm_status = _status(_value(row, "strm_status"))
+    strm_skip_reason = ""
+    if strm_status == "skipped":
+        strm_skip_reason = safe_download_text(_value(row, "strm_error"), limit=80, fallback="")
+        if strm_skip_reason == "整理未产生需要同步的媒体变更":
+            strm_skip_reason = "无变更"
     title = {
         "attention": "⚠️ 下载入库需要处理",
         "error": "❌ 下载失败" if downloads_failed else "⚠️ 下载入库部分完成",
@@ -260,6 +299,19 @@ def build_download_lifecycle_event(
     if task is not None and state == "completed":
         # 本地文件归档完成不代表异步媒体库已经可见，不能把刷新入队当作入库验证。
         title = "✅ 下载与归档完成"
+    elif (
+        state == "completed"
+        and archive_name == "光鸭整理"
+        and archive_status in {"completed", "success"}
+        and strm_skip_reason == "无变更"
+    ):
+        source_stats = _current_organize_source_stats(row)
+        moved = source_stats.get("moved")
+        if type(moved) is not int or moved <= 0:
+            title = "✅ 下载与整理完成"
+        recycled = source_stats.get("duplicate_recycled")
+        if type(recycled) is int and recycled > 0:
+            archive_value += f"（本轮该来源回收 {recycled} 项同版本媒体，保留已有版本）"
     media_title = notification_payload.get("title")
     if not usable_download_title(media_title):
         media_title = download_display_title(row)
@@ -270,9 +322,11 @@ def build_download_lifecycle_event(
     ]
     if qb_cleanup_pending:
         fields.append(("qB 收尾", QB_CLEANUP_WARNING))
-    strm_status = _status(_value(row, "strm_status"))
     if strm_status:
-        fields.append(("STRM", _label(strm_status)))
+        strm_label = _label(strm_status)
+        if strm_skip_reason:
+            strm_label += f"（{strm_skip_reason}）"
+        fields.append(("STRM", strm_label))
     previous_refresh = _previous_field(previous, "媒体库")
     local_refresh = LOCAL_REFRESH_LABELS.get(refresh_status, "")
     if refresh_status == "skipped" and strm_status and previous_refresh not in LOCAL_REFRESH_LABELS.values():
