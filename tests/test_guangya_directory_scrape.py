@@ -30,6 +30,7 @@ from tests.support import (
     _ParsingScraper, _DirectoryScrapeTMDB,
     InitializedWebTestCase,
     IsolatedDatabaseTestCase,
+    assert_present,
     isolated_test_database,
 )
 
@@ -4495,6 +4496,143 @@ class DirectoryScrapeApiTests(InitializedWebTestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["directory"]["name"], "钢铁侠")
+
+    def test_manual_release_directory_archives_all_eight_episodes_after_skip(self):
+        from app.modules import directory_scrape, organize_tasks
+        from app.modules.organize_confirmations import skip_confirmation
+        from app.repositories import organize_confirmations
+
+        self.enterContext(isolated_test_database())
+        headers = self._login()
+        directory = (
+            "【高清剧集网发布 www.DDHDTV.com】有人刚好提起我吗？"
+            "[杜比视界版本][全8集][简繁英字幕].2160p.NF.WEB-DL.DDP.5.1.DV.H.265-BlackTV"
+        )
+        title = "有人刚好提起我吗？"
+        episodes = []
+        subtitles = (
+            "Becomes.a.Nobody", "Receives.Some.Lines", "Rents.a.Room", "Uses.a.Stage.Name",
+            "Goes.to.Kyoto", "Blows.His.Fuse.and.Goes.Viral", "Goes.Back.to.Square.One", "is.Reborn",
+        )
+        for episode, subtitle in enumerate(subtitles, 1):
+            name = (
+                f"Did.Someone.Happen.to.Mention.Me.S01E{episode:02}.Act.{episode}.A.Renowned.Actor.{subtitle}"
+                ".2160p.NF.WEB-DL.DDP.5.1.DV.H.265-BlackTV.mkv"
+            )
+            episodes.append(_file(f"episode-{episode}", name, "source"))
+        old_logs = [
+            db.add_organize_log(
+                "guangya", f"/{directory}/{video.name}", "", video.file_id, "manual",
+                source_dir_id="source", original_parent_id=video.parent_id, original_name=video.name,
+                current_parent_id=video.parent_id, current_name=video.name,
+            )
+            for video in episodes
+        ]
+        for video in episodes:
+            organize_confirmations.create_organize_confirmation(
+                token=video.file_id, fingerprint=video.file_id, chat_id="", source_name=directory,
+                directory_path=f"/{directory}", expires_at="2099-01-01 00:00:00",
+                payload={
+                    "source_dir_id": "source", "allow_skip_terminal": True, "_notification_suppressed": True,
+                    "files": [{"file_id": video.file_id, "name": video.name, "parent_id": video.parent_id,
+                               "size": video.size, "etag": video.etag}],
+                },
+            )
+            self.assertTrue(skip_confirmation(video.file_id, chat_id="")["skipped"])
+        cloud = _MutableTreeClient(
+            {"source": episodes, "archive": []},
+            {"source": _dir("source", directory), "archive": _dir("archive", "媒体库"),
+             **{video.file_id: video for video in episodes}},
+        )
+        detail = {
+            "id": 300527, "name": title, "original_name": "Did Someone Happen to Mention Me",
+            "first_air_date": "2026-01-01", "seasons": [{"season_number": 1, "episode_count": 8}],
+        }
+        tmdb = Mock(spec=TMDBClient, api_key="test", config_error="")
+        tmdb.search.return_value = [detail]
+        tmdb.get.return_value = detail
+        scraper = TMDBScraper(tmdb)
+        self.addCleanup(scraper.close)
+        service = directory_scrape.DirectoryScrapeService(
+            client=cast(GuangYaClient, cloud), scraper=scraper,
+            store=directory_scrape.DirectoryScrapeStore(),
+            rules_loader=lambda: OrganizeRules(
+                target_dir_id="archive", clean_empty=False, media_info_enabled=False,
+                media_probe_enabled=False, link_strm=False, notify_enabled=False, emby_refresh=False,
+            ),
+        )
+        self.addCleanup(service.close)
+        self.enterContext(patch(
+            "app.routes.guangya_scrape_api.get_directory_scrape_service", return_value=service,
+        ))
+        endpoint = "/api/guangya/directory-scrape"
+        response = self.client.post(f"{endpoint}/inspect", headers=headers, json={"directory_id": "source"})
+        self.assertEqual(response.status_code, 200, response.text)
+        inspected = response.json()
+        self.assertEqual(
+            (inspected["suggested_query"], inspected["media_type"], inspected["season"]), (title, "tv", 1),
+        )
+        positions = [(1, episode) for episode in range(1, 9)]
+        self.assertEqual(sorted((item["season"], item["episode"]) for item in inspected["videos"]), positions)
+        self.assertEqual(inspected["pending_videos"], [])
+
+        selection = {"inspection_id": inspected["inspection_id"], "media_type": "tv"}
+        response = self.client.post(
+            f"{endpoint}/search", headers=headers, json={**selection, "query": inspected["suggested_query"]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        [candidate] = response.json()["candidates"]
+        tmdb.search.assert_called_once_with(title, "", "tv")
+        self.assertEqual(candidate["tmdb_id"], "300527")
+        response = self.client.post(
+            f"{endpoint}/preview", headers=headers, json={**selection, "tmdb_id": candidate["tmdb_id"]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        preview = response.json()
+        self.assertFalse(preview["cloud_write"])
+        self.assertEqual(preview["match"]["tmdb_id"], "300527")
+        self.assertEqual(sorted((plan["season"], plan["episode"]) for plan in preview["plans"]), positions)
+        self.assertEqual(cloud.list_dir("source"), episodes)
+        self.assertEqual(cloud.list_dir("archive"), [])
+
+        other_series = [_file(f"other-{i}", f"Severance.S01E{i:02}.2160p.mkv", "source") for i in (1, 2)]
+        with patch.dict(cloud.tree, source=episodes + other_series), patch.dict(
+            cloud.infos, {video.file_id: video for video in other_series},
+        ):
+            mixed = self.client.post(f"{endpoint}/inspect", headers=headers, json={"directory_id": "source"})
+            single = self.client.post(f"{endpoint}/inspect", headers=headers, json={"file_id": episodes[0].file_id})
+        self.assertEqual(mixed.status_code, 400, mixed.text)
+        self.assertEqual(mixed.json()["error"], "目录包含多个不同媒体，请选择单个视频或进入对应的子目录刮削")
+        self.assertEqual(single.status_code, 200, single.text)
+        self.assertEqual([item["file_id"] for item in single.json()["videos"]], [episodes[0].file_id])
+
+        manager = Mock()
+        manager.task_result.return_value = None
+        manager.start_durable_operation.return_value = {"ok": True, "task_id": preview["preview_id"]}
+        with patch.object(organize_tasks, "get_organize_manager", return_value=manager):
+            accepted = self.client.post(
+                f"{endpoint}/run", headers=headers, json={"mode": "manual", "preview_id": preview["preview_id"]},
+            )
+        self.assertEqual(accepted.status_code, 202, accepted.text)
+        with patch.object(directory_scrape, "get_directory_scrape_service", return_value=service):
+            result = directory_scrape.execute_durable_directory_scrape_job(
+                manager.start_durable_operation.call_args.kwargs["payload"],
+            )
+        self.assertEqual((result["stats"]["moved"], result["stats"]["failed"]), (8, 0))
+        self.assertEqual(len(result["log_ids"]), 8)
+        self.assertEqual(cloud.list_dir("source"), [])
+        for plan in preview["plans"]:
+            archived = cloud.infos[plan["file_id"]]
+            self.assertEqual(archived.name, plan["new_name"])
+            self.assertIn(f"S01E{plan['episode']:02}", archived.name)
+            season = cloud.infos[archived.parent_id]
+            self.assertEqual(season.name, "Season 1")
+            self.assertTrue(cloud.infos[season.parent_id].name.endswith(" {tmdb-300527}"))
+        for video in episodes:
+            old_confirmation = assert_present(organize_confirmations.get_organize_confirmation(video.file_id))
+            self.assertEqual(old_confirmation["status"], "cancelled")
+            self.assertEqual(json.loads(old_confirmation["result_json"])["resolution"], "skipped")
+        self.assertEqual([assert_present(db.get_organize_log(log_id))["status"] for log_id in old_logs], ["skipped"] * 8)
 
     def test_inspect_file_routes_to_file_scope(self):
         headers = self._login()

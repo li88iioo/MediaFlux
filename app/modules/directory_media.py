@@ -26,6 +26,8 @@ from app.modules.special_media import (
 )
 from app.modules.subtitle_identity import plan_subtitle_companions
 
+_MIXED_MEDIA_MESSAGE = "目录包含多个不同媒体，请选择单个视频或进入对应的子目录刮削"
+
 
 @dataclass(frozen=True)
 class MediaSnapshot:
@@ -799,7 +801,7 @@ class DirectoryMediaInspector:
                 and (same_title_unpositioned or isolated_outlier)
             )
             if not can_defer:
-                raise DirectoryScrapeRequestError("目录包含多个不同媒体，请进入子目录分别刮削")
+                raise DirectoryScrapeRequestError(_MIXED_MEDIA_MESSAGE)
             primary = primary_group
             weak.extend(secondary)
             pending_reasons.update({
@@ -842,22 +844,22 @@ class DirectoryMediaInspector:
         tmdb_ids = {item.tmdb_id for item in primary if item.tmdb_id}
         years = {item.year for item in primary if item.year}
         if len(tmdb_ids) > 1 or len(years) > 1:
-            raise DirectoryScrapeRequestError("目录包含多个不同媒体，请进入子目录分别刮削")
+            raise DirectoryScrapeRequestError(_MIXED_MEDIA_MESSAGE)
 
         primary_title = primary[0].title
         for item in special:
             special_title = cls._special_identity_title(item.title)
             if item.tmdb_id and tmdb_ids and item.tmdb_id not in tmdb_ids:
-                raise DirectoryScrapeRequestError("目录包含多个不同媒体，请进入子目录分别刮削")
+                raise DirectoryScrapeRequestError(_MIXED_MEDIA_MESSAGE)
             if item.year and years and item.year not in years:
-                raise DirectoryScrapeRequestError("目录包含多个不同媒体，请进入子目录分别刮削")
+                raise DirectoryScrapeRequestError(_MIXED_MEDIA_MESSAGE)
             if (
                 not item.special_container
                 and special_title
                 and not cls._weak_identity_title(special_title)
                 and not cls._same_title_identity(special_title, primary_title, "tv")
             ):
-                raise DirectoryScrapeRequestError("目录包含多个不同媒体，请进入子目录分别刮削")
+                raise DirectoryScrapeRequestError(_MIXED_MEDIA_MESSAGE)
 
         if not weak:
             return [item.file for item in primary] + special_files, []
@@ -870,7 +872,7 @@ class DirectoryMediaInspector:
             or primary_count / total_regular < 0.8
             or len(weak) > allowed_pending
         ):
-            raise DirectoryScrapeRequestError("目录包含多个不同媒体，请进入子目录分别刮削")
+            raise DirectoryScrapeRequestError(_MIXED_MEDIA_MESSAGE)
 
         pending = [
             PendingMedia(

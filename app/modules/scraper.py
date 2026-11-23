@@ -398,15 +398,13 @@ class RecognitionResult(MatchResult):
 
 
 _RELEASE_PREFIX = re.compile(r"^\s*(\[[^\]]{1,96}\]|【[^】]{1,96}】)\s*")
+_RELEASE_HOST = r"(?:[A-Za-z0-9-]+\.)+(?:site|tv|com|net|org|cc|me|cn)"
 _SITE_PREFIX = re.compile(
-    # 必须是由点分隔的完整主机名，且最后一个 label 才是受支持 TLD。
-    # 旧表达式会把 ``LIAR.GAME.`` 回溯解释为以 ``me`` 结尾的网站前缀，
-    # 从而把真实标题整体删除。这里仍兼容 ``www.Site.com@Title`` 与
-    # ``foo.me_Title``，但不再在普通单词内部匹配伪 TLD。
-    r"^\s*@?((?:[A-Za-z0-9-]+\.)+(?:site|tv|com|net|org|cc|me|cn))"
-    r"(?:@|[._ -]+)",
+    rf"^\s*@?({_RELEASE_HOST})"
+    r"(?![. -]+(?:19|20)\d{2}[. _-]*$)[@._ -]+(?=[^@.\s_-])",
     re.IGNORECASE,
 )
+_SITE_ONLY = re.compile(rf"(?=www\.|@|[^\s@]+@)@?({_RELEASE_HOST})[@. _-]*", re.IGNORECASE)
 _CHECKSUM_SUFFIX = re.compile(
     r"(?:[\[【](?P<bracket>[A-Fa-f0-9]{8,40})[\]】]|"
     r"\((?P<parenthesized>[A-Fa-f0-9]{8,40})\))\s*$"
@@ -675,7 +673,7 @@ _BRACKET_DUB_AUDIO_NOISE = re.compile(
 # 年龄限制版只在完整括号发布标记中清理，不能删除裸片名中的年龄词或描述性副标题。
 _BRACKET_RELEASE_EDITION_NOISE = re.compile(
     r"(?i)^(?:\d{2,3}\s*(?:fps|帧率|幀率)(?:版本|版)?|"
-    r"高(?:码|碼)(?:率)?(?:版本|版)|年[齡龄]限制版)$"
+    r"高(?:码|碼)(?:率)?(?:版本|版)|杜比[视視]界(?:版本|版)|年[齡龄]限制版)$"
 )
 _BRACKET_STREAMING_PLATFORM_NOISE = re.compile(
     r"(?i)^(?:wetv|tving|iqiyi|youku|viki|viu|crunchyroll|"
@@ -1965,7 +1963,10 @@ def _clean_release_stem(value: str) -> tuple[str, dict[str, list[str]]]:
             break
         cleaned["release_prefixes"].append(token)
         stem = remainder
-    site = _SITE_PREFIX.match(stem)
+    # 季集号前还要留有片名，不能把 Mention.Me 当作站点清掉。
+    episode_marker = _STRUCTURED_EPISODE_POSITION.search(stem)
+    before_episode = stem[:episode_marker.start()] if episode_marker else stem
+    site = _SITE_PREFIX.match(before_episode)
     if site:
         cleaned["release_prefixes"].append(site.group(1))
         stem = stem[site.end():]
@@ -2186,6 +2187,13 @@ def _parse_release_surface(
 ) -> dict[str, Any]:
     """解析一个文件名 surface；领域差异只通过输入策略表达。"""
     source = (stem or "")
+    # 有些发布只有站点和季集号。先去掉明确的 www. / @ 站点，
+    # 让文字清洗与 GuessIt 都从季集号开始，缺少片名时可沿用父目录。
+    position = _STRUCTURED_EPISODE_POSITION.search(source)
+    prefix = source[:position.start()] if position else ""
+    site_only = _SITE_ONLY.fullmatch(prefix) if prefix and not _SITE_PREFIX.match(prefix) else None
+    if site_only:
+        source = source[site_only.end():]
     identity_stem = _strip_trailing_checksum(source) if context_mode else source
     guessed = _guessit_info(identity_stem)
     guessed_title_raw = str(guessed.get("title") or "").strip()
@@ -2256,6 +2264,8 @@ def _parse_release_surface(
         )
     )
     filename_title, cleaned = _clean_release_stem(title_source)
+    if site_only:
+        cleaned["release_prefixes"].insert(0, site_only.group(1))
     if episode_title_prefix is not None:
         filename_title, _ = _clean_release_stem(episode_title_prefix)
         # 标题候选只能来自已确认集号之前；不能被后面的单集名重新覆盖。
@@ -2414,7 +2424,13 @@ def _parse_release_core(
             and not surface["untrusted_guessed_episode"]
         )
     ) else (folder_type or "movie")
-    original_source = _strip_known_episode_suffix(filename_stem, episode, season)
+    # 有作品名的 SxxExx 发布只从集号之前提取剧名别名，避免分集标题回流进搜索。
+    identity_stem = surface["stem"]
+    position = _STRUCTURED_EPISODE_POSITION.search(identity_stem) if release_title_candidates else None
+    original_source = _strip_known_episode_suffix(
+        identity_stem[:position.start()] if position and position.start() else identity_stem,
+        episode, season,
+    )
     if surface["fractional_position"] is not None:
         original_source = strip_special_media_markers(original_source)
     original_title, _ = _clean_release_stem(original_source)

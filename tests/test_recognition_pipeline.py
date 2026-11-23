@@ -672,17 +672,44 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         self.assertEqual((context.season, context.episode), (1, 16))
         self.assertNotIn("LIAR.GAME", context.cleaned_components["release_prefixes"])
 
-    def test_real_me_hostname_prefix_is_still_removed(self):
+    def test_real_hostname_prefix_preserves_the_following_series_title(self):
         scraper = self.recognition_module()
+        for host, separator in (("foo.me", "@"), ("ReleaseSite.net", "."), ("www.example.tv.com", "_"),
+                                ("www.release.tv", ".")):
+            with self.subTest(host=host):
+                context = scraper.extract_recognition_context(
+                    f"{host}{separator}Mention.Me.S01E01.1080p.WEB-DL.mkv",
+                )
+                self.assertEqual(context.normalized_title, "Mention Me")
+                self.assertEqual((context.season, context.episode), (1, 1))
+                self.assertIn(host, context.cleaned_components["release_prefixes"])
 
-        context = scraper.extract_recognition_context(
-            "foo.me@Example.Show.S01E01.1080p.WEB-DL.mkv",
-            "",
-        )
+    def test_site_and_episode_without_a_series_name_uses_the_parent_title(self):
+        scraper = self.recognition_module()
+        for host, separator in (("www.release.tv", "."), ("foo.me", "@")):
+            with self.subTest(host=host):
+                context = scraper.extract_recognition_context(
+                    f"{host}{separator}S02E03.1080p.WEB-DL.mkv", "漫长的季节 (2023)",
+                )
+                self.assertEqual(context.normalized_title, "漫长的季节")
+                self.assertEqual(scraper.generate_query_variants(context), ["漫长的季节"])
+                self.assertEqual((context.season, context.episode), (2, 3))
+                self.assertIn(host, context.cleaned_components["release_prefixes"])
 
-        self.assertEqual(context.normalized_title, "Example Show")
-        self.assertEqual((context.season, context.episode), (1, 1))
-        self.assertIn("foo.me", context.cleaned_components["release_prefixes"])
+    def test_series_title_ending_in_me_is_shared_across_episode_subtitles(self):
+        scraper = self.recognition_module()
+        parent = ("【高清剧集网发布 www.DDHDTV.com】有人刚好提起我吗？[杜比视界版本]"
+                  "[全8集][简繁英字幕].2160p.NF.WEB-DL.DDP.5.1.DV.H.265-BlackTV")
+        for episode, subtitle, year in ((1, "Becomes.a.Nobody", ""), (8, "is.Reborn", ""), (8, "is.Reborn", "2026.")):
+            name = (f"Did.Someone.Happen.to.Mention.Me.{year}S01E{episode:02}.Act.{episode}."
+                    f"A.Renowned.Actor.{subtitle}.2160p.NF.WEB-DL.DDP.5.1.DV.H.265-BlackTV.mkv")
+            with self.subTest(episode=episode, year=year):
+                context = scraper.extract_recognition_context(name, parent)
+                self.assertEqual((context.season, context.episode), (1, episode))
+                self.assertEqual(context.normalized_title, "Did Someone Happen to Mention Me")
+                self.assertEqual(context.folder_title, "有人刚好提起我吗？")
+                self.assertEqual(scraper.generate_query_variants(context),
+                                 [context.normalized_title, context.folder_title])
 
     def test_cr_source_marker_before_webrip_is_not_part_of_title(self):
         scraper = self.recognition_module()
