@@ -39,6 +39,7 @@ _MEDIA_ITEM_PAGE_SIZE = 5_000
 _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
 _TV_TYPES = frozenset({"season", "series"})
 _LEAF_TYPES = frozenset({"movie", "episode"})
+_NON_LIBRARY_VIEWS = frozenset({"playlists", "boxsets", "folders", "livetv"})
 
 
 def _item_type(item: Mapping[str, Any]) -> str:
@@ -569,6 +570,16 @@ class MediaServerClient:
 
     def _web_url(self, item_id: str) -> str:
         raise NotImplementedError
+
+    def _library_views(self, user_id: str) -> list[dict[str, Any]]:
+        """看板只展示媒体库分区，排除直播等系统导航入口。"""
+        data = self._request(f"/Users/{user_id}/Views")
+        items, _ = self._items_payload(data)
+        return [
+            item
+            for item in items
+            if str(item.get("CollectionType") or "").strip().lower() not in _NON_LIBRARY_VIEWS
+        ]
 
     def _libraries(self) -> list[Library]:
         raise NotImplementedError

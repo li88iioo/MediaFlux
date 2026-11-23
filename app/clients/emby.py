@@ -165,13 +165,9 @@ class EmbyClient(MediaServerClient):
 
     def _libraries(self) -> list[Library]:
         uid = self._user_id()
-        data = self._request(f"/Users/{uid}/Views")
         libs: list[Library] = []
-        raw_items, _total = self._items_payload(data)
-        for item in raw_items:
+        for item in self._library_views(uid):
             collection_type = str(item.get("CollectionType") or "")
-            if collection_type.lower() in {"playlists", "boxsets", "folders"}:
-                continue
             item_id = str(item.get("Id") or "")
             libs.append(
                 Library(

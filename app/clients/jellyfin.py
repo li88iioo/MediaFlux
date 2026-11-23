@@ -211,13 +211,9 @@ class JellyfinClient(MediaServerClient):
 
     def _libraries(self) -> list[Library]:
         user_id = self._user_id()
-        data = self._request(f"/Users/{user_id}/Views")
         libraries: list[Library] = []
-        raw_items, _total = self._items_payload(data)
-        for item in raw_items:
+        for item in self._library_views(user_id):
             collection_type = item.get("CollectionType", "")
-            if collection_type in {"playlists", "boxsets", "folders"}:
-                continue
             item_id = item.get("Id", "")
             libraries.append(
                 Library(

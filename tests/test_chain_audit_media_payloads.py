@@ -92,6 +92,22 @@ class MediaListPayloadContractTests(unittest.TestCase):
                 self.assertEqual([row.id for row in client.recent_media()], ["film"])
                 self.assertEqual([row.id for row in client._libraries()], ["film"])
 
+    def test_libraries_exclude_live_tv_but_keep_an_empty_library_with_the_same_name(self):
+        views = [
+            {"Id": "live", "Name": "电视直播", "CollectionType": "livetv"},
+            {"Id": "recordings", "Name": "电视直播", "CollectionType": "tvshows"},
+        ]
+        for cls in (EmbyClient, JellyfinClient):
+            client = self.client(cls)
+            with (
+                self.subTest(server=cls.__name__),
+                patch.object(client, "_request", return_value={"Items": views}),
+                patch.object(client, "_library_count", return_value=0) as count,
+            ):
+                libraries = client._libraries()
+                self.assertEqual([(row.id, row.count) for row in libraries], [("recordings", 0)])
+                count.assert_called_once_with("viewer", views[1])
+
     def test_history_bad_user_data_does_not_hide_valid_history(self):
         for cls in (EmbyClient, JellyfinClient):
             client = self.client(cls)
