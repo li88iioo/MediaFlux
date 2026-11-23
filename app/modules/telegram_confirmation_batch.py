@@ -10,6 +10,8 @@ from typing import NamedTuple
 
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.agent import feature_gate
+from app.modules.organize import Organizer
+from app.modules.organize_confirmations import WEB_CORRECTION_GUIDE, decode_row
 from app.modules.telegram_notification_center import (
     get_notification_thread_snapshot,
     publish_notification_thread,
@@ -31,6 +33,12 @@ _STATUSES = {
     "completed": "整理完成", "failed": "失败", "cancelled": "已结束", "expired": "已过期",
 }
 _ISSUE_STATES = {"partial", "waiting"}
+_REVIEW_PROGRESS = {"waiting": "待发起", "pending": "已排队", "queued": "已排队", "running": "进行中"}
+_DISCOVERY_OUTCOMES = {
+    "abstained": "本轮未提供可用候选，仍待确认。",
+    "failed": "查找候选失败，仍待确认。",
+    "cancelled": "查找候选已取消，仍待确认。",
+}
 
 
 class _Receipt(NamedTuple):
@@ -154,6 +162,36 @@ def _candidate(item: dict, index: object) -> dict | None:
                  if candidate.get("index") == index), None)
 
 
+def _reviewable(item: dict) -> bool:
+    return bool(item.get("candidates")) or item.get("can_discover_candidates") is True
+
+
+def _can_request_review(item: dict) -> bool:
+    return item.get("status") == "pending" and _reviewable(item)
+
+
+def _review_note(item: dict, limit: int) -> str:
+    if not _reviewable(item):
+        return ""
+    stage = str(item.get("review_status") or "")
+    has_candidates = bool(item.get("candidates"))
+    if item.get("status") == "pending" and stage in _REVIEW_PROGRESS:
+        label = "只读复核" if has_candidates else "查找候选"
+        return f"{label}{_REVIEW_PROGRESS[stage]}"
+    summary = truncate_telegram_text(item.get("review_summary"), limit)
+    if not has_candidates and (not summary or summary in {"no_match", "no_candidate"}):
+        return _DISCOVERY_OUTCOMES.get(stage, "")
+    return summary
+
+
+def _group_scope(item: dict, chat_id: str) -> str:
+    # 审阅列表未返回来源规则，此处只回读本页要展示的组。
+    row = organize_confirmations_repo.get_organize_confirmation(item["confirmation_id"])
+    if row is None or str(row["chat_id"] or "") != chat_id:
+        return ""
+    return Organizer._confirmation_scope_summary(decode_row(row))
+
+
 def _candidate_label(candidate: dict) -> str:
     title = truncate_telegram_text(candidate.get("title") or "未命名候选", 80)
     year = str(candidate.get("year") or "")
@@ -237,6 +275,7 @@ def _batch_event(
     page = max(1, min(page, pages))
     anchor = str(items[0]["confirmation_id"])
     active = bool(counts["pending"] or counts["queued"] or counts["running"] or downstream_counts["waiting"] or truncated)
+    review_enabled = not truncated and feature_gate.recognition_review_enabled()
     status_text = " · ".join(f"{label} {counts[status]}" for status, label in _STATUSES.items() if counts[status])
     metadata: dict = {
         "batch_id": batch_id, "page": page, "detail_token": detail_token,
@@ -251,8 +290,10 @@ def _batch_event(
     if detail_index is not None:
         detail, detail_receipts = items[detail_index], receipts[detail_index]
         status = str(detail.get("status") or "pending")
+        candidates = detail.get("candidates") or []
         fields = (
             ("媒体", str(detail.get("identity") or "待确认媒体")),
+            ("涉及文件", _group_scope(detail, chat_id)),
             ("来源", f"{detail.get('source') or ''}/{detail.get('directory') or ''}"),
             ("状态", _STATUSES.get(status, status)),
             ("有效期", str(detail.get("expires_at") or "")),
@@ -275,9 +316,11 @@ def _batch_event(
                 except ValueError:
                     pass  # 普通候选仍可由原单组链路重新核验。
                 lines.extend(_mapping_notice(item) for item in mapping_items)
-        elif detail.get("review_summary"):
-            lines.append(f"复核结果：{truncate_telegram_text(detail['review_summary'], 240)}")
-        for candidate in detail.get("candidates", []):
+        else:
+            review_note = _review_note(detail, 240)
+            if review_note:
+                lines.append(f"Agent 复核：{review_note}")
+        for candidate in candidates:
             index = candidate["index"]
             label = _candidate_label(candidate)
             lines.append(f"{index + 1}. {label}")
@@ -298,21 +341,31 @@ def _batch_event(
             actions.append(NotificationAction("跳过此组", f"orgc:{detail_token}:skip"))
         actions.append(_button("返回批次摘要", anchor, "p", page))
         title = "整理确认 · 媒体详情"
-        footer = "选择候选后进入原整理队列；跳过时源文件保持原位。"
-        if mapping_items:
+        if status != "pending":
+            footer = "请在 Web 整理日志查看处理明细。"
+        elif not candidates:
+            footer = "暂无候选。"
+            if review_enabled and _can_request_review(detail):
+                footer += "可返回批次摘要，点击「请求 Agent 只读复核」查找候选。"
+            footer += f"{WEB_CORRECTION_GUIDE}\n跳过此组时源文件保持原位。"
+        elif mapping_items:
             footer = "此组涉及季集映射，请到 Web 查看完整映射后确认；TG 仅保留跳过操作。"
+        else:
+            footer = "选择候选后进入原整理队列；跳过时源文件保持原位。"
     else:
         metadata["detail_token"] = ""
         title = (
-            "⚠️ 整理待确认批次" if counts["pending"] else
+            "⚠️ 光鸭整理待确认批次" if counts["pending"] else
             "⚠️ 整理批次部分完成" if downstream_counts["partial"] else
             "⏳ 整理批次处理中" if active else
             "✅ 整理批次已完成" if counts["completed"] else "整理批次已结束"
         )
         # 分母是整批进入过复核的组；已确认或已处理的组算完成，不能移出分母让进度倒退。
-        reviewing = [item for item in items if item.get("review_status")]
-        review_count = sum(item.get("status") == "pending" and item["review_status"] in {"waiting", "pending", "running"}
+        reviewing = [item for item in items if _reviewable(item) and item.get("review_status")]
+        review_count = sum(item.get("status") == "pending" and item["review_status"] in _REVIEW_PROGRESS
                            for item in reviewing)
+        candidate_count = sum(item.get("status") == "pending" and bool(item.get("candidates")) for item in items)
+        reviewable_count = sum(_can_request_review(item) for item in items)
         fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text))
         if pages > 1:
             fields += (("分页", f"{page}/{pages}"),)
@@ -329,6 +382,12 @@ def _batch_event(
                 label = "整理失败"
             elif status == "completed" and item_receipts.organize_issue:
                 label = "整理部分完成"
+            elif status == "pending":
+                scope = _group_scope(item, chat_id)
+                if scope:
+                    label += f" · {scope}"
+                if not item.get("candidates"):
+                    label += " · 暂无候选"
             lines.append(f"{offset}. {identity} · {label}")
             if item_receipts.organize_issue:
                 lines.append(f"整理：{truncate_telegram_text(item_receipts.organize_issue, 140)}")
@@ -338,22 +397,33 @@ def _batch_event(
             if candidate and status == "pending":
                 assert isinstance(suggestion, dict)
                 lines.append(f"建议：{_candidate_label(candidate)}\n{truncate_telegram_text(suggestion.get('summary') or '请查看候选详情', 140)}")
-            elif item.get("review_summary") and status == "pending":
-                lines.append(f"复核：{truncate_telegram_text(item['review_summary'], 140)}")
+            elif status == "pending":
+                review_note = _review_note(item, 140)
+                if review_note:
+                    lines.append(f"复核：{review_note}")
             actions.append(_button(f"查看 {offset} · {identity}", item["confirmation_id"], "d", page))
         if page > 1:
             actions.append(_button("上一页", anchor, "p", page - 1))
         if page < pages:
             actions.append(_button("下一页", anchor, "p", page + 1))
-        footer = ("打开媒体详情可手动选择候选。没有建议的媒体不会自动选择。" if counts["pending"] else
-                  "后续处理仍在进行，可刷新摘要查看状态。" if active else
-                  "请在 Web 整理日志查看处理明细。")
+        if truncated:
+            footer = (
+                "此批次超过 1000 组，仅展示前 1000 组。"
+                "请在 Web 分批处理，入口为「日志记录 → 整理日志 → 批量审阅光鸭待确认」。"
+            )
+        elif counts["pending"]:
+            footer = "有候选的组可打开详情手动选择。" if candidate_count else ""
+        else:
+            footer = "后续处理仍在进行，可刷新摘要查看状态。" if active else "请在 Web 整理日志查看处理明细。"
+        if counts["pending"] > candidate_count:
+            guide = f"暂无候选的组可{WEB_CORRECTION_GUIDE}"
+            footer = f"{footer}\n{guide}" if footer else guide
+        if review_enabled and reviewable_count > candidate_count:
+            footer += "\n「请求 Agent 只读复核」可为符合条件的组查找候选，仍需人工确认。"
         if downstream_counts["submitted"]:
             footer += "\n收到后台刷新回执后，会更新这条消息。"
         preview = None
-        if truncated:
-            footer = "此批次超过 1000 组，仅展示前 1000 组；请在 Web 分批审阅、复核和确认。"
-        else:
+        if not truncated:
             try:
                 # 建议只来自通过确定性复核门的 Agent 结果或人工保存的选择。
                 preview = _suggestion_preview(items, chat_id)
@@ -373,12 +443,12 @@ def _batch_event(
                 f"{'确认已核验的普通建议' if mapped else '确认全部已核验建议'}（{len(preview['entries'])} 组）",
                 anchor, "a", str(preview["digest"])[:16],
             ))
-            footer += ("\n一键确认只包含 Agent 已通过服务器核验或你已保存的选择，可翻页逐组查看；"
-                       "没有建议的组需逐组选择，建议变化时需刷新后再次确认。")
+            footer += ("\n一键确认只包含 Agent 已通过服务器核验或你已保存的选择，可翻页逐组查看。"
+                       "建议变化时请刷新后再确认。")
             if preview.get("note"):
                 footer += f"\n{preview['note']}"
-        if not truncated and counts["pending"] and feature_gate.recognition_review_enabled():
-            actions.append(_button("请求 Agent 只读复核", anchor, "r", page))
+        if review_enabled and reviewable_count:
+            actions.append(_button(f"请求 Agent 只读复核（{reviewable_count} 组）", anchor, "r", page))
         if active:
             actions.append(_button("刷新摘要", anchor, "p", page))
     return NotificationEvent(
@@ -424,7 +494,7 @@ def _publish_batch_view(
                 and previous.get("downstream") == downstream_counts
                 and previous.get("downstream_digest") == downstream_digest
                 and previous.get("truncated") == truncated
-                and any(item.get("status") == "pending" and item.get("review_status") in {"waiting", "pending", "running"} for item in items)):
+                and any(_can_request_review(item) and item.get("review_status") in _REVIEW_PROGRESS for item in items)):
             return True
         event = _batch_event(
             batch_id, items, receipts, chat_id=target,
@@ -484,15 +554,17 @@ def handle_batch_callback(data: str, *, chat_id: str, message_id: int) -> str:
             raise ValueError("批次分页参数无效")
         page = int(value)
     if action == "r":
-        if not feature_gate.recognition_review_enabled():
-            raise ValueError("Agent 复核未启用，可直接手动选择候选")
         result = _batch_items(batch_id, chat_id)
         if result.get("selection_truncated") or result["total"] > len(result["items"]):
-            raise ValueError("此批次超过 1000 组，请在 Web 分批请求复核")
-        tokens = [item["confirmation_id"] for item in result["items"] if item.get("status") == "pending"]
+            raise ValueError("此批次超过 1000 组，请在 Web「批量审阅光鸭待确认」分批处理")
+        tokens = [item["confirmation_id"] for item in result["items"] if _can_request_review(item)]
         if tokens:
+            if not feature_gate.recognition_review_enabled():
+                raise ValueError(f"Agent 复核未启用。有候选的组可打开详情手动选择。{WEB_CORRECTION_GUIDE}")
             counts = request_reviews(tokens, chat_id=chat_id)
             notice = f"只读复核：新请求 {counts['requested']} 组，保留 {counts['unchanged']} 组，不可用 {counts['unavailable']} 组；仍需人工确认"
+        elif any(item.get("status") == "pending" for item in result["items"]):
+            notice = f"待确认组暂无候选。{WEB_CORRECTION_GUIDE}"
         else:
             notice = "此批次已无待复核项"
     elif action == "a":

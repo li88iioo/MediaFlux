@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
+from contextlib import nullcontext
 from datetime import datetime
 
 from app import database as db
@@ -11,6 +12,8 @@ from app.repositories import telegram_notifications
 
 # 重试确认绑定原候选的 payload 键；仓储与确认服务共用。
 RETRY_SELECTED_INDEX_KEY = "_retry_selected_index"
+MAX_REVIEW_FILES = 80
+_MAX_CORRECTION_LOGS = 50
 
 # review_status / review_result_json 是每组的“建议槽”，Agent 复核与人工审阅共用：
 # - Agent：waiting → pending → running → approved / abstained / failed；
@@ -33,16 +36,20 @@ def create_organize_confirmation(
     review_ready: bool = False,
 ) -> int:
     """持久化一组 Telegram 整理候选，并使同指纹旧按钮失效。"""
-    timestamp = db.now()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        # 冻结确认创建时的日志范围，秒级时间戳不能区分同秒的新扫描记录。
+        timestamp = db.now()
+        # 日志上界随重试继承。原地纠正沿用日志 ID，每张新卡单独记录操作步骤上界。
         payload = dict(payload)
         if "_organize_log_upper_bound" not in payload:
             payload["_organize_log_upper_bound"] = conn.execute(
                 "SELECT COALESCE(MAX(id),0) FROM organize_log"
             ).fetchone()[0]
+        payload["_organize_step_upper_bound"] = conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM organize_operation_steps"
+        ).fetchone()[0]
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        _require_no_running_correction(conn, encoded)
         conn.execute(
             "UPDATE organize_confirmations SET status='expired',"
             "result_json=?,error='新的候选卡已替代本次确认',"
@@ -83,33 +90,153 @@ def create_organize_confirmation(
         return cursor.lastrowid
 
 
+def _log_confirmation_owners(
+    conn: sqlite3.Connection, log_ids: list[int], *, minimum_confirmation_id: int = 0,
+) -> dict[int, sqlite3.Row]:
+    if not log_ids:
+        return {}
+    rows = conn.execute(
+        """
+        WITH logs AS (
+            SELECT id,file_id,updated_at FROM organize_log
+            WHERE id IN (SELECT value FROM json_each(?))
+              AND source='guangya' AND status='manual' AND file_id<>''
+        ), latest AS (
+            SELECT CAST(json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id') AS TEXT)
+                   AS file_id,MAX(c.id) AS confirmation_id
+            FROM organize_confirmations c
+            JOIN json_each(CASE WHEN json_valid(c.payload_json)
+                               THEN c.payload_json ELSE '{}' END,'$.files') f
+            WHERE c.id>=?
+              AND COALESCE(json_extract(CASE WHEN json_valid(c.payload_json)
+                                       THEN c.payload_json ELSE '{}' END,'$.kind'),'guangya')='guangya'
+              AND CAST(json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id') AS TEXT)
+                  IN (SELECT file_id FROM logs)
+            GROUP BY 1
+        )
+        SELECT l.id AS log_id,c.token,c.status,c.expires_at,
+               NOT EXISTS (
+                   SELECT 1 FROM organize_log newer
+                   WHERE newer.source='guangya' AND newer.file_id=l.file_id AND newer.id>l.id
+               ) AS latest_log
+        FROM logs l
+        JOIN latest ON latest.file_id=l.file_id
+        JOIN organize_confirmations c ON c.id=latest.confirmation_id
+        WHERE CASE WHEN json_valid(c.payload_json) THEN
+              ((json_type(c.payload_json,'$._organize_log_upper_bound')='integer'
+                AND l.id<=json_extract(c.payload_json,'$._organize_log_upper_bound') AND l.updated_at<=c.created_at)
+               OR (json_type(c.payload_json,'$._organize_log_upper_bound') IS NULL AND l.updated_at<c.created_at))
+          ELSE 0 END
+        """, (json.dumps(log_ids), minimum_confirmation_id),
+    )
+    return {row["log_id"]: row for row in rows}
+
+
+def _pending_log_owners(conn: sqlite3.Connection, log_ids: list[int], timestamp: str) -> dict[int, str]:
+    return {log_id: row["token"] for log_id, row in _log_confirmation_owners(conn, log_ids).items()
+            if row["status"] == "pending" and row["expires_at"] > timestamp}
+
+
 def pending_confirmation_tokens_by_log(log_ids: Iterable[int]) -> dict[int, str]:
     """按冻结日志范围定位最新确认单，禁止从已入队项回退到旧待确认单。"""
     ids = list(dict.fromkeys(log_ids))
     if not ids:
         return {}
     with db.get_conn() as conn:
-        rows = conn.execute(
-            """
-            WITH matches AS (
-                SELECT l.id AS log_id,l.updated_at AS log_updated_at,c.*,
-                       ROW_NUMBER() OVER (PARTITION BY l.id ORDER BY c.id DESC) AS latest
-                FROM organize_log l JOIN organize_confirmations c
-                JOIN json_each(CASE WHEN json_valid(c.payload_json)
-                               THEN c.payload_json ELSE '{}' END,'$.files') f
-                  ON json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id')=l.file_id
-                WHERE l.id IN (SELECT value FROM json_each(?))
-                  AND l.source='guangya' AND l.status='manual' AND l.file_id<>''
-                  AND COALESCE(json_extract(CASE WHEN json_valid(c.payload_json)
-                                            THEN c.payload_json ELSE '{}' END,'$.kind'),'guangya')='guangya'
-            )
-            SELECT log_id,token FROM matches WHERE latest=1 AND status='pending' AND expires_at>?
-              AND ((json_type(payload_json,'$._organize_log_upper_bound')='integer'
-                    AND log_id<=json_extract(payload_json,'$._organize_log_upper_bound') AND log_updated_at<=created_at)
-                   OR (json_type(payload_json,'$._organize_log_upper_bound') IS NULL AND log_updated_at<created_at))
-            """, (json.dumps(ids), db.now()),
-        ).fetchall()
-    return {row["log_id"]: row["token"] for row in rows}
+        return _pending_log_owners(conn, ids, db.now())
+
+
+def correction_log_confirmation(
+    log_id: int, *, expected_token: str = "", conn: sqlite3.Connection | None = None,
+) -> sqlite3.Row | None:
+    """返回原日志在冻结范围内的最新确认及其状态。"""
+    with (nullcontext(conn) if conn is not None else db.get_conn()) as connection:
+        minimum_id = 0
+        if expected_token:
+            expected = connection.execute(
+                "SELECT id FROM organize_confirmations WHERE token=?", (expected_token,),
+            ).fetchone()
+            if expected is None:
+                return None
+            minimum_id = expected["id"]
+        return _log_confirmation_owners(connection, [log_id], minimum_confirmation_id=minimum_id).get(log_id)
+
+
+def _matches_pending_member(item: sqlite3.Row, snapshot: dict) -> bool:
+    parent_id, name = snapshot.get("parent_id"), snapshot.get("name")
+    size, etag = snapshot.get("size"), snapshot.get("etag")
+    return (
+        isinstance(parent_id, str) and bool(parent_id.strip())
+        and isinstance(name, str) and bool(name.strip())
+        and item["original_parent_id"] == item["current_parent_id"] == parent_id
+        and item["original_name"] == item["current_name"] == name
+        and (size is None or (type(size) is int and size == item["size"]))
+        and (not etag or (isinstance(etag, str) and etag.lower() == str(item["etag"] or "").lower()))
+    )
+
+
+def _pending_reorganize_log_ids(
+    conn: sqlite3.Connection, rows: list[sqlite3.Row], timestamp: str,
+) -> dict[str, list[int]]:
+    """整组文件及伴随物都与最新的原日志快照一致时才交给纠正识别。"""
+    groups: dict[str, tuple[str, list[str], dict[str, dict]]] = {}
+    video_count = 0
+    for row in rows:
+        if row["status"] != "pending" or row["expires_at"] <= timestamp:
+            continue
+        payload = json.loads(row["payload_json"])
+        if not isinstance(payload, dict):
+            continue
+        source_id = payload.get("source_dir_id")
+        files, companions = payload.get("files"), payload.get("companions", [])
+        if not isinstance(source_id, str) or not source_id or not isinstance(files, list) or not files:
+            continue
+        if not isinstance(companions, list):
+            continue
+        video_count += len(files)
+        if video_count > _MAX_CORRECTION_LOGS:
+            return {}
+        snapshots = {
+            item["file_id"]: item for item in (*files, *companions)
+            if isinstance(item, dict) and isinstance(item.get("file_id"), str) and item["file_id"].strip()
+        }
+        if len(snapshots) != len(files) + len(companions):
+            continue
+        groups[row["token"]] = (source_id, [item["file_id"] for item in files], snapshots)
+    if not groups:
+        return {}
+    primary_ids = list({file_id for _, files, _ in groups.values() for file_id in files})
+    logs = {row["file_id"]: row for row in conn.execute(
+        "SELECT l.id,l.file_id,l.source_dir_id FROM json_each(?) f JOIN organize_log l ON l.id=("
+        "SELECT id FROM organize_log WHERE source='guangya' AND file_id=f.value ORDER BY id DESC LIMIT 1) "
+        "WHERE l.status='manual' AND COALESCE(l.legacy_incomplete,0)=0",
+        (json.dumps(primary_ids),),
+    )}
+    owners = _pending_log_owners(conn, [row["id"] for row in logs.values()], timestamp)
+    if not owners:
+        return {}
+    members: dict[int, list[sqlite3.Row]] = {}
+    for item in conn.execute(
+        "SELECT * FROM organize_log_items WHERE log_id IN (SELECT value FROM json_each(?))",
+        (json.dumps(list(owners)),),
+    ):
+        members.setdefault(item["log_id"], []).append(item)
+    result = {}
+    for token, (source_id, file_ids, snapshots) in groups.items():
+        group_logs = [logs[file_id] for file_id in file_ids if file_id in logs]
+        if len(group_logs) != len(file_ids) or any(
+            owners.get(log["id"]) != token or log["source_dir_id"] != source_id for log in group_logs
+        ):
+            continue
+        items = [item for log in group_logs for item in members.get(log["id"], ())]
+        if len(items) != len(snapshots) or {item["file_id"] for item in items} != snapshots.keys():
+            continue
+        videos = {(item["log_id"], item["file_id"]) for item in items if item["role"] == "video"}
+        if videos != {(log["id"], log["file_id"]) for log in group_logs}:
+            continue
+        if all(_matches_pending_member(item, snapshots[item["file_id"]]) for item in items):
+            result[token] = sorted(log["id"] for log in group_logs)
+    return result
 
 
 def get_organize_confirmation(token: str) -> sqlite3.Row | None:
@@ -124,6 +251,7 @@ def query_organize_confirmations(
     *, batch_id: str = "", task_id: str = "", source: str = "", reason: str = "",
     keyword: str = "", status: str = "pending", tokens: list[str] | None = None,
     chat_id: str | None = None, page: int = 1, page_size: int = 20, selection_limit: int = 1000,
+    include_correction_logs: bool = False,
 ) -> dict:
     """Web、TG 和 SDK 使用同一持久候选集合；筛选值始终为绑定参数。"""
     clauses = ["json_valid(payload_json)", "COALESCE(json_extract(payload_json,'$.kind'),'guangya')='guangya'"]
@@ -176,10 +304,22 @@ def query_organize_confirmations(
         selected = conn.execute(
             "SELECT token" + where + " ORDER BY id DESC LIMIT ?", [*values, selection_limit],
         ).fetchall()
-        # 一次查询本页的精确执行关联；不按标题猜测，也不为每条确认单分别查日志。
         log_ids: dict[str, list[int]] = {}
-        if rows:
-            operations = {f"recognition-confirm:{row['token']}": row["token"] for row in rows}
+        if (
+            include_correction_logs and tokens is not None
+            and len(tokens) <= _MAX_CORRECTION_LOGS and counts.get("pending")
+        ):
+            # 按整次选择计数，跨页同样受纠正入口的条数限制。
+            video_count = conn.execute(
+                "SELECT COALESCE(SUM(json_array_length(payload_json,'$.files')),0)" + where
+                + " AND status='pending' AND expires_at>?", [*values, timestamp],
+            ).fetchone()[0]
+            if 0 < video_count <= _MAX_CORRECTION_LOGS:
+                log_ids = _pending_reorganize_log_ids(conn, rows, timestamp)
+        # 执行关联沿用唯一操作令牌，待审组则取整组原日志。
+        operations = {f"recognition-confirm:{row['token']}": row["token"] for row in rows
+                      if row["status"] != "pending"}
+        if operations:
             for log in conn.execute(
                 "SELECT id,operation_token FROM organize_log WHERE operation_token!='' AND operation_token IN ("
                 + ",".join("?" for _ in operations) + ") ORDER BY id", list(operations),
@@ -189,12 +329,26 @@ def query_organize_confirmations(
             "total": total, "counts": counts, "log_ids": log_ids}
 
 
+def can_discover_candidates(payload: dict) -> bool:
+    """无候选时，只允许用户为普通光鸭媒体请求 TMDB 补搜。"""
+    files = payload.get("files")
+    rules = payload.get("rules", {})
+    return (
+        (payload.get("kind") or "guangya") == "guangya"
+        and not payload.get("candidates") and RETRY_SELECTED_INDEX_KEY not in payload
+        and isinstance(rules, dict) and not rules.get("nsfw_exclusive")
+        and isinstance(files, list) and 0 < len(files) <= MAX_REVIEW_FILES
+        and all(isinstance(item, dict) and isinstance(item.get("name"), str)
+                and item["name"].strip() for item in files)
+    )
+
+
 def request_organize_confirmation_reviews(tokens: list[str], *, chat_id: str | None = None) -> dict:
     """只读复核显式请求；切换模式与自动写入竞争同一数据库事务。"""
     counts = {"requested": 0, "unchanged": 0, "unavailable": 0}
-    timestamp = db.now()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        timestamp = db.now()
         for token in tokens:
             row = conn.execute("SELECT * FROM organize_confirmations WHERE token=?", (token,)).fetchone()
             if (row is None or (chat_id is not None and row["chat_id"] != chat_id)
@@ -202,11 +356,17 @@ def request_organize_confirmation_reviews(tokens: list[str], *, chat_id: str | N
                 counts["unavailable"] += 1
                 continue
             payload = json.loads(row["payload_json"])
-            if not payload.get("candidates"):
+            discover = not payload.get("candidates")
+            if discover and not can_discover_candidates(payload):
                 counts["unavailable"] += 1
                 continue
-            payload["review_only"] = True
             active = row["review_status"] in {"pending", "running", "approved"}
+            if active and payload.get("review_only") and (not discover or payload.get("discover_candidates")):
+                counts["unchanged"] += 1
+                continue
+            payload["review_only"] = True
+            if discover:
+                payload["discover_candidates"] = True
             conn.execute(
                 "UPDATE organize_confirmations SET payload_json=?,review_status=?,"
                 "review_attempts=?,updated_at=? WHERE token=?",
@@ -247,17 +407,17 @@ def save_organize_confirmation_selection(token: str, candidate_index: int, *, ch
         )
 
 
-def activate_organize_confirmation_review(token: str) -> bool:
-    """人工候选卡已可靠入队后，才允许后台 Agent 领取复核。"""
+def activate_organize_confirmation_reviews(tokens: list[str]) -> int:
+    """通知完成后只激活建卡时已授权主动复核的组。"""
     timestamp = db.now()
     with db.get_conn() as conn:
         cursor = conn.execute(
             "UPDATE organize_confirmations SET review_status='pending',updated_at=? "
-            "WHERE token=? AND status='pending' AND review_status='waiting' "
+            "WHERE token IN (SELECT value FROM json_each(?)) AND status='pending' AND review_status='waiting' "
             "AND expires_at>?",
-            (timestamp, (token or ""), timestamp),
+            (timestamp, json.dumps(tokens), timestamp),
         )
-        return cursor.rowcount == 1
+        return cursor.rowcount
 
 
 def recover_interrupted_organize_confirmation_reviews() -> int:
@@ -342,6 +502,7 @@ def complete_organize_confirmation_review(
     *,
     status: str,
     result: dict | None = None,
+    discovered_candidates: list[dict] | None = None,
 ) -> bool:
     """保存最小复核回执；模型上下文与工具原始载荷不会持久化。"""
     normalized_status = (status or "").strip().lower()
@@ -349,22 +510,32 @@ def complete_organize_confirmation_review(
         "approved", "abstained", "failed", "cancelled"
     }:
         raise ValueError("Agent 复核状态无效")
-    timestamp = db.now()
     encoded = json.dumps(
         result or {}, ensure_ascii=False, separators=(",", ":"), default=str
     )
+    candidate_update = ""
+    discovery_guard = ""
+    bindings: dict[str, str] = {"status": normalized_status, "result": encoded, "token": token}
+    if discovered_candidates:
+        # 补搜结果与建议同时可见，永远不能覆盖已有候选或复活已处理/过期的卡。
+        index = (result or {}).get("candidate_index")
+        if normalized_status != "approved" or type(index) is not int or not 0 <= index < len(discovered_candidates):
+            raise ValueError("补搜作品与复核建议不一致")
+        candidate_update = ",payload_json=json_set(payload_json,'$.candidates',json(:candidates))"
+        bindings["candidates"] = json.dumps(discovered_candidates, ensure_ascii=False)
+        discovery_guard = (
+            " AND status='pending' AND expires_at>:now"
+            " AND json_extract(payload_json,'$.review_only')=1"
+            " AND json_extract(payload_json,'$.discover_candidates')=1"
+            " AND COALESCE(json_array_length(payload_json,'$.candidates'),0)=0"
+        )
     with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        bindings["now"] = db.now()
         cursor = conn.execute(
-            "UPDATE organize_confirmations SET review_status=?,review_result_json=?,"
-            "review_completed_at=?,updated_at=? "
-            "WHERE token=? AND review_status='running'",
-            (
-                normalized_status,
-                encoded,
-                timestamp,
-                timestamp,
-                (token or ""),
-            ),
+            "UPDATE organize_confirmations SET review_status=:status,review_result_json=:result,"
+            f"review_completed_at=:now,updated_at=:now{candidate_update} "
+            f"WHERE token=:token AND review_status='running'{discovery_guard}", bindings,
         )
         return cursor.rowcount == 1
 
@@ -472,6 +643,19 @@ def _pending_confirmation_row(conn: sqlite3.Connection, token: str, chat_id: str
     return row
 
 
+def _require_no_running_correction(conn: sqlite3.Connection, payload_json: str) -> None:
+    payload = "CASE WHEN json_valid(?) THEN ? ELSE '{}' END"
+    row = conn.execute(
+        f"SELECT 1 FROM json_each({payload},'$.files') f "
+        "JOIN organize_log l ON l.file_id=json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id') "
+        "WHERE l.source='guangya' AND l.status='reorganizing' "
+        f"AND COALESCE(json_extract({payload},'$.kind'),'guangya')='guangya' LIMIT 1",
+        (payload_json, payload_json, payload_json, payload_json),
+    ).fetchone()
+    if row is not None:
+        raise ValueError("本组日志正在纠正，请等待操作结束后刷新")
+
+
 def claim_organize_confirmation(
     token: str, *, chat_id: str, selected_index: int, actor: str = "human",
     event_json: str = "", message_id: int | None = None, explicit_approval: bool = False,
@@ -510,6 +694,7 @@ def claim_organize_confirmation(
             )
             claimed = None
         else:
+            _require_no_running_correction(conn, row["payload_json"])
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='queued',selected_index=?,"
                 "payload_json=CASE WHEN ? THEN json_set(payload_json,'$._explicit_approval',json('true')) ELSE payload_json END,"
@@ -586,6 +771,7 @@ def cancel_organize_confirmation(
             )
             cancelled = None
         else:
+            _require_no_running_correction(conn, row["payload_json"])
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='cancelled',selected_index=NULL,"
                 "queued_at=NULL,task_id='',result_json=?,error='',"

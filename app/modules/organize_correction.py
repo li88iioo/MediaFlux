@@ -177,7 +177,7 @@ class OrganizeCorrectionService:
             return replace(rules, nsfw_enabled=True, nsfw_exclusive=True)
         return rules.for_source(str(data.get("source_dir_id") or ""), client=self.client)
 
-    def detail(self, log_id: int) -> dict:
+    def detail(self, log_id: int, *, confirmation_id: str = "") -> dict:
         row = db.get_organize_log(log_id)
         if not row:
             raise LookupError("日志不存在")
@@ -189,6 +189,8 @@ class OrganizeCorrectionService:
         steps = [self._row_dict(step) for step in organize_history_repo.list_organize_operation_steps(log_id)]
         complete, safety_notice = self._snapshot_complete(data, items)
         status = str(data.get("status") or "")
+        if confirmation_id:
+            self._reorganize_confirmation_id(log_id, status, expected=confirmation_id)
         busy = status in BUSY_STATUSES
         data["items"] = items
         data["related_logs"] = [dict(row) for row in organize_history_repo.list_related_organize_logs(log_id)]
@@ -209,7 +211,9 @@ class OrganizeCorrectionService:
             "revert": complete and has_reversible_step and status in REVERT_STATUSES,
             "delete": complete and status in DELETE_STATUSES,
             # 待确认日志可按所属确认组跳过（与 Telegram 每组的终止按钮一致），文件保持原位。
-            "skip": status == "manual" and bool(organize_confirmations_repo.pending_confirmation_tokens_by_log([log_id])),
+            "skip": status == "manual" and bool(
+                confirmation_id or organize_confirmations_repo.pending_confirmation_tokens_by_log([log_id])
+            ),
         }
         if not complete:
             data["safety_notice"] = safety_notice
@@ -231,6 +235,34 @@ class OrganizeCorrectionService:
             ),
         }
         return data
+
+    @staticmethod
+    def _reorganize_confirmation_id(log_id: int, status: str, *, expected: str | None = None, conn=None) -> str:
+        owner = (organize_confirmations_repo.correction_log_confirmation(log_id, expected_token=expected or "", conn=conn)
+                 if status == "manual" else None)
+        if owner is not None and (
+            not owner["latest_log"] or owner["status"] in {"queued", "running", "cancelled"}
+        ):
+            raise DirectoryScrapeConflictError("原待确认组或关联日志已变化，请刷新后重新选择")
+        token = (owner["token"] if owner is not None
+                 and owner["status"] == "pending" and owner["expires_at"] > db.now() else "")
+        if expected is not None and token != expected:
+            raise DirectoryScrapeConflictError("原待确认组已变化，请刷新后重新选择")
+        return token
+
+    @staticmethod
+    def _validate_confirmation_log_selection(entries: list[dict]) -> None:
+        groups: dict[str, list[int]] = {}
+        for entry in entries:
+            if token := entry.get("confirmation_id"):
+                groups.setdefault(token, []).append(int(entry["log_id"]))
+        if not groups:
+            return
+        current = organize_confirmations_repo.query_organize_confirmations(
+            tokens=list(groups), page_size=len(groups), include_correction_logs=True,
+        )["log_ids"]
+        if current != {token: sorted(log_ids) for token, log_ids in groups.items()}:
+            raise DirectoryScrapeConflictError("原待确认组或关联日志已变化，请刷新并选择完整媒体组")
 
     def validate_batch(self, log_ids: list[int], action: str) -> list[dict]:
         """批量操作写入前统一校验；任何不合格成员都会阻止整个批次。"""
@@ -301,6 +333,7 @@ class OrganizeCorrectionService:
         ids = [entry["log_id"] for entry in entries]
         if len(ids) != len(set(ids)) or not 2 <= len(ids) <= 50:
             raise ValueError("请选择 2–50 条不同的整理日志")
+        self._validate_confirmation_log_selection(entries)
         items: list[dict] = []
         title_groups: dict[str, list[int]] = {}
         destinations: dict[tuple[str, str, str], int] = {}
@@ -311,7 +344,8 @@ class OrganizeCorrectionService:
             log_id = int(entry["log_id"])
             row = {"log_id": log_id, "original_name": ""}
             try:
-                detail = self.detail(log_id)
+                confirmation_id = entry.get("confirmation_id", "")
+                detail = self.detail(log_id, confirmation_id=confirmation_id) if confirmation_id else self.detail(log_id)
                 row["original_name"] = detail.get("original_name") or detail.get("current_name") or ""
                 if detail["version"] != entry["expected_version"]:
                     raise ValueError("日志状态或版本已变化，请刷新后重新预览")
@@ -330,7 +364,7 @@ class OrganizeCorrectionService:
                     # 裸集号没有标题时，仅在同一原始目录中允许人工指定同一作品。
                     title_groups.setdefault("directory:" + video.original_parent_id, []).append(log_id)
                 self._verify_items(members)
-                preview = self.preview_reorganize(log_id, **selected)
+                preview = self.preview_reorganize(log_id, **selected, confirmation_id=confirmation_id)
                 if not preview["target_root_id"]:
                     raise ValueError("尚未配置归档目标目录")
                 target_dir = self.organizer._find_existing_dir_chain(
@@ -465,8 +499,8 @@ class OrganizeCorrectionService:
         }
 
     def search_candidates(self, log_id: int, query: str = "", year: str = "",
-                          media_type: str = "") -> list[dict | CleanTitleCandidate]:
-        detail = self.detail(log_id)
+                          media_type: str = "", *, confirmation_id: str = "") -> list[dict | CleanTitleCandidate]:
+        detail = self.detail(log_id, confirmation_id=confirmation_id) if confirmation_id else self.detail(log_id)
         if not detail["allowed_actions"]["search"]:
             raise ValueError(detail.get("safety_notice") or "该日志不能人工纠偏")
         query = (query or detail.get("title") or detail.get("original_name") or "").strip()
@@ -591,9 +625,10 @@ class OrganizeCorrectionService:
         self, log_id: int, tmdb_id: str, media_type: str,
         title: str = "", year: str = "",
         season: int | None = None, episode: int | None = None,
-        *, provider: str = "", external_id: str = "",
+        *, provider: str = "", external_id: str = "", confirmation_id: str = "",
     ) -> dict:
-        detail = self.detail(log_id)
+        detail = self.detail(log_id, confirmation_id=confirmation_id) if confirmation_id else self.detail(log_id)
+        owner = confirmation_id or self._reorganize_confirmation_id(log_id, detail["status"])
         if not detail["allowed_actions"]["preview"]:
             raise ValueError(detail.get("safety_notice") or "当前状态不能重新整理")
         items = self._load_items(log_id)
@@ -693,6 +728,7 @@ class OrganizeCorrectionService:
         return {
             "log_id": log_id,
             "version": int(detail.get("version") or 1),
+            "confirmation_id": owner,
             "match": {
                 "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
                 "media_type": match.media_type,
@@ -715,7 +751,8 @@ class OrganizeCorrectionService:
             "cloud_write": False,
         }
 
-    def submit_reorganize(self, preview: dict, operation_token: str, *, confirmation_actor: str) -> dict:
+    def submit_reorganize(self, preview: dict, operation_token: str, *, confirmation_actor: str,
+                          confirmation_id: str = "") -> dict:
         """提交已冻结的单条纠偏预览；与 Web 共用执行、回滚、确认收尾及 STRM 联动。"""
         from copy import deepcopy
         from app.modules.organize_tasks import get_organize_manager
@@ -724,9 +761,14 @@ class OrganizeCorrectionService:
             raise ValueError("识别确认来源无效")
         frozen = deepcopy(preview)
         log_id, version = frozen["log_id"], frozen["version"]
-        current = self.detail(log_id)
+        if confirmation_id:
+            self._validate_confirmation_log_selection([{"log_id": log_id, "confirmation_id": confirmation_id}])
+        owner = frozen.get("confirmation_id", "")
+        current = self.detail(log_id, confirmation_id=owner) if owner else self.detail(log_id)
         if current["version"] != version or not current["allowed_actions"]["reorganize"]:
             raise ValueError("日志状态或版本已变化，请重新预览")
+        if not owner:
+            self._reorganize_confirmation_id(log_id, current["status"], expected="")
         if not self.client.logged_in:
             raise ValueError("光鸭未登录，无法重新整理")
 
@@ -1693,8 +1735,15 @@ class OrganizeCorrectionService:
     def _execute_reorganize(self, log_id: int, operation_token: str,
                             expected_version: int, preview: dict, *, confirmation_actor: str = "human") -> dict:
         items = self._load_items(log_id)
+        if [(item.id, item.file_id, item.role, item.current_parent_id, item.current_name) for item in items] != [
+            (item["item_id"], item["file_id"], item["role"], item["from_parent_id"], item["from_name"])
+            for item in preview["items"]
+        ]:
+            raise DirectoryScrapeConflictError("纠正文件快照已变化，请重新预览")
         self._verify_items(items)
-        current_rules = self._rules_for_log(self.detail(log_id))
+        owner = preview.get("confirmation_id", "")
+        detail = self.detail(log_id, confirmation_id=owner) if owner else self.detail(log_id)
+        current_rules = self._rules_for_log(detail)
         if organize_rules_snapshot_changes(preview["rules_snapshot"], current_rules):
             raise DirectoryScrapeStateError("整理规则已变化，请重新预览并确认")
         rules = restore_organize_rules_snapshot(preview["rules_snapshot"], trusted_rules=current_rules)
@@ -1719,10 +1768,13 @@ class OrganizeCorrectionService:
             release_parse["manual_position"] = dict(preview["manual_position"])
         elif match["media_type"] != "tv":
             release_parse.pop("manual_position", None)
-        if not db.claim_organize_log_operation(
-            log_id, operation_token, "reorganizing", tuple(REORGANIZE_STATUSES), expected_version,
-        ):
-            raise RuntimeError("日志状态或版本已变化，请刷新后重试")
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._reorganize_confirmation_id(log_id, previous_log["status"], expected=owner, conn=conn)
+            if not db.claim_organize_log_operation(
+                log_id, operation_token, "reorganizing", tuple(REORGANIZE_STATUSES), expected_version, _conn=conn,
+            ):
+                raise RuntimeError("日志状态或版本已变化，请刷新后重试")
         created_dirs: list[GuangYaFile] = []
         completed: list[AppliedTransition] = []
         try:

@@ -269,14 +269,20 @@ def reconcile_reorganized_confirmations(
                         break
                 else:
                     step = connection.execute(
-                        "SELECT finished_at FROM organize_operation_steps WHERE log_id=? AND operation_token=? "
+                        "SELECT id,finished_at FROM organize_operation_steps WHERE log_id=? AND operation_token=? "
                         "AND file_id=? AND action='move_rename' AND status='success' "
                         "AND to_parent_id=? AND to_name=? ORDER BY id DESC LIMIT 1",
                         (evidence['log_id'], evidence['log_operation_token'], str(item['file_id']),
                          evidence['current_parent_id'], evidence['current_name']),
                     ).fetchone()
-                    if (evidence['operation_type'] != 'reorganize' or step is None
-                            or str(step['finished_at'] or '') <= confirmation['created_at']):
+                    if evidence['operation_type'] != 'reorganize' or step is None:
+                        break
+                    finished_at = str(step['finished_at'] or '')
+                    step_bound = payload.get('_organize_step_upper_bound')
+                    if finished_at < confirmation['created_at'] or (
+                        finished_at == confirmation['created_at']
+                        and (type(step_bound) is not int or step['id'] <= step_bound)
+                    ):
                         break
                 log_ids.add(int(evidence['log_id']))
             else:

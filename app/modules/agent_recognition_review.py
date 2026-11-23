@@ -36,6 +36,7 @@ from app.agent.kernel.provider_model import (
 )
 from app.agent.kernel.session import SessionLimits
 from app.logger import get_logger
+from app.modules.media_identity import normalize_tmdb_id
 from app.modules.nsfw import (
     MetaTubeClient,
     MetaTubeError,
@@ -47,14 +48,48 @@ from app.modules.nsfw_clean_review import (
     inspect_nsfw_clean_candidate,
     nsfw_clean_review_enabled,
 )
-from app.modules.scraper import TMDBScraper
+from app.modules.organize_identity import _GENERIC_FILENAME_IDENTITY_HINTS
+from app.modules.recognition.resolver import _resolve_explicit_tmdb_marker
+from app.modules.scraper import (
+    Candidate,
+    TMDBScraper,
+    _candidate_aliases,
+    _low_information_query,
+    extract_recognition_context,
+    parse_release_position,
+)
+from app.modules.special_media import title_hint_from_path
+from app.repositories.organize_confirmations import MAX_REVIEW_FILES as _MAX_FILES
+from app.repositories.organize_confirmations import can_discover_candidates
 from app.sensitive_data import contains_sensitive_credential
 
 logger = get_logger(__name__)
 
 _MIN_APPROVAL_CONFIDENCE = 0.92
-_MAX_FILES = 80
 _MAX_CANDIDATES = 3
+_DISCOVERY_MISS_REASONS = (
+    "episode_boundary_unverified", "discovery_tmdb_marker_conflict", "candidate_year_mismatch",
+    "candidate_title_mismatch", "no_candidate",
+)
+_DISCOVERY_FALLBACK_REASONS = {"no_candidate", "candidate_title_mismatch", "candidate_year_mismatch"}
+_DISCOVERY_SUMMARIES = {
+    "unsafe_input": "识别材料疑似包含凭据，请移除后重试。",
+    "discovery_media_type_conflict": "这组文件同时出现电影和剧集线索，请分别核对作品。",
+    "discovery_year_conflict": "文件名或目录记载的年份不一致，请核对作品版本。",
+    "discovery_source_title_missing": "文件名和目录缺少可用片名，请手动核对作品。",
+    "discovery_source_title_conflict": "文件名指向多个作品，请分别核对后再选择。",
+    "discovery_episode_position_conflict": "文件名和待确认记录中的季集不一致，请核对文件后重新整理。",
+    "discovery_multi_episode_file": "这组包含多集合并文件，请手动核对并处理整段集号。",
+    "discovery_tmdb_marker_conflict": "文件或目录中的 TMDB 标记与候选不一致，请核对标记和作品。",
+    "episode_position_incomplete": "文件名和目录缺少明确的季集，请核对季号和集号。",
+    "no_candidate": "TMDB 未查到匹配作品，请核对片名或手动选择。",
+    "discovery_search_not_configured": "请检查 TMDB 搜索配置后重试。",
+    "discovery_search_unavailable": "TMDB 搜索暂不可用，请稍后重试。",
+    "candidate_not_revalidated": "暂时无法核验 TMDB 候选详情，请稍后重试或手动核对。",
+    "candidate_title_mismatch": "TMDB 详情的片名和别名无法对应来源作品，请手动核对片名。",
+    "candidate_year_mismatch": "TMDB 候选年份与来源证据不一致，请核对作品版本。",
+    "discovery_ambiguous": "有多个同名 TMDB 候选符合来源证据，请手动选定作品。",
+}
 
 _SYSTEM_PROMPT = """
 你是 MediaFlux 内部媒体识别复核器。你只处理当前冻结的待确认案例，不与用户聊天。
@@ -85,6 +120,7 @@ class RecognitionReviewDecision:
     episode_research_receipt: dict[str, Any] | None = None
     # 仅保留 MetaTube 的结构化详情，不收模型解释或上游原始载荷。
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    discovered_candidates: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def approved(self) -> bool:
@@ -93,6 +129,7 @@ class RecognitionReviewDecision:
     def audit_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("status", None)
+        payload.pop("discovered_candidates", None)
         # 默认审计不收模型自由文本；公共摘要由调用方单独脱敏、截断后保存。
         payload.pop("summary", None)
         if not self.entry_mode:
@@ -909,7 +946,211 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
     )
 
 
+def _discovery_abstention(reason_code: str, summary: str = "") -> RecognitionReviewDecision:
+    return RecognitionReviewDecision(
+        status="abstained", reason_code=reason_code, summary=summary or _DISCOVERY_SUMMARIES[reason_code],
+    )
+
+
+def _discovery_title_key(title: str) -> str:
+    key = _normalized_title(title)
+    if (key.isdigit() or key in _GENERIC_FILENAME_IDENTITY_HINTS
+            or _low_information_query(title) or not title_hint_from_path(title)):
+        return ""
+    return key
+
+
+def _verify_discovered_candidates(
+    scraper: TMDBScraper, candidates: list[Candidate], *, media_type: str, year: str,
+    required_titles: set[str], episodes_by_season: dict[int, set[int]], file_count: int, explicit_tmdb_id: str,
+) -> RecognitionReviewDecision:
+    title_field, original_field, date_field = (
+        ("name", "original_name", "first_air_date") if media_type == "tv"
+        else ("title", "original_title", "release_date")
+    )
+    selected: dict[str, Any] | None = None
+    seen_ids: set[str] = set()
+    misses = {"no_candidate": ""}
+    for candidate in candidates[:_MAX_CANDIDATES]:
+        if candidate.provider != "tmdb" or candidate.media_type != media_type:
+            continue
+        if year and candidate.year and candidate.year != year:
+            misses["candidate_year_mismatch"] = ""
+            continue
+        try:
+            tmdb_id = normalize_tmdb_id(candidate.tmdb_id)
+        except ValueError:
+            continue
+        if explicit_tmdb_id and tmdb_id != explicit_tmdb_id:
+            misses["discovery_tmdb_marker_conflict"] = ""
+            continue
+        if tmdb_id in seen_ids:
+            continue
+        seen_ids.add(tmdb_id)
+
+        # 只传请求身份，让缓存中的真实详情独立证明标题、别名和年份。
+        detail, verified = scraper._enrich_candidate_for_scoring({"id": tmdb_id}, media_type)
+        title = str(detail.get(title_field) or "").strip()
+        if not verified or not title:
+            return _discovery_abstention("candidate_not_revalidated")
+        aliases = {
+            _normalized_title(value)
+            for value in (title, detail.get(original_field), *_candidate_aliases(detail))
+        }
+        if not required_titles <= aliases:
+            misses["candidate_title_mismatch"] = ""
+            continue
+        try:
+            detail_year = date.fromisoformat(str(detail.get(date_field) or "")).isoformat()[:4]
+        except ValueError:
+            return _discovery_abstention("candidate_not_revalidated")
+        if any(expected and detail_year != expected for expected in (year, candidate.year)):
+            misses["candidate_year_mismatch"] = ""
+            continue
+
+        # 逐季读取真实集号，全组检查成员资格，即使季集映射关闭也必须通过。
+        for season, episodes in episodes_by_season.items():
+            season_detail = scraper.get_tv_season_detail(tmdb_id, season)
+            rows = season_detail.get("episodes")
+            if (season_detail.get("season_number") != season or not isinstance(rows, list)
+                    or any(not isinstance(row, dict) or type(row.get("episode_number")) is not int
+                           or row.get("season_number", season) != season for row in rows)):
+                return _discovery_abstention(
+                    "discovery_season_unavailable", f"无法核验 TMDB 的 S{season:02d} 逐集详情，请稍后重试。",
+                )
+            missing = episodes.difference(_season_projection(season_detail, season=season)["episode_numbers"])
+            if missing:
+                label = f"S{season:02d}E{min(missing):02d}"
+                misses["episode_boundary_unverified"] = f"TMDB 季详情未记录 {label}，请手动核对该集。"
+                break
+        else:
+            if selected is not None:
+                return _discovery_abstention("discovery_ambiguous")
+            selected = {
+                "provider": "tmdb", "external_id": tmdb_id, "tmdb_id": tmdb_id,
+                "media_type": media_type, "title": title, "year": detail_year,
+                "score": candidate.score, "support": file_count,
+                "genre_ids": list(candidate.metadata.get("genre_ids") or []),
+            }
+
+    if selected is None:
+        reason = next(reason for reason in _DISCOVERY_MISS_REASONS if reason in misses)
+        return _discovery_abstention(reason, misses[reason])
+    return RecognitionReviewDecision(
+        status="approved", candidate_index=0, confidence=1.0,
+        reason_code="tmdb_discovery_verified", summary="已补搜并核验全组 TMDB 候选，等待人工确认",
+        discovered_candidates=[selected],
+    )
+
+
+def _discover_tmdb_candidate(
+    payload: dict[str, Any], discovery_scraper: TMDBScraper | None,
+) -> RecognitionReviewDecision:
+    files = payload["files"]
+    directory = str(payload.get("directory") or "")
+    names = [item["name"].strip() for item in files]
+    if (not _model_visible_payload_is_safe(payload, [])
+            or any(contains_sensitive_credential(value) for value in (directory, *names))):
+        return _discovery_abstention("unsafe_input")
+
+    if any(parse_release_position(name).get("episode_end") is not None for name in names):
+        return _discovery_abstention("discovery_multi_episode_file")
+    explicit_ids: set[str] = set()
+    for value in (directory, *names):
+        marker_id, conflict = _resolve_explicit_tmdb_marker(value, nearest_first=True)
+        if conflict:
+            return _discovery_abstention("discovery_tmdb_marker_conflict")
+        if marker_id:
+            try:
+                explicit_ids.add(normalize_tmdb_id(marker_id))
+            except ValueError:
+                return _discovery_abstention("discovery_tmdb_marker_conflict")
+    if len(explicit_ids) > 1:
+        return _discovery_abstention("discovery_tmdb_marker_conflict")
+    explicit_tmdb_id = next(iter(explicit_ids), "")
+
+    contexts = [extract_recognition_context(name, directory) for name in names]
+    media_type = contexts[0].media_type
+    if any(context.media_type != media_type for context in contexts):
+        return _discovery_abstention("discovery_media_type_conflict")
+    years = {year for context in contexts for year in (context.filename_year, context.folder_year) if year}
+    if len(years) > 1:
+        return _discovery_abstention("discovery_year_conflict")
+    year = next(iter(years), "")
+
+    filename_titles: dict[str, str] = {}
+    folder_titles: dict[str, str] = {}
+    required_titles: set[str] = set()
+    episodes_by_season: dict[int, set[int]] = {}
+    for item, context in zip(files, contexts, strict=True):
+        title = context.filename_title
+        key = _discovery_title_key(title)
+        folder_key = _discovery_title_key(context.folder_title)
+        if folder_key:
+            folder_titles.setdefault(folder_key, context.folder_title)
+        if key:
+            filename_titles.setdefault(key, title)
+        if not (key or folder_key):
+            return _discovery_abstention("discovery_source_title_missing")
+        required_titles.add(key or folder_key)
+
+        season, episode = context.season, context.episode
+        for field_name, parsed in (("season", season), ("episode", episode)):
+            frozen = item.get(field_name)
+            if frozen not in (None, "") and (not str(frozen).isdecimal() or int(frozen) != parsed):
+                return _discovery_abstention("discovery_episode_position_conflict")
+        if media_type == "tv":
+            if season is None or not 0 <= season <= 99 or episode is None or episode < 1:
+                return _discovery_abstention("episode_position_incomplete")
+            episodes_by_season.setdefault(season, set()).add(episode)
+
+    # 同目录的标题可以给无标题文件补证据，但不能掩盖两个不同的文件名标题。
+    if len(filename_titles) > 1 or len(folder_titles) > 1:
+        return _discovery_abstention("discovery_source_title_conflict")
+    scraper = discovery_scraper if discovery_scraper is not None else TMDBScraper()
+    try:
+        best_miss = _discovery_abstention("no_candidate")
+        searched: set[str] = set()
+        for source_key, title in (*filename_titles.items(), *folder_titles.items()):
+            query = scraper.clean_title(title)
+            query_key = _discovery_title_key(query)
+            if not query_key or query_key in searched:
+                continue
+            if contains_sensitive_credential(query):
+                return _discovery_abstention("unsafe_input")
+            searched.add(query_key)
+            # 与手动选片共用搜索缓存和真实候选格式，并保留网络失败状态。
+            outcome = scraper._search_with_outcome(query, year, media_type)
+            if outcome.status == "no_result":
+                continue
+            if outcome.status != "matched":
+                return _discovery_abstention(
+                    "discovery_search_not_configured" if outcome.status == "config_error"
+                    else "discovery_search_unavailable",
+                )
+            candidates = scraper._pick_best(query, year, media_type, list(outcome.results)).candidates
+            decision = _verify_discovered_candidates(
+                scraper, candidates, media_type=media_type, year=year,
+                required_titles=required_titles | {source_key}, episodes_by_season=episodes_by_season,
+                file_count=len(files), explicit_tmdb_id=explicit_tmdb_id,
+            )
+            if decision.approved:
+                if not _model_visible_payload_is_safe(payload, decision.discovered_candidates):
+                    return _discovery_abstention("unsafe_input")
+                return decision
+            if decision.reason_code not in _DISCOVERY_FALLBACK_REASONS:
+                return decision
+            if _DISCOVERY_MISS_REASONS.index(decision.reason_code) < _DISCOVERY_MISS_REASONS.index(best_miss.reason_code):
+                best_miss = decision
+        return best_miss
+    finally:
+        if discovery_scraper is None:
+            scraper.close()
+
+
 def _should_research_episodes(payload: dict, decision: RecognitionReviewDecision | None = None) -> bool:
+    if not payload.get("candidates"):
+        return False
     from app.modules.episode_research_service import episode_research_enabled
     if not episode_research_enabled() or str(payload.get("kind") or "guangya") != "guangya":
         return False
@@ -946,11 +1187,16 @@ def _research_episode_decision(payload: dict) -> RecognitionReviewDecision:
     )
 
 
-def review_confirmation_payload(payload: dict[str, Any]) -> RecognitionReviewDecision:
+def review_confirmation_payload(
+    payload: dict[str, Any], *, discovery_scraper: TMDBScraper | None = None,
+) -> RecognitionReviewDecision:
     """同步入口，供持久化后台 Worker 调用。异常一律收敛为人工回退。"""
     if not feature_gate.recognition_review_enabled():
         raise RecognitionReviewUnavailable("Agent 主动复核未启用或模型未配置")
     try:
+        if (payload.get("review_only") is True and payload.get("discover_candidates") is True
+                and can_discover_candidates(payload)):
+            return _discover_tmdb_candidate(payload, discovery_scraper)
         if _should_research_episodes(payload):
             return _research_episode_decision(payload)
         decision = asyncio.run(_review_async(dict(payload)))

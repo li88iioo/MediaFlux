@@ -523,6 +523,30 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         assert get_organize_confirmation_result_4 is not None
         self.assertEqual(get_organize_confirmation_result_4['status'], 'completed')
 
+    def test_same_second_in_place_correction_only_closes_cards_created_before_its_step(self):
+        timestamp = '2026-01-01 00:00:00'
+        db.update_organize_log(self.log_id, operation_token='old-op')
+
+        def complete_step(token):
+            organize_history.add_organize_operation_step(
+                self.log_id, token, 1, 'move_rename', file_id='video', to_parent_id='target',
+                to_name='video.mkv', status='success', finished_at=timestamp,
+            )
+
+        complete_step('old-op')
+        self.confirm('current', 'pending')
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=['video']), [])
+        db.update_organize_log(self.log_id, operation_token='new-op')
+        complete_step('new-op')
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=['video']), ['current'])
+        self.confirm('legacy', 'pending')
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=json_remove("
+                         "payload_json,'$._organize_step_upper_bound') WHERE token='legacy'")
+        db.update_organize_log(self.log_id, operation_token='legacy-op')
+        complete_step('legacy-op')
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=['video']), [])
+
     def test_expired_and_cancelled_cards_can_be_resolved_but_active_execution_cannot(self):
         for status in ('expired', 'cancelled', 'queued', 'running'):
             with self.subTest(status=status):

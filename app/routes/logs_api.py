@@ -57,8 +57,11 @@ def query_organize_confirmations(request: Request, data: dict = Body(...)):
     require_api_login(request)
     from app.modules.organize_confirmation_batches import list_confirmations
     try:
-        return list_confirmations(confirmation_ids=data.get("confirmation_ids", []), status=data.get("status", "all"),
-                                  page=data.get("page", 1), page_size=data.get("page_size", 20))
+        return list_confirmations(
+            confirmation_ids=data.get("confirmation_ids", []), status=data.get("status", "all"),
+            page=data.get("page", 1), page_size=data.get("page_size", 20),
+            include_correction_logs=data.get("include_correction_logs", False),
+        )
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -422,11 +425,16 @@ def clear_organize_log_records(request: Request, data: dict | None = Body(defaul
 
 
 @router.get("/organize/{log_id}")
-def organize_log_detail(log_id: int, request: Request):
+def organize_log_detail(log_id: int, request: Request, confirmation_id: str = ""):
     require_api_login(request)
     service = OrganizeCorrectionService()
     try:
-        return service.detail(log_id)
+        confirmation_id = _optional_confirmation_id({"confirmation_id": confirmation_id})
+        return service.detail(log_id, confirmation_id=confirmation_id) if confirmation_id else service.detail(log_id)
+    except DirectoryScrapeConflictError as exc:
+        return api_error(public_error_message(exc), exc.status_code)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
     except LookupError as exc:
         return api_error(str(exc), 404)
     except Exception as exc:
@@ -447,12 +455,16 @@ def organize_recognition_search(log_id: int, request: Request,
         return api_error("media_type 仅支持 movie 或 tv", 400)
     service = OrganizeCorrectionService()
     try:
+        confirmation_id = _optional_confirmation_id(data)
         return {
             "candidates": service.search_candidates(
                 log_id, str(data.get("query") or "").strip(),
                 str(data.get("year") or "").strip(), media_type,
+                **({"confirmation_id": confirmation_id} if confirmation_id else {}),
             )
         }
+    except DirectoryScrapeConflictError as exc:
+        return api_error(public_error_message(exc), exc.status_code)
     except LookupError as exc:
         return api_error(str(exc), 404)
     except ValueError as exc:
@@ -462,6 +474,13 @@ def organize_recognition_search(log_id: int, request: Request,
         return api_error(str(exc), 502)
     finally:
         service.close()
+
+
+def _optional_confirmation_id(data: dict) -> str:
+    value = data.get("confirmation_id", "")
+    if not isinstance(value, str) or len(value) > 128:
+        raise ValueError("待确认组 ID 无效")
+    return value.strip()
 
 
 def _optional_position(data: dict, key: str, *, minimum: int) -> int | None:
@@ -487,11 +506,13 @@ def _reorganize_candidate(data: dict) -> dict:
     media_type = str(data.get("media_type") or "").strip()
     if provider not in {"tmdb", "metatube", "clean_title"} or not external_id or media_type not in {"movie", "tv"}:
         raise ValueError("请选择有效的媒体候选")
+    confirmation_id = _optional_confirmation_id(data)
     return {
         "tmdb_id": tmdb_id, "media_type": media_type, "provider": provider, "external_id": external_id,
         "title": str(data.get("title") or "").strip(), "year": str(data.get("year") or "").strip(),
         "season": _optional_position(data, "season", minimum=0),
         "episode": _optional_position(data, "episode", minimum=1),
+        **({"confirmation_id": confirmation_id} if confirmation_id else {}),
     }
 
 
@@ -549,6 +570,8 @@ def _batch_operation_payload(data: dict) -> tuple[str, list[dict]]:
             "log_id": log_id,
             "expected_version": version,
             "operation_token": token,
+            **({"confirmation_id": confirmation_id}
+               if action == "reorganize" and (confirmation_id := _optional_confirmation_id(raw)) else {}),
         })
     return action, entries
 
@@ -586,6 +609,8 @@ def preview_organize_batch(request: Request, data: dict | None = Body(default=No
             raise ValueError("批量预览仅用于纠正识别")
         service = OrganizeCorrectionService()
         return service.preview_batch(entries, data.get("candidate"))
+    except DirectoryScrapeConflictError as exc:
+        return api_error(public_error_message(exc), exc.status_code)
     except LookupError as exc:
         return api_error(str(exc), 404)
     except ValueError as exc:
@@ -639,6 +664,8 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
             return api_error(result["error"], 409)
         transferred = True
         return {**result, "action": action, "count": len(entries)}
+    except DirectoryScrapeConflictError as exc:
+        return api_error(public_error_message(exc), exc.status_code)
     except LookupError as exc:
         return api_error(str(exc), 404)
     except ValueError as exc:
@@ -669,7 +696,10 @@ def run_reorganize(log_id: int, request: Request,
             raise DirectoryScrapeConflictError("整理预览已变化，请重新预览后再执行")
         if not service.client.logged_in:
             return api_error("光鸭未登录，无法重新整理", 503)
-        result = service.submit_reorganize(preview, token, confirmation_actor="human")
+        result = service.submit_reorganize(
+            preview, token, confirmation_actor="human",
+            **({"confirmation_id": candidate["confirmation_id"]} if "confirmation_id" in candidate else {}),
+        )
         if not result["ok"]:
             return api_error(result["error"], 409)
         return {**result, "operation_token": token}

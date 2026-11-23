@@ -12,6 +12,7 @@ from app.clients.guangya import GuangYaClient
 from app.modules.scraper import TMDBScraper
 
 import copy
+import json
 import re
 import shutil
 import threading
@@ -25,9 +26,11 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
+from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.organize import OrganizeRules
 from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.scraper import MatchResult
+from app.repositories import organize_confirmations as confirmation_repo
 from tests.support import authenticated_session, isolated_test_database, release_parse_result
 
 
@@ -303,6 +306,7 @@ def _add_log(
     original_path: str = "/incoming/Series",
     release_parse: dict[str, Any] | None = None,
     log_file_id: str | None = None,
+    status: str = "success",
 ) -> int:
     file_id = log_file_id or f"file-{len(cloud.files) + 1}"
     cloud.add_file(file_id, filename, parent_id=parent_id)
@@ -311,7 +315,7 @@ def _add_log(
         original_path=original_path,
         new_path="",
         file_id=file_id,
-        status="success",
+        status=status,
         tmdb_id=old_tmdb_id,
         operation_type="organize",
         source_dir_id="source-config",
@@ -336,9 +340,38 @@ def _add_log(
         "current_name": filename,
         "size": record["size"],
         "etag": record["etag"],
-        "status": "success",
+        "status": status,
     }])
     return log_id
+
+
+def _pending_group(harness: _Harness, episodes: int) -> tuple[list[int], dict]:
+    ids = [_add_log(harness.cloud, f"Series.S01E{episode:02}.mkv", status="manual")
+           for episode in range(1, episodes + 1)]
+    subtitle_id = "subtitle-1"
+    harness.cloud.add_file(subtitle_id, "Series.S01E01.zh.srt")
+    subtitle = harness.cloud.files[subtitle_id]
+    db.add_organize_log_items(ids[0], [{
+        "file_id": subtitle_id, "role": "subtitle", "status": "manual",
+        "original_parent_id": subtitle["parent_id"], "current_parent_id": subtitle["parent_id"],
+        "original_name": subtitle["name"], "current_name": subtitle["name"],
+        "size": subtitle["size"], "etag": subtitle["etag"],
+    }])
+
+    def snapshot(file_id: str) -> dict:
+        item = harness.cloud.files[file_id]
+        return {"file_id": file_id, **{key: item[key] for key in ("name", "parent_id", "size", "etag")}}
+
+    payload = {
+        "source_dir_id": "source-config", "source_parent_id": "source",
+        "files": [snapshot(assert_present(db.get_organize_log(log_id))["file_id"]) for log_id in ids],
+        "companions": [snapshot(subtitle_id)], "_notification_suppressed": True,
+    }
+    confirmation_repo.create_organize_confirmation(
+        token="pending-group", fingerprint="pending-group", chat_id="", source_name="incoming",
+        directory_path="/incoming/Series", payload=payload, expires_at="2099-01-01 00:00:00",
+    )
+    return ids, payload
 
 
 def _entries(log_ids: list[int]) -> list[dict[str, Any]]:
@@ -757,6 +790,168 @@ def logs_api_client(
         yield client
 
 
+def test_selected_confirmation_poll_skips_pending_log_resolution(
+    logs_api_client, harness: _Harness, monkeypatch: pytest.MonkeyPatch,
+):
+    _pending_group(harness, 1)
+    confirmation_repo.create_organize_confirmation(
+        token="executed-group", fingerprint="executed-group", chat_id="", source_name="incoming",
+        directory_path="/incoming/Done", payload={"files": [{"file_id": "done", "name": "Done.mkv"}]},
+        expires_at="2099-01-01 00:00:00",
+    )
+    confirmation_repo.update_organize_confirmation("executed-group", status="completed")
+    executed_log = db.add_organize_log(
+        "guangya", "/incoming/Done", "/archive/Done", "done", "success",
+        operation_token="recognition-confirm:executed-group",
+    )
+
+    def unexpected_resolution(*_args):
+        pytest.fail("普通确认状态回读触发了待确认日志归属查询")
+
+    monkeypatch.setattr(confirmation_repo, "_pending_reorganize_log_ids", unexpected_resolution)
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    url = "/api/logs/organize/confirmations"
+    tokens = ["pending-group", "executed-group"]
+    selected = {"confirmation_ids": tokens, "status": "all", "page": 1, "page_size": 20}
+    for response in (
+        client.post(f"{url}/query", json=selected),
+        client.post(f"{url}/query", json={**selected, "include_correction_logs": False}),
+        client.get(url, params={"confirmation_ids": ",".join(tokens), "status": "all"}),
+    ):
+        assert response.status_code == 200, response.text
+        assert {item["confirmation_id"]: item["log_ids"] for item in response.json()["items"]} == {
+            "pending-group": [], "executed-group": [executed_log],
+        }
+    assert client.post(f"{url}/query", json={**selected, "include_correction_logs": "false"}).status_code == 400
+
+
+def test_pending_group_handoff_and_retry_settle_all_eight_logs(
+    logs_api_client, harness: _Harness, archive_rules, monkeypatch: pytest.MonkeyPatch,
+):
+    with monkeypatch.context() as clock:
+        clock.setattr(db, "now", lambda: "2026-01-01 00:00:00")
+        log_ids, _ = _pending_group(harness, 8)
+    archive_rules.clean_empty = archive_rules.link_strm = archive_rules.notify_enabled = False
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    query = "/api/logs/organize/confirmations/query"
+    selection = {"confirmation_ids": ["pending-group"], "status": "all", "include_correction_logs": True}
+    listed, = client.get(query.removesuffix("/query")).json()["items"]
+    assert listed["status"] == "pending" and listed["log_ids"] == []
+    response = client.post(query, json=selection)
+    assert response.status_code == 200, response.text
+    item, = response.json()["items"]
+    assert item["status"] == "pending"
+    assert item["log_ids"] == log_ids
+    assert len(item["files"]) == 8
+    assert harness.cloud.write_calls == []
+
+    service = harness.service()
+    entries = [{**entry, "confirmation_id": "pending-group"} for entry in _entries(item["log_ids"])]
+    preview = _preview(service, entries)
+    assert preview["can_execute"], preview
+    failed_id = log_ids[-1]
+    failed_file = assert_present(db.get_organize_log(failed_id))["file_id"]
+    harness.cloud.fail_rename_ids.add(failed_file)
+    receipt = service.run_batch("reorganize", entries, candidate=CANDIDATE, preview_digest=preview["preview_digest"])
+    assert [row["log_id"] for row in receipt["completed"]] == log_ids[:-1]
+    assert [row["log_id"] for row in receipt["failed"]] == [failed_id]
+    card = assert_present(confirmation_repo.get_organize_confirmation("pending-group"))
+    assert card["status"] == "pending" and not card["result_json"]
+    item, = client.post(query, json=selection).json()["items"]
+    assert item["log_ids"] == []
+    assert harness.cloud.files[failed_file]["parent_id"] == "source"
+
+    completed = [dict(assert_present(db.get_organize_log(log_id))) for log_id in log_ids[:-1]]
+    writes_after_partial = len(harness.cloud.write_calls)
+    harness.cloud.fail_rename_ids.clear()
+    retry = service.preview_reorganize(failed_id, **CANDIDATE)
+    assert service._execute_reorganize(failed_id, "retry-failed-episode", retry["version"], retry)["success"]
+    assert all(call[1] == failed_file for call in harness.cloud.write_calls[writes_after_partial:])
+    assert [dict(assert_present(db.get_organize_log(log_id))) for log_id in log_ids[:-1]] == completed
+    card = assert_present(confirmation_repo.get_organize_confirmation("pending-group"))
+    assert card["status"] == "completed"
+    result = json.loads(card["result_json"])
+    assert (result["resolution"], result["moved"], result["organize_log_ids"]) == ("reorganized", 8, log_ids)
+    assert [assert_present(db.get_organize_log(log_id))["episode"] for log_id in log_ids] == list(range(1, 9))
+    for log_id in log_ids:
+        members = db.list_organize_log_items(log_id)
+        assert len(members) == (2 if log_id == log_ids[0] else 1)
+        for member in members:
+            assert member["status"] == "success"
+            remote = harness.cloud.files[member["file_id"]]
+            assert (remote["parent_id"], remote["name"]) == (member["current_parent_id"], member["current_name"])
+
+
+def test_pending_log_handoff_is_bounded_across_selected_tokens_and_pages(
+    isolated_db, harness: _Harness,
+):
+    log_ids, payload = _pending_group(harness, 1)
+    large_group = {**payload, "files": [
+        {**payload["files"][0], "file_id": f"large-{index}"} for index in range(50)
+    ], "companions": []}
+    confirmation_repo.create_organize_confirmation(
+        token="large-group", fingerprint="large-group", chat_id="", source_name="incoming",
+        directory_path="/incoming/Large", payload=large_group, expires_at="2099-01-01 00:00:00",
+    )
+    assert confirmation_repo.query_organize_confirmations(
+        tokens=["pending-group"], include_correction_logs=True,
+    )["log_ids"] == {
+        "pending-group": log_ids,
+    }
+    second_page = confirmation_repo.query_organize_confirmations(
+        tokens=["pending-group", "large-group"], page=2, page_size=1, include_correction_logs=True,
+    )
+    assert second_page["rows"][0]["token"] == "pending-group"
+    assert second_page["log_ids"] == {}
+    oversized_selection = ["pending-group", *(f"missing-{index}" for index in range(50))]
+    assert confirmation_repo.query_organize_confirmations(
+        tokens=oversized_selection, include_correction_logs=True,
+    )["log_ids"] == {}
+
+
+@pytest.mark.parametrize("change", ["newer_card", "rescan", "legacy_same_second", "updated_after",
+                                     "wrong_source", "missing_companion", "etag_changed"])
+def test_pending_group_handoff_rejects_incomplete_or_stale_original_logs(
+    isolated_db, harness: _Harness, monkeypatch: pytest.MonkeyPatch, change,
+):
+    from app.modules.organize_confirmation_batches import list_confirmations
+
+    monkeypatch.setattr(db, "now", lambda: "2026-01-01 00:00:00")
+    log_ids, payload = _pending_group(harness, 2)
+    last_file = payload["files"][-1]
+    if change == "newer_card":
+        confirmation_repo.create_organize_confirmation(
+            token="newer-card", fingerprint="different-snapshot", chat_id="", source_name="incoming",
+            directory_path="/incoming/Series", payload={**payload, "files": [last_file], "companions": []},
+            expires_at="2099-01-01 00:00:00",
+        )
+        confirmation_repo.update_organize_confirmation("newer-card", status="queued")
+    elif change == "rescan":
+        _add_log(harness.cloud, last_file["name"], log_file_id=last_file["file_id"], status="manual")
+    elif change == "legacy_same_second":
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='pending-group'", (json.dumps(payload),))
+    elif change == "updated_after":
+        monkeypatch.setattr(db, "now", lambda: "2026-01-01 00:00:01")
+        db.update_organize_log(log_ids[-1], error="同期日志发生了更新")
+    elif change == "wrong_source":
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_log SET source_dir_id='another-source' WHERE id=?", (log_ids[-1],))
+    elif change == "missing_companion":
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM organize_log_items WHERE log_id=? AND role='subtitle'", (log_ids[0],))
+    else:
+        member, = db.list_organize_log_items(log_ids[-1])
+        db.update_organize_log_item(member["id"], etag="different-etag")
+    item, = list_confirmations(
+        confirmation_ids=["pending-group"], status="all", include_correction_logs=True,
+    )["items"]
+    assert item["status"] == "pending" and item["log_ids"] == []
+    assert harness.cloud.write_calls == []
+
+
 def test_batch_api_requires_auth_accepts_preview_and_rejects_legacy_implicit_request(
     logs_api_client, harness: _Harness,
 ):
@@ -800,11 +995,11 @@ def test_single_web_confirmation_binds_the_preview_through_execution(
     monkeypatch.setattr(manager, "start_operation", accept)
     monkeypatch.setattr(organize_tasks, "get_organize_manager", lambda: manager)
     monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", harness.service)
-    monkeypatch.setattr(OrganizeCorrectionService, "_notify_reorganize_result", lambda *a, **kw: [])
-    monkeypatch.setattr(OrganizeCorrectionService, "_finalize_reorganized_source", lambda *a, **kw: [])
     archive_rules.year_split = False
-    archive_rules.link_strm = False
-    log_id = _add_log(harness.cloud, "Series.S01E01.mkv")
+    archive_rules.clean_empty = archive_rules.link_strm = archive_rules.notify_enabled = False
+    with monkeypatch.context() as clock:
+        clock.setattr(db, "now", lambda: "2026-01-01 00:00:00")
+        [log_id], _ = _pending_group(harness, 1)
     client = logs_api_client
     assert client.post("/__test/login").status_code == 200
     url = f"/api/logs/organize/{log_id}/reorganize"
@@ -836,3 +1031,98 @@ def test_single_web_confirmation_binds_the_preview_through_execution(
     assert operations.pop()()["success"]
     saved = assert_present(db.get_organize_log(log_id))
     assert saved["new_path"] == f"{fresh['target_path']}/{fresh['file_name']}"
+    card = assert_present(confirmation_repo.get_organize_confirmation("pending-group"))
+    assert card["status"] == "completed"
+    assert json.loads(card["result_json"])["organize_log_ids"] == [log_id]
+
+
+@pytest.mark.parametrize("transition", ["rescan", "queue", "skip"])
+def test_old_confirmation_cannot_be_used_after_other_entry_changes_ownership(
+    logs_api_client, harness: _Harness, transition,
+):
+    [log_id], payload = _pending_group(harness, 1)
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    url = f"/api/logs/organize/{log_id}"
+    selection = {"confirmation_id": "pending-group"}
+    assert client.get(url, params=selection).status_code == 200
+    body = {**CANDIDATE, **selection}
+    response = client.post(f"{url}/reorganize/preview", json=body)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["confirmation_id"] == "pending-group"
+
+    latest_id = None
+    if transition == "rescan":
+        member = payload["files"][0]
+        latest_id = _add_log(harness.cloud, member["name"], log_file_id=member["file_id"], status="manual")
+        confirmation_repo.create_organize_confirmation(
+            token="new-card", fingerprint="pending-group", chat_id="", source_name="incoming",
+            directory_path="/incoming/Series", payload=payload, expires_at="2099-01-01 00:00:00",
+        )
+        assert client.get(f"/api/logs/organize/{latest_id}", params={"confirmation_id": "new-card"}).status_code == 200
+    elif transition == "queue":
+        confirmation_repo.claim_organize_confirmation("pending-group", chat_id="", selected_index=0)
+    else:
+        # 观察取消事务已经提交、跳过日志投影尚未更新原日志的区间。
+        confirmation_repo.cancel_organize_confirmation("pending-group", chat_id="", resolution="skipped")
+    assert client.get(url, params=selection).status_code == 409
+    assert client.post(f"{url}/recognition/search", json=body).status_code == 409
+    assert client.post(f"{url}/reorganize/preview", json=body).status_code == 409
+    response = client.post(f"{url}/reorganize", json={
+        **body, "operation_token": "old-card", "expected_version": preview["version"],
+        "preview_digest": preview["preview_digest"],
+    })
+    assert response.status_code == 409, response.text
+    with pytest.raises(DirectoryScrapeConflictError, match="待确认组"):
+        harness.service()._execute_reorganize(log_id, "stale-worker", preview["version"], preview)
+    assert assert_present(db.get_organize_log(log_id))["status"] == "manual"
+    assert harness.cloud.write_calls == []
+    if latest_id is not None:
+        assert assert_present(db.get_organize_log(latest_id))["status"] == "manual"
+        assert assert_present(confirmation_repo.get_organize_confirmation("new-card"))["status"] == "pending"
+
+
+def test_claimed_correction_excludes_rescan_confirm_and_skip(
+    isolated_db, harness: _Harness, archive_rules, monkeypatch: pytest.MonkeyPatch,
+):
+    [log_id], payload = _pending_group(harness, 1)
+    archive_rules.clean_empty = archive_rules.link_strm = archive_rules.notify_enabled = False
+    original = dict(assert_present(confirmation_repo.get_organize_confirmation("pending-group")))
+    service = harness.service()
+    preview = service.preview_reorganize(log_id, **CANDIDATE, confirmation_id="pending-group")
+    provider_move = harness.cloud.move
+    observed = []
+
+    def move(ids, target):
+        if not observed:
+            observed.append(assert_present(db.get_organize_log(log_id))["status"])
+            with pytest.raises(ValueError, match="正在纠正"):
+                confirmation_repo.create_organize_confirmation(
+                    token="new-card", fingerprint="pending-group", chat_id="", source_name="incoming",
+                    directory_path="/incoming/Series", payload=payload, expires_at="2099-01-01 00:00:00",
+                )
+            with pytest.raises(ValueError, match="正在纠正"):
+                confirmation_repo.claim_organize_confirmation("pending-group", chat_id="", selected_index=0)
+            with pytest.raises(ValueError, match="正在纠正"):
+                confirmation_repo.cancel_organize_confirmation("pending-group", chat_id="", resolution="skipped")
+            assert confirmation_repo.get_organize_confirmation("new-card") is None
+            assert dict(assert_present(confirmation_repo.get_organize_confirmation("pending-group"))) == original
+        provider_move(ids, target)
+
+    monkeypatch.setattr(harness.cloud, "move", move)
+    assert service._execute_reorganize(log_id, "active-correction", preview["version"], preview)["success"]
+    assert observed == ["reorganizing"]
+    assert assert_present(confirmation_repo.get_organize_confirmation("pending-group"))["status"] == "completed"
+
+
+def test_bound_batch_cannot_convert_only_part_of_a_pending_group(isolated_db, harness: _Harness):
+    log_ids, _ = _pending_group(harness, 3)
+    entries = [{**entry, "confirmation_id": "pending-group"} for entry in _entries(log_ids)]
+    service = harness.service()
+    with pytest.raises(DirectoryScrapeConflictError, match="完整媒体组"):
+        service.preview_batch(entries[:2], CANDIDATE)
+    preview = service.preview_batch(entries, CANDIDATE)
+    assert preview["can_execute"], preview
+    assert [item["confirmation_id"] for item in preview["items"]] == ["pending-group"] * 3
+    assert harness.cloud.write_calls == []

@@ -129,7 +129,7 @@
         <header class="organize-detail-head">
             <div class="organize-detail-heading">
                 <h2 id="confirmationReviewTitle">批量审阅光鸭待确认</h2>
-                <p id="confirmationReviewHelp">光鸭候选队列 · 每组各自选择作品；Agent 仅只读复核，最终确认后才后台整理。</p>
+                <p id="confirmationReviewHelp">逐组核对作品。Agent 可只读核对或搜索候选，确认后才会整理。</p>
             </div>
             <button type="button" class="icon-action" data-modal-close aria-label="关闭批量审阅"><i data-lucide="x"></i></button>
         </header>
@@ -139,7 +139,7 @@
                 <label><span>任务</span><input class="form-input" id="confirmationReviewTask" name="task_id" placeholder="全部任务"></label>
                 <label><span>来源（精确名称）</span><input class="form-input" id="confirmationReviewSource" name="source" placeholder="全部光鸭来源"></label>
                 <label><span>原因（包含）</span><input class="form-input" id="confirmationReviewReason" name="reason" placeholder="全部原因"></label>
-                <label><span>关键词</span><input type="search" class="form-input" id="confirmationReviewQuery" name="q" placeholder="搜索作品或目录"></label>
+                <label><span>关键词</span><input type="search" class="form-input" id="confirmationReviewQuery" name="q" placeholder="按作品或目录筛选"></label>
                 <button type="submit" class="jump-btn"><i data-lucide="list-filter"></i>筛选</button>
             </form>
             <button type="button" class="jump-btn" id="confirmationReviewRefresh" aria-label="刷新审阅状态"><i data-lucide="refresh-cw"></i>刷新</button>
@@ -173,6 +173,9 @@
             <div>
                 <p id="confirmationReviewReady"><strong>已选 0 组 · 可确认 0 组</strong><span>仅确认已有建议或已保存人工选择的项，其余保留待确认。</span></p>
                 <p id="confirmationReviewState" role="status" aria-live="polite" aria-atomic="true"></p>
+                <div id="confirmationReviewCorrection" hidden>
+                    <button type="button" class="jump-btn" id="confirmationReviewCorrect" title="为所选媒体组重新识别作品" disabled>纠正识别</button>
+                </div>
             </div>
             <div class="confirmation-review-actions">
                 <button type="button" class="jump-btn" id="confirmationReviewSkip" title="结束所选待确认，文件保持原位" disabled>批量跳过</button>

@@ -485,7 +485,7 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             return_value=True,
         ), patch.object(
             organize_confirmations_repo,
-            "activate_organize_confirmation_review",
+            "activate_organize_confirmation_reviews",
             side_effect=RuntimeError("database busy"),
         ):
             self.assertTrue(
@@ -761,10 +761,11 @@ class RecognitionReviewDispatcherTests(IsolatedDatabaseTestCase):
             claims.append(worker)
             if not first_worker:
                 first_worker.append(worker)
-                return {"token": "review-token"}
+                return {"token": "review-token", "payload_json": "{}"}
             return None
 
-        def process(_row):
+        def process(_row, *, discovery_scraper=None):
+            self.assertIsNone(discovery_scraper)
             processing.set()
             release.wait(timeout=2)
             return "abstained"

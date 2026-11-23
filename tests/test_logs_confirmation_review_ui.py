@@ -12,7 +12,7 @@ def groups(count=25) -> list[dict]:
         "confirmation_id": f"group-{number:03d}", "batch_id": "source-batch", "task_id": "task-a",
         "source": "光鸭来源 A", "directory": f"/incoming/group-{number}",
         "identity": f"媒体组 {number:03d}", "reason": "识别歧义", "status": "pending",
-        "expires_at": "2099-12-01T00:00:00Z", "review_status": "waiting",
+        "expires_at": "2099-12-01T00:00:00Z", "review_status": "waiting", "can_discover_candidates": False,
         "suggestion": ({"candidate_index": 1, "summary": "年份及文件证据一致", "confidence": .91,
                         "reason_code": "file_evidence", "source": "agent"} if number == 1 else None),
         "selected_index": None, "error": "", "review_summary": "", "downstream": {},
@@ -26,6 +26,13 @@ def groups(count=25) -> list[dict]:
     } for number in range(1, count + 1)]
 
 
+def without_candidates(group, *log_ids):
+    return {
+        **group, "candidates": [], "suggestion": None, "log_ids": list(log_ids),
+        "files": [{**group["files"][0], "file_id": f"f{log_id}"} for log_id in log_ids],
+    }
+
+
 CONFIRMATION_API = r"""
 (() => {
     const fallback=window.fetch;
@@ -33,6 +40,7 @@ CONFIRMATION_API = r"""
     const reply=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}});
     window.__confirmationCalls=[];
     window.__heldConfirmationLists=[];
+    window.__heldConfirmationReviews=[];
     window.__heldConfirmationPreviews=[];
     window.__heldConfirmationSubmits=[];
     window.fetch=async(input,options={})=>{
@@ -55,7 +63,11 @@ CONFIRMATION_API = r"""
             });
             const truncated=matched.length>1000, rows=matched.slice(0,1000);
             const page=Number(params.page)||1, size=Math.min(100,Number(params.page_size)||20);
-            const data={items:matched.slice((page-1)*size,page*size),total:matched.length,pages:Math.ceil(matched.length/size),page,
+            const items=matched.slice((page-1)*size,page*size).map(item=>{
+                if(params.include_correction_logs===true||item.status!=='pending')return item;
+                const summary={...item};delete summary.log_ids;return summary;
+            });
+            const data={items,total:matched.length,pages:Math.ceil(matched.length/size),page,
                 confirmation_ids:rows.map(item=>item.confirmation_id),counts:matched.reduce((counts,item)=>{counts[item.status]=(counts[item.status]||0)+1;return counts;},{}),
                 selection_truncated:truncated,review_enabled:config.reviewEnabled!==false};
             const response=config.failList&&!suffix?reply({error:'列表暂时不可用'},503):reply(data);
@@ -64,7 +76,9 @@ CONFIRMATION_API = r"""
         }
         if(suffix==='/review'){
             body.confirmation_ids.forEach(token=>{const item=config.items.find(item=>item.confirmation_id===token);item.review_status='pending';});
-            return reply({requested:body.confirmation_ids.length,unchanged:0});
+            const response=reply({requested:body.confirmation_ids.length,unchanged:0,unavailable:0});
+            if(config.holdReview)return new Promise(resolve=>window.__heldConfirmationReviews.push(()=>resolve(response)));
+            return response;
         }
         if(suffix==='/skip'){
             const items=body.confirmation_ids.map(token=>{
@@ -128,8 +142,12 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
             additions = '<link rel="stylesheet" href="/static/css/pages/logs.css">'
             additions += '<script>window.__confirmationConfig=' + config + ';' + CONFIRMATION_API + '</script>'
             html = self.html.replace('</head>', additions + '</head>')
-            # 使用生产弹窗管理器验证焦点、Esc、滚动锁；不修改共享夹具。
-            html = html.replace('<script src="/static/js/logs.js">', '<script src="/static/js/app.js"></script><script src="/static/js/logs.js">')
+            # 使用真实批量审阅、纠正弹窗和二次确认。
+            base = (support.ROOT / 'app/templates/base.html').read_text(encoding='utf-8')
+            confirm = base.index('<dialog class="app-modal app-confirm-modal"')
+            confirm_end = base.index('</dialog>', confirm) + len('</dialog>')
+            html = html.replace('<script src="/static/js/logs.js">',
+                                base[confirm:confirm_end] + '<script src="/static/js/app.js"></script><script src="/static/js/logs.js">')
             route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html)
         elif path in {"/static/css/pages/logs.css", "/static/js/app.js"}:
             route.fulfill(status=200, content_type="text/css" if path.endswith('.css') else "text/javascript",
@@ -151,12 +169,289 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         calls = self.page.evaluate('window.__confirmationCalls')
         return calls if suffix is None else [call for call in calls if call['suffix'] == suffix]
 
+    def organize_calls(self, suffix):
+        return self.page.evaluate('path=>window.__apiCalls.filter(call=>call.path===path)', '/api/logs/organize' + suffix)
+
     def select_all(self):
         self.page.locator('#confirmationReviewSelectMatching').click()
 
     def refresh(self):
         self.page.locator('#confirmationReviewRefresh').click()
         self.idle()
+
+    def test_one_zero_candidate_group_uses_all_logs_and_syncs_completed_group_on_return(self):
+        first, other = groups(2)
+        self.open([without_candidates(first, 10, 11), other])
+        trigger = self.page.locator('#confirmationReviewCorrect')
+        self.assertTrue(trigger.is_hidden())
+        detail = self.page.locator('#confirmationReviewDetail')
+        self.assertIn('点击「纠正识别」重新查找作品', detail.inner_text())
+        self.assertEqual(detail.locator('.confirmation-review-suggestion').count(), 0)
+        self.page.get_by_role('checkbox', name='选择待确认媒体组 媒体组 001', exact=True).check()
+        self.assertTrue(self.page.locator('#confirmationReviewAgent').is_disabled())
+        trigger.click()
+        modal = self.page.get_by_role('dialog', name='批量纠正识别')
+        modal.wait_for()
+        self.assertIs(self.calls('/query')[-1]['body']['include_correction_logs'], True)
+        for log_id in (10, 11):
+            detail_call, = self.organize_calls(f'/{log_id}')
+            self.assertEqual(detail_call['confirmationId'], 'group-001')
+        self.assertTrue(self.page.locator('#confirmationReviewModal').evaluate('node => node.inert'))
+        self.assertIn('2 条日志', modal.locator('#organizeDetailSubtitle').inner_text())
+        query = modal.locator('#organizeTmdbQuery')
+        query.fill('实际作品')
+        query.press('Enter')
+        modal.get_by_role('button', name='候选 A', exact=False).click()
+        execute = modal.locator('#organizeBatchExecuteBtn')
+        self.page.wait_for_function("!document.querySelector('#organizeBatchExecuteBtn').disabled")
+        search, = self.organize_calls('/10/recognition/search')
+        self.assertEqual(search['body']['confirmation_id'], 'group-001')
+        preview = self.organize_calls('/batch/preview')[0]['body']
+        self.assertEqual([(entry['log_id'], entry['expected_version'], entry['confirmation_id']) for entry in preview['entries']],
+                         [(10, 4, 'group-001'), (11, 7, 'group-001')])
+        self.assertEqual(preview['candidate']['tmdb_id'], '111')
+        execute.click()
+        self.page.locator('#appConfirmModal').wait_for()
+        self.assertFalse(self.page.evaluate("__apiCalls.some(call => call.path === '/api/logs/organize/batch')"))
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function("document.querySelector('#organizeOperationState').textContent.includes('逐条结果已返回')")
+        submit, = self.organize_calls('/batch')
+        self.assertEqual(submit['body']['entries'], preview['entries'])
+        self.page.evaluate("window.__confirmationConfig.items[0].status='completed'")
+        modal.locator('#organizeBatchCancelBtn').click()
+        self.idle()
+        self.assertFalse(self.page.locator('#confirmationReviewModal').evaluate('node => node.inert'))
+        self.assertIn('1 组已完成', self.page.locator('#confirmationReviewState').inner_text())
+        self.assertIn('已选 0 / 1000', self.page.locator('#confirmationReviewSelectionCount').inner_text())
+        self.assertNotIn('媒体组 001', self.page.locator('#confirmationReviewList').inner_text())
+        self.assertNotIn('include_correction_logs', self.calls('/query')[-1]['body'])
+        for suffix in ('/selection', '/submit', '/skip'):
+            self.assertEqual(self.calls(suffix), [])
+
+    def test_correct_cross_page_groups_with_candidates_preserves_filter_and_shows_mixed_work_errors(self):
+        items = groups(21)
+        items[0]['log_ids'] = [10]
+        items[-1]['log_ids'] = [11]
+        self.page.evaluate("preview=>window.__testConfig.previewById['8801']=preview", support._preview('8801', errors=True))
+        self.open(items)
+        field = self.page.locator('#confirmationReviewQuery')
+        field.fill('媒体组')
+        field.press('Enter')
+        self.idle()
+        self.page.get_by_role('checkbox', name='选择待确认媒体组 媒体组 001', exact=True).check()
+        self.page.locator('#confirmationReviewNext').click()
+        self.idle()
+        self.page.get_by_role('checkbox', name='选择待确认媒体组 媒体组 021', exact=True).check()
+        trigger = self.page.locator('#confirmationReviewCorrect')
+        trigger.click()
+        modal = self.page.get_by_role('dialog', name='批量纠正识别')
+        modal.wait_for()
+        self.assertEqual(self.calls('/query')[-1]['body']['confirmation_ids'], ['group-001', 'group-021'])
+        query = modal.locator('#organizeTmdbQuery')
+        query.fill('8801')
+        query.press('Enter')
+        self.page.wait_for_function("document.querySelector('#organizeBatchPreview').textContent.includes('来源标题不匹配')")
+        preview, = self.organize_calls('/batch/preview')
+        self.assertEqual([(entry['log_id'], entry['confirmation_id']) for entry in preview['body']['entries']],
+                         [(10, 'group-001'), (11, 'group-021')])
+        self.assertTrue(modal.locator('#organizeBatchExecuteBtn').is_disabled())
+        self.assertEqual(modal.locator('.organize-batch-preview-error').count(), 2)
+        self.page.keyboard.press('Escape')
+        self.idle()
+        self.assertEqual(field.input_value(), '媒体组')
+        self.assertIn('2 / 2 页', self.page.locator('#confirmationReviewPageInfo').inner_text())
+        self.assertIn('已选 2 / 1000', self.page.locator('#confirmationReviewSelectionCount').inner_text())
+        self.page.wait_for_function("document.activeElement.id==='confirmationReviewCorrect'")
+        self.assertFalse(self.page.evaluate("__apiCalls.some(call => call.path === '/api/logs/organize/batch')"))
+
+    def test_single_file_uses_single_log_preview_and_explicit_id_in_narrow_layout(self):
+        self.page.set_viewport_size({'width': 320, 'height': 720})
+        self.open([without_candidates(groups(1)[0], 10)])
+        self.select_all()
+        correction = self.page.locator('#confirmationReviewCorrect')
+        self.assertEqual(self.page.locator('.confirmation-review-actions > button').count(), 4)
+        self.assertTrue(self.page.locator('.confirmation-review-dialog').evaluate('node=>node.scrollWidth<=node.clientWidth'))
+        bounds = correction.bounding_box()
+        assert bounds is not None
+        self.assertGreaterEqual(bounds['height'], 44)
+        self.assertLessEqual(bounds['x'] + bounds['width'], 320)
+        correction.click()
+        modal = self.page.get_by_role('dialog', name='整理日志 #10')
+        modal.wait_for()
+        self.assertEqual(self.organize_calls('/10')[0]['confirmationId'], 'group-001')
+        self.assertEqual(modal.locator('#organizeTmdbType').input_value(), 'tv')
+        query = modal.locator('#organizeTmdbQuery')
+        query.fill('8801')
+        query.press('Enter')
+        modal.locator('#organizeNamingPreview').wait_for()
+        self.assertIn('Correct.mkv', modal.locator('#organizeNamingPreview').inner_text())
+        preview, = self.organize_calls('/10/reorganize/preview')
+        self.assertEqual(preview['body']['confirmation_id'], 'group-001')
+        modal.locator('#organizeReorganizeBtn').click()
+        self.page.locator('#appConfirmModal').wait_for()
+        self.assertFalse(self.page.evaluate("__apiCalls.some(call=>call.path.endsWith('/reorganize'))"))
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function("document.querySelector('#organizeOperationState').textContent.includes('云端操作已完成')")
+        post, = self.organize_calls('/10/reorganize')
+        self.assertEqual((post['body']['tmdb_id'], post['body']['preview_digest']), ('8801', 'single-digest-8801'))
+        self.assertEqual(post['body']['confirmation_id'], 'group-001')
+        self.assertFalse(self.page.evaluate("__apiCalls.some(call=>call.path.includes('/organize/batch'))"))
+
+    def test_partial_correction_receipt_opens_only_failed_log_for_retry(self):
+        log_ids = list(range(10, 18))
+        preview = support._preview('8801')
+        preview['items'] = [{**preview['items'][0], 'log_id': log_id, 'episode': index,
+                             'file_name': f'Correct - S01E{index:02d}.mkv'}
+                            for index, log_id in enumerate(log_ids, 1)]
+        result = {'requested': 8, 'completed': [{'log_id': log_id} for log_id in log_ids[:-1]],
+                  'failed': [{'log_id': 17, 'error': '改名失败'}]}
+        self.page.evaluate("""({preview,result})=>Object.assign(window.__testConfig,{
+            previewById:{'8801':preview},taskStatus:'partial',taskResult:result,singleTaskStatus:'completed',
+        })""", {'preview': preview, 'result': result})
+        self.open([without_candidates(groups(1)[0], *log_ids)])
+        self.select_all()
+        self.page.locator('#confirmationReviewCorrect').click()
+        batch = self.page.get_by_role('dialog', name='批量纠正识别')
+        query = batch.locator('#organizeTmdbQuery')
+        query.fill('8801')
+        query.press('Enter')
+        execute = batch.locator('#organizeBatchExecuteBtn')
+        execute.click()
+        self.page.locator('#appConfirmSubmit').click()
+        failure = batch.get_by_role('button', name='打开失败的整理日志 #17')
+        failure.wait_for()
+        self.assertTrue(execute.is_disabled())
+        self.assertIn('打开整理日志单独重试', batch.locator('#organizeBatchPreview').inner_text())
+        self.assertEqual(batch.locator('.organize-batch-preview-result.is-success').count(), 7)
+        self.assertEqual(batch.get_by_role('button', name='打开失败的整理日志').count(), 1)
+        self.page.evaluate('window.__confirmationConfig.items[0].log_ids=[]')
+        failure.click()
+        single = self.page.get_by_role('dialog', name='整理日志 #17')
+        query = single.locator('#organizeTmdbQuery')
+        query.fill('8801')
+        query.press('Enter')
+        single.locator('#organizeNamingPreview').wait_for()
+        self.assertEqual([call['confirmationId'] for call in self.organize_calls('/17')], ['group-001', None])
+        self.assertNotIn('confirmation_id', self.organize_calls('/17/reorganize/preview')[0]['body'])
+        single.locator('#organizeReorganizeBtn').click()
+        self.assertEqual(self.organize_calls('/17/reorganize'), [])
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function("document.querySelector('#organizeOperationState').textContent.includes('云端操作已完成')")
+        self.assertEqual(len(self.organize_calls('/batch')), 1)
+        self.assertNotIn('confirmation_id', self.organize_calls('/17/reorganize')[0]['body'])
+        retry_paths = self.page.evaluate("window.__apiCalls.filter(call=>call.path.endsWith('/reorganize')).map(call=>call.path)")
+        self.assertEqual(retry_paths, ['/api/logs/organize/17/reorganize'])
+
+    def test_incomplete_and_oversize_selections_block_correction_before_reading_logs(self):
+        first, second = groups(2)
+        missing = {**without_candidates(second, 11, 12), "log_ids": [11]}
+        large = {**without_candidates(second, *range(11, 61)), "log_ids": []}
+        self.open([without_candidates(first, 10), missing])
+        self.select_all()
+        trigger = self.page.locator('#confirmationReviewCorrect')
+        trigger.click()
+        self.idle()
+        status = self.page.locator('#confirmationReviewState').inner_text()
+        self.assertIn('「媒体组 002」缺少完整的关联日志，无法整组纠正', status)
+        self.assertIn('按回执中的日志编号在整理日志里单独重试失败项', status)
+        self.page.evaluate("item=>{window.__confirmationConfig.items[0].log_ids=[];window.__confirmationConfig.items[1]=item;}", large)
+        trigger.click()
+        self.idle()
+        self.assertIn('51 个视频，单次纠正最多 50 条日志', self.page.locator('#confirmationReviewState').inner_text())
+        self.assertTrue(self.page.locator('#organizeDetailModal').is_hidden())
+        self.assertFalse(self.page.evaluate("__apiCalls.some(call=>/\\/organize\\/\\d+$/.test(call.path))"))
+
+    def test_agent_rechecks_unknown_cross_page_choices_for_mixed_candidate_eligibility(self):
+        items = groups(21)
+        items = [without_candidates(item, index) for index, item in enumerate(items, 100)]
+        self.open(items)
+        agent = self.page.locator('#confirmationReviewAgent')
+        self.page.locator('#confirmationReviewSelectPage').check()
+        self.assertTrue(agent.is_disabled())
+        self.select_all()
+        self.assertTrue(agent.is_enabled())
+        agent.click()
+        self.idle()
+        self.assertTrue(agent.is_disabled())
+        self.assertEqual(self.calls('/review'), [])
+        self.assertIn('无法由 Agent 搜索候选', self.page.locator('#confirmationReviewState').inner_text())
+
+        # 跨页快照包含已有候选、允许搜索的空候选和已经离开待确认状态的项。
+        more = groups(24)[21:]
+        more[1] = {**without_candidates(more[1], 122), 'can_discover_candidates': True}
+        more[2] = {**without_candidates(more[2], 123), 'can_discover_candidates': True}
+        self.page.evaluate('items=>window.__confirmationConfig.items.push(...items)', more)
+        self.refresh()
+        self.select_all()
+        self.page.evaluate("window.__confirmationConfig.items[23].status='queued'")
+        agent.click()
+        self.idle()
+        self.assertEqual([call['body'] for call in self.calls('/review')], [{'confirmation_ids': ['group-022', 'group-023']}])
+        status = self.page.locator('#confirmationReviewState').inner_text()
+        self.assertIn('其中 1 组将搜索候选', status)
+        self.assertIn('21 组无候选且不具备搜索资格', status)
+        self.assertTrue(self.calls('/query'))
+        self.assertTrue(all('include_correction_logs' not in call['body'] for call in self.calls('/query')))
+
+    def test_agent_candidate_search_reports_progress_and_results_then_previews_verified_candidate(self):
+        groups_with_candidates = groups(3)
+        items = [{**without_candidates(item, index), 'can_discover_candidates': True}
+                 for index, item in enumerate(groups_with_candidates, 10)]
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.page.clock.install()
+        self.page.evaluate('window.__confirmationConfig.holdReview=true')
+        self.open(items)
+        self.select_all()
+        agent = self.page.locator('#confirmationReviewAgent')
+        detail = self.page.locator('#confirmationReviewDetail')
+        correction = self.page.locator('#confirmationReviewCorrect')
+        self.assertTrue(agent.is_enabled())
+        self.assertTrue(correction.is_enabled())
+        self.assertIn('「Agent 只读复核」搜索候选', detail.inner_text())
+        agent.click()
+        self.page.wait_for_function('window.__heldConfirmationReviews.length===1')
+        self.assertTrue(agent.is_disabled())
+        self.assertIn('3 组将搜索候选', self.page.locator('#confirmationReviewState').inner_text())
+        self.page.evaluate('window.__heldConfirmationReviews.shift()()')
+        self.idle()
+        self.assertEqual([call['body'] for call in self.calls('/review')], [
+            {'confirmation_ids': ['group-001', 'group-002', 'group-003']},
+        ])
+        detail.get_by_text('候选搜索排队中', exact=True).wait_for()
+        self.page.evaluate("window.__confirmationConfig.items[0].review_status='running'")
+        self.page.clock.fast_forward(4100)
+        detail.get_by_text('Agent 正在搜索候选', exact=True).wait_for()
+
+        discovered = groups_with_candidates[0]['candidates']
+        discovered[1]['title'] = '新找到的作品'
+        self.page.evaluate("""candidates=>{
+            const [found,empty,failed]=window.__confirmationConfig.items;
+            Object.assign(found,{review_status:'approved',can_discover_candidates:false,candidates,
+                suggestion:{candidate_index:1,summary:'作品与文件季集证据一致',source:'agent',confidence:0.91}});
+            Object.assign(empty,{review_status:'abstained',review_summary:'TMDB 搜索未命中匹配的作品'});
+            Object.assign(failed,{review_status:'failed',review_summary:'TMDB 搜索超时，可稍后重试'});
+        }""", discovered)
+        self.page.clock.fast_forward(4100)
+        detail.get_by_text('Agent 候选建议（只读）', exact=True).wait_for()
+        self.assertTrue(detail.get_by_role('radio', name='选择候选 新找到的作品 (2024)').is_checked())
+        self.page.get_by_role('button', name='审阅 媒体组 002', exact=True).click()
+        self.assertIn('未找到可用候选', detail.inner_text())
+        self.assertIn('TMDB 搜索未命中匹配的作品', detail.inner_text())
+        self.page.get_by_role('button', name='审阅 媒体组 003', exact=True).click()
+        self.assertIn('复核失败', detail.inner_text())
+        self.assertIn('TMDB 搜索超时，可稍后重试', detail.inner_text())
+        self.assertTrue(correction.is_enabled())
+        self.assertTrue(self.page.locator('.confirmation-review-dialog').evaluate('node=>node.scrollWidth<=node.clientWidth'))
+        self.assertTrue(self.page.locator('#confirmationReviewSubmit').is_disabled())
+        self.assertEqual(self.calls('/preview'), [])
+        self.page.locator('#confirmationReviewPrepare').click()
+        self.idle()
+        self.assertEqual([call['body'] for call in self.calls('/preview')], [
+            {'entries': [{'confirmation_id': 'group-001', 'candidate_index': 1}]},
+        ])
+        self.assertIn('新找到的作品', self.page.locator('#confirmationReviewPreview').inner_text())
+        for suffix in ('/selection', '/submit', '/skip'):
+            self.assertEqual(self.calls(suffix), [])
 
     def test_filters_and_cross_page_selection_use_frozen_post_queries(self):
         self.open()

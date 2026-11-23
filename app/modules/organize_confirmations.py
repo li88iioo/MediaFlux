@@ -12,6 +12,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
@@ -44,7 +45,7 @@ from app.modules.organize import (
     restore_organize_rules_snapshot,
 )
 from app.modules.organize_results import organize_strm_error
-from app.modules.scraper import MatchResult, TMDBScraper
+from app.modules.scraper import MatchResult, TMDBScraper, extract_recognition_context
 from app.modules.telegram_notification_center import (
     deserialize_notification_event,
     serialize_notification_event,
@@ -58,6 +59,10 @@ from app.notifier import (
 )
 
 logger = get_logger(__name__)
+WEB_CORRECTION_GUIDE = (
+    "在 Web「整理日志 → 批量审阅光鸭待确认」勾选媒体组，"
+    "点击「纠正识别」为整组文件一次选择作品。"
+)
 _CONFIRMATION_TTL_HOURS = 24
 _MAX_CANDIDATES = 3
 _DISPATCH_POLL_SECONDS = 1.0
@@ -135,6 +140,13 @@ def _valid_confirmation_candidate(candidate: object) -> bool:
     return False
 
 
+def _confirmation_candidates(group: dict) -> list[dict]:
+    return [
+        dict(candidate) for candidate in (group.get("candidates") or [])[:_MAX_CANDIDATES]
+        if _valid_confirmation_candidate(candidate)
+    ]
+
+
 def semantic_candidate_category(candidate: dict) -> str:
     """把 provider、媒体大类与题材合并成用户可理解的候选身份。"""
     if _candidate_provider(candidate) in {"metatube", "clean_title"}:
@@ -191,7 +203,7 @@ def _safe_label(candidate: dict, index: int) -> str:
 
 def _candidate_summary_lines(group: dict) -> tuple[str, ...]:
     lines: list[str] = []
-    for index, candidate in enumerate((group.get("candidates") or [])[:_MAX_CANDIDATES]):
+    for index, candidate in enumerate(_confirmation_candidates(group)):
         title = _candidate_display_name(candidate, f"候选 {index + 1}")
         year = str(candidate.get("year") or "").strip()
         score = max(0.0, min(float(candidate.get("score") or 0.0), 1.0))
@@ -215,9 +227,12 @@ def _fingerprint(payload: dict) -> str:
         if key not in {
             "organize_task_id", "organize_rollup", "download_request_ids", "_telegram_message_id",
             organize_confirmations_repo.RETRY_SELECTED_INDEX_KEY, _NOTIFICATION_SUPPRESSED_KEY, "_organize_log_upper_bound",
-            "_confirmation_batch", "review_only", "_explicit_approval",
+            "_organize_step_upper_bound", "_confirmation_batch", "review_only", "discover_candidates", "_explicit_approval",
         }
     }
+    if payload.get("discover_candidates"):
+        # 手动补搜的同组重试仍应被新一轮整理生成的原始空候选卡替代。
+        stable_payload["candidates"] = []
     encoded = json.dumps(
         stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
@@ -230,6 +245,18 @@ def confirmation_kind(payload: dict) -> str:
     if kind not in {"guangya", "local_media"}:
         raise ValueError("确认任务类型无效，请重新执行整理")
     return kind
+
+
+def confirmation_files(payload: dict) -> list[dict]:
+    """旧卡可能缺少季集号；预览和执行都使用补搜核验时的文件名及父目录。"""
+    files = [dict(item) for item in payload.get("files") or []]
+    candidates = payload.get("candidates") or []
+    if payload.get("discover_candidates") and candidates and candidates[0].get("media_type") == "tv":
+        for item in files:
+            if item.get("season") in (None, "") or item.get("episode") in (None, ""):
+                context = extract_recognition_context(item["name"], payload.get("directory") or "")
+                item.update(season=context.season, episode=context.episode)
+    return files
 
 
 def _clean_review_candidate(candidate: dict) -> bool:
@@ -557,7 +584,7 @@ def publish_confirmation_event(
     finally:
         if not terminal:
             try:
-                if organize_confirmations_repo.activate_organize_confirmation_review(resolved_token):
+                if organize_confirmations_repo.activate_organize_confirmation_reviews([resolved_token]):
                     wake_recognition_review_dispatcher()
             except Exception as exc:  # noqa: BLE001 - 自动复核不得破坏人工通知
                 logger.warning(
@@ -691,10 +718,7 @@ def create_confirmation_actions(
     notification_suppressed: bool = False,
 ) -> tuple[NotificationAction, ...]:
     """持久化候选组；无元数据时仍返回可终结待确认状态的跳过按钮。"""
-    candidates = [
-        dict(item) for item in (group.get("candidates") or [])[:_MAX_CANDIDATES]
-        if _valid_confirmation_candidate(item)
-    ]
+    candidates = _confirmation_candidates(group)
     files = [dict(item) for item in (group.get("files") or [])]
     if not files:
         return ()
@@ -1591,7 +1615,7 @@ def _confirmation_dispatch_loop(
         wakeup_event.clear()
 
 
-def _process_recognition_review_row(row) -> str:
+def _process_recognition_review_row(row, *, discovery_scraper: TMDBScraper | None = None) -> str:
     """处理一条已领取记录；只返回审计状态，不暴露模型上下文。"""
     token = str(row["token"] or "")
     if not feature_gate.recognition_review_enabled():
@@ -1607,13 +1631,15 @@ def _process_recognition_review_row(row) -> str:
     payload = decode_row(row)
     from app.modules.agent_recognition_review import review_confirmation_payload
 
-    decision = review_confirmation_payload(payload)
+    decision = (review_confirmation_payload(payload, discovery_scraper=discovery_scraper)
+                if discovery_scraper is not None else review_confirmation_payload(payload))
     audit = decision.audit_payload()
     current = organize_confirmations_repo.get_organize_confirmation(token)
-    if current is not None and decode_row(current).get("review_only"):
+    if decision.discovered_candidates or (current is not None and decode_row(current).get("review_only")):
         # 批量审阅只保存建议，批准与候选入队由用户的同一份预览决定。
         saved = organize_confirmations_repo.complete_organize_confirmation_review(
             token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
+            discovered_candidates=decision.discovered_candidates,
         )
         batch_id = str(payload.get("_confirmation_batch") or "")
         if saved and batch_id and _confirmation_delivery_enabled(payload):
@@ -1706,41 +1732,57 @@ def _recognition_review_loop(
             "恢复 Agent 主动识别复核失败 type=%s", type(exc).__name__
         )
 
-    while not stop_event.is_set():
-        token: str = ""
-        try:
-            row = organize_confirmations_repo.claim_next_organize_confirmation_review()
-            if row is None:
-                wakeup_event.wait(_DISPATCH_POLL_SECONDS)
-                wakeup_event.clear()
-                continue
-            token = str(row["token"] or "")
-            _process_recognition_review_row(row)
-        except Exception as exc:  # noqa: BLE001 - 失败关闭，保留人工按钮
-            logger.warning(
-                "Agent 主动识别复核队列异常 type=%s",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            if token:
-                try:
-                    organize_confirmations_repo.complete_organize_confirmation_review(
-                        token,
-                        status="failed",
-                        result={
-                            "reason_code": "worker_error",
-                            "summary": "Agent 复核异常，已保留人工确认",
-                            "failure_code": type(exc).__name__,
-                        },
-                    )
-                except Exception:
-                    logger.warning(
-                        "Agent 复核失败回执保存异常 token=%s",
-                        token[:6],
-                        exc_info=True,
-                    )
-        wakeup_event.wait(_DISPATCH_POLL_SECONDS)
-        wakeup_event.clear()
+    current_batch = ""
+    batch_scraper = None
+    with ExitStack() as resources:
+        while not stop_event.is_set():
+            token: str = ""
+            try:
+                row = organize_confirmations_repo.claim_next_organize_confirmation_review()
+                token = str(row["token"]) if row is not None else ""
+                # 旧版本可能把同剧每集拆成一张卡。只复用本批次的 TMDB 查询缓存，
+                # 每张卡仍按自己的原文件和季集核验、保存建议。
+                payload = decode_row(row) if row is not None else {}
+                batch_id = str(payload.get("_confirmation_batch") or "") if payload.get("discover_candidates") else ""
+                if batch_id != current_batch:
+                    resources.close()
+                    batch_scraper = None
+                    current_batch = ""
+                    if batch_id:
+                        batch_scraper = TMDBScraper()
+                        resources.callback(batch_scraper.close)
+                        current_batch = batch_id
+                if row is None:
+                    wakeup_event.wait(_DISPATCH_POLL_SECONDS)
+                    wakeup_event.clear()
+                    continue
+                _process_recognition_review_row(row, discovery_scraper=batch_scraper)
+            except Exception as exc:  # noqa: BLE001 - 失败关闭，保留人工按钮
+                logger.warning(
+                    "Agent 主动识别复核队列异常 type=%s",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                if token:
+                    try:
+                        organize_confirmations_repo.complete_organize_confirmation_review(
+                            token,
+                            status="failed",
+                            result={
+                                "reason_code": "worker_error",
+                                "summary": "Agent 复核异常，已保留人工确认",
+                                "failure_code": type(exc).__name__,
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Agent 复核失败回执保存异常 token=%s",
+                            token[:6],
+                            exc_info=True,
+                        )
+            wakeup_event.wait(_DISPATCH_POLL_SECONDS)
+            wakeup_event.clear()
+
 
 def start_recognition_review_dispatcher() -> None:
     """启动独立只读复核消费者；不占用文件整理执行线程。"""
@@ -2793,7 +2835,7 @@ def _execute_guangya_confirmation(
         ):
             raise DirectoryScrapeConflictError("原下载请求已取消、重新提交或尚未下载完成，未执行整理")
 
-        files = [dict(item) for item in (payload.get("files") or [])]
+        files = confirmation_files(payload)
         companions = [dict(item) for item in (payload.get("companions") or [])]
         source_snapshots = {
             str(item.get("file_id") or ""): GuangYaFile(
@@ -3126,25 +3168,33 @@ def confirmation_event(
     actions = create_confirmation_actions(
         group, rules, source_name=source_name, chat_id=chat_id
     )
+    lines = _candidate_summary_lines(group) if actions else ()
     reason = str(group.get("reason") or "匹配结果需要人工确认").strip()
+    validity = "候选" if lines else "待确认"
     expiry_hint = (
-        f"候选有效期为 {_CONFIRMATION_TTL_HOURS} 小时；到期未处理将自动结束，"
+        f"{validity}有效期为 {_CONFIRMATION_TTL_HOURS} 小时，到期未处理将自动结束，"
         "源文件保持原位。"
     )
-    if list(group.get("candidates") or []):
+    if lines:
         footer = (
             f"{reason}\n\n请选择候选继续整理，或跳过此组。"
             f"\n\n{expiry_hint}"
         )
     else:
+        agent_hint = ""
+        if actions and feature_gate.recognition_review_enabled():
+            token = actions[0].callback_data.split(":", 2)[1]
+            row = organize_confirmations_repo.get_organize_confirmation(token)
+            if row is not None and organize_confirmations_repo.can_discover_candidates(decode_row(row)):
+                agent_hint = "\n也可在同一页面点击「Agent 只读复核」查找候选，仍需人工确认。"
         footer = (
-            f"{reason}\n\n当前没有可用元数据。可跳过此组；文件保持原位，"
-            f"本次待确认状态会结束。\n\n{expiry_hint}"
+            f"{reason}\n\n暂无候选。{WEB_CORRECTION_GUIDE}{agent_hint}"
+            f"\n\n跳过此组会结束本次待确认，源文件保持原位。\n\n{expiry_hint}"
         )
     return NotificationEvent(
         title=title,
         fields=tuple(fields.items()),
-        lines=_candidate_summary_lines(group),
+        lines=lines,
         footer=footer,
         actions=actions,
         layout="relaxed",

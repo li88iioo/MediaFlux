@@ -10,10 +10,14 @@ let organizeDetail = null, selectedOrganizeCandidate = null;
 let organizePreview = null;
 let organizeRows = [], selectedOrganizeLogs = new Map();
 let batchCorrection = null, batchCorrectionSession = 0, organizeDetailSerial = 0, organizeSearchSerial = 0;
+let onOrganizeDetailClose = null;
 const organizeModal = createAppModal(document.getElementById('organizeDetailModal'), {
     onRequestClose: ({close}) => {
+        const onClose = onOrganizeDetailClose;
+        onOrganizeDetailClose = null;
         invalidateBatchCorrection();
         close();
+        onClose?.();
     },
 });
 
@@ -342,14 +346,14 @@ function profiledBatchMediaType(data){
     const values=[data?.release_parse?.media_type,data?.media_type];
     return values.find(value=>value==='tv'||value==='movie')||'tv';
 }
-async function openBatchCorrection(){
-    const rows=[...selectedOrganizeLogs.values()];
+async function openBatchCorrection(rows=[...selectedOrganizeLogs.values()], trigger=document.getElementById('organizeBatchRenameBtn'), firstDetail=null){
     if(rows.length<2||rows.length>50){_setOrganizeBatchState('批量纠正识别需选择 2–50 条日志','error');return;}
     invalidateBatchCorrection();
     const session=++batchCorrectionSession;
     batchCorrection={
         active:true,session,rows,
-        entries:rows.map(row=>({log_id:row.id,expected_version:row.version??null,operation_token:_operationToken()})),
+        entries:rows.map(row=>({log_id:row.id,expected_version:row.version??null,operation_token:_operationToken(),
+            ...(row.confirmation_id?{confirmation_id:row.confirmation_id}:{})})),
         preview:null,previewDigest:'',previewSerial:0,searchSerial:0,
         executable:false,confirming:false,executing:false,executed:false,candidate:null,
     };
@@ -370,14 +374,11 @@ async function openBatchCorrection(){
     document.getElementById('organizeBatchActions').hidden=false;
     document.querySelector('.organize-single-actions').hidden=true;
     document.getElementById('organizeBatchExecuteBtn').disabled=true;
-    organizeModal.open(document.getElementById('organizeBatchRenameBtn'));
+    organizeModal.open(trigger);
     _setOrganizeState('正在读取首条日志详情与来源策略…');
     try{
-        const response=await api(`/api/logs/organize/${rows[0].id}`);
-        const data=await response.json().catch(()=>({}));
+        const data=firstDetail||await readOrganizeDetail(rows[0].id);
         if(!isBatchCorrectionSession(session))return;
-        if(!response.ok)throw new Error(data.error||'首条日志详情读取失败');
-        if(!data||typeof data!=='object')throw new Error('首条日志详情无效，无法建立批量纠正上下文');
         data.allowed_actions=data.allowed_actions||{};
         _renderOrganizeDetail(data);
         syncBatchCorrectionMode(data);
@@ -445,8 +446,9 @@ function renderBatchCorrectionPreview(data,state=batchCorrection,outcomes=null){
         const success=outcomeStatus==='success';
         const outcomeLabel=outcomes?(failed?'执行失败':success?'已完成':'未返回逐条结果'):'';
         const errorText=outcomes?(failed?(outcome.error||outcome.message||'该条执行失败'):''):previewError;
+        const logNumber=failed?`<button type="button" class="jump-btn" data-failed-log="${_attr(id)}" aria-label="打开失败的整理日志 #${_attr(id)}">#${_esc(id)}</button>`:`#${_esc(id)}`;
         return `<article class="organize-batch-preview-row${previewError||failed?' is-error':''}" data-log-id="${_attr(id)}">
-            <div class="organize-batch-preview-head"><span class="organize-batch-preview-index">${index+1} / ${state.rows.length} · #${_esc(id)}</span>${outcomeLabel?`<span class="organize-batch-preview-result ${failed?'is-error':success?'is-success':'is-pending'}">${_esc(outcomeLabel)}</span>`:''}</div>
+            <div class="organize-batch-preview-head"><span class="organize-batch-preview-index">${index+1} / ${state.rows.length} · ${logNumber}</span>${outcomeLabel?`<span class="organize-batch-preview-result ${failed?'is-error':success?'is-success':'is-pending'}">${_esc(outcomeLabel)}</span>`:''}</div>
             <div class="organize-batch-preview-flow"><strong class="organize-batch-preview-source" title="${_attr(source)}">${_esc(source)}</strong><span aria-hidden="true">→</span><code class="organize-batch-preview-target" title="${_attr(target)}">${_esc(target)}</code></div>
             <div class="organize-batch-preview-position">各自季集：${_esc(position)}</div>
             ${errorText?`<div class="organize-batch-preview-error">${_esc(errorText)}</div>`:''}
@@ -455,9 +457,12 @@ function renderBatchCorrectionPreview(data,state=batchCorrection,outcomes=null){
     const failedCount=outcomes?[...outcomes.values()].filter(item=>item.status==='failed').length:0;
     const completeResults=Boolean(outcomes&&state.rows.every(row=>outcomes.has(String(row.id))));
     const intro=outcomes
-        ? `<p class="organize-batch-preview-summary ${failedCount?'is-error':completeResults?'is-success':'is-warning'}">${failedCount?`执行完成，${failedCount} 条失败；请按行核对。`:completeResults?'整批执行已完成，以下为逐条结果。':'执行请求已返回，但逐条结果不完整；请刷新日志核实，未确认的记录不会标记为成功。'}</p>`
+        ? `<p class="organize-batch-preview-summary ${failedCount?'is-error':completeResults?'is-success':'is-warning'}">${failedCount?`有 ${failedCount} 条失败。点击失败项的日志编号，打开整理日志单独重试。`:completeResults?'整批执行已完成，以下为逐条结果。':'执行请求已返回，但逐条结果不完整；请刷新日志核实，未确认的记录不会标记为成功。'}</p>`
         : `<p class="organize-batch-preview-summary" title="核对每条文件的目标和季集；整批预检通过后才能提交。">预览 · 尚未执行</p>`;
     box.innerHTML=`${intro}<div class="organize-batch-preview-list">${rows}</div>`;
+    box.querySelectorAll('[data-failed-log]').forEach(button=>{
+        button.addEventListener('click',()=>openOrganizeDetail(Number(button.dataset.failedLog),button));
+    });
     box.hidden=false;
 }
 function batchPreviewCanExecute(data,state){
@@ -843,7 +848,7 @@ function _renderOrganizeDetail(data){
     const audits=data.delete_audits||[];document.getElementById('organizeDeleteAuditSection').hidden=!audits.length;document.getElementById('organizeDeleteAudits').innerHTML=audits.map(audit=>`<div class="organize-delete-audit"><span class="status-pill ${audit.status==='success'?'done':audit.status==='failed'?'failed':'paused'}">${_esc(audit.status)}</span><div><strong>${_esc(audit.reason||'未记录原因')}</strong><small>${_esc(audit.file_name||audit.file_id)}${audit.replacement_name?` → 替换为 ${_esc(audit.replacement_name)}`:''}</small><small>${_esc(audit.provider||'guangya')} · ${_esc(audit.provider_result||audit.error||'-')}</small></div></div>`).join('');
     document.getElementById('organizeTmdbQuery').value=data.title||data.original_name||'';
     document.getElementById('organizeTmdbYear').value=data.year||'';
-    document.getElementById('organizeTmdbType').value=data.media_type==='tv'?'tv':'movie';
+    document.getElementById('organizeTmdbType').value=onOrganizeDetailClose?profiledBatchMediaType(data):data.media_type==='tv'?'tv':'movie';
     document.getElementById('organizeSeasonOverride').value=data.season??'';
     document.getElementById('organizeEpisodeOverride').value=data.episode??'';
     syncOrganizeRecognitionFields();
@@ -860,62 +865,77 @@ function _renderOrganizeDetail(data){
     document.getElementById('organizeTmdbCandidates').replaceChildren();_setOrganizeState('');
     window.renderLucideIcons?.(document.getElementById('organizeDetailModal'));
 }
-async function openOrganizeDetail(logId,trigger){
+async function readOrganizeDetail(logId,confirmationId=''){
+    const query=confirmationId?`?confirmation_id=${encodeURIComponent(confirmationId)}`:'';
+    const response=await api(`/api/logs/organize/${logId}${query}`);
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok||data?.id!==logId)throw new Error(`日志 #${logId}：${data?.error||'详情加载失败'}`);
+    return {...data,confirmation_id:confirmationId};
+}
+
+async function openOrganizeDetail(logId,trigger,detail=null){
     invalidateBatchCorrection();
     const serial=organizeDetailSerial;
     organizeDetail=null;selectedOrganizeCandidate=null;
-    document.getElementById("organizeCorrectionPanel").hidden=true;
-    organizeModal.open(trigger);_setOrganizeState('正在读取媒体组快照...');
-    try{const response=await api('/api/logs/organize/'+logId);const data=await response.json();if(serial!==organizeDetailSerial)return;if(!response.ok)throw new Error(data.error||'详情加载失败');_renderOrganizeDetail(data);}catch(error){if(serial===organizeDetailSerial)_setOrganizeState(error.message,'error');}
+    document.getElementById('organizeCorrectionPanel').hidden=true;
+    const modal=document.getElementById('organizeDetailModal');
+    if(modal.hidden)organizeModal.open(trigger);
+    else if(trigger&&!trigger.isConnected)modal.querySelector('[data-modal-close]').focus({preventScroll:true});
+    _setOrganizeState('正在读取媒体组快照...');
+    try{
+        const data=detail||await readOrganizeDetail(logId);
+        if(serial===organizeDetailSerial)_renderOrganizeDetail(data);
+    }catch(error){if(serial===organizeDetailSerial)_setOrganizeState(error.message,'error');}
 }
 function organizeRecognitionProfile(){return organizeDetail?.recognition||{provider:'tmdb',label:'TMDB',nsfw_only:false,query_placeholder:'输入片名或剧名'};}
-function syncOrganizeRecognitionFields(){const profile=organizeRecognitionProfile();const nsfwOnly=Boolean(profile.nsfw_only);document.getElementById('organizeRecognitionTitle').textContent=nsfwOnly?'重新识别 · MetaTube':'重新识别';const query=document.getElementById('organizeTmdbQuery');query.placeholder=profile.query_placeholder||(nsfwOnly?'输入番号或包含番号的文件名':'输入片名或剧名');document.querySelectorAll('[data-recognition-tmdb-only]').forEach(element=>{element.hidden=nsfwOnly;});document.getElementById('organizeRecognitionSearchLabel').textContent=nsfwOnly?'识别番号':'搜索';if(nsfwOnly)document.getElementById('organizeTmdbType').value='movie';}
+function acceptsOrganizeTmdbId(){return !organizeRecognitionProfile().nsfw_only&&Boolean(batchCorrection?.active||onOrganizeDetailClose);}
+function syncOrganizeRecognitionFields(){
+    const profile=organizeRecognitionProfile();
+    const nsfwOnly=Boolean(profile.nsfw_only);
+    document.getElementById('organizeRecognitionTitle').textContent=nsfwOnly?'重新识别 · MetaTube':'重新识别';
+    document.getElementById('organizeTmdbQuery').placeholder=acceptsOrganizeTmdbId()?'输入作品名或 TMDB ID':
+        profile.query_placeholder||(nsfwOnly?'输入番号或包含番号的文件名':'输入片名或剧名');
+    document.querySelectorAll('[data-recognition-tmdb-only]').forEach(element=>{element.hidden=nsfwOnly;});
+    document.getElementById('organizeRecognitionSearchLabel').textContent=nsfwOnly?'识别番号':'搜索';
+    if(nsfwOnly)document.getElementById('organizeTmdbType').value='movie';
+}
 async function searchOrganizeTmdb(){
     if(!organizeDetail)return;
+    const {id,confirmation_id}=organizeDetail;
     const profile=organizeRecognitionProfile();
     const query=document.getElementById('organizeTmdbQuery').value.trim();
     const year=profile.nsfw_only?'':document.getElementById('organizeTmdbYear').value.trim();
     const media_type=profile.nsfw_only?'movie':document.getElementById('organizeTmdbType').value;
-    if(batchCorrection?.active){
-        const state=batchCorrection;
-        const session=state.session;
-        const sequence=++state.searchSerial;
-        selectedOrganizeCandidate=null;
+    const batch=batchCorrection;
+    const serial=organizeDetailSerial;
+    const sequence=batch?++batch.searchSerial:++organizeSearchSerial;
+    const current=()=>batch?isBatchCorrectionSession(batch.session)&&sequence===batch.searchSerial:
+        serial===organizeDetailSerial&&sequence===organizeSearchSerial;
+    const candidates=document.getElementById('organizeTmdbCandidates');
+    selectedOrganizeCandidate=null;
+    if(batch){
         clearBatchCorrectionPreview();
-        document.getElementById('organizeTmdbCandidates').replaceChildren();
+        candidates.replaceChildren();
         if(!query){_setOrganizeState('请输入作品名或 TMDB ID','error');return;}
-        if(!profile.nsfw_only&&/^\d+$/.test(query)){
-            const candidate={tmdb_id:query,external_id:query,provider:'tmdb',media_type,title:`TMDB-${query}`,explicit_id:true};
-            renderOrganizeCandidates([candidate]);
-            _setOrganizeState('已按 TMDB ID 建立候选，正在生成整批预览…','success');
-            await selectOrganizeCandidate(candidate,document.querySelector('#organizeTmdbCandidates .organize-candidate'));
-            return;
-        }
-        _setOrganizeState(`正在搜索 ${profile.label||'媒体信息'}...`);
-        try{
-            const response=await api(`/api/logs/organize/${organizeDetail.id}/recognition/search`,{method:'POST',body:JSON.stringify({query,year,media_type})});
-            const data=await response.json().catch(()=>({}));
-            if(!isBatchCorrectionSession(session)||sequence!==state.searchSerial)return;
-            if(!response.ok)throw new Error(data.error||'搜索失败');
-            renderOrganizeCandidates(data.candidates||[]);
-            _setOrganizeState(data.candidates?.length?'请选择一个候选并预览整批':'没有找到精确候选',data.candidates?.length?'success':'error');
-        }catch(error){if(isBatchCorrectionSession(session)&&sequence===state.searchSerial)_setOrganizeState(error.message||'搜索失败','error');}
+    }else invalidateOrganizePreview();
+    if(acceptsOrganizeTmdbId()&&/^\d+$/.test(query)){
+        const candidate={tmdb_id:query,external_id:query,provider:'tmdb',media_type,title:`TMDB-${query}`,explicit_id:true};
+        renderOrganizeCandidates([candidate]);
+        await selectOrganizeCandidate(candidate,candidates.firstElementChild);
         return;
     }
-    const serial=organizeDetailSerial;
-    const searchSerial=++organizeSearchSerial;
-    selectedOrganizeCandidate=null;
-    invalidateOrganizePreview();
     _setOrganizeState(`正在搜索 ${profile.label||'媒体信息'}...`);
     try{
-        const response=await api(`/api/logs/organize/${organizeDetail.id}/recognition/search`,{method:'POST',body:JSON.stringify({query,year,media_type})});
-        const data=await response.json();
-        if(serial!==organizeDetailSerial||searchSerial!==organizeSearchSerial)return;
+        const response=await api(`/api/logs/organize/${id}/recognition/search`,{method:'POST',
+            body:JSON.stringify({query,year,media_type,...(confirmation_id?{confirmation_id}:{})})});
+        const data=await response.json().catch(()=>({}));
+        if(!current())return;
         if(!response.ok)throw new Error(data.error||'搜索失败');
         renderOrganizeCandidates(data.candidates||[]);
-        _setOrganizeState(data.candidates?.length?'请选择候选并预览命名':'没有找到精确候选',data.candidates?.length?'success':'error');
+        const message=batch?'请选择一个候选并预览整批':'请选择候选并预览命名';
+        _setOrganizeState(data.candidates?.length?message:'没有找到精确候选',data.candidates?.length?'success':'error');
     }catch(error){
-        if(serial===organizeDetailSerial&&searchSerial===organizeSearchSerial)_setOrganizeState(error.message,'error');
+        if(current())_setOrganizeState(error.message||'搜索失败','error');
     }
 }
 function renderOrganizeCandidates(candidates){const box=document.getElementById('organizeTmdbCandidates');box.replaceChildren();candidates.forEach(candidate=>{const row=document.createElement('button');row.type='button';row.className='candidate-item organize-candidate';const provider=String(candidate.provider||'tmdb').toLowerCase();const identity=provider==='metatube'?`MetaTube · ${candidate.external_id||'-'}`:(provider==='clean_title'?`清洗标题 · ${candidate.external_id||'-'}`:`TMDB-${candidate.tmdb_id||candidate.external_id||'-'}`);const action=candidate.explicit_id?'指定 ID':provider==='clean_title'?'清洗标题后入库':`${Math.round((candidate.score||0)*100)}%`;row.innerHTML=`<div class="candidate-info"><strong>${_esc(candidate.title||candidate.external_id||candidate.tmdb_id)}</strong><span class="text-muted">${_esc(candidate.year||'-')} · ${_esc(identity)}</span></div><span class="tag-mini">${_esc(action)}</span>`;row.addEventListener('click',()=>selectOrganizeCandidate(candidate,row));box.appendChild(row);});}
@@ -924,6 +944,7 @@ function organizeCandidatePayload(candidate=selectedOrganizeCandidate){
     if(!candidate)return null;
     if(batchCorrection?.active)return batchCandidatePayload(candidate);
     const payload={...candidate};
+    if(organizeDetail?.confirmation_id)payload.confirmation_id=organizeDetail.confirmation_id;
     payload.provider=String(payload.provider||'tmdb').toLowerCase();
     payload.external_id=String(payload.external_id||payload.tmdb_id||'');
     payload.tmdb_id=String(payload.tmdb_id||'');
@@ -1009,7 +1030,7 @@ async function waitOrganizeTask(taskId,logId,contextSerial=null,deleting=false){
             if(contextSerial!==null&&!isCurrent())return null;
             const status=String(task.status||'').toLowerCase();
             if(terminalStatuses.has(status)){
-                loadOverview();loadOrganize();
+                loadOverview();loadOrganize(organizePage,Boolean(onOrganizeDetailClose));
                 const failure=organizeTaskFailure(task,batch);
                 if(failure&&!(batch&&deleting))throw new Error(failure);
                 if(batch)return task;
@@ -1254,12 +1275,27 @@ if (initialTab === 'runtime') {
         page:1,pages:0,total:0,active:'',filters:{},counts:{},truncated:false,reviewEnabled:false,
         serial:0,previewSerial:0,preview:null,busy:false,loading:false,synced:false,timer:null};
     const statuses={pending:'待确认',queued:'已入队',running:'整理中',completed:'已完成',failed:'失败',expired:'已过期',cancelled:'已取消'};
-    const reviewStatuses={waiting:'等待发起只读复核',pending:'复核排队中',queued:'复核排队中',running:'只读复核中',approved:'复核已有建议',abstained:'复核弃权',completed:'复核完成',failed:'复核失败',unavailable:'复核不可用'};
+    const reviewStatuses={waiting:'等待发起只读复核',pending:'复核排队中',queued:'复核排队中',running:'只读复核中',approved:'复核已有建议',abstained:'复核弃权',completed:'复核完成',failed:'复核失败',unavailable:'复核不可用',cancelled:'复核已取消'};
+    const activeReviewStatuses=new Set(['pending','queued','running']);
     const textValue=value=>typeof value==='object'&&value!==null?String(value.title||value.name||value.path||JSON.stringify(value)):String(value??'');
     const evidenceLabels={number:'番号',release_date:'发行日期',actors:'演员',maker:'制作商',label:'厂牌',series:'系列'};
     const evidenceValue=value=>Array.isArray(value)?value.map(textValue).join('、'):textValue(value);
     const sameEntries=(left,right)=>Array.isArray(left)&&left.length===right.length&&new Set(left.map(entry=>entry.confirmation_id)).size===right.length&&
         right.every(entry=>left.some(other=>other.confirmation_id===entry.confirmation_id&&other.candidate_index===entry.candidate_index));
+    const hasCandidates=item=>Array.isArray(item.candidates)&&item.candidates.length>0;
+    const canDiscoverCandidates=item=>!hasCandidates(item)&&item.can_discover_candidates===true;
+    const canReview=item=>item.status==='pending'&&(hasCandidates(item)||canDiscoverCandidates(item));
+    function reviewStatusLabel(item){
+        const status=item.review_status;
+        if(!hasCandidates(item)){
+            if(canDiscoverCandidates(item)&&activeReviewStatuses.has(status)){
+                return status==='running'?'Agent 正在搜索候选':'候选搜索排队中';
+            }
+            if(status==='abstained')return '未找到可用候选';
+            if(!status||status==='waiting')return state.reviewEnabled&&canDiscoverCandidates(item)?'可搜索候选':'无候选';
+        }
+        return reviewStatuses[status]||'';
+    }
     const title=item=>textValue(item.identity)||textValue(item.directory)||'未命名媒体组';
     const statusClass=item=>item.status==='completed'?'done':['failed','expired'].includes(item.status)?'failed':item.status==='pending'?'paused':'running';
     const localTime=value=>{const date=new Date(value);return Number.isNaN(date.getTime())?String(value):date.toLocaleString('zh-CN',{hour12:false});};
@@ -1306,10 +1342,11 @@ if (initialTab === 'runtime') {
         return data;
     }
     // 冻结 token 查询不继承当前筛选；按服务端分页回读，不能用缓存授权执行。
-    async function snapshot(tokens){
+    async function snapshot(tokens,{includeCorrectionLogs=false}={}){
         const items=[];
         for(let offset=0;offset<tokens.length;offset+=100){
-            const query={confirmation_ids:tokens.slice(offset,offset+100),status:'all',page_size:100};
+            const query={confirmation_ids:tokens.slice(offset,offset+100),status:'all',page_size:100,
+                ...(includeCorrectionLogs?{include_correction_logs:true}:{})};
             let page=1,pages=1;
             do{
                 const data=await request('/query',{...query,page});
@@ -1327,12 +1364,18 @@ if (initialTab === 'runtime') {
     function controls(){
         const count=state.selected.size;
         const locked=state.busy||!state.synced;
+        const selected=[...state.selected].map(token=>state.cache.get(token));
+        const mayReview=selected.some(item=>!item||canReview(item));
+        const mayCorrect=selected.some(item=>!item||item.status==='pending');
         el('SelectionCount').textContent=`已选 ${count} / ${limit} 组`;
         el('Clear').disabled=state.busy||!count;
         el('SelectMatching').disabled=locked||state.loading||!state.tokens.length||el('Scope').value!=='pending';
         el('Skip').disabled=locked||!count;
-        el('Agent').disabled=locked||!count||!state.reviewEnabled;
-        el('Agent').title=state.reviewEnabled?'仅生成候选建议，不执行媒体整理':'当前未启用 Agent 复核，可手动选择候选';
+        el('Agent').disabled=locked||!state.reviewEnabled||!mayReview;
+        el('Agent').title=!state.reviewEnabled?'当前未启用 Agent 复核':count&&!mayReview?'所选项暂无可执行的只读复核':
+            '核对已有候选或为符合条件的媒体组搜索候选';
+        el('Correction').hidden=!mayCorrect;
+        el('Correct').disabled=locked||!mayCorrect;
         el('Prepare').disabled=locked||!count;
         el('Submit').disabled=locked||!state.preview;
         el('Refresh').disabled=state.busy||state.loading;
@@ -1386,7 +1429,7 @@ if (initialTab === 'runtime') {
             const context=[item.source,item.reason].filter(Boolean).join(' · ');
             button.querySelector('small').textContent=context;button.querySelector('small').title=context;
             const index=serverIndex(item);
-            const statusMarkup=`<span class="status-pill ${statusClass(item)}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(reviewStatuses[item.review_status]||(index!==null?(item.suggestion?.source==='human'?'已保存人工选择':'已有候选建议'):'等待选择'))}</span>`;
+            const statusMarkup=`<span class="status-pill ${statusClass(item)}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(reviewStatusLabel(item)||(index!==null?(item.suggestion?.source==='human'?'已保存人工选择':'已有候选建议'):'等待选择'))}</span>`;
             const statusNode=button.querySelector('.confirmation-review-row-status');
             if(statusNode.innerHTML!==statusMarkup)statusNode.innerHTML=statusMarkup;
             if(row!==cursor)list.insertBefore(row,cursor);
@@ -1402,23 +1445,32 @@ if (initialTab === 'runtime') {
             delete detail.dataset.signature;return;
         }
         const draft=state.drafts.has(item.confirmation_id)?state.drafts.get(item.confirmation_id):serverIndex(item);
-        const signature=JSON.stringify([item,draft]);
+        const signature=JSON.stringify([item,draft,state.reviewEnabled]);
         if(detail.dataset.signature===signature)return;
         detail.dataset.signature=signature;
         const suggestion=item.suggestion;
         const files=Array.isArray(item.files)?item.files:[];
         const candidates=Array.isArray(item.candidates)?item.candidates:[];
+        const reviewing=activeReviewStatuses.has(item.review_status);
+        const canSearch=state.reviewEnabled&&canDiscoverCandidates(item)&&!reviewing;
+        const emptyCandidates=item.status!=='pending'?'没有可选候选。':canSearch?
+            '没有可选候选。勾选此组，可用「Agent 只读复核」搜索候选，或点击「纠正识别」重新查找作品。':
+            '没有可选候选。勾选需要处理的媒体组，点击「纠正识别」重新查找作品。';
         const confidence=Number(suggestion?.confidence);
-        const suggestionTitle=suggestion?.source==='human'?'已保存人工选择':suggestion?'Agent 候选建议（只读）':'尚无候选建议';
+        const reviewStarted=Boolean(item.review_status&&item.review_status!=='waiting');
+        const suggestionTitle=suggestion?.source==='human'?'已保存人工选择':suggestion?'Agent 候选建议（只读）':
+            (reviewStarted?reviewStatusLabel(item):'')||(candidates.length?'尚无候选建议':'Agent 复核结果');
+        const reviewSummary=reviewing?'':suggestion?.summary||item.review_summary||
+            (candidates.length&&!reviewStarted?(state.reviewEnabled?'选择候选，或对已选媒体组发起 Agent 只读复核。':'请核对后选择候选。'):'');
         detail.innerHTML=`<h3>${_esc(title(item))}</h3>
             <div class="confirmation-review-context"><span class="status-pill ${statusClass(item)}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(item.source||'未知来源')}</span><span>任务 ${_esc(item.task_id||'—')}</span></div>
             <code class="confirmation-review-path">${_esc(textValue(item.directory))}</code>
             <dl class="confirmation-review-facts"><div><dt>待确认原因</dt><dd>${_esc(item.reason||'未提供')}</dd></div>${item.expires_at?`<div><dt>有效期至</dt><dd>${_esc(localTime(item.expires_at))}</dd></div>`:''}</dl>
             ${item.error?`<p class="confirmation-review-error">${_esc(item.error)}</p>`:''}
             <details class="confirmation-review-files"><summary>查看 ${files.length} 个文件及季集信息</summary><ul>${files.map(file=>`<li>${_esc(file.name||textValue(file))}${file.season!=null?` · 第 ${_esc(file.season)} 季`:''}${file.episode!=null?`第 ${_esc(file.episode)} 集`:''}</li>`).join('')}</ul></details>
-            <div class="confirmation-review-suggestion"><strong>${_esc(suggestionTitle)}</strong>${_esc(suggestion?.summary||item.review_summary||reviewStatuses[item.review_status]||'手动选择候选，或对已选媒体组发起 Agent 只读复核。')}${suggestion?.reason_code?`<br>依据：${_esc(suggestion.reason_code)}`:''}${suggestion?.confidence!=null&&Number.isFinite(confidence)?` · 置信度 ${Math.round(confidence*100)}%`:''}</div>
+            ${candidates.length||reviewStarted||reviewSummary?`<div class="confirmation-review-suggestion"><strong>${_esc(suggestionTitle)}</strong>${_esc(reviewSummary)}${suggestion?.reason_code?`<br>依据：${_esc(suggestion.reason_code)}`:''}${suggestion?.confidence!=null&&Number.isFinite(confidence)?` · 置信度 ${Math.round(confidence*100)}%`:''}</div>`:''}
             ${item.downstream&&Object.keys(item.downstream).length?`<div class="confirmation-review-downstream"><strong>STRM / 媒体库后续</strong>${Object.entries(item.downstream).filter(([,value])=>value!==''&&value!==null).map(([key,value])=>`<p>${_esc(({strm:'STRM',media_refresh:'媒体库刷新',media_library:'媒体库',library:'媒体库',partial:'部分完成',status:'状态',error:'错误',message:'说明'})[key]||key)}：${_esc(typeof value==='boolean'?(value?'是':'否'):evidenceValue(value))}</p>`).join('')}</div>`:''}
-            <fieldset class="confirmation-review-candidates"><legend>候选作品 · 不会默认选择第一项</legend>${candidates.map(candidate=>`<label class="confirmation-review-candidate${draft===candidate.index?' is-selected':''}"><input type="radio" name="confirmation-review-candidate" value="${_attr(candidate.index)}" aria-label="选择候选 ${_attr(candidate.title)} (${_attr(candidate.year||'年份未知')})"${draft===candidate.index?' checked':''}><span class="confirmation-review-candidate-body"><strong>${_esc(candidate.title||'未命名候选')} ${_esc(candidate.year||'')}</strong><small>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')} · ${_esc(candidate.media_type||'')}</small><span class="confirmation-review-evidence">${Object.entries(candidate.evidence||{}).filter(([,value])=>value!=null&&evidenceValue(value)).map(([key,value])=>`<small>${_esc(evidenceLabels[key]||key)}：${_esc(evidenceValue(value))}</small>`).join('')}</span></span></label>`).join('')||'<p class="confirmation-review-note">没有可选候选，请保留待确认。</p>'}</fieldset>
+            <fieldset class="confirmation-review-candidates"><legend>候选作品 · 不会默认选择第一项</legend>${candidates.map(candidate=>`<label class="confirmation-review-candidate${draft===candidate.index?' is-selected':''}"><input type="radio" name="confirmation-review-candidate" value="${_attr(candidate.index)}" aria-label="选择候选 ${_attr(candidate.title)} (${_attr(candidate.year||'年份未知')})"${draft===candidate.index?' checked':''}><span class="confirmation-review-candidate-body"><strong>${_esc(candidate.title||'未命名候选')} ${_esc(candidate.year||'')}</strong><small>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')} · ${_esc(candidate.media_type||'')}</small><span class="confirmation-review-evidence">${Object.entries(candidate.evidence||{}).filter(([,value])=>value!=null&&evidenceValue(value)).map(([key,value])=>`<small>${_esc(evidenceLabels[key]||key)}：${_esc(evidenceValue(value))}</small>`).join('')}</span></span></label>`).join('')||`<p class="confirmation-review-note">${emptyCandidates}</p>`}</fieldset>
             <div class="confirmation-review-savebar"><button type="button" class="jump-btn" data-review-action="save">保存并下一条</button><button type="button" class="jump-btn" data-review-action="next">下一条 / 暂留待确认</button><button type="button" class="jump-btn" data-review-action="skip" title="结束此组待确认，文件保持原位">跳过此组</button></div>`;
     }
     function render(){
@@ -1469,6 +1521,29 @@ if (initialTab === 'runtime') {
         state.busy=true;state.loading=false;++state.serial;clearTimeout(state.timer);controls();
         try{await work();}catch(error){say(error.message||'操作失败，请刷新后重试',true);}
         finally{state.busy=false;el('List').setAttribute('aria-busy','false');if(visible()){render();if(!state.synced)load();else schedule();}}
+    }
+    async function returnFromCorrection(tokens){
+        if(!visible())return;
+        const restoreFocus=document.activeElement===el('Correct');
+        await act(async()=>{
+            const serial=state.serial;
+            const items=await snapshot(tokens);
+            if(serial!==state.serial||!visible())return;
+            merge(items);
+            const completed=items.filter(item=>item.status==='completed');
+            for(const item of completed){
+                state.selected.delete(item.confirmation_id);
+                state.drafts.delete(item.confirmation_id);
+            }
+            persist();
+            const pending=items.filter(item=>item.status==='pending').length;
+            say(`已同步所选组，${completed.length} 组已完成，${pending} 组仍待确认。`);
+        });
+        if(!visible())return;
+        await load(state.page,true);
+        if(restoreFocus&&document.activeElement===document.body){
+            (el('Correct').disabled?el('Refresh'):el('Correct')).focus({preventScroll:true});
+        }
     }
     // 与 Telegram 每组的终止按钮一致：无元数据组“跳过此组”、有候选组“暂不处理”；文件保持原位，日志标记为跳过。
     async function skip(tokens){
@@ -1560,7 +1635,7 @@ if (initialTab === 'runtime') {
         state.drafts.set(state.active,Number(event.target.value));invalidatePreview();
         event.target.closest('fieldset').querySelectorAll('label').forEach(label=>label.classList.toggle('is-selected',label.querySelector('input').checked));
         // 记录当前 DOM 的新签名，后台刷新无需重建用户正在操作的候选。
-        el('Detail').dataset.signature=JSON.stringify([item,state.drafts.get(state.active)]);
+        el('Detail').dataset.signature=JSON.stringify([item,state.drafts.get(state.active),state.reviewEnabled]);
         controls();say('候选尚未保存，请点击“保存并下一条”；预览不会使用未保存的选择。');
     });
     el('Detail').addEventListener('click',event=>{
@@ -1589,12 +1664,63 @@ if (initialTab === 'runtime') {
     }).then(()=>load(state.page,true)));
     el('Agent').addEventListener('click',()=>act(async()=>{
         invalidatePreview();
+        say('正在核对所选组的复核资格…');
         const tokens=[...state.selected],items=await snapshot(tokens);merge(items);
-        const eligible=items.filter(item=>item.status==='pending'&&item.suggestion?.source!=='human'&&!['pending','queued','running'].includes(item.review_status)).map(item=>item.confirmation_id);
-        if(!eligible.length){say('没有需要复核的待确认项；人工选择、已排队及已完成项已保留。');return;}
-        const data=await request('/review',{confirmation_ids:eligible});
-        merge(await snapshot(eligible));
-        say(`已请求 ${data.requested??eligible.length} 组只读复核${data.unchanged?`，${data.unchanged} 组保持原状态`:''}；建议会自动刷新，未执行整理。`);
+        const pending=items.filter(item=>item.status==='pending');
+        const reviewable=pending.filter(canReview);
+        const eligible=reviewable.filter(item=>item.suggestion?.source!=='human'&&!activeReviewStatuses.has(item.review_status));
+        if(!eligible.length){
+            say(pending.length&&!reviewable.length?'所选待确认组无法由 Agent 搜索候选，可用「纠正识别」查找作品。':
+                '没有需要复核的待确认项；人工选择、已排队及已完成项已保留。');
+            return;
+        }
+        const discoverCount=eligible.filter(canDiscoverCandidates).length;
+        const confirmation_ids=eligible.map(item=>item.confirmation_id);
+        say(discoverCount?`正在请求只读复核，${discoverCount} 组将搜索候选…`:'正在请求只读复核…');
+        const data=await request('/review',{confirmation_ids});
+        const requested=data.requested??eligible.length;
+        const ineligibleCount=pending.length-reviewable.length;
+        const message=[`已请求 ${requested} 组只读复核`,
+            discoverCount&&requested===eligible.length?`其中 ${discoverCount} 组将搜索候选`:'',
+            data.unchanged?`${data.unchanged} 组保持原状态`:'',
+            data.unavailable?`${data.unavailable} 组当前无法复核`:'',
+            ineligibleCount?`${ineligibleCount} 组无候选且不具备搜索资格`:'',
+        ].filter(Boolean).join('，')+'。状态会自动刷新。';
+        say(message,!requested&&Boolean(data.unavailable));
+        try{merge(await snapshot(confirmation_ids));}
+        catch(error){say(`${message} 读取复核状态失败：${error.message}`,true);}
+    }));
+    el('Correct').addEventListener('click',()=>act(async()=>{
+        const tokens=[...state.selected];
+        const serial=state.serial;
+        const items=await snapshot(tokens,{includeCorrectionLogs:true});
+        if(serial!==state.serial||!visible())return;
+        const byToken=new Map(items.map(item=>[item.confirmation_id,item]));
+        merge(items);
+        const fileCount=items.reduce((count,item)=>count+(item.files?.length||0),0);
+        if(fileCount>50)throw new Error(`所选媒体组共 ${fileCount} 个视频，单次纠正最多 50 条日志，请减少选择。`);
+        const logs=new Map();
+        for(const token of tokens){
+            const item=byToken.get(token);
+            const label=title(item||state.cache.get(token)||{identity:token});
+            if(item?.status!=='pending')throw new Error(`「${label}」已不在待确认队列，请刷新并调整选择。`);
+            const ids=item.log_ids;
+            if(!Array.isArray(ids)||!ids.length||ids.length!==item.files?.length||ids.some(id=>!Number.isSafeInteger(id)||id<1)){
+                throw new Error(`「${label}」缺少完整的关联日志，无法整组纠正。若有部分失败，请按回执中的日志编号在整理日志里单独重试失败项。`);
+            }
+            for(const id of ids){
+                if(logs.has(id))throw new Error('所选媒体组关联了重复日志，请刷新并核对选择。');
+                logs.set(id,token);
+            }
+        }
+        const rows=await Promise.all([...logs].map(([id,token])=>readOrganizeDetail(id,token)));
+        if(serial!==state.serial||!visible())return;
+        const blocked=rows.find(row=>!row.allowed_actions?.search||!row.allowed_actions?.reorganize||!Number.isSafeInteger(row.version));
+        if(blocked)throw new Error(`日志 #${blocked.id} 无法纠正：${blocked.safety_notice||'当前状态不允许纠正，请刷新后核对。'}`);
+        invalidatePreview();
+        onOrganizeDetailClose=()=>returnFromCorrection(tokens);
+        if(rows.length===1)await openOrganizeDetail(rows[0].id,el('Correct'),rows[0]);
+        else await openBatchCorrection(rows,el('Correct'),rows[0]);
     }));
     el('Prepare').addEventListener('click',()=>act(async()=>{
         invalidatePreview();const serial=state.previewSerial;

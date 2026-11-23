@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timedelta
 from sqlite3 import Row
 from types import SimpleNamespace
@@ -99,12 +100,12 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         groups = [self._group(index) for index in range(100)]
         with patch.object(service, "list_confirmations", wraps=service.list_confirmations) as listing, patch.object(
             confirmations, "publish_confirmation_event",
-        ) as single_publish, patch.object(service, "request_reviews") as reviews:
+        ) as single_publish, patch.object(organize_confirmations_repo, "activate_organize_confirmation_reviews") as activation:
             self.assertTrue(Organizer._deliver_task_confirmation_groups(
                 groups, self.rules, chat_id="100", organize_task_id="task-100",
             ))
         single_publish.assert_not_called()
-        reviews.assert_not_called()
+        activation.assert_not_called()
         listing.assert_called_once()
         self.assertEqual(listing.call_args.kwargs["page_size"], 1000)
         self.assertEqual(listing.call_args.kwargs["status"], "all")
@@ -119,6 +120,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertRegex(next(iter(ids)), r"^[0-9a-f]{16,32}$")
         self.assertTrue(all(payload["review_only"] for payload in payloads))
         self.assertTrue(all(row["status"] == "pending" and row["selected_index"] is None for row in rows))
+        self.assertTrue(all(row["review_status"] == "" for row in rows))
         self.assertEqual(threads[0]["thread_key"], f"confirmation-batch:{next(iter(ids))}")
         self.assertEqual(self.sent.call_count, 1)
         self.assertNotIn("STRM 状态", dict(self.sent.call_args.args[0].fields))
@@ -127,31 +129,37 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_agent_reviews_activate_only_after_all_groups_and_summary_are_persisted(self):
         self.review_enabled.return_value = True
-        self.agent_enabled.return_value = True
-        requested = service.request_reviews
+        activate = organize_confirmations_repo.activate_organize_confirmation_reviews
 
-        def request(tokens, **kwargs):
+        def activate_after_publish(tokens):
             with db.get_conn() as conn:
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM organize_confirmations").fetchone()[0], 3)
+                rows = conn.execute("SELECT token,review_status FROM organize_confirmations").fetchall()
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM telegram_notification_outbox").fetchone()[0], 1)
-            self.assertTrue(all(self._confirmation(token)["review_status"] == "waiting" for token in tokens))
-            return requested(tokens, **kwargs)
+            self.assertEqual(len(rows), 3)
+            self.assertCountEqual(tokens, [row["token"] for row in rows])
+            self.assertTrue(all(row["review_status"] == "waiting" for row in rows))
+            return activate(tokens)
 
-        with patch.object(service, "request_reviews", side_effect=request) as reviews:
+        with patch.object(
+            organize_confirmations_repo, "activate_organize_confirmation_reviews", side_effect=activate_after_publish,
+        ) as activation:
             self.assertTrue(Organizer._deliver_task_confirmation_groups(
                 [self._group(index) for index in range(3)], self.rules, chat_id="100",
             ))
-        reviews.assert_called_once()
-        self.assertTrue(all(self._confirmation(token)["review_status"] == "pending" for token in reviews.call_args.args[0]))
+        activation.assert_called_once()
+        self.assertTrue(all(self._confirmation(token)["review_status"] == "pending"
+                            for token in activation.call_args.args[0]))
         self.dispatch.assert_not_called()
 
     def test_rejected_summary_keeps_all_frozen_groups_without_activating_reviews(self):
         self.review_enabled.return_value = True
-        with patch.object(batch, "publish_batch_summary", return_value=False), patch.object(service, "request_reviews") as reviews:
+        with patch.object(batch, "publish_batch_summary", return_value=False), patch.object(
+            organize_confirmations_repo, "activate_organize_confirmation_reviews",
+        ) as activation:
             self.assertFalse(Organizer._deliver_task_confirmation_groups(
                 [self._group(index) for index in range(2)], self.rules, chat_id="100",
             ))
-        reviews.assert_not_called()
+        activation.assert_not_called()
         with db.get_conn() as conn:
             rows = conn.execute("SELECT status,review_status FROM organize_confirmations").fetchall()
         self.assertEqual(len(rows), 2)
@@ -293,30 +301,180 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_readonly_review_button_preserves_approved_choice_and_never_executes(self):
         first, second = self._create()
+        nsfw_rules = replace(self.rules, nsfw_enabled=True, nsfw_exclusive=True)
+        empty = confirmations.create_confirmation_actions(
+            {**self._group(2), "candidates": []}, nsfw_rules, chat_id="100",
+        )[0].callback_data.split(":")[1]
+        discoverable = confirmations.create_confirmation_actions(
+            {**self._group(4), "candidates": []}, self.rules, chat_id="100",
+        )[0].callback_data.split(":")[1]
+        queued, = self._create(1, start=3)
+        organize_confirmations_repo.update_organize_confirmation(queued, status="queued")
         self._review(first, index=1)
         self.review_enabled.return_value = True
-        self.agent_enabled.return_value = True
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
-        notice = self._callback(self._action("请求 Agent"))
+        summary = self._snapshot().event
+        self.assertIn("媒体 2 · 待确认", render_event(summary))
+        self.assertIn("暂无候选", render_event(summary))
+        self.assertIn("有候选的组可打开详情手动选择", str(summary.footer))
+        self.assertIn("纠正识别", str(summary.footer))
+        with patch.object(service, "request_reviews", wraps=service.request_reviews) as reviews:
+            notice = self._callback(self._action("请求 Agent 只读复核（3 组）"))
+        reviews.assert_called_once()
+        self.assertCountEqual(reviews.call_args.args[0], [first, second, discoverable])
+        self.assertEqual(reviews.call_args.kwargs["chat_id"], "100")
         self.assertIn("只读复核", notice)
+        self.assertIn("不可用 0 组", notice)
+        self.assertEqual(self._confirmation(empty)["review_status"], "")
+        self.assertEqual(self._confirmation(queued)["review_status"], "")
         self.assertEqual(self._confirmation(second)["review_status"], "pending")
+        discovery_row = self._confirmation(discoverable)
+        self.assertEqual(discovery_row["review_status"], "pending")
+        self.assertTrue(json.loads(discovery_row["payload_json"])["discover_candidates"])
         first_row = self._confirmation(first)
         self.assertEqual(first_row["review_status"], "approved")
         self.assertEqual(json.loads(first_row["review_result_json"])["candidate_index"], 1)
-        self.assertTrue(all(self._confirmation(token)["status"] == "pending" for token in (first, second)))
+        self.assertTrue(all(self._confirmation(token)["status"] == "pending"
+                            for token in (first, second, empty, discoverable)))
         self.dispatch.assert_not_called()
+
+    def test_empty_group_discovery_reports_progress_and_keeps_no_match_pending(self):
+        self.review_enabled.return_value = True
+        group = self._group(0)
+        group.update(
+            reason="未找到可用元数据", candidates=[], files=[
+                {**group["files"][0], "file_id": f"episode-{episode}", "episode": episode}
+                for episode in range(1, 9)
+            ],
+        )
+        token = confirmations.create_confirmation_actions(group, self.rules, chat_id="100")[0].callback_data.split(":")[1]
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True))
+        summary = self._snapshot().event
+        self.assertIn(("媒体组", "1"), summary.fields)
+        scope = "第 1 季 · E01–E08 · 共 8 个视频"
+        self.assertIn(f"媒体 0 · 待确认 · {scope} · 暂无候选", render_event(summary))
+        self.assertIn("整理日志 → 批量审阅光鸭待确认", str(summary.footer))
+        self.assertIn("纠正识别", str(summary.footer))
+        self.assertIn("整组文件", str(summary.footer))
+        self.assertNotIn("手动选择", str(summary.footer))
+        self.assertNotIn("Agent 复核", dict(summary.fields))
+        self.assertIn("查找候选", str(summary.footer))
+        self.assertEqual(self._confirmation(token)["review_status"], "")
+
+        notice = self._callback(self._action("请求 Agent 只读复核（1 组）"))
+        self.assertIn("新请求 1 组", notice)
+        requested = self._confirmation(token)
+        payload = json.loads(requested["payload_json"])
+        self.assertTrue(payload["review_only"] and payload["discover_candidates"])
+        self.assertEqual(requested["review_status"], "pending")
+        queued = self._snapshot().event
+        self.assertIn("查找候选已排队", render_event(queued))
+        self.assertIn("已完成 0/1 组", str(dict(queued.fields)["Agent 复核"]))
+
+        claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+        assert claimed is not None
+        self.assertEqual(claimed["token"], token)
+        self._callback(self._action("刷新摘要"))
+        self.assertIn("查找候选进行中", render_event(self._snapshot().event))
+        no_match = "本轮未找到可核验的候选，仍待确认。"
+        self.assertTrue(organize_confirmations_repo.complete_organize_confirmation_review(
+            token, status="abstained", result={"reason_code": "no_candidate", "summary": no_match},
+        ))
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
+        summary = self._snapshot().event
+        self.assertIn(no_match, render_event(summary))
+        self.assertFalse(any(":a:" in action.callback_data for action in summary.actions))
+        self.assertEqual(self._confirmation(token)["status"], "pending")
+
+        self._callback(self._action("查看"))
+        detail = self._snapshot().event
+        self.assertIn(("涉及文件", scope), detail.fields)
+        self.assertIn("纠正识别", str(detail.footer))
+        self.assertNotIn("选择候选", str(detail.footer))
+        self.assertIn(no_match, render_event(detail))
+        group_actions = [action.callback_data for action in detail.actions if action.callback_data.startswith("orgc:")]
+        self.assertEqual(group_actions, [f"orgc:{token}:skip"])
+        self.assertEqual(self._snapshot().message_id, 77)
+        self.sent.assert_called_once()
+        self.dispatch.assert_not_called()
+
+        organize_confirmations_repo.update_organize_confirmation(
+            token, review_result_json=json.dumps({"reason_code": "no_match"}),
+        )
+        self._callback(self._action("返回批次摘要"))
+        self.assertIn("本轮未提供可用候选，仍待确认。", render_event(self._snapshot().event))
+        self._callback(self._action("请求 Agent"))
+        retried = render_event(self._snapshot().event)
+        self.assertIn("查找候选已排队", retried)
+        self.assertNotIn("仍待确认。", retried)
+
+        claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+        assert claimed is not None
+        self.assertEqual(claimed["token"], token)
+        self.assertTrue(organize_confirmations_repo.complete_organize_confirmation_review(
+            token, status="approved", result={"candidate_index": 1, "summary": "找到并核验候选"},
+            discovered_candidates=self._group(0)["candidates"],
+        ))
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
+        self.assertIn("建议：候选 0-1", render_event(self._snapshot().event))
+        self._callback(self._action("查看"))
+        self.assertEqual(self._action("选择 2 · 候选 0-1"), f"orgc:{token}:1")
+        self.assertEqual(self._confirmation(token)["status"], "pending")
+        self.dispatch.assert_not_called()
+
+    def test_group_scope_preserves_seasons_and_gaps_from_saved_positions(self):
+        group = self._group(0)
+        group["files"] = [
+            {**group["files"][0], "file_id": f"video-{index}", "season": season, "episode": episode}
+            for index, (season, episode) in enumerate(((1, 1), (1, 3), (2, 1), (None, None)))
+        ]
+        confirmations.create_confirmation_actions(group, self.rules, chat_id="100")
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True))
+        scope = "第 1 季 · E01、E03 · 第 2 季 · E01 · 共 4 个视频"
+        self.assertIn(scope, render_event(self._snapshot().event))
+        self._callback(self._action("查看"))
+        self.assertIn(("涉及文件", scope), self._snapshot().event.fields)
+
+    def test_old_nsfw_group_uses_saved_source_policy_even_without_candidates(self):
+        group = self._group(0)
+        group["candidates"] = []
+        group["files"][0]["episode"] = 61
+        nsfw_rules = replace(self.rules, nsfw_enabled=True, nsfw_exclusive=True)
+        token = confirmations.create_confirmation_actions(group, nsfw_rules, chat_id="100")[0].callback_data.split(":")[1]
+        self.assertTrue(json.loads(self._confirmation(token)["payload_json"])["rules"]["nsfw_exclusive"])
+        self.review_enabled.return_value = True
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True))
+        event = self._snapshot().event
+        self.assertFalse(any(":r:" in action.callback_data for action in event.actions))
+        summary = render_event(event)
+        self.assertIn("共 1 个视频", summary)
+        self.assertNotIn("E61", summary)
+        with patch.object(service, "request_reviews") as reviews:
+            for enabled in (True, False):
+                self.review_enabled.return_value = enabled
+                with self.subTest(review_enabled=enabled):
+                    notice = self._callback(f"orgb:{token}:r:1")
+                    self.assertIn("暂无候选", notice)
+                    self.assertIn("纠正识别", notice)
+            reviews.assert_not_called()
+        self.assertEqual(self._confirmation(token)["review_status"], "")
+        self._callback(self._action("查看"))
+        self.assertIn(("涉及文件", "共 1 个视频"), self._snapshot().event.fields)
 
     def test_group_without_candidates_does_not_keep_finished_reviews_waiting(self):
         first, second = self._create()
         group = {**self._group(2), "candidates": [], "allow_skip_terminal": True}
         self.review_enabled.return_value = True
-        actions = confirmations.create_confirmation_actions(group, self.rules, chat_id="100")
+        nsfw_rules = replace(self.rules, nsfw_enabled=True, nsfw_exclusive=True)
+        actions = confirmations.create_confirmation_actions(group, nsfw_rules, chat_id="100")
         token = actions[0].callback_data.split(":")[1]
         self.assertEqual(self._confirmation(token)["review_status"], "")
+        self._review(token, index=None, status="running")  # 旧记录残留的复核状态
         self._review(first, status="running")
         self._review(second, status="pending")
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
         before = self._snapshot().revision
+        self.assertTrue(str(dict(self._snapshot().event.fields)["Agent 复核"]).startswith("已完成 0/2 组"))
         self._review(first)
         self._review(second, index=None, status="abstained")
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
@@ -428,11 +586,14 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_wrong_chat_message_anchor_and_malformed_callbacks_cannot_mutate_batch(self):
         tokens = self._create()
+        self.review_enabled.return_value = True
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
         callback = self._action("查看")
+        review = self._action("请求 Agent")
         revision = self._snapshot().revision
         for data, chat, message in (
             (callback, "200", 77), (callback, "100", 88),
+            (review, "200", 77), (review, "100", 88), (f"orgb:{tokens[0]}:r:0", "100", 77),
             ("orgb:missing:p:1", "100", 77), ("orgb:token:p:0", "100", 77),
             ("orgb:" + "x" * 80 + ":p:1", "100", 77),
         ):
@@ -440,6 +601,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
                 self._callback(data, chat_id=chat, message_id=message)
         self.assertEqual(self._snapshot().revision, revision)
         self.assertTrue(all(self._confirmation(token)["status"] == "pending" for token in tokens))
+        self.assertTrue(all(self._confirmation(token)["review_status"] == "" for token in tokens))
         self.assertEqual(self.sent.call_count, 1)
         self.edited.assert_not_called()
 
@@ -465,12 +627,11 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_over_thousand_groups_persist_without_silently_reviewing_only_a_subset(self):
         self.review_enabled.return_value = True
-        self.agent_enabled.return_value = True
-        with patch.object(service, "request_reviews") as reviews:
+        with patch.object(organize_confirmations_repo, "activate_organize_confirmation_reviews") as activation:
             self.assertTrue(Organizer._deliver_task_confirmation_groups(
                 [self._group(index) for index in range(1001)], self.rules, chat_id="100",
             ))
-        reviews.assert_not_called()
+        activation.assert_not_called()
         event = self.sent.call_args.args[0]
         self.assertIn("超过 1000", event.footer)
         self.assertIn("Web 分批", event.footer)

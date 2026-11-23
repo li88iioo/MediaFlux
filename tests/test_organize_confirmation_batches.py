@@ -7,10 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from threading import Barrier
-from unittest.mock import patch
+from threading import Barrier, Event
+from unittest.mock import Mock, patch
 
 from app import database as db
+from app.clients.tmdb import TMDBClient
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.modules import organize_confirmation_batches as batches
 from app.modules import organize_confirmations as confirmations
@@ -160,6 +161,350 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         start.assert_not_called()
         self.assertEqual(self.row("one")["status"], "pending")
         self.assertEqual(batches.list_confirmations()["items"][0]["suggestion"]["candidate_index"], 1)
+
+    @staticmethod
+    def _unmatched_series(title: str, count: int = 1) -> dict:
+        return {
+            "identity": title, "directory": f"/incoming/{title}", "reason": "暂无可用元数据",
+            "source_dir_id": "source", "source_parent_id": "parent", "candidates": [],
+            "files": [{
+                "file_id": f"{title}-{episode}", "name": f"{title}.S01E{episode:02}.mkv",
+                "parent_id": "parent", "size": 100000000, "etag": f"etag-{episode}",
+                "season": 1, "episode": episode,
+            } for episode in range(1, count + 1)],
+        }
+
+    def _schedule_unmatched_group(self, group: dict, task_id: str) -> str:
+        self.assertEqual(confirmations.schedule_guangya_recognition_reviews(
+            {"task_id": task_id, "confirmation_groups": [group]}, self.rules, chat_id="chat",
+        ), 1)
+        [token] = batches.list_confirmations(task_id=task_id)["confirmation_ids"]
+        return token
+
+    @staticmethod
+    def _discovered_series(title: str) -> RecognitionReviewDecision:
+        return RecognitionReviewDecision(
+            status="approved", candidate_index=0, confidence=.99,
+            reason_code="evidence_consistent", summary="已核对作品和季集",
+            discovered_candidates=[{
+                "title": title, "year": "2024", "media_type": "tv",
+                "provider": "tmdb", "tmdb_id": "7654", "external_id": "7654",
+            }],
+        )
+
+    def test_proactive_single_and_batch_notifications_do_not_queue_empty_groups(self):
+        known = self._unmatched_series("known")
+        known["candidates"] = [{"title": "已识别剧集", "provider": "tmdb", "tmdb_id": "7653", "media_type": "tv"}]
+        scenarios = {
+            "single": [self._unmatched_series("single")],
+            "empty-batch": [self._unmatched_series(f"empty-{index}") for index in range(2)],
+            "mixed-batch": [self._unmatched_series("mixed-empty"), known],
+        }
+        with (
+            patch.object(feature_gate, "recognition_review_enabled", return_value=True),
+            patch.object(batches, "request_reviews", wraps=batches.request_reviews) as manual_request,
+            patch("app.modules.telegram_notification_center.publish_notification_thread", return_value=True) as single,
+            patch("app.modules.telegram_confirmation_batch.publish_batch_summary", return_value=True) as multiple,
+        ):
+            for task_id, groups in scenarios.items():
+                self.assertTrue(confirmations.Organizer._deliver_task_confirmation_groups(
+                    groups, self.rules, chat_id="chat", organize_task_id=task_id,
+                ))
+                items = batches.list_confirmations(task_id=task_id)["items"]
+                self.assertEqual(len(items), len(groups))
+                for item in items:
+                    with self.subTest(task=task_id, group=item["identity"]):
+                        has_candidates = item["identity"] == known["identity"]
+                        self.assertEqual(item["status"], "pending")
+                        self.assertEqual(item["review_status"], "pending" if has_candidates else "")
+                        self.assertIs(item["can_discover_candidates"], not has_candidates)
+                        payload = confirmations.decode_row(self.row(item["confirmation_id"]))
+                        self.assertFalse(payload.get("discover_candidates"))
+        single.assert_called_once()
+        self.assertEqual(multiple.call_count, 2)
+        manual_request.assert_not_called()
+        claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+        assert claimed is not None
+        self.assertEqual(confirmations.decode_row(claimed)["identity"], known["identity"])
+        self.assertIsNone(organize_confirmations_repo.claim_next_organize_confirmation_review())
+
+    def test_manual_discovery_saves_suggestion_and_requires_confirmation_for_an_eight_episode_group(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.routes import logs_api
+
+        app = FastAPI()
+        app.include_router(logs_api.router)
+        self.enterContext(patch.object(logs_api, "require_api_login"))
+        self.enterContext(patch.object(feature_gate, "recognition_review_enabled", return_value=True))
+        client = self.enterContext(TestClient(app))
+        endpoint = "/api/logs/organize/confirmations"
+        group = self._unmatched_series("有人刚好提起我吗", count=8)
+        token = self._schedule_unmatched_group(group, "one-series")
+        ordinary = self.create("ordinary")
+        exclusive = self._unmatched_series("exclusive")
+        exclusive["rules"] = {"nsfw_exclusive": True}
+        excluded = self._schedule_unmatched_group(exclusive, "exclusive")
+        selection = {"confirmation_ids": [token, "ordinary", excluded]}
+        before = client.post(f"{endpoint}/query", json=selection)
+        self.assertEqual(before.status_code, 200, before.text)
+        views = {item["confirmation_id"]: item for item in before.json()["items"]}
+        self.assertEqual({key: item["can_discover_candidates"] for key, item in views.items()},
+                         {token: True, "ordinary": False, excluded: False})
+        self.assertIsNone(organize_confirmations_repo.claim_next_organize_confirmation_review())
+
+        entries = [{"confirmation_id": token, "candidate_index": 0}]
+        self.assertEqual(client.post(f"{endpoint}/preview", json={"entries": entries}).status_code, 400)
+        requested = client.post(f"{endpoint}/review", json=selection)
+        self.assertEqual(requested.status_code, 200, requested.text)
+        self.assertEqual(requested.json(), {"requested": 2, "unchanged": 0, "unavailable": 1})
+        discovered_request = confirmations.decode_row(self.row(token))
+        self.assertIs(discovered_request["review_only"], True)
+        self.assertIs(discovered_request["discover_candidates"], True)
+        self.assertFalse(confirmations.decode_row(self.row("ordinary")).get("discover_candidates"))
+        self.assertEqual(self.row(excluded)["review_status"], "")
+
+        decision = self._discovered_series(group["identity"])
+        existing_decision = RecognitionReviewDecision(status="approved", candidate_index=1, confidence=.99)
+        with patch("app.modules.agent_recognition_review.review_confirmation_payload",
+                   side_effect=[decision, existing_decision]), \
+                patch.object(confirmations, "start_confirmation") as start:
+            for expected in (token, "ordinary"):
+                claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+                assert claimed is not None
+                self.assertEqual(claimed["token"], expected)
+                self.assertEqual(confirmations._process_recognition_review_row(claimed), "approved")
+        start.assert_not_called()
+        self.assertIsNone(organize_confirmations_repo.claim_next_organize_confirmation_review())
+        self.assertEqual(confirmations.decode_row(self.row("ordinary"))["candidates"], ordinary["candidates"])
+
+        stored = self.row(token)
+        payload = confirmations.decode_row(stored)
+        self.assertEqual(payload["candidates"], decision.discovered_candidates)
+        self.assertEqual(payload["files"], group["files"])
+        self.assertEqual((stored["status"], stored["review_status"], stored["selected_index"]),
+                         ("pending", "approved", None))
+        audit = json.loads(stored["review_result_json"])
+        self.assertEqual(audit["candidate_index"], 0)
+        self.assertNotIn("discovered_candidates", audit)
+        response = client.post(f"{endpoint}/query", json={"confirmation_ids": [token]})
+        self.assertEqual(response.status_code, 200, response.text)
+        [view] = response.json()["items"]
+        self.assertFalse(view["can_discover_candidates"])
+        self.assertEqual(view["suggestion"]["source"], "agent")
+        self.assertEqual(view["candidates"][view["suggestion"]["candidate_index"]]["tmdb_id"], "7654")
+        with self.assertRaises(ValueError):
+            confirmations.start_confirmation(token, 0, chat_id="chat", actor="agent", dispatch=False)
+        self.assertEqual(client.post(f"{endpoint}/submit", json={"entries": entries}).status_code, 400)
+
+        preview = client.post(f"{endpoint}/preview", json={"entries": entries})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        [item] = preview.json()["items"]
+        self.assertEqual([(file["season"], file["episode"]) for file in item["files"]],
+                         [(1, episode) for episode in range(1, 9)])
+        self.assertIn("Season 1", item["target"])
+        self.assertEqual(self.row(token)["status"], "pending")
+        accepted = client.post(f"{endpoint}/submit", json={"entries": entries, "digest": preview.json()["digest"]})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual((accepted.json()["accepted"], accepted.json()["failed"]), (1, 0))
+        queued = self.row(token)
+        self.assertEqual((queued["status"], queued["confirmation_actor"], queued["selected_index"]), ("queued", "human", 0))
+        self.assertEqual(confirmations.decode_row(queued)["files"], group["files"])
+        self.assertEqual(self.row("ordinary")["status"], "pending")
+
+    def test_legacy_eight_card_batch_shares_search_and_checks_episodes_individually(self):
+        self.enterContext(patch.object(feature_gate, "recognition_review_enabled", return_value=True))
+        title, original_title = "有人刚好提起我吗？", "Did Someone Happen to Mention Me"
+        series = self._unmatched_series(title, count=8)
+        directory = (
+            f"/incoming/【高清剧集网发布 www.DDHDTV.com】{title}"
+            "[杜比视界版本][全8集][简繁英字幕].2160p.NF.WEB-DL.DDP.5.1.DV.H.265-BlackTV"
+        )
+        missing_episode = 8
+        files = series["files"]
+        groups = []
+        # 先处理缺集卡，后续七张卡仍须在相同缓存上独立核验成功。
+        for file in [files[-1], *files[:-1]]:
+            episode = file["episode"]
+            subtitle = {1: "Becomes.a.Nobody", missing_episode: "is.Reborn"}.get(episode, f"Episode.{episode:02}")
+            name = (
+                f"{original_title.replace(' ', '.')}.S01E{episode:02}.Act.{episode}.A.Renowned.Actor.{subtitle}"
+                ".2160p.NF.WEB-DL.DDP.5.1.DV.H.265-BlackTV.mkv"
+            )
+            groups.append({**series, "identity": f"Act {episode}", "directory": directory,
+                           "files": [{**file, "name": name}]})
+        task_id = "legacy-eight-cards"
+        self.assertEqual(confirmations.schedule_guangya_recognition_reviews(
+            {"task_id": task_id, "confirmation_groups": groups}, self.rules, chat_id="chat",
+        ), 8)
+        batch = batches.list_confirmations(task_id=task_id)
+        [batch_id] = {item["batch_id"] for item in batch["items"]}
+        self.assertTrue(batch_id)
+        self.assertEqual(batches.request_reviews(batch["confirmation_ids"]),
+                         {"requested": 8, "unchanged": 0, "unavailable": 0})
+
+        available = set(range(1, 9)) - {missing_episode}
+        detail = {
+            "id": 7654, "name": title, "original_name": original_title, "first_air_date": "2024-05-03",
+        }
+        tmdb = Mock(spec=TMDBClient, api_key="fixture-key", config_error="")
+        tmdb.search.return_value = [detail]
+        tmdb.detail_with_alternative_titles.return_value = detail
+        tmdb.tv_season_detail.return_value = {
+            "season_number": 1, "episodes": [{"episode_number": number} for number in sorted(available)],
+        }
+        stop, wake = Event(), Event()
+        remaining = len(groups)
+
+        def skip_wait(_timeout: float) -> bool:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0:
+                stop.set()
+            return True
+
+        with patch("app.modules.scraper.TMDBClient", return_value=tmdb), \
+                patch.object(wake, "wait", side_effect=skip_wait):
+            confirmations._recognition_review_loop(stop_event=stop, wakeup_event=wake)
+
+        items = batches.list_confirmations(batch_id=batch_id)["items"]
+        self.assertEqual(len(items), 8)
+        approved = set()
+        for item in items:
+            [file] = item["files"]
+            episode = file["episode"]
+            with self.subTest(episode=episode):
+                self.assertEqual((item["status"], item["selected_index"]), ("pending", None))
+                if episode == missing_episode:
+                    self.assertEqual(item["review_status"], "abstained")
+                    self.assertIsNone(item["suggestion"])
+                    self.assertEqual(item["candidates"], [])
+                    self.assertIn("S01E08", item["review_summary"])
+                    row = self.row(item["confirmation_id"])
+                    audit = confirmations.decode_json_object(row["review_result_json"])
+                    self.assertEqual(audit["reason_code"], "episode_boundary_unverified")
+                else:
+                    self.assertEqual(item["review_status"], "approved")
+                    index = item["suggestion"]["candidate_index"]
+                    self.assertEqual(item["candidates"][index]["tmdb_id"], "7654")
+                    approved.add(episode)
+        self.assertEqual(approved, available)
+        tmdb.search.assert_called_once_with(original_title, "", "tv")
+        tmdb.tv_season_detail.assert_called_once_with("7654", 1)
+
+    def test_discovery_does_not_add_candidates_after_skip_expiry_supersession_or_no_match(self):
+        self.enterContext(patch.object(feature_gate, "recognition_review_enabled", return_value=True))
+        for state in ("skipped", "expired", "superseded", "abstained"):
+            with self.subTest(state=state):
+                group = self._unmatched_series(f"late-{state}")
+                token = self._schedule_unmatched_group(group, state)
+                self.assertEqual(batches.request_reviews([token])["requested"], 1)
+                claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+                assert claimed is not None
+                self.assertEqual(claimed["token"], token)
+                now = db.now()
+                replacement = None
+
+                def decide(_payload):
+                    nonlocal now, replacement
+                    if state == "skipped":
+                        self.assertEqual(batches.skip_confirmations([token])["skipped"], 1)
+                    elif state == "expired":
+                        now = (datetime.fromisoformat(claimed["expires_at"]) + timedelta(seconds=1)).isoformat(sep=" ")
+                    elif state == "superseded":
+                        replacement = self._schedule_unmatched_group(group, "replacement")
+                    else:
+                        return RecognitionReviewDecision(status="abstained", reason_code="no_match")
+                    return self._discovered_series(group["identity"])
+
+                # 复核已经领取，推进时间或走实际人工操作后才让模型返回。
+                with patch.object(db, "now", side_effect=lambda: now), \
+                        patch("app.modules.agent_recognition_review.review_confirmation_payload", side_effect=decide):
+                    confirmations._process_recognition_review_row(claimed)
+                    [view] = batches.list_confirmations(confirmation_ids=[token], status="all")["items"]
+                self.assertEqual(view["candidates"], [])
+                self.assertIsNone(view["suggestion"])
+                self.assertIsNone(view["selected_index"])
+                self.assertEqual(view["status"], {"skipped": "cancelled", "abstained": "pending"}.get(state, "expired"))
+                self.assertIs(view["can_discover_candidates"], state == "abstained")
+                row = self.row(token)
+                self.assertEqual(confirmations.decode_row(row)["candidates"], [])
+                self.assertIsNone(confirmations.decode_json_object(row["review_result_json"]).get("candidate_index"))
+                if state in {"skipped", "superseded"}:
+                    self.assertEqual(json.loads(row["result_json"])["resolution"], state)
+                if replacement is not None:
+                    self.assertEqual(confirmations.decode_row(self.row(replacement))["candidates"], [])
+                if state == "abstained":
+                    self.assertEqual(row["review_status"], "abstained")
+
+    def test_candidate_discovery_request_checks_the_frozen_group_eligibility(self):
+        self.enterContext(patch.object(feature_gate, "recognition_review_enabled", return_value=True))
+        fixtures: dict[str, dict] = {
+            "max": self._unmatched_series("max", count=80),
+            "over-limit": self._unmatched_series("over-limit", count=81),
+            "empty": self._unmatched_series("empty", count=0),
+            "unnamed": {**self._unmatched_series("unnamed"), "files": [{"name": "  "}]},
+            "retry": {**self._unmatched_series("retry"), organize_confirmations_repo.RETRY_SELECTED_INDEX_KEY: 0},
+            "local": {**self._unmatched_series("local"), "kind": "local_media"},
+        }
+        expires_at = (datetime.now() + timedelta(hours=1)).isoformat(sep=" ", timespec="seconds")
+        for token, payload in fixtures.items():
+            organize_confirmations_repo.create_organize_confirmation(
+                token=token, fingerprint=token, chat_id="chat", source_name="来源A",
+                directory_path=payload["directory"], payload=payload, expires_at=expires_at,
+            )
+        tokens = list(fixtures)
+        views = batches.list_confirmations(confirmation_ids=tokens)["items"]
+        self.assertEqual({view["confirmation_id"]: view["can_discover_candidates"] for view in views},
+                         {token: token == "max" for token in fixtures if token != "local"})
+        self.assertEqual(batches.request_reviews(tokens), {"requested": 1, "unchanged": 0, "unavailable": 5})
+        claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+        assert claimed is not None
+        self.assertEqual(claimed["token"], "max")
+        self.assertIsNone(organize_confirmations_repo.claim_next_organize_confirmation_review())
+        for token in fixtures.keys() - {"max"}:
+            self.assertFalse(confirmations.decode_row(self.row(token)).get("discover_candidates"))
+
+    def test_discovery_candidate_and_suggestion_writes_roll_back_together(self):
+        self.enterContext(patch.object(feature_gate, "recognition_review_enabled", return_value=True))
+        failures = {
+            "candidate": "json_array_length(NEW.payload_json,'$.candidates') > 0",
+            "suggestion": "NEW.review_status='approved'",
+        }
+        # 分别拒绝候选与建议写入，防止任一先单独提交后留下半成品。
+        for boundary, condition in failures.items():
+            with self.subTest(boundary=boundary):
+                group = self._unmatched_series(f"failure-{boundary}")
+                token = self._schedule_unmatched_group(group, boundary)
+                self.assertEqual(batches.request_reviews([token])["requested"], 1)
+                decision = self._discovered_series(group["identity"])
+                self._run_review_with_failing_write(condition, decision)
+                stored = self.row(token)
+                self.assertEqual((stored["status"], stored["review_status"], stored["selected_index"]),
+                                 ("pending", "failed", None))
+                self.assertEqual(confirmations.decode_row(stored)["candidates"], [])
+                self.assertIsNone(confirmations.decode_json_object(stored["review_result_json"]).get("candidate_index"))
+                [view] = batches.list_confirmations(confirmation_ids=[token])["items"]
+                self.assertIsNone(view["suggestion"])
+
+    @staticmethod
+    def _run_review_with_failing_write(condition: str, decision: RecognitionReviewDecision) -> None:
+        with db.get_conn() as conn:
+            conn.execute(f"""
+                CREATE TRIGGER reject_review_write BEFORE UPDATE ON organize_confirmations
+                WHEN {condition}
+                BEGIN SELECT RAISE(ABORT, 'test review write failed'); END
+            """)
+        stop, wake = Event(), Event()
+        try:
+            with (
+                patch("app.modules.agent_recognition_review.review_confirmation_payload", return_value=decision),
+                patch.object(wake, "wait", side_effect=lambda _: stop.set()),
+            ):
+                confirmations._recognition_review_loop(stop_event=stop, wakeup_event=wake)
+        finally:
+            with db.get_conn() as conn:
+                conn.execute("DROP TRIGGER reject_review_write")
 
     def test_read_only_request_revokes_automatic_claim_even_if_worker_already_read_payload(self):
         self.create("one", review=True)

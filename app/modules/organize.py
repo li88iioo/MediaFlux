@@ -4258,13 +4258,12 @@ class Organizer:
                     from app.agent import feature_gate
 
                     if feature_gate.recognition_review_enabled():
-                        from app.modules.organize_confirmation_batches import MAX_SELECTION, request_reviews
-                        from app.notifier import notification_target_chat_id
+                        from app.modules.organize_confirmation_batches import MAX_SELECTION
+                        from app.modules.organize_confirmations import wake_recognition_review_dispatcher
+                        from app.repositories.organize_confirmations import activate_organize_confirmation_reviews
 
-                        if len(batch_tokens) <= MAX_SELECTION:
-                            request_reviews(
-                                batch_tokens, chat_id=notification_target_chat_id(chat_id),
-                            )
+                        if len(batch_tokens) <= MAX_SELECTION and activate_organize_confirmation_reviews(batch_tokens):
+                            wake_recognition_review_dispatcher()
                 else:
                     confirmation_failures += 1
             except Exception as exc:
@@ -4350,47 +4349,42 @@ class Organizer:
 
     @staticmethod
     def _confirmation_scope_summary(group: dict) -> str:
-        from app.notifier import safe_int
+        from app.notifier import _format_episode_range, safe_int
 
         files = [
             item for item in (group.get("files") or []) if isinstance(item, dict)
         ]
+        video_count = f"共 {len(files)} 个视频"
         if (group.get("rules") or {}).get("nsfw_exclusive") or any(
-            candidate.get("provider") in {"metatube", "clean_title"}
-            for candidate in group.get("candidates", [])
+            str(candidate.get("provider") or "").strip().lower() in {"metatube", "clean_title"}
+            for candidate in (group.get("candidates") or []) if isinstance(candidate, dict)
         ):
-            return f"共 {len(files)} 个视频"
-        seasons = sorted({
-            safe_int(item.get("season"), 0, minimum=0)
-            for item in files if item.get("season") not in (None, "")
-        })
-        episodes = sorted({
-            safe_int(item.get("episode"), 0, minimum=0)
-            for item in files if item.get("episode") not in (None, "")
-        })
+            return video_count
+        episodes_by_season: dict[int, set[int]] = {}
+        for item in files:
+            season = safe_int(item.get("season"), -1)
+            episode = safe_int(item.get("episode"), -1)
+            if season >= 0 or episode >= 0:
+                episodes = episodes_by_season.setdefault(max(-1, season), set())
+                if episode >= 0:
+                    episodes.add(episode)
+        seasons = sorted(episodes_by_season, key=lambda season: (season < 0, season))
         parts: list[str] = []
-        if len(seasons) == 1:
-            parts.append("特别篇" if seasons[0] == 0 else f"第 {seasons[0]} 季")
-        elif len(seasons) > 1:
-            parts.append(f"{len(seasons)} 个季度")
-        if episodes:
-            ranges: list[str] = []
-            start = previous = episodes[0]
-            for episode in episodes[1:]:
-                if episode == previous + 1:
-                    previous = episode
-                    continue
-                ranges.append(
-                    f"E{start:02d}" if start == previous
-                    else f"E{start:02d}–E{previous:02d}"
-                )
-                start = previous = episode
-            ranges.append(
-                f"E{start:02d}" if start == previous
-                else f"E{start:02d}–E{previous:02d}"
-            )
-            parts.append("、".join(ranges))
-        parts.append(f"共 {len(files)} 个视频")
+        for season in seasons[:3]:
+            if season >= 0:
+                parts.append("特别篇" if season == 0 else f"第 {season} 季")
+            elif len(seasons) > 1:
+                parts.append("未标季")
+            episodes = episodes_by_season[season]
+            ranges = ["E00"] if 0 in episodes else []
+            compact = _format_episode_range(tuple(episodes)).replace("-", "–")
+            if compact:
+                ranges.extend(compact.split("、"))
+            if ranges:
+                parts.append("、".join(ranges[:3]) + (" 等" if len(ranges) > 3 else ""))
+        if len(seasons) > 3:
+            parts.append("其余季集省略")
+        parts.append(video_count)
         return " · ".join(parts)
 
     @staticmethod

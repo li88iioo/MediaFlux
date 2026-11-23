@@ -611,6 +611,14 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(self.config_posts, [(200, {"AGENT_LLM_ENABLED": "1"})])
         self.assertEqual(config.get("AGENT_LIBRARY_PATROL_ENABLED"), "1")
 
+        page.locator('#settings-tab-metadata').click()
+        review = page.get_by_role('region', name='Agent 主动复核', exact=True)
+        self.assertTrue(review.is_visible())
+        copy = review.inner_text()
+        self.assertIn('只有一组待确认且通过快照和季集校验时，才可自动确认', copy)
+        self.assertIn('多组只提供建议', copy)
+        self.assertIn('手动请求始终只读', copy)
+
     def test_environment_managed_indexer_sites_are_read_only(self):
         from playwright.sync_api import expect
 

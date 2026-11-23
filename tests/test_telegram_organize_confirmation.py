@@ -595,10 +595,14 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 "parent_id": "parent", "size": 100, "etag": "adult-etag",
             }],
         })
-        actions = create_confirmation_actions(
-            group, OrganizeRules(), source_name="NSFW", chat_id="100",
-        )
-
+        with patch("app.agent.feature_gate.recognition_review_enabled", return_value=True):
+            pending = confirmation_event(
+                "待确认", {"媒体": group["identity"]}, group,
+                OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True), source_name="NSFW", chat_id="100",
+            )
+        self.assertIn("纠正识别", str(pending.footer))
+        self.assertNotIn("Agent 只读复核", str(pending.footer))
+        actions = pending.actions
         self.assertEqual(len(actions), 1)
         self.assertEqual(str(actions[0].label), "跳过此组")
         self.assertTrue(actions[0].callback_data.endswith(":skip"))
@@ -2219,6 +2223,51 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["organize_task_id"], "task-grouped")
         self.assertEqual(payload["organize_rollup"]["actionable_groups"], 1)
         self.assertEqual(payload["organize_rollup"]["actionable_files"], 1)
+
+    def test_single_group_without_candidates_delivers_whole_show_web_correction_guide(self):
+        group = self._group()
+        group.update(
+            reason="未找到可用元数据", candidates=[], files=[
+                {**group["files"][0], "file_id": f"video-{episode}",
+                 "name": f"Nagatoro - {episode:02d}.mp4", "episode": episode}
+                for episode in range(1, 9)
+            ],
+        )
+        with patch("app.agent.feature_gate.recognition_review_enabled", return_value=True), patch.object(
+            notification_center, "allows_notification", return_value=True,
+        ), patch.object(notification_center, "wake_telegram_notification_dispatcher"), patch.object(
+            notification_center, "send_event_result", return_value=TelegramSendResult(True, message_id=77),
+        ) as sender:
+            self.assertTrue(Organizer.notify_task_confirmations(
+                {"task_id": "single-uncatalogued-series", "confirmation_groups": [group]},
+                OrganizeRules(notify_enabled=True, library_notify=True), chat_id="100",
+            ))
+
+        sender.assert_called_once()
+        event = sender.call_args.args[0]
+        self.assertEqual(event.title, "⚠️ 待确认媒体 1/1")
+        self.assertIn(("剧集", "第 2 季 · E01–E08 · 共 8 个视频"), event.fields)
+        self.assertIn("整理日志 → 批量审阅光鸭待确认", str(event.footer))
+        self.assertIn("Agent 只读复核", str(event.footer))
+        self.assertIn("查找候选", str(event.footer))
+        self.assertIn("纠正识别", str(event.footer))
+        self.assertIn("整组文件", str(event.footer))
+        self.assertNotIn("请选择候选", str(event.footer))
+        skip_action, = event.actions
+        self.assertEqual(skip_action.label, "跳过此组")
+        token = skip_action.callback_data.split(":")[1]
+        self.assertEqual(skip_action.callback_data, f"orgc:{token}:skip")
+        row = organize_confirmations_repo.get_organize_confirmation(token)
+        assert row is not None
+        self.assertEqual(row["review_status"], "")
+        payload = json.loads(row["payload_json"])
+        self.assertNotIn("_confirmation_batch", payload)
+        self.assertFalse(payload.get("discover_candidates"))
+        snapshot = notification_center.get_notification_thread_snapshot(
+            f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+        )
+        assert snapshot is not None
+        self.assertEqual(snapshot.message_id, 77)
 
     def test_directory_notification_creates_clickable_candidate_event(self):
         group = self._group()

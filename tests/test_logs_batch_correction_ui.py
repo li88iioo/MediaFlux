@@ -141,7 +141,7 @@ window.fetch=async(input,options={})=>{
   let body={};
   try{body=options.body?JSON.parse(options.body):{};}catch{}
   const taskId=url.searchParams.get('task_id');
-  window.__apiCalls.push({path:url.pathname,method,body,taskId,page:url.searchParams.get('page')});
+  window.__apiCalls.push({path:url.pathname,method,body,taskId,page:url.searchParams.get('page'),confirmationId:url.searchParams.get('confirmation_id')});
   const config=window.__testConfig;
   if(url.pathname==='/api/logs/overview')return jsonResponse({timeline:{success:0,failed:0,skipped:0,reverted:0}});
   if(url.pathname==='/api/logs/organize/timeline'){

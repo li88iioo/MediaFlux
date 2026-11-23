@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -1421,6 +1421,8 @@ def claim_organize_log_operation(
     next_status: str,
     allowed_statuses: tuple[str, ...],
     expected_version: int | None = None,
+    *,
+    _conn: sqlite3.Connection | None = None,
 ) -> bool:
     statuses = tuple(dict.fromkeys(item for item in allowed_statuses if item))
     if not statuses or not operation_token:
@@ -1434,7 +1436,7 @@ def claim_organize_log_operation(
     if expected_version is not None:
         sql += " AND version=?"
         params.append(expected_version)
-    with get_conn() as conn:
+    with (nullcontext(_conn) if _conn is not None else get_conn()) as conn:
         cur = conn.execute(sql, params)
         return cur.rowcount == 1
 

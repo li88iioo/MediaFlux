@@ -83,17 +83,17 @@ def _view(row) -> dict:
         )}
         suggestion["source"] = review.get("source") or "agent"
         suggestion["summary"] = redact_sensitive_text(suggestion["summary"])
+    status = "expired" if row["status"] == "pending" and row["expires_at"] <= db.now() else row["status"]
     return {
         "confirmation_id": row["token"], "task_id": row["organize_task_id"],
         "batch_id": str(payload.get("_confirmation_batch") or ""),
         "source": row["source_name"], "directory": row["directory_path"],
         "identity": payload.get("identity") or row["directory_path"],
-        "reason": payload.get("reason") or "", "status": (
-            "expired" if row["status"] == "pending" and row["expires_at"] <= db.now() else row["status"]
-        ),
+        "reason": payload.get("reason") or "", "status": status,
         "expires_at": row["expires_at"], "candidates": candidates,
+        "can_discover_candidates": status == "pending" and organize_confirmations_repo.can_discover_candidates(payload),
         "files": [{key: file.get(key) for key in ("file_id", "name", "size", "season", "episode")}
-                  for file in payload.get("files") or []],
+                  for file in confirmations.confirmation_files(payload)],
         "review_status": row["review_status"], "suggestion": suggestion,
         "review_summary": redact_sensitive_text(review.get("summary") or review.get("reason_code") or ""),
         "selected_index": row["selected_index"], "error": redact_sensitive_text(row["error"] or ""),
@@ -107,6 +107,7 @@ def list_confirmations(
     *, batch_id: str = "", task_id: str = "", source: str = "", reason: str = "",
     q: str = "", status: str = "pending", confirmation_ids: list[str] | None = None,
     page: int = 1, page_size: int = 20, chat_id: str | None = None,
+    include_correction_logs: bool = False,
 ) -> dict:
     if not isinstance(status, str) or status not in {"all", "pending", "queued", "running", "completed", "failed", "expired", "cancelled"}:
         raise ValueError("确认状态无效")
@@ -114,10 +115,13 @@ def list_confirmations(
         raise ValueError("筛选参数无效")
     if type(page) is not int or page < 1 or type(page_size) is not int or not 1 <= page_size <= MAX_SELECTION:
         raise ValueError("分页参数无效")
+    if type(include_correction_logs) is not bool:
+        raise ValueError("include_correction_logs 必须是布尔值")
     result = organize_confirmations_repo.query_organize_confirmations(
         batch_id=batch_id, task_id=task_id, source=source, reason=reason,
         keyword=q, status=status, tokens=_tokens(confirmation_ids) if confirmation_ids is not None else None,
         chat_id=chat_id, page=page, page_size=page_size, selection_limit=MAX_SELECTION,
+        include_correction_logs=include_correction_logs,
     )
     return {
         "items": [{**_view(row), "log_ids": result["log_ids"].get(row["token"], [])}
@@ -271,10 +275,10 @@ def preview_choices(entries: list[dict], *, chat_id: str | None = None) -> dict:
             )
             mappings = _episode_mappings(row, index)
             positions = {mapping["file_index"]: mapping for mapping in mappings}
-            files = [{**file, **({"season": positions[i]["target_season"], "episode": positions[i]["target_episode"]}
-                                if i in positions else {})} for i, file in enumerate(payload.get("files") or [])]
-            targets = list(dict.fromkeys("/".join(organizer.build_media_path_parts(match, file, current)) for file in files))
             view = _view(row)
+            files = [{**file, **({"season": positions[i]["target_season"], "episode": positions[i]["target_episode"]}
+                                if i in positions else {})} for i, file in enumerate(view["files"])]
+            targets = list(dict.fromkeys("/".join(organizer.build_media_path_parts(match, file, current)) for file in files))
             items.append({**view, "candidate": _candidate_view(candidate, index),
                           "target": "；".join(targets), "target_root_id": current.target_dir_id,
                           "episode_mappings": mappings})
