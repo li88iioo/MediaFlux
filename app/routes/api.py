@@ -15,6 +15,7 @@ from app.clients.douban_authenticated import (
     DoubanAuthenticatedClient,
     normalize_dbcl2,
 )
+from app.clients.qbittorrent import validate_qb_url
 from app.defaults import (
     AI_RECOGNITION_CONFIDENCE_BOUNDS,
     INT_SETTING_BOUNDS,
@@ -1183,6 +1184,9 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 web_updates["ENV_WEB_PASSWORD"] = password
 
         try:
+            if "QB_URL" in data and not _is_config_mask(data["QB_URL"]):
+                url = str(data["QB_URL"]).strip()
+                data["QB_URL"] = validate_qb_url(url) if url else ""
             discovery_updates = _validate_discovery_updates(data)
             indexer_updates = _validate_indexer_updates(data)
             ai_recognition_updates = _validate_ai_recognition_updates(data)

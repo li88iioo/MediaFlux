@@ -211,6 +211,49 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(self.config_posts, [])
         self.assertEqual(config.get("AGENT_LLM_API_KEY"), "stored-test-key")
 
+    def test_downloader_url_save_rejects_an_invalid_draft_and_accepts_its_correction(self):
+        from playwright.sync_api import expect
+
+        saved_url = "http://192.0.2.10:8080"
+        draft_url = "192.0.2.20:8080"
+        self._write(QB_URL=saved_url, QB_CATEGORY="old")
+        before = config.ENV_FILE.read_bytes()
+        page = self._open("/settings#downloads")
+        panel = page.locator('[data-settings-panel="downloads"]')
+        url = panel.locator('[data-key="QB_URL"]')
+        category = panel.locator('[data-key="QB_CATEGORY"]')
+        save = panel.get_by_role("button", name="保存下载器设置")
+        state = panel.locator("[data-settings-state]")
+        url.fill(draft_url)
+        category.fill("new")
+        panel.get_by_role("button", name="测试客户端连接").click()
+        diagnostic = panel.locator("#qbDiagnosticText")
+        expect(diagnostic).to_contain_text("qBittorrent HTTP(S)")
+        save.click()
+        expect(save).to_be_enabled()
+        self.assertEqual(
+            (self.config_posts[-1][0], config.get("QB_URL"), config.get("QB_CATEGORY")),
+            (400, saved_url, "old"),
+            state.inner_text(),
+        )
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+        expect(state).to_have_text(diagnostic.inner_text())
+        expect(url).to_have_value(draft_url)
+        expect(category).to_have_value("new")
+
+        corrected_url = "http://" + draft_url
+        url.fill(corrected_url)
+        save.click()
+        expect(state).to_have_text("当前分区已保存")
+        self.assertEqual(self.config_posts[-1], (200, {"QB_URL": corrected_url, "QB_CATEGORY": "new"}))
+        self.assertEqual((config.get("QB_URL"), config.get("QB_CATEGORY")), (corrected_url, "new"))
+
+        url.fill("")
+        save.click()
+        expect(save).to_be_enabled()
+        self.assertEqual(self.config_posts[-1], (200, {"QB_URL": ""}))
+        self.assertEqual(config.get("QB_URL"), "")
+
     def test_qb_auth_preview_matches_saved_draft_and_cleared_key(self):
         from playwright.sync_api import expect
 

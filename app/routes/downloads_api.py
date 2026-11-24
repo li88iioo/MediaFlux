@@ -14,6 +14,7 @@ from app.clients.qbittorrent import (
     QBConnectionTestError,
     QBittorrentClient,
     close_qbittorrent_client,
+    validate_qb_url,
 )
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.modules.download_dispatcher import (
@@ -173,15 +174,6 @@ def _public_resubmit_result(result: dict, *, source_request_id: int, target: str
     }
 
 
-def _qb_test_secret(value: object, *, key: str, url: str, saved_url: str) -> str:
-    raw = str(value or "").strip()
-    if raw != "********":
-        return raw
-    if url != saved_url:
-        raise ValueError("修改 qB 地址后，请重新输入密码或 API Key")
-    return config.get(key, "").strip()
-
-
 _QB_TEST_ERRORS = {
     "authentication": "qBittorrent 已响应，但认证失败",
     "not_qb_api": "地址可达，但不是有效的 qBittorrent WebUI",
@@ -205,32 +197,24 @@ def test_qb_connection(request: Request, data: object = Body(default=None)):
     if unknown:
         return api_error(f"包含不允许的测试参数: {', '.join(unknown[:3])}", 400)
 
-    from app.modules.media_proxy import validate_upstream_url
-
     try:
-        url = validate_upstream_url(str(data.get("url") or ""))
-    except (TypeError, ValueError):
-        return api_error("请输入安全有效的 qBittorrent HTTP(S) 地址", 400)
-    try:
-        saved_url = validate_upstream_url(config.get("QB_URL", ""))
-    except (TypeError, ValueError):
-        saved_url = ""
-    try:
-        password = _qb_test_secret(
-            data.get("password"), key="QB_PASSWORD", url=url, saved_url=saved_url,
-        )
-        api_key = _qb_test_secret(
-            data.get("api_key"), key="QB_API_KEY", url=url, saved_url=saved_url,
-        )
+        url = validate_qb_url(str(data.get("url") or ""))
     except ValueError as exc:
         return api_error(str(exc), 400)
+    saved_url = config.get("QB_URL", "").strip().rstrip("/")
+    credentials = {}
+    for field, key in (("password", "QB_PASSWORD"), ("api_key", "QB_API_KEY")):
+        value = str(data.get(field) or "").strip()
+        if value == "********":
+            if url != saved_url:
+                return api_error("修改 qB 地址后，请重新输入密码或 API Key", 400)
+            value = config.get(key, "").strip()
+        credentials[field] = value
     username = str(data.get("username") or "").strip()
-    if not api_key and (not username or not password):
+    if not credentials["api_key"] and (not username or not credentials["password"]):
         return api_error("请填写 API Key，或同时填写用户名和密码", 400)
 
-    client = QBittorrentClient(
-        url=url, username=username, password=password, api_key=api_key, timeout=8,
-    )
+    client = QBittorrentClient(url=url, username=username, timeout=8, **credentials)
     started = time.perf_counter()
     try:
         versions = client.test_connection()

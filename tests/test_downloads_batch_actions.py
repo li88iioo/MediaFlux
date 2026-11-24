@@ -4,12 +4,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+import socket
 import sqlite3
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from app import config
 from app.repositories import download_requests as download_requests_repo
 from app.config import web_credentials
 from app.main import create_app
@@ -105,6 +107,26 @@ class DownloadBatchActionApiTests(LoggedInDownloadsApiCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("重新输入", response.json()["error"])
         client.assert_not_called()
+
+    def test_qb_probe_resolves_the_target_once_and_uses_saved_credentials_at_the_same_url(self):
+        headers = self._headers()
+        url = "http://qb.example.invalid:8080"
+        config.set_and_save({
+            "QB_URL": url + "/", "QB_API_KEY": "fixture-key", "QB_PASSWORD": "fixture-password",
+        })
+        answer = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 8080))
+        with patch("socket.getaddrinfo", return_value=[answer]) as resolve, patch(
+            "app.routes.downloads_api.QBittorrentClient",
+        ) as client:
+            client.return_value.test_connection.return_value = {"app": "5", "webapi": "2", "auth_mode": "api_key"}
+            response = self.client.post("/api/downloads/qb/test", headers=headers, json={
+                "url": url, "username": "user", "password": "********", "api_key": "********",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        client.assert_called_once_with(
+            url=url, username="user", password="fixture-password", api_key="fixture-key", timeout=8,
+        )
+        resolve.assert_called_once_with("qb.example.invalid", 8080, type=socket.SOCK_STREAM)
 
     def test_batch_resume_deduplicates_hashes_and_reports_accepted_count(self):
         headers = self._headers()

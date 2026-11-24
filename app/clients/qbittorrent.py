@@ -19,6 +19,15 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 
+def validate_qb_url(value: str) -> str:
+    from app.modules.media_proxy import validate_upstream_url
+
+    try:
+        return validate_upstream_url(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("请输入安全有效的 qBittorrent HTTP(S) 地址") from exc
+
+
 def close_qbittorrent_client(client: object | None) -> None:
     """尽力释放短生命周期 qB Client，不让清理异常覆盖业务结果。"""
     if client is None:
