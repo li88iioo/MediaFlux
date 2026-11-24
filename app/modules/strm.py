@@ -2416,6 +2416,7 @@ def _sync_strm_impl(
         nonlocal scan_errors
         pending_dirs = deque([(initial_dir_id, initial_parts)])
         visited_dir_ids: set[str] = set()
+        candidate_parents: dict[str, str] = {}
         observed_dirs: dict[str, str] = {}
         snapshot_dirs: dict[str, list[GuangYaFile]] | None = None
         snapshot_attempted = False
@@ -2600,34 +2601,29 @@ def _sync_strm_impl(
                         rel_dir = str(Path(*rel_parts)) if rel_parts else ""
                         ext = file.name.rsplit(".", 1)[-1].lower() if "." in file.name else ""
                         if ext in metadata:
+                            candidates, count_key = metadata_candidates, "metadata_total"
                             target = _metadata_target(file, rel_dir, strm_root)
-                            target_key = str(target)
-                            if (
-                                target_key not in metadata_candidates
-                                and len(video_candidates) + len(metadata_candidates) >= max_candidates
-                            ):
-                                abort_scan("candidates", "STRM 候选数量超过扫描上限")
-                                break
-                            stats["metadata_total"] += 1
-                            _record_candidate(metadata_candidates, target, (file, rel_dir))
+                        elif ext in exts:
+                            if threshold_bytes and 0 < file.size < threshold_bytes:
+                                # 旧实例的小视频仍可用于核实迁入目录的归属。
+                                if preferred and len(filtered_videos) <= max_candidates:
+                                    filtered_videos.append((file, str(Path(component, *rel_parts[1:]))))
+                                continue
+                            candidates, count_key = video_candidates, "total"
+                            target = _strm_target(file, rel_dir, strm_root)
+                        else:
                             continue
-                        if ext not in exts:
-                            continue
-                        if threshold_bytes and 0 < file.size < threshold_bytes:
-                            # 旧实例可能生成过小视频的指针。目录归属仍可核实，生成遵从本机阈值。
-                            if preferred and len(filtered_videos) <= max_candidates:
-                                filtered_videos.append((file, str(Path(component, *rel_parts[1:]))))
-                            continue
-                        target = _strm_target(file, rel_dir, strm_root)
-                        target_key = str(target)
+                        if file.file_id and candidate_parents.setdefault(file.file_id, dir_id) != dir_id:
+                            abort_scan("source_changed", "扫描期间同一文件出现在两个云端目录，等待重新扫描")
+                            break
                         if (
-                            target_key not in video_candidates
+                            str(target) not in candidates
                             and len(video_candidates) + len(metadata_candidates) >= max_candidates
                         ):
                             abort_scan("candidates", "STRM 候选数量超过扫描上限")
                             break
-                        stats["total"] += 1
-                        _record_candidate(video_candidates, target, (file, rel_dir))
+                        stats[count_key] += 1
+                        _record_candidate(candidates, target, (file, rel_dir))
                     if not scan_abort.is_set():
                         pending_dirs.extend(child_dirs)
 
@@ -2673,7 +2669,7 @@ def _sync_strm_impl(
         try:
             videos = _rebase_strm_candidates(video_candidates, component, strm_root, _strm_target, should_stop)
             verified = verify_strm_adoption(
-                Path(strm_root).expanduser(), component,
+                Path(strm_root).expanduser().resolve(strict=False), component,
                 chain(
                     ((file, Path(target)) for target, (file, _, _) in videos.items()),
                     ((file, _strm_target(file, folder, strm_root)) for file, folder in filtered_videos),

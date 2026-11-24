@@ -630,6 +630,33 @@ raise AssertionError("crash checkpoint not reached")
             {str(old), str(self.target)},
         )
 
+    def test_receipt_ack_failure_retries_handoff_without_spending_download_budget(self):
+        old = self.queue_move()
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER fail_receipt_ack BEFORE DELETE ON strm_path_cleanup "
+                "BEGIN SELECT RAISE(ABORT,'fixture-receipt-ack'); END"
+            )
+        with patch("app.modules.strm.requests.get", return_value=_Response()) as download:
+            self.worker._process_one()
+        download.assert_called_once()
+        self.assertEqual(self.target.read_bytes(), b"metadata")
+        self.assertFalse(old.exists())
+        self.assertEqual(len(strm_repo.list_strm_path_cleanup("guangya-meta:source")), 1)
+        self.assertEqual({row["path"] for row in strm_repo.list_strm_refresh_entries()}, {str(old)})
+        row = self.queue_row()
+        self.assertEqual((row["status"], row["attempts"]), ("retry_wait", 0))
+        self.assertEqual(db.count_strm_failures(status="open"), 0)
+
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER fail_receipt_ack")
+        self.make_due()
+        with patch("app.modules.strm.requests.get", side_effect=AssertionError("must reuse installed bytes")):
+            self.assertTrue(self.worker._process_one())
+        self.assertEqual(self.queue_row()["status"], "completed")
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
+        self.assertEqual({row["path"] for row in strm_repo.list_strm_refresh_entries()}, {str(old), str(self.target)})
+
     def test_moved_receipt_recovery_keeps_frozen_refresh_policy(self):
         for enabled, allow_emby in ((False, False), (True, False)):
             with self.subTest(enabled=enabled, allow_emby=allow_emby):

@@ -414,6 +414,31 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(config.get("EMBY_PATH_MAPPINGS"), "")
             self.assertEqual(local_media_repo.list_local_library_targets(source_id)[0].path, str(destination))
 
+    def test_mapping_save_replaces_local_bindings_only_when_supplied(self):
+        headers = {"X-CSRF-Token": self.login()}
+        url = "/api/media-libraries/mappings"
+        with TemporaryDirectory() as root, patch(
+            "app.modules.local_media_scheduler.get_local_media_scheduler",
+        ) as get_scheduler:
+            destination = Path(root) / "media"
+            destination.mkdir()
+            source_id = local_media_repo.create_local_media_source(
+                name="本地下载", qb_profile="", qb_path_prefix="", local_root=root, owner="admin",
+            )
+            local_media_repo.upsert_local_library_target(source_id, "default", str(destination))
+            for body in ({}, {"strm_mappings": {"jellyfin": []}}):
+                response = self.client.post(url, json=body, headers=headers)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual([row["local_path"] for row in response.json()["local_bindings"]], [str(destination)])
+                self.assertEqual([row.path for row in local_media_repo.list_local_library_targets(source_id)], [str(destination)])
+            get_scheduler.assert_not_called()
+
+            response = self.client.post(url, json={"local_bindings": []}, headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["local_bindings"], [])
+            self.assertEqual(local_media_repo.list_local_library_targets(source_id), [])
+            get_scheduler.return_value.reload.assert_called_once_with()
+
     def test_unified_save_rejects_local_mapping_without_media_library(self):
         csrf = self.login()
         headers = {"X-CSRF-Token": csrf}

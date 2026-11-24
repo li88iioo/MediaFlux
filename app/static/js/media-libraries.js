@@ -27,6 +27,7 @@
         saving: false,
         get dirty() { return JSON.stringify(this.rows) !== this.savedRows; },
     };
+    const pathTests = new WeakMap();
 
     function icons(root = document) {
         if (window.lucide) window.lucide.createIcons({nodes: [root]});
@@ -60,12 +61,9 @@
     function setBusy(button, busy, label) {
         if (!button) return;
         const labelNode = $('[data-button-label]', button);
-        if (button.dataset.idleLabel === undefined) {
-            button.dataset.idleLabel = labelNode?.textContent || button.textContent.trim();
-        }
         button.disabled = busy;
         button.classList.toggle('is-loading', busy);
-        if (labelNode) labelNode.textContent = busy ? label : button.dataset.idleLabel;
+        if (labelNode) labelNode.textContent = label;
     }
 
     function animateCount(id, value) {
@@ -458,11 +456,18 @@
         return row;
     }
 
-    function resetResult(rowElement) {
-        const result = $('[data-mapping-result]', rowElement);
-        if (!result) return;
-        result.className = 'ml-mapping-result';
-        result.textContent = '';
+    function showMappingResult(node, message = '', tone = '', title = '') {
+        node.className = tone ? `ml-mapping-result is-${tone}` : 'ml-mapping-result';
+        node.textContent = message;
+        if (title) node.title = title;
+        else node.removeAttribute('title');
+    }
+
+    function syncEditedRow(rowElement) {
+        syncRow(rowElement);
+        pathTests.get(rowElement)?.abort();
+        showMappingResult($('[data-mapping-result]', rowElement));
+        updateActions();
     }
 
     function openMappingDirectoryPicker(rowElement) {
@@ -546,20 +551,22 @@
     }
 
     async function testMapping(rowElement, button) {
-        const row = syncRow(rowElement);
+        const row = {...syncRow(rowElement)};
         const resultNode = $('[data-mapping-result]', rowElement);
-        if (!row?.provider || !row.local || !row.server) {
-            resultNode.className = 'ml-mapping-result is-error';
-            resultNode.textContent = '请选择媒体库、来源目录并填写服务器路径';
+        if (!row.provider || !row.local || !row.server) {
+            showMappingResult(resultNode, '请选择媒体库、来源目录并填写服务器路径', 'error');
             return;
         }
+        const controller = new AbortController();
+        const {signal} = controller;
+        pathTests.set(rowElement, controller);
+        signal.addEventListener('abort', () => setBusy(button, false, ''), {once: true});
         setBusy(button, true, '');
-        resultNode.removeAttribute('title');
-        resultNode.className = 'ml-mapping-result';
-        resultNode.textContent = '正在核对服务器媒体库…';
+        showMappingResult(resultNode, '正在核对服务器媒体库…');
         try {
             const result = await api('/api/media-libraries/path-test', {
                 method: 'POST',
+                signal,
                 body: JSON.stringify({
                     provider: row.provider,
                     source_kind: row.kind,
@@ -570,42 +577,37 @@
                     sample_path: row.local,
                 }),
             });
+            if (signal.aborted) return;
             const selectedMatch = !row.libraryId || result.matches.some(
                 (item) => String(item.id || '') === row.libraryId,
             );
             const names = result.matches.map((item) => item.name).filter(Boolean);
             if (result.status === 'ambiguous') {
-                resultNode.className = 'ml-mapping-result is-warning';
-                resultNode.textContent = '路径有歧义，自动刷新将跳过。请调整媒体库目录后重试。';
-                resultNode.title = names.join('、');
+                showMappingResult(resultNode, '路径有歧义，自动刷新将跳过。请调整媒体库目录后重试。', 'warning', names.join('、'));
             } else if (result.status === 'covered') {
-                resultNode.className = 'ml-mapping-result is-warning';
-                resultNode.textContent = '当前路径是媒体库的上层目录，请选择库内目录后重试。';
+                showMappingResult(resultNode, '当前路径是媒体库的上层目录，请选择库内目录后重试。', 'warning');
             } else if (result.status === 'matched' && selectedMatch) {
-                resultNode.className = 'ml-mapping-result is-success';
-                resultNode.textContent = `映射有效：${result.mapped_path} · ${row.libraryName || names.join('、')}`;
+                showMappingResult(resultNode, `映射有效：${result.mapped_path} · ${row.libraryName || names.join('、')}`, 'success');
             } else if (result.matches.length) {
-                resultNode.className = 'ml-mapping-result is-warning';
-                resultNode.textContent = `路径命中了 ${names.join('、')}，但不是当前选择的媒体库`;
+                showMappingResult(resultNode, `路径命中了 ${names.join('、')}，但不是当前选择的媒体库`, 'warning');
             } else {
-                resultNode.className = 'ml-mapping-result is-warning';
-                resultNode.textContent = `转换后路径 ${result.mapped_path} 未命中服务器媒体库`;
+                showMappingResult(resultNode, `转换后路径 ${result.mapped_path} 未命中服务器媒体库`, 'warning');
             }
         } catch (error) {
-            resultNode.className = 'ml-mapping-result is-error';
-            resultNode.textContent = error.message;
+            if (!signal.aborted) showMappingResult(resultNode, error.message, 'error');
         } finally {
-            setBusy(button, false, '');
+            if (pathTests.get(rowElement) === controller) {
+                pathTests.delete(rowElement);
+                setBusy(button, false, '');
+            }
         }
     }
 
     function showRowError(rowElements, index, message) {
         const result = $('[data-mapping-result]', rowElements[index]);
-        if (!result) return false;
-        result.className = 'ml-mapping-result is-error';
-        result.textContent = message;
+        if (!result) return;
+        showMappingResult(result, message, 'error');
         rowElements[index].scrollIntoView({behavior: 'smooth', block: 'nearest'});
-        return false;
     }
 
     function mappingScopes(rows) {
@@ -802,17 +804,13 @@
             return;
         }
 
-        syncRow(rowElement);
-        resetResult(rowElement);
-        updateActions();
+        syncEditedRow(rowElement);
     });
 
     $('#mlMappingWorkbench')?.addEventListener('input', (event) => {
         const rowElement = event.target.closest('[data-mapping-row]');
         if (!rowElement || !event.target.matches('[data-mapping-server]')) return;
-        syncRow(rowElement);
-        resetResult(rowElement);
-        updateActions();
+        syncEditedRow(rowElement);
     });
 
     icons(page);

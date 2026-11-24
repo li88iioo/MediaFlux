@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterable
 
@@ -28,14 +28,12 @@ def _batch_size(value: int) -> int:
 
 
 def _normalize(path: object) -> str:
-    text = str(path or "").replace("\\", "/").rstrip("/")
-    return text
+    text = str(path or "").replace("\\", "/")
+    return (text.rstrip("/") or "/") if text else ""
 
 
 def _is_descendant(candidate: str, ancestor: str) -> bool:
-    if not candidate or not ancestor:
-        return False
-    return candidate == ancestor or candidate.startswith(f"{ancestor}/")
+    return candidate == ancestor or candidate.startswith(ancestor.rstrip("/") + "/")
 
 
 @dataclass(frozen=True)
@@ -72,20 +70,6 @@ class RefreshPlan:
         }
 
 
-@dataclass
-class _Boundary:
-    """刷新目标不得收敛到媒体根之上，否则等价于全库刷新。"""
-
-    roots: tuple[str, ...] = field(default_factory=tuple)
-
-    def allows(self, path: str) -> bool:
-        if not self.roots:
-            return True
-        return any(
-            _is_descendant(path, root) and path != root for root in self.roots
-        )
-
-
 def plan_refresh_targets(
     changed_paths: Iterable[object] | None = (),
     changed_dirs: Iterable[object] | None = (),
@@ -95,14 +79,14 @@ def plan_refresh_targets(
 ) -> RefreshPlan:
     """把变化文件与溢出目录收敛成最小刷新目标集合。"""
     max_targets = _batch_size(max_targets)
-    boundary = _Boundary(tuple(
-        item for item in (_normalize(root) for root in media_roots or ()) if item
-    ))
-    candidates: list[str] = []
-    for item in changed_dirs or ():
-        normalized = _normalize(item)
-        if normalized:
-            candidates.append(normalized)
+    roots = {root for raw in media_roots or () if (root := _normalize(raw))}
+
+    def allows(path: str) -> bool:
+        if path == "/" or path in roots:
+            return False
+        return not roots or any(_is_descendant(path, root) for root in roots)
+
+    candidates = [path for raw in changed_dirs or () if (path := _normalize(raw))]
     files_by_dir: dict[str, list[str]] = {}
     for item in changed_paths or ():
         normalized = _normalize(item)
@@ -112,8 +96,8 @@ def plan_refresh_targets(
     for parent, files in files_by_dir.items():
         files = list(dict.fromkeys(files))
         # 媒体根本身不能成为目标；根下直放的文件只能逐个精确定位。
-        candidates.extend([parent] if len(files) > 1 and boundary.allows(parent) else files)
-    unique = [item for item in dict.fromkeys(candidates) if boundary.allows(item)]
+        candidates.extend([parent] if len(files) > 1 and allows(parent) else files)
+    unique = [item for item in dict.fromkeys(candidates) if allows(item)]
     if not unique:
         return RefreshPlan(reason="本轮没有可定位的变化目录")
 

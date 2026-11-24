@@ -383,6 +383,41 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             self.assertEqual(subtitle.read_bytes(), b"local subtitle")
             self.assertFalse(fallback.exists())
 
+    def test_configured_root_alias_reuses_copied_directory_and_cleans_old_pointer(self):
+        source = {"id": "alias-source", "name": "电影"}
+        video = GuangYaFile("video", "Movie.mkv", False, 20000000, "etag", source["id"])
+        client = cast(GuangYaClient, _TreeClient({source["id"]: [video]}))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "physical"
+            root = output.with_name("configured")
+            output.mkdir()
+            root.symlink_to(output, target_is_directory=True)
+            copied = generate_strm(video, source["name"], "http://old.invalid", str(output))
+            subtitle = copied.with_suffix(".srt")
+            subtitle.write_bytes(b"local subtitle")
+            db.reconcile_configured_strm_sources([source], str(root))
+            assigned = db.get_strm_source_prefixes([source])[source["id"]]
+            self.assertNotEqual(assigned, source["name"])
+
+            def sync():
+                prefix = db.get_strm_source_prefixes([source])[source["id"]]
+                return sync_strm(source["id"], "http://new.invalid", str(root), client=client, rel_prefix=prefix)
+
+            result = sync()
+            self.assertEqual(result.get("adopted_prefix"), source["name"], result)
+            self.assertTrue(copied.read_text().startswith("http://new.invalid/playgy/"))
+            self.assertEqual(subtitle.read_bytes(), b"local subtitle")
+            self.assertFalse(copied.parent.with_name(assigned).exists())
+            self.assertEqual(strm_repo.list_strm_index("guangya:alias-source")[0]["strm_path"], str(copied))
+            self.assertFalse(result.get("recovery_pending"), result)
+
+            duplicate = copied.with_name("历史副本.strm")
+            duplicate.write_bytes(copied.read_bytes())
+            result = sync()
+            self.assertFalse(duplicate.exists(), result)
+            self.assertTrue(copied.exists())
+            self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:alias-source"), [])
+
     def test_copied_pointer_changed_after_directory_check_is_preserved(self):
         from app.modules import strm_adoption
 

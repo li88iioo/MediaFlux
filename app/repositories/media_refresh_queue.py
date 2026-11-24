@@ -149,14 +149,6 @@ def _normalized_library_ids(values: Iterable[object] | None) -> tuple[str, ...]:
     )))
 
 
-def _normalized_paths(values: Iterable[object] | None) -> list[str]:
-    return list(dict.fromkeys(
-        str(item or "").strip()
-        for item in (values or ())
-        if str(item or "").strip()
-    ))
-
-
 def _normalized_binding(value: dict[str, str] | None) -> dict[str, str]:
     if not value:
         return {}
@@ -221,7 +213,7 @@ def _pending_deadlines(group: dict[str, Any]) -> dict[str, float]:
     overrides = group.get("path_due_at") or {}
     return {
         path: float(overrides.get(path, due_at))
-        for path in _normalized_paths(group.get("pending_paths"))
+        for path in _merge_paths(group.get("pending_paths"))
     }
 
 
@@ -273,7 +265,7 @@ def enqueue_media_refresh(
     normalized_provider = _normalized_provider(provider)
     normalized_ids = _normalized_library_ids(allowed_library_ids)
     binding = _normalized_binding(library_binding)
-    normalized_paths = _normalized_paths(paths)
+    normalized_paths = _merge_paths(paths)
     if not normalized_paths:
         return {"queued": 0, "group_key": "", "path_count": 0}
     if intent is None:
@@ -301,13 +293,12 @@ def enqueue_media_refresh(
                 "path": path, "providers": {}, "source": source_entries is not None,
                 "allow_emby": bool(entry.get("allow_emby", True)), "origins": [],
             })
-            # outbox ACK 失败后的幂等交接不能重放已接受/失败的刷新。
+            # queued 与该 token 的队列归属在同一事务写入，重交接不能修改后到的变化。
             previous = event["providers"].get(normalized_provider, {})
-            if previous.get("status") in {"success", "failed", "skipped"}:
+            if previous.get("status") in {"queued", "success", "failed", "skipped"}:
                 continue
-            if previous.get("status") != "queued":
-                touched_origins.update(event.get("origins", []))
-                event["providers"][normalized_provider] = {"status": "queued"}
+            touched_origins.update(event.get("origins", []))
+            event["providers"][normalized_provider] = {"status": "queued"}
             events_by_path.setdefault(path, []).append(token)
         for origin_key in touched_origins:
             state["origins"][origin_key]["revision"] += 1
@@ -343,20 +334,13 @@ def enqueue_media_refresh(
             or _normalized_binding(group.get("library_binding")) != binding
         ):
             raise RuntimeError("媒体库刷新队列分组冲突")
-        before = len(_normalized_paths(group.get("pending_paths")))
+        before = len(group["pending_paths"])
         group["pending_paths"] = _merge_paths(
             group.get("pending_paths"), normalized_paths
         )
         pending_events = group.setdefault("pending_events", {})
-        inflight_events = group.get("inflight_events", {})
         for path, tokens in events_by_path.items():
-            # 同一事件已被消费者领取时，重交接只收尾原 outbox。
-            tokens = [token for token in tokens if token not in inflight_events.get(path, [])]
             pending_events[path] = _merge_paths(pending_events.get(path), tokens)
-        group["pending_paths"] = [
-            path for path in group["pending_paths"]
-            if path not in events_by_path or pending_events.get(path)
-        ]
         deadlines = group.get("path_due_at") or {}
         for path in normalized_paths:
             if path in deadlines:
@@ -472,10 +456,10 @@ def settle_media_refresh(
         ttl = max(0, (recent_ttl_seconds or 0))
         if ttl and upstream:
             expiry = now_value + ttl
-            for item_id in _normalized_paths(refreshed_target_ids):
+            for item_id in _merge_paths(refreshed_target_ids):
                 state["recent"][f"{upstream}:{item_id}"] = expiry
         deferred = dict(deferred_targets or {})
-        inflight = _normalized_paths(group.get("inflight_paths"))
+        inflight = _merge_paths(group.get("inflight_paths"))
         if not deferred.keys() <= set(inflight):
             raise ValueError("延后刷新路径不属于本轮任务")
         result = outcome or {"ok": True}
@@ -497,7 +481,7 @@ def settle_media_refresh(
                 }
         for key in touched_origins:
             state["origins"][key]["revision"] += 1
-        pending = _normalized_paths(group.get("pending_paths"))
+        pending = _merge_paths(group.get("pending_paths"))
         pending_deadlines = _pending_deadlines(group)
         deadlines = dict(group.get("path_due_at") or {})
         for path, target in deferred.items():
@@ -745,8 +729,8 @@ def media_refresh_queue_status(*, now_epoch: float | None = None) -> dict[str, i
         status = str(group.get("status") or "")
         if status in {"queued", "running"}:
             counts[status] += 1
-        counts["paths"] += len(_normalized_paths(group.get("pending_paths")))
-        counts["paths"] += len(_normalized_paths(group.get("inflight_paths")))
+        counts["paths"] += len(_merge_paths(group.get("pending_paths")))
+        counts["paths"] += len(_merge_paths(group.get("inflight_paths")))
     recent_count = 0
     for raw_expiry in state["recent"].values():
         try:

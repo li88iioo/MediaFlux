@@ -317,14 +317,11 @@ def list_strm_path_cleanup(
 
 
 def delete_strm_path_cleanup(ids: list[int]) -> None:
-    values = list(dict.fromkeys(value for value in ids))
-    if not values:
-        return
-    with db.get_conn() as conn:
-        for start in range(0, len(values), 500):
-            batch = values[start:start + 500]
+    if ids:
+        with db.get_conn() as conn:
             conn.execute(
-                f"DELETE FROM strm_path_cleanup WHERE id IN ({','.join('?' for _ in batch)})", batch,
+                "DELETE FROM strm_path_cleanup WHERE id IN (SELECT value FROM json_each(?))",
+                (json.dumps(ids),),
             )
 
 
@@ -438,6 +435,8 @@ def retire_deleted_strm_files(files: Iterable[dict[str, Any]]) -> dict[str, int]
 
 DEFAULT_STRM_METADATA_LEASE_SECONDS = 900
 DEFAULT_STRM_METADATA_MAX_ATTEMPTS = 6
+# 跨租约恢复时，只有已换版本的任务丢弃前一版的重试计数。
+_METADATA_RECLAIM_ATTEMPTS = "attempts=CASE WHEN dirty THEN 0 ELSE attempts END,dirty=0,"
 
 
 def _metadata_snapshot(item: dict[str, Any], *, enqueue: bool = False) -> tuple[str, ...]:
@@ -566,34 +565,21 @@ def claim_due_strm_metadata_jobs(
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
-            "SELECT * FROM strm_metadata_queue WHERE provider=? AND ("
+            "SELECT id FROM strm_metadata_queue WHERE provider=? AND ("
             "(status IN ('queued','retry_wait') AND next_attempt_at<=?) OR "
             "(status='running' AND lease_until<=?)) "
             "ORDER BY next_attempt_at,id LIMIT ?",
             ((provider or "guangya"), stamp, now_epoch, max(1, (limit or 1))),
         ).fetchall()
         for row in rows:
-            previous_generation = int(row["lease_generation"] or 0)
-            cur = conn.execute(
-                "UPDATE strm_metadata_queue SET status='running',dirty=0,lease_owner=?,"
+            claimed_row = conn.execute(
+                f"UPDATE strm_metadata_queue SET status='running',{_METADATA_RECLAIM_ATTEMPTS}"
+                "lease_owner=?,"
                 "lease_until=?,lease_generation=lease_generation+1,last_attempt_at=?,updated_at=? "
-                "WHERE id=? AND lease_generation=? AND ("
-                "(status IN ('queued','retry_wait') AND next_attempt_at<=?) OR "
-                "(status='running' AND lease_until<=?))",
-                (
-                    (owner or ""), deadline, stamp, stamp, int(row["id"]),
-                    previous_generation, stamp, now_epoch,
-                ),
-            )
-            if cur.rowcount != 1:
-                continue
-            payload = dict(row)
-            payload["status"] = "running"
-            payload["dirty"] = 0
-            payload["lease_owner"] = (owner or "")
-            payload["lease_until"] = deadline
-            payload["lease_generation"] = previous_generation + 1
-            claimed.append(payload)
+                "WHERE id=? RETURNING *",
+                (owner or "", deadline, stamp, stamp, row["id"]),
+            ).fetchone()
+            claimed.append(dict(claimed_row))
     return claimed
 
 
@@ -921,7 +907,8 @@ def recover_stale_strm_metadata_jobs(
         params.append(time.time())
     with db.get_conn() as conn:
         cur = conn.execute(
-            "UPDATE strm_metadata_queue SET status='retry_wait',dirty=0,next_attempt_at=?,"
+            f"UPDATE strm_metadata_queue SET status='retry_wait',{_METADATA_RECLAIM_ATTEMPTS}"
+            "next_attempt_at=?,"
             "lease_owner='',lease_until=0,lease_generation=lease_generation+1,"
             "last_error_type='ProcessInterrupted',last_error='上次进程在元数据下载期间中断',"
             f"updated_at=? WHERE {where}",

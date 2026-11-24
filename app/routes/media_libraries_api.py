@@ -397,9 +397,7 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
     payload = data or {}
     if not isinstance(payload, dict):
         return api_error("映射配置必须是 JSON 对象", 400)
-    scoped = "expected_revisions" in payload
-    writes_local = "local_bindings" in payload or not scoped
-    expected = payload.get("expected_revisions")
+    writes_local = "local_bindings" in payload
     try:
         with mapping_write_guard():
             raw, values = config.read_env_snapshot(config.ENV_FILE)
@@ -409,7 +407,8 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
             revisions = {provider: path_mapping_snapshot(provider, values)[2] for provider in strm_mappings}
             if writes_local:
                 revisions["local"] = local_media_repo.local_library_bindings_revision(previous_bindings)
-            if scoped:
+            if "expected_revisions" in payload:
+                expected = payload["expected_revisions"]
                 if not isinstance(expected, dict) or expected.keys() != revisions.keys():
                     return api_error("映射修改范围和加载版本不一致", 400)
                 changed = [provider for provider, revision in revisions.items() if expected[provider] != revision]
@@ -418,7 +417,7 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
                     names = "、".join(labels[provider] for provider in changed)
                     return api_error(f"{names}映射已由其他操作更新，请核对最新映射", 409)
             if writes_local:
-                local_bindings = _validated_local_bindings(payload.get("local_bindings", []))
+                local_bindings = _validated_local_bindings(payload["local_bindings"])
                 revisions["local"] = local_media_repo.replace_local_library_targets(
                     local_bindings, owner=_OWNER, expected_revision=revisions["local"],
                 )

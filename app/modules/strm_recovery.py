@@ -204,9 +204,10 @@ def recover_pending_paths(
                                 for item in strm_repo.list_strm_index(source_key, only_file_ids=only_file_ids)
                             }
                         active = current.get(file_id)
-                        replacement = _cleanup_location(active["strm_path"], roots) if active else None
-                        if active is None or not replacement or not strm._fingerprint_matches(
-                            replacement[1], active["content_fingerprint"]
+                        if (
+                            active is None
+                            or (replacement := _cleanup_location(active["strm_path"], roots)) is None
+                            or not strm._fingerprint_matches(replacement[1], active["content_fingerprint"])
                         ):
                             _blocked(stats, path, "新文件尚未验证，已保留旧 STRM 和清理凭据")
                             continue
@@ -227,17 +228,17 @@ def recover_pending_paths(
                     completed.append(int(row["id"]))
                 except (OSError, RuntimeError, ValueError) as exc:
                     _blocked(stats, path, str(exc))
-            # 生产调用使用已固定刷新策略的 sink；持久化失败时不确认凭据。
+            # 刷新持久化和凭据确认都可重放，失败时保留凭据供下一轮继续交接。
             if completed:
                 changed_targets = plan_refresh_targets(changed_paths, media_roots=[str(media_root)]).targets
-                if changed_targets and sink:
-                    try:
+                try:
+                    if changed_targets and sink:
                         sink(list(changed_targets))
-                    except Exception as exc:
-                        _blocked(stats, source_key, f"旧目录刷新交接失败（{type(exc).__name__}），保留清理凭据")
-                        stats.update(stopped=True, stop_stage="refresh-persist")
-                        return
-                strm_repo.delete_strm_path_cleanup(completed)
+                    strm_repo.delete_strm_path_cleanup(completed)
+                except Exception as exc:
+                    _blocked(stats, source_key, f"旧路径刷新或凭据确认失败（{type(exc).__name__}），保留清理凭据")
+                    stats.update(stopped=True, stop_stage="refresh-persist")
+                    return
 
 
 def _pointer(path: Path) -> bytes:
@@ -283,8 +284,6 @@ def _local_pointers(
                         )
                         return
                     entries += 1
-                    if entry.is_symlink():
-                        continue
                     if entry.is_dir(follow_symlinks=False):
                         child = Path(entry.path)
                         if child in protected_dirs:
@@ -326,7 +325,7 @@ def reconcile_historical_strm(
 
     if stats.get("clean_skipped") or _stopped(stats, should_stop):
         return
-    root = Path(strm_root).expanduser() / strm.STRM_SUBDIR
+    root = Path(strm_root).expanduser().resolve(strict=False) / strm.STRM_SUBDIR
     if not sources or not root.is_dir() or root.is_symlink():
         return
     source_keys = {f"guangya:{source['id']}" for source in sources}

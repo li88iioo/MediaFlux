@@ -358,6 +358,39 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["attempts"], 0)
         self.assertGreater(row["lease_generation"], claimed["lease_generation"])
 
+    def test_recovery_keeps_retry_budget_with_the_snapshot_that_used_it(self):
+        def fail(job):
+            return strm_repo.fail_or_retry_strm_metadata_job(
+                job["id"], expected_lease_generation=job["lease_generation"],
+                expected_revision=job["revision"], expected_owner=job["lease_owner"],
+                error_type="IncompleteRead", error="fixture transient failure",
+            )
+
+        for restart in (True, False):
+            for changed in (True, False):
+                with self.subTest(restart=restart, changed=changed), isolated_test_database():
+                    strm_repo.enqueue_strm_metadata_jobs([_job()], max_attempts=2)
+                    first = strm_repo.claim_due_strm_metadata_jobs(owner="old")[0]
+                    with patch.object(strm_repo, "_future_stamp", return_value=db.now()):
+                        self.assertEqual(fail(first), "retry_wait")
+                    old = strm_repo.claim_due_strm_metadata_jobs(owner="old")[0]
+                    if changed:
+                        self.assertEqual(strm_repo.enqueue_strm_metadata_jobs(
+                            [_job(etag="etag-new")], max_attempts=2,
+                        )["dirty"], 1)
+                    if restart:
+                        self.assertEqual(strm_repo.recover_stale_strm_metadata_jobs(force=True), 1)
+                    else:
+                        with db.get_conn() as conn:
+                            conn.execute("UPDATE strm_metadata_queue SET lease_until=0 WHERE id=?", (old["id"],))
+                    current = strm_repo.claim_due_strm_metadata_jobs(owner="successor")[0]
+                    self.assertEqual(fail(old), "stale")
+                    self.assertEqual(current["etag"], "etag-new" if changed else "etag-1")
+                    state = fail(current)
+                    self.assertEqual((state, self._rows()[0]["attempts"]),
+                                     ("retry_wait", 1) if changed else ("failed", 2))
+                    self.assertEqual(current["attempts"], 0 if changed else 1)
+
     def test_forced_recovery_can_be_scoped_to_one_worker_owner(self):
         strm_repo.enqueue_strm_metadata_jobs([
             _job(file_id="meta-a", filename="a.nfo"),

@@ -588,6 +588,49 @@ def test_empty_provider_finishes_without_pending_refresh_or_later_replay(tmp_pat
         assert claim_due_media_refreshes(owner="later", force=True) == []
 
 
+def test_full_scan_during_cloud_move_preserves_last_index_until_stable_scan(tmp_path):
+    video = GuangYaFile("v", "Movie.mkv", False, 100, "e", "old")
+    tree = {
+        "s": [GuangYaFile("old", "Z", True, parent_id="s"), GuangYaFile("new", "A", True, parent_id="s")],
+        "old": [video], "new": [],
+    }
+    media_root = tmp_path / strm.STRM_SUBDIR
+    old, new = (media_root / directory / "Movie.strm" for directory in ("Z", "A"))
+
+    def move_after_listing(client, directory):
+        listing = client.tree[directory]
+        if directory == "old":
+            client.tree["old"] = []
+            client.tree["new"] = [replace(video, parent_id="new")]
+        return listing
+
+    with isolated_test_database(), _providers("jellyfin"), patch.dict(os.environ, STRM_SCAN_WORKERS="1"):
+        initial = _run(tmp_path, tree=tree)
+        assert initial["stats"]["generated"] == 1
+        _consume(providers=("jellyfin",), expected_paths=[str(old)])
+        pointer = old.read_bytes()
+
+        with patch.object(_TreeClient, "list_dir", move_after_listing):
+            interrupted = _run(tmp_path, tree=tree)
+        run = db.get_last_task_run("strm_sync")
+        assert run is not None
+        assert (run["status"], interrupted["stats"]["generated"], interrupted["stats"]["cleaned"]) == (
+            "partial", 0, 0,
+        )
+        source_stats = interrupted["sources"][0]["stats"]
+        assert source_stats["scan_incomplete"] and interrupted["stats"]["clean_skipped"]
+        assert any("同一文件出现在两个云端目录" in sample for sample in source_stats["error_samples"])
+        assert old.read_bytes() == pointer and not new.exists()
+        assert [row["strm_path"] for row in repository.list_strm_index("guangya:s")] == [str(old)]
+        assert repository.count_strm_refresh_paths() == 0 and media_refresh_queue_status()["paths"] == 0
+
+        recovered = _run(tmp_path, tree=tree)
+        assert recovered["ok"] and not recovered["partial"]
+        assert not old.exists() and new.read_bytes() == pointer
+        assert [row["strm_path"] for row in repository.list_strm_index("guangya:s")] == [str(new)]
+        _consume(providers=("jellyfin",), expected_paths=[str(old), str(new)])
+
+
 @pytest.mark.parametrize("removal", ["cloud-delete", "retirement"])
 def test_single_source_root_file_create_delete_and_refresh(tmp_path, removal):
     with isolated_test_database(), _providers("jellyfin"):

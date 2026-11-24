@@ -78,6 +78,25 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         second = claim_due_media_refreshes(owner="worker", now_epoch=121)[0]
         self.assertEqual(second["paths"], ["/media/B"])
 
+    def test_replayed_strm_handoff_preserves_later_local_change_and_due_time(self):
+        from app.repositories import strm as strm_repo
+
+        self.enterContext(media_refresh_providers("jellyfin"))
+        paths = ["/media/A"]
+        entries = strm_repo.enqueue_strm_refresh_paths(paths)
+        enqueue_media_refresh("jellyfin", paths, source_entries=entries, debounce_seconds=0, now_epoch=100)
+        enqueue_media_refresh("jellyfin", paths, source_entries=entries, debounce_seconds=60, now_epoch=100)
+        claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
+        enqueue_media_refresh("jellyfin", paths, debounce_seconds=20, now_epoch=101)
+        # 旧 STRM 回执重送时，同一路径已因一次独立的本地整理排队。
+        enqueue_media_refresh("jellyfin", paths, source_entries=entries, debounce_seconds=60, now_epoch=102)
+        self.assertTrue(settle_media_refresh(
+            claimed["group_key"], owner="worker", lease_generation=claimed["lease_generation"], now_epoch=103,
+        ))
+        db.init_db()
+        self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=120), [])
+        self.assertEqual([g["paths"] for g in claim_due_media_refreshes(owner="next", now_epoch=121)], [paths])
+
     def test_producer_never_recovers_a_slow_running_consumer(self):
         queued = enqueue_media_refresh(
             "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,

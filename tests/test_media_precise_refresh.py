@@ -170,11 +170,11 @@ class RefreshTargetPlanningTests(unittest.TestCase):
         ])))
 
     def test_files_directly_in_media_root_never_collapse_to_the_root(self):
-        files = [f"{ROOT}/A.strm", f"{ROOT}/B.strm"]
-
-        plan = plan_refresh_targets(files, media_roots=[ROOT])
-
-        self.assertEqual(plan.targets, tuple(files))
+        for root in (ROOT, "/", "D:/"):
+            files = [root.rstrip("/") + suffix for suffix in ("/A.strm", "/B.strm")]
+            with self.subTest(root=root):
+                plan = plan_refresh_targets(files, changed_dirs=[root], media_roots=[root])
+                self.assertEqual(plan.targets, tuple(files))
 
     def test_overflow_directory_absorbs_files_beneath_it(self):
         inside = f"{ROOT}/剧集/作品 A/Season 01/E01.strm"

@@ -284,3 +284,63 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
                 self.assertNotIn("跳过", result.inner_text())
                 self.assertEqual(fixture["errors"], [])
                 self.assertEqual(fixture["unexpected"], [])
+
+    def test_mapping_path_test_ignores_superseded_draft_and_retry_works(self):
+        from playwright.sync_api import expect
+
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                page, fixture = self.make_page(width)
+                page.evaluate("""() => {
+                    const fetchWithCsrf = window.fetch.bind(window);
+                    window.pathTestReplies = 0;
+                    window.fetch = async (url, options) => {
+                        if (url !== '/api/media-libraries/path-test') return fetchWithCsrf(url, options);
+                        const response = await fetchWithCsrf(url, {...options, signal: undefined});
+                        const readJson = response.json.bind(response);
+                        response.json = async () => {
+                            const data = await readJson();
+                            requestAnimationFrame(() => { window.pathTestReplies++; });
+                            return data;
+                        };
+                        return response;
+                    };
+                }""")
+                fixture["hold"] = True
+                button = page.get_by_role("button", name="测试路径映射")
+                field = page.get_by_label("服务器路径").last
+                result = page.locator("[data-mapping-result]")
+                with page.expect_request("**/api/media-libraries/path-test"):
+                    button.click()
+                expect(result).to_contain_text("正在核对")
+                field.fill("/media/new")
+                can_test_new_path = button.is_enabled()
+
+                fixture["pending"].pop().fulfill(json={
+                    "status": "matched", "mapped_path": "/media/movies",
+                    "matches": [{"id": "a", "name": "电影 A", "mode": "direct"}],
+                })
+                page.wait_for_function("window.pathTestReplies === 1")
+                self.assertEqual(result.text_content(), "", "迟到的旧路径结果不得覆盖当前草稿")
+                self.assertTrue(can_test_new_path, "草稿改变后可直接测试新路径")
+                expect(button).to_be_enabled()
+
+                with page.expect_request("**/api/media-libraries/path-test"):
+                    button.click()
+                expect(result).to_contain_text("正在核对")
+                fixture["pending"].pop().fulfill(status=503, json={"error": "上游暂不可用"})
+                expect(result).to_have_text("上游暂不可用")
+                expect(field).to_have_value("/media/new")
+                expect(button).to_be_enabled()
+                with page.expect_request("**/api/media-libraries/path-test"):
+                    button.click()
+                expect(result).to_contain_text("正在核对")
+                fixture["pending"].pop().fulfill(json={
+                    "status": "unmatched", "mapped_path": "/media/new", "matches": [],
+                })
+                expect(result).to_contain_text("未命中")
+                self.assertEqual([call["server_path"] for call in fixture["calls"]],
+                                 ["/media/movies", "/media/new", "/media/new"])
+                self.assertEqual(fixture["errors"], [])
+                self.assertEqual(fixture["unexpected"], [])
+                page.close()
