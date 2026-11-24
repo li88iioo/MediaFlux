@@ -1,5 +1,7 @@
 (function(){
     const form=document.getElementById('strmForm');
+    const configFields=form.querySelector('[data-config-fields]');
+    const configReady=()=>!configFields.disabled;
     const input=document.getElementById('strmSourceDirs');
     const cron=document.getElementById('strmCron');
     const metadata=document.getElementById('strmMetadataEnabled');
@@ -15,7 +17,6 @@
     const strmBaseUrlRefreshTitle=document.getElementById('strmBaseUrlRefreshTitle');
     const strmBaseUrlRefreshText=document.getElementById('strmBaseUrlRefreshText');
     const refreshStrmBaseUrlBtn=document.getElementById('refreshStrmBaseUrlBtn');
-    const saveStrmBtn=document.getElementById('saveStrmBtn');
     const runStrmFullBtn=document.getElementById('runStrmFullBtn');
     const cancelMetadataBtn=document.getElementById('cancelStrmMetadataBacklogBtn');
     let metadataCancelBusy=false;
@@ -52,7 +53,6 @@
     const validStrmTabs=new Set(strmTabs.map(button=>button.dataset.tab));
     const strmLoadedTabs=new Set();
     let activeStrmTab='config';
-    let strmConfigReady=false;
     let strmSyncRunning=false;
     let baseUrlRefreshPending=false;
     let baseUrlRefreshAwaitingRun=false;
@@ -79,22 +79,19 @@
         }
         if(document.documentElement?.dataset)delete document.documentElement.dataset.strmInitialTab;
         if(normalized!=='schedule')stopStatusPolling({abort:true});
-        if(strmConfigReady){
-            const alreadyLoaded=strmLoadedTabs.has(normalized);
-            void ensureStrmTabLoaded(normalized);
-            if(normalized==='schedule'&&alreadyLoaded)void loadStatus();
-        }
+        ensureStrmTabLoaded(normalized);
     }
 
     function ensureStrmTabLoaded(tab){
-        if(!strmConfigReady||strmLoadedTabs.has(tab))return Promise.resolve();
-        strmLoadedTabs.add(tab);
-        if(tab==='config'){
-            return strmBaseUrlInput.value.trim()?Promise.resolve():loadStrmBaseUrlCandidates();
+        if(tab!=='diagnostics'&&!configReady())return;
+        if(strmLoadedTabs.has(tab)){
+            if(tab==='schedule')void loadStatus();
+            return;
         }
-        if(tab==='schedule')return Promise.all([validateCron(),loadStatus()]);
-        if(tab==='diagnostics')return Promise.all([loadIndexDiagnostics(),loadFailures()]);
-        return Promise.resolve();
+        strmLoadedTabs.add(tab);
+        if(tab==='config'&&!strmBaseUrlInput.value.trim())void loadStrmBaseUrlCandidates();
+        if(tab==='schedule'){void validateCron();void loadStatus();}
+        if(tab==='diagnostics'){void loadIndexDiagnostics();void loadFailures();}
     }
 
     strmTabs.forEach((button,index)=>{
@@ -110,9 +107,6 @@
             activateStrmTab(strmTabs[nextIndex].dataset.tab,{focus:true});
         });
     });
-    activateStrmTab(window.location?.hash?.slice(1)||'',{updateHash:false});
-    window.addEventListener?.('hashchange',()=>activateStrmTab(window.location?.hash?.slice(1)||'',{updateHash:false}));
-
     // Tag Input Helper System
     function initTagInput(boxEl, hiddenInputEl, options={}){
         const listEl=boxEl.querySelector('.strm-tag-list');
@@ -246,15 +240,15 @@
         strmBaseUrlRefresh.hidden=state==='idle';
         strmBaseUrlRefreshTitle.textContent=copy[0];
         strmBaseUrlRefreshText.textContent=message||copy[1];
-        const actionable=(state==='pending'||state==='error')&&strmConfigReady&&!strmSyncRunning&&!isBaseUrlManaged();
+        const actionable=(state==='pending'||state==='error')&&configReady()&&!strmSyncRunning&&!isBaseUrlManaged();
         refreshStrmBaseUrlBtn.disabled=!actionable;
         refreshStrmBaseUrlBtn.setAttribute('aria-disabled',String(!actionable));
     }
     function syncBaseUrlControlAvailability(){
         const managed=isBaseUrlManaged();
         const hasCandidates=strmBaseUrlCandidates.dataset.hasCandidates==='true';
-        strmBaseUrlDetectBtn.disabled=!strmConfigReady||managed;
-        strmBaseUrlCandidates.disabled=!strmConfigReady||managed||!hasCandidates;
+        strmBaseUrlDetectBtn.disabled=!configReady()||managed;
+        strmBaseUrlCandidates.disabled=!configReady()||managed||!hasCandidates;
         if(managed){
             strmBaseUrlState.dataset.tone='warning';
             strmBaseUrlState.textContent='播放地址由部署环境管理，请修改环境变量后重启服务。';
@@ -344,7 +338,7 @@
         }
     }
     async function loadStrmBaseUrlCandidates(interactive=false){
-        if(strmBaseUrlDetectBtn.disabled||!strmConfigReady||isBaseUrlManaged())return;
+        if(strmBaseUrlDetectBtn.disabled||!configReady()||isBaseUrlManaged())return;
         strmBaseUrlDetectBtn.disabled=true;strmBaseUrlDetectBtn.classList.add('is-loading');strmBaseUrlDetectBtn.setAttribute('aria-busy','true');
         strmBaseUrlState.dataset.tone='testing';strmBaseUrlState.textContent='正在发现监听配置与局域网候选地址…';
         try{const response=await fetch('/api/strm/base-url-candidates');const data=await response.json();if(!response.ok)throw new Error(data.error||'候选地址读取失败');renderStrmBaseUrlCandidates(data, interactive);}
@@ -494,7 +488,7 @@
     }
     document.addEventListener?.('visibilitychange',()=>{
         if(document.hidden)stopStatusPolling({abort:true});
-        else if(activeStrmTab==='schedule'&&strmConfigReady)void loadStatus({background:true});
+        else if(activeStrmTab==='schedule'&&configReady())void loadStatus({background:true});
     });
     function getDiagnosticValue(data, key){
         if(!data||!key)return 0;
@@ -849,43 +843,15 @@
         }
     }
 
-    loadAppConfig().then(cfg=>{
-        fillConfigFields(form,cfg);
-
-        // Init Tag Inputs
-        videoTagInput.setTagsFromString(cfg.STRM_VIDEO_EXTS || '');
-        metadataTagInput.setTagsFromString(cfg.STRM_METADATA_EXTS || '');
-
-        const canonical=String(cfg.GY_STRM_SOURCE_DIRS??'').trim();
-        try{sources=canonical?JSON.parse(canonical):[];}catch(_){sources=[];}
-        if(!Array.isArray(sources))sources=[];
-        const seen=new Set();sources=sources.map((item,index)=>typeof item==='string'?{id:item,name:`源目录${index+1}`}:item).filter(item=>item&&String(item.id||'').trim()&&String(item.id)!=='0'&&!seen.has(String(item.id))&&seen.add(String(item.id))).map((item,index)=>({id:String(item.id),name:String(item.name||`源目录${index+1}`)}));
-        renderSources();
-        syncMetadata();
-        strmConfigReady=true;
-        saveStrmBtn.disabled=false;
-        saveStrmBtn.setAttribute('aria-disabled','false');
-        syncBaseUrlControlAvailability();
-        void ensureStrmTabLoaded(activeStrmTab);
-    }).catch(error=>{
-        strmConfigReady=false;
-        saveStrmBtn.disabled=true;
-        saveStrmBtn.setAttribute('aria-disabled','true');
-        syncBaseUrlControlAvailability();
-        const state=document.getElementById('strmSaveState');
-        state.className='is-error';
-        state.textContent=error.message||'配置读取失败，请刷新页面后重试';
-    });
-
     strmBaseUrlDetectBtn.addEventListener('click',()=>loadStrmBaseUrlCandidates(true));
     strmBaseUrlCandidates.addEventListener('change',()=>{
-        if(!strmConfigReady||isBaseUrlManaged()||!strmBaseUrlCandidates.value)return;
+        if(!configReady()||isBaseUrlManaged()||!strmBaseUrlCandidates.value)return;
         strmBaseUrlInput.value=strmBaseUrlCandidates.value;
         strmBaseUrlInput.dispatchEvent(new Event('input',{bubbles:true}));
         strmBaseUrlState.dataset.tone='success';strmBaseUrlState.textContent='候选地址已填入；保存后请执行一次完整刷新。';
     });
     strmBaseUrlInput.addEventListener('input',()=>{
-        if(!strmConfigReady||isBaseUrlManaged())return;
+        if(!configReady()||isBaseUrlManaged())return;
         const state=document.getElementById('strmSaveState');
         const changed=normalizeBaseUrl(strmBaseUrlInput.value)!==normalizeBaseUrl(strmBaseUrlInput.dataset.configInitialValue||'');
         if(changed){state.className='is-dirty';state.textContent='播放地址已修改，等待保存';}
@@ -994,37 +960,35 @@
     }
     runStrmFullBtn.addEventListener('click',runFullStrmSync);
     refreshStrmBaseUrlBtn.addEventListener('click',runFullStrmSync);
-    saveStrmBtn.addEventListener('click',async event=>{
-        if(!strmConfigReady)return;
-        const btn=event.currentTarget;
-        const state=document.getElementById('strmSaveState');
-        const previousBaseUrl=normalizeBaseUrl(strmBaseUrlInput.dataset.configInitialValue||'');
-        const nextBaseUrl=normalizeBaseUrl(strmBaseUrlInput.value);
-        const baseUrlChanged=!isBaseUrlManaged()&&previousBaseUrl!==nextBaseUrl;
-        btn.disabled=true;btn.setAttribute('aria-disabled','true');state.className='';state.textContent='保存中...';
-        try{
-            const result=await saveAppConfig(form);
-            const hasPendingChanges=result?.__hasPendingConfigChanges===true;
+    bindAppConfigForm(form,{
+        requiredKey:'STRM_SKIP_THRESHOLD_MB',
+        hydrate(cfg){
+            videoTagInput.setTagsFromString(cfg.STRM_VIDEO_EXTS);
+            metadataTagInput.setTagsFromString(cfg.STRM_METADATA_EXTS);
+            try{sources=JSON.parse(cfg.GY_STRM_SOURCE_DIRS||'[]');}catch(_){sources=[];}
+            if(!Array.isArray(sources))sources=[];
+            const seen=new Set();sources=sources.map((item,index)=>typeof item==='string'?{id:item,name:`源目录${index+1}`}:item).filter(item=>item&&String(item.id||'').trim()&&String(item.id)!=='0'&&!seen.has(String(item.id))&&seen.add(String(item.id))).map((item,index)=>({id:String(item.id),name:String(item.name||`源目录${index+1}`)}));
+            renderSources();
+            syncMetadata();
+            syncBaseUrlControlAvailability();
+            ensureStrmTabLoaded(activeStrmTab);
+        },
+        async persist(){
+            const baseUrlChanged=!isBaseUrlManaged()
+                &&normalizeBaseUrl(strmBaseUrlInput.dataset.configInitialValue)!==normalizeBaseUrl(strmBaseUrlInput.value);
+            const pending=(await saveAppConfig(form)).__hasPendingConfigChanges;
+            let message=pending?'':'STRM 设置已保存';
             if(baseUrlChanged){
                 baseUrlRefreshPending=true;
                 baseUrlRefreshAwaitingRun=false;
                 setBaseUrlRefreshState('pending');
+                message=pending?'上一版播放地址已保存，仍有未保存更改。完整刷新待执行':'播放地址已保存，待完整刷新 STRM';
             }
-            if(hasPendingChanges){
-                state.className='';
-                state.textContent=baseUrlChanged
-                    ? '上一版播放地址已保存，仍有未保存更改；完整刷新待执行'
-                    : '上一版已保存，仍有未保存更改';
-            }else if(baseUrlChanged){
-                state.className='is-success';
-                state.textContent='播放地址已保存，待完整刷新 STRM';
-            }else{
-                state.className='is-success';
-                state.textContent='STRM 设置已保存';
-            }
-            validateCron();loadStatus();
-        }catch(error){state.className='is-error';state.textContent=error.message;}
-        finally{btn.disabled=!strmConfigReady;btn.setAttribute('aria-disabled',String(!strmConfigReady));}
+            void validateCron();void loadStatus();
+            return {pending,message};
+        },
     });
+    activateStrmTab(window.location?.hash?.slice(1)||'',{updateHash:false});
+    window.addEventListener?.('hashchange',()=>activateStrmTab(window.location?.hash?.slice(1)||'',{updateHash:false}));
     if(globalThis.__MEDIAFLUX_STRM_TEST_HOOK__)globalThis.__MEDIAFLUX_STRM_TEST_API__={renderFailures,retryFailures,loadFailures,clearFailures,renderStatus,snapshot:()=>failureSnapshot};
 })();

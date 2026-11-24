@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from sqlite3 import Row
 
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
@@ -16,6 +16,7 @@ from app.modules.share_transfer import (
     create_share_request,
     get_share_transfer_store,
     inspect_share_for_transfer,
+    share_receipt_owner,
 )
 from app.web import csrf_token, require_api_login
 
@@ -33,16 +34,13 @@ def _web_owner(request: Request) -> str:
     return f"web:{owner_id}"
 
 
-def _remember_share_request(request: Request, request_id: Any) -> None:
-    try:
-        normalized = int(request_id)
-    except (TypeError, ValueError):
-        return
-    remembered = [
-        int(item) for item in list(request.session.get("share_transfer_requests") or [])
-        if str(item).isdigit()
-    ]
-    request.session["share_transfer_requests"] = list(dict.fromkeys([*remembered, normalized]))[-20:]
+def _owns_web_share_receipt(request: Request, row: Row) -> bool:
+    if row["kind"] != "guangya_share" or row["origin"] != "web":
+        return False
+    if row["user_id"]:
+        return row["user_id"] == share_receipt_owner(_web_owner(request))
+    # 早期 Web 回执仅在原会话的签名 Cookie 中记录了请求 ID。
+    return row["id"] in request.session.get("share_transfer_requests", ())
 
 
 def _preview_error(exc: Exception) -> JSONResponse:
@@ -125,7 +123,6 @@ def restore_share(request: Request, data: dict | None = Body(default=None)):
         return JSONResponse({"error": "分享转存失败，请稍后查看任务状态"}, status_code=502)
     finally:
         close_guangya_client(client)
-    _remember_share_request(request, result.get("request_id"))
     if result.get("duplicate") and result.get("accepted"):
         return JSONResponse({
             "success": False,
@@ -153,14 +150,8 @@ def restore_share(request: Request, data: dict | None = Body(default=None)):
 @router.get("/requests/{request_id}")
 def share_request_status(request_id: int, request: Request):
     require_api_login(request)
-    remembered = {
-        int(item) for item in list(request.session.get("share_transfer_requests") or [])
-        if str(item).isdigit()
-    }
-    if request_id not in remembered:
-        return JSONResponse({"error": "转存请求不存在"}, status_code=404)
     row = download_requests_repo.get_download_request(request_id)
-    if row is None or str(row["kind"] or "") != "guangya_share" or str(row["origin"] or "") != "web":
+    if row is None or not _owns_web_share_receipt(request, row):
         return JSONResponse({"error": "转存请求不存在"}, status_code=404)
     status = str(row["status"] or "pending")
     success = status == "completed" and str(row["gy_status"] or "") == "completed"

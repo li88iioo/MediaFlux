@@ -257,9 +257,11 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 return
             if path == "/api/config":
                 route.fulfill(json={
+                    "__managed_fields": [],
                     "GY_STRM_SOURCE_DIRS": "[]",
                     "GY_STRM_BASE_URL": "http://fixture.invalid:1258",
                     "STRM_SCHEDULE_CRON": "0 4 * * *",
+                    "STRM_SKIP_THRESHOLD_MB": "10",
                 })
                 return
             if path == "/api/strm/index-diagnostics":

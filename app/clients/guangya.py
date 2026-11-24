@@ -512,7 +512,10 @@ def _token_file_fingerprint(path: Path) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _read_token_generation(path: Path) -> int:
+def read_guangya_credential_generation(path: Path | None = TOKEN_FILE) -> int:
+    """读取持久化登录世代，无需打开客户端或访问光鸭。"""
+    if path is None:
+        return 0
     generation_file = _token_generation_file(path)
     try:
         raw = generation_file.read_text(encoding="utf-8").strip()
@@ -550,14 +553,10 @@ def _atomic_write_text(path: Path, value: str) -> None:
             pass
 
 
-def _token_generation(path: Path) -> int:
-    return _read_token_generation(_canonical_token_path(path))
-
-
 def _advance_token_generation(path: Path) -> int:
     """在调用方持有 token 跨进程锁时递增并持久化凭据世代。"""
     canonical = _canonical_token_path(path)
-    generation = _read_token_generation(canonical) + 1
+    generation = read_guangya_credential_generation(canonical) + 1
     _atomic_write_text(_token_generation_file(canonical), str(generation))
     return generation
 
@@ -705,20 +704,24 @@ def _read_success_acknowledged(response: dict) -> bool:
     )
 
 
-def _read_page_has_more(response: object, *, count: int, seen: int, page_size: int | None) -> bool:
-    """优先采用服务端分页证据。page_size=None 时以空页作为结束标志。"""
-    fallback = bool(count) if page_size is None else count >= page_size
+def _read_page_has_more(
+    response: object, *, count: int, seen: int, page_size: int | None,
+    known_total: int | None = None,
+) -> bool:
+    """当前页缺少分页信息时，优先使用前页已核对的总数。"""
     payload = response.get("data", response) if isinstance(response, dict) else {}
-    if not isinstance(payload, dict):
-        return fallback
-    total = payload.get("total")
-    if isinstance(total, int) and not isinstance(total, bool) and total > seen:
-        return True
-    if isinstance(payload.get("hasMore"), bool):
-        return payload["hasMore"]
-    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
-        return False
-    return fallback
+    if isinstance(payload, dict):
+        total = payload.get("total")
+        if type(total) is int and total > seen:
+            return True
+        has_more = payload.get("hasMore")
+        if isinstance(has_more, bool):
+            return has_more
+        if type(total) is int and total >= 0:
+            return False
+    if known_total is not None:
+        return seen < known_total
+    return bool(count) if page_size is None else count >= page_size
 
 
 def _validate_write_response(response, *, operation: str) -> None:
@@ -1360,7 +1363,7 @@ class GuangYaClient:
         with self._token_lock:
             with _acquire_process_lock(self._token_process_lock):
                 self._cleanup_token_temp_files()
-                self._token_generation = _token_generation(self.token_file)
+                self._token_generation = read_guangya_credential_generation(self.token_file)
                 if not self.token_file.exists():
                     self._credential_fingerprint = ""
                     return
@@ -1410,7 +1413,7 @@ class GuangYaClient:
             # 兼容只封装 SDK raw client、未经过 __init__ 的轻量实例；
             # 这类实例没有持久化 token 路径，也就不存在跨实例吊销范围。
             return True
-        current_generation = _token_generation(token_file)
+        current_generation = read_guangya_credential_generation(token_file)
         instance_generation = getattr(self, "_token_generation", current_generation)
         current_fingerprint = _token_file_fingerprint(token_file)
         instance_fingerprint = getattr(
@@ -1871,10 +1874,7 @@ class GuangYaClient:
     def credential_generation(self) -> int:
         """返回跨进程持久凭据世代，用于绑定短期确认票据。"""
         self._invalidate_if_stale()
-        token_file = getattr(self, "token_file", None)
-        if token_file is None:
-            return 0
-        return _token_generation(token_file)
+        return read_guangya_credential_generation(getattr(self, "token_file", None))
 
     @property
     def credentials_current(self) -> bool:
@@ -1946,7 +1946,7 @@ class GuangYaClient:
             with self._token_lock:
                 with _acquire_process_lock(self._token_process_lock):
                     # 登录是一次凭据替换：先同步当前持久世代与指纹，再原子写入并递增。
-                    self._token_generation = _token_generation(self.token_file)
+                    self._token_generation = read_guangya_credential_generation(self.token_file)
                     self._credential_fingerprint = _token_file_fingerprint(self.token_file)
                     previous = self._raw
                     self._raw = tmp
@@ -1983,7 +1983,7 @@ class GuangYaClient:
                 self._last_persisted_token = ""
                 if not token_exists:
                     raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
-                self._token_generation = _token_generation(self.token_file)
+                self._token_generation = read_guangya_credential_generation(self.token_file)
                 self._load_token()
                 if self._raw is None:
                     raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
@@ -2141,11 +2141,7 @@ class GuangYaClient:
                 metrics.record_page()
             payload = response.get("data", response) if isinstance(response, dict) else {}
             page_total = payload.get("total") if isinstance(payload, dict) else None
-            valid_total = (
-                isinstance(page_total, int)
-                and not isinstance(page_total, bool)
-                and page_total >= 0
-            )
+            valid_total = type(page_total) is int and page_total >= 0
             if strict and not valid_total:
                 raise RuntimeError("光鸭全账号目录快照缺少有效total")
             if valid_total:
@@ -2165,6 +2161,7 @@ class GuangYaClient:
 
             has_more = _read_page_has_more(
                 response, count=len(items), seen=yielded, page_size=page_size,
+                known_total=directory_total,
             )
             if strict:
                 assert directory_total is not None
@@ -2662,7 +2659,11 @@ class GuangYaClient:
         selected = list(dict.fromkeys(item.strip() for item in file_ids if item.strip()))
         if not selected:
             return {"success": False, "error": "至少选择一个文件", "count": 0}
-        raw = self.raw
+        try:
+            raw = self.raw
+        except Exception as exc:  # 凭据准备失败时尚未发送转存请求。
+            logger.warning("光鸭转存准备失败 type=%s", type(exc).__name__)
+            return {"success": False, "retry_safe": True, "error": "光鸭登录凭据暂不可用", "count": 0}
         if cancel_check:
             cancel_check()
         result = raw.share_restore(
@@ -2671,12 +2672,7 @@ class GuangYaClient:
             parent_id=target_dir_id if target_dir_id != "0" else "",
         )
         if not isinstance(result, dict):
-            return {
-                "success": False,
-                "retry_safe": False,
-                "error": "光鸭转存结果不明确",
-                "count": 0,
-            }
+            result = {}
         message = self._extract_message(result)
         code = result.get("code")
         explicit_failure = result.get("success") is False or code is not None

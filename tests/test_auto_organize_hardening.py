@@ -398,7 +398,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
     def test_tracker_matches_unverified_magnet_by_unique_staging_directory(self):
         row = {
             "gy_task_id": "", "title": "磁力任务", "source_value": "magnet:?xt=urn:btih:test",
-            "gy_target_dir": "staging-21",
+            "gy_target_dir": "staging-21", "gy_isolated": 1,
         }
         tasks = [
             {"id": "a", "name": "磁力任务", "target_dir": "staging-other", "raw": {}},
@@ -667,6 +667,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         title_task = {"id": "title-match", "name": "Same title", "raw": {}}
 
         self.assertIs(DownloadTracker._match_gy(row, [source_task, title_task]), source_task)
+        self.assertIsNone(DownloadTracker._match_gy(row, [source_task, {**source_task, "id": "duplicate-source"}]))
         row["source_value"] = ""
         self.assertIsNone(DownloadTracker._match_gy(row, [source_task, title_task]))
 

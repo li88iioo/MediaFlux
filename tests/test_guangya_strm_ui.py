@@ -29,7 +29,7 @@ class GuangyaStrmUiTests(unittest.TestCase):
         self.assertIn("/api/strm/base-url-candidates", self.template)
         self.assertIn("发现候选地址", self.template)
         self.assertIn("不验证 Jellyfin / Emby 是否能够访问", self.template)
-        self.assertIn("return strmBaseUrlInput.value.trim()?Promise.resolve():loadStrmBaseUrlCandidates()", self.template)
+        self.assertIn("if(tab==='config'&&!strmBaseUrlInput.value.trim())void loadStrmBaseUrlCandidates()", self.template)
         self.assertIn("strmBaseUrlInput.value=strmBaseUrlCandidates.value", self.template)
         self.assertIn("baseUrlRefreshPending=true", self.template)
         self.assertIn("完整刷新", self.template)
@@ -68,11 +68,10 @@ class GuangyaStrmUiTests(unittest.TestCase):
 
     def test_config_loading_and_environment_management_lock_actions(self):
         self.assertIn('id="saveStrmBtn" disabled aria-disabled="true"', self.template)
-        self.assertIn("strmConfigReady=true", self.template)
-        self.assertIn("saveStrmBtn.disabled=false", self.template)
-        self.assertIn("}).catch(error=>{", self.template)
+        self.assertEqual(self.template.count('<fieldset data-config-fields'), 2)
+        self.assertIn("bindAppConfigForm(form,", self.template)
         self.assertIn("isBaseUrlManaged()", self.template)
-        self.assertIn("strmBaseUrlCandidates.disabled=!strmConfigReady||managed||!hasCandidates", self.template)
+        self.assertIn("strmBaseUrlCandidates.disabled=!configReady()||managed||!hasCandidates", self.template)
         self.assertIn("播放地址由部署环境管理", self.template)
 
     def test_metadata_queue_status_is_explicit_and_keeps_polling_until_drained(self):

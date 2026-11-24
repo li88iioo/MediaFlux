@@ -12,11 +12,16 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import rss as rss_repo
+from app.clients.guangya import GuangYaClient
 from app.clients.qbittorrent import TorrentAddResult
 from app.modules import download_dispatcher as dispatcher
+from app.modules.download_tracker import DownloadTracker
 from app.modules.rss import RSSEngine, rss_entry_delivery
 from app.repositories.download_requests import apply_download_tracker_update
 from app.repositories.rss import bind_rss_entry_download, rss_retry_source_is_safe
@@ -558,6 +563,66 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                 self.assertTrue(row["delivery"]["retryable"])
                 self.assertNotIn("super-secret", row["delivery"]["error"])
                 self.assertNotIn("source_value", row)
+
+    def test_historical_guangya_receipt_never_follows_an_unrelated_task_in_the_same_directory(self):
+        sid, eid, item = self.pending("guangya")
+        rss_repo.update_rss_subscription(sid, {"gy_target_dir": "shared-directory"})
+        app = FastAPI()
+        app.include_router(rss_api.router)
+        app.include_router(downloads_api.router)
+        client = self.enterContext(TestClient(app))
+        self.enterContext(patch.object(downloads_api, "require_api_login"))
+        backend = self.enterContext(patch.object(dispatcher, "_submit_guangya", side_effect=[
+            {"ok": True, "decision": {"target_dir_id": "shared-directory"}},
+            {"ok": True, "task_id": "retry-task"},
+        ]))
+        endpoint = f"/api/rss/entries/{eid}/download"
+        submitted = client.post(endpoint)
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        request_id = submitted.json()["result"]["request_id"]
+        receipt = assert_present(download_requests_repo.get_download_request(request_id))
+        self.assertEqual((receipt["gy_task_id"], receipt["gy_isolated"], receipt["gy_target_dir"]),
+                         ("", 0, "shared-directory"))
+
+        unrelated_task = GuangYaClient._to_offline_task({
+            "taskId": "unrelated", "status": 2, "parentId": "shared-directory",
+            "sourceUrl": "magnet:?xt=urn:btih:" + "f" * 40,
+        })
+        tracker = DownloadTracker()
+        with (
+            patch.object(tracker, "_run_staging_reconciliation_if_due"),
+            patch.object(tracker, "_run_torrent_data_cleanup_if_due"),
+            patch.object(tracker, "_gy_tasks", return_value=(True, [unrelated_task])),
+            patch.object(tracker, "_notify_completion"),
+            patch.object(tracker, "_staging_ready_for_organize", return_value=True),
+            patch.object(tracker, "_start_organize") as organize,
+        ):
+            self.assertEqual(tracker.run_once(), 1)
+            polled = assert_present(download_requests_repo.get_download_request(request_id))
+            self.assertEqual((polled["status"], polled["gy_status"], polled["gy_task_id"]),
+                             ("submitted", "submitted", ""))
+            self.assertTrue(polled["gy_task_missing_since"])
+            download_requests_repo.update_download_request(request_id, gy_task_missing_since="2000-01-01 00:00:00")
+            self.assertEqual(tracker.run_once(), 1)
+        organize.assert_not_called()
+
+        [entry] = client.get(f"/api/rss/entries?subscription_id={sid}").json()["items"]
+        self.assertEqual(entry["delivery"]["backend_status"], "manual_review")
+        self.assertTrue(entry["delivery"]["review_required"])
+        self.assertFalse(entry["delivery"]["retryable"])
+        repeated = client.post(endpoint)
+        self.assertEqual(repeated.status_code, 400)
+        self.assertTrue(repeated.json()["review_required"])
+        backend.assert_called_once()
+
+        retry = client.post(f"/api/downloads/issues/{request_id}/resubmit", json={"target": "guangya"})
+        self.assertEqual(retry.status_code, 200, retry.text)
+        successor_id = retry.json()["request_id"]
+        self.assertNotEqual(successor_id, request_id)
+        self.assertEqual(backend.call_args.args[0]["source_value"], item.source_value)
+        self.assertEqual(rss_entry_delivery(rss_repo.get_rss_entry(eid))["request_id"], successor_id)
+        self.assertTrue(client.post(endpoint).json()["result"]["already_processed"])
+        self.assertEqual(backend.call_count, 2)
 
     def test_retention_preserves_failed_and_unknown_delivery_not_healthy_receipts(self):
         failed_request, failed, _ = self.accepted()

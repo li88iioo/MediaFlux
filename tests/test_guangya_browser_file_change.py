@@ -34,7 +34,10 @@ class GuangYaBrowserFileChangeTests(InitializedWebTestCase):
             GuangYaFile("nested", "nested", True, parent_id="folder"),
             GuangYaFile("episode", "E01.mkv", False, 64, "episode-etag", "nested"),
         )}
-        self.provider = Mock(spec=GuangYaClient, logged_in=True)
+        self.provider = Mock(spec=GuangYaClient, logged_in=True, credential_generation=1)
+        self.read_generation = self.enterContext(patch(
+            "app.routes.guangya_api.read_guangya_credential_generation", return_value=1,
+        ))
         self.provider.file_info.side_effect = self.files.get
         self.provider.list_dir.side_effect = self._list_dir
         self.provider.create_dir.side_effect = self._mkdir
@@ -150,6 +153,53 @@ class GuangYaBrowserFileChangeTests(InitializedWebTestCase):
         self.provider.move.assert_called_once_with(["folder"], "0")
         self.provider.create_dir.assert_called_once_with("新目录", "0")
         self.assertNotIn(call("0"), self.provider.file_info.call_args_list)
+
+    def test_account_switch_after_mkdir_admission_never_writes_to_replacement_root(self):
+        payload = {"operation": "mkdir", "target_dir_id": "0", "name": "原账号目录"}
+        replacement = Mock(spec=GuangYaClient, logged_in=True, credential_generation=2)
+        replacement_root = []
+        replacement.list_dir.side_effect = lambda _parent: replacement_root.copy()
+
+        def create_on_replacement(name, parent_id):
+            replacement_root.append(GuangYaFile("new-folder", name, True, parent_id=parent_id))
+            return "new-folder"
+
+        replacement.create_dir.side_effect = create_on_replacement
+        current = self.provider
+        entered, release = Event(), Event()
+        run_operation = self.manager._run_operation
+
+        def wait_before_execution(*args):
+            entered.set()
+            if release.wait(5):
+                run_operation(*args)
+
+        with (
+            patch("app.routes.guangya_api.GuangYaClient", side_effect=lambda: current),
+            patch.object(self.manager, "_run_operation", side_effect=wait_before_execution),
+        ):
+            try:
+                response = self._post(payload)
+                self.assertEqual(response.status_code, 202, response.text)
+                self.assertTrue(entered.wait(3))
+                current = replacement
+                self.read_generation.return_value = 2
+                self.provider.logged_in = False
+                competing = self._post(payload)
+            finally:
+                release.set()
+            self.assertTrue(self.finished.wait(3))
+
+            replacement.create_dir.assert_not_called()
+            self._assert_no_writes()
+            receipt = self._receipt(response.json()["task_id"])
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIn("光鸭登录已变化", receipt["error"])
+            self.assertEqual(competing.status_code, 409, competing.text)
+
+            retry = self._run(payload)
+            self.assertEqual(retry["status"], "completed", retry)
+            replacement.create_dir.assert_called_once_with(payload["name"], "0")
 
     def test_same_parent_move_is_unchanged_and_copy_requires_another_target(self):
         task = self._run(self._payload("move", "target", "0"))

@@ -988,23 +988,73 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
         self.assertNotIn(SHARE_URL, response.text)
         self.assertNotIn("2468", response.text)
 
-    def test_first_previews_from_the_same_browser_cookie_keep_the_same_owner(self):
-        # 两个请求从同一份初始 cookie 发出，第二个响应最后写回浏览器。
+    def test_overlapping_share_requests_keep_both_receipts_in_one_browser_session(self):
+        # 两个标签页从相同登录快照发起请求，第二份转存响应最后写回 Cookie。
         sibling = TestClient(self.client.app, raise_server_exceptions=False)
         self.addCleanup(sibling.close)
         sibling.cookies.update(self.client.cookies)
         fake = FakeShareClient()
+        restore = fake.restore_share
+
+        def restore_with_lost_reply(token, file_ids, target_id, **kwargs):
+            result = restore(token, file_ids, target_id, **kwargs)
+            if target_id == "dir-a":
+                raise TimeoutError("转存已发送，响应超时")
+            return result
+
+        fake.restore_share = Mock(side_effect=restore_with_lost_reply)
         with patch("app.routes.share_api.GuangYaClient", return_value=fake):
             first = self.client.post('/api/share/inspect', headers=self.headers, json={'url': SHARE_URL})
             second = sibling.post('/api/share/inspect', headers=self.headers, json={'url': SHARE_URL})
             self.assertEqual((first.status_code, second.status_code), (200, 200))
-            restored = sibling.post('/api/share/restore', headers=self.headers, json={
+            uncertain = sibling.post('/api/share/restore', headers=self.headers, json={
                 'preview_id': first.json()['preview_id'], 'file_ids': ['file-1'],
-                'target_dir_id': 'dir-target', 'target_dir_name': '电影',
+                'target_dir_id': 'dir-a', 'target_dir_name': '电影',
             })
+            restored = self.client.post('/api/share/restore', headers=self.headers, json={
+                'preview_id': second.json()['preview_id'], 'file_ids': ['file-1'],
+                'target_dir_id': 'dir-b', 'target_dir_name': '电影',
+            })
+        self.assertEqual(uncertain.status_code, 502, uncertain.text)
         self.assertEqual(restored.status_code, 200)
         self.assertTrue(restored.json()['success'])
-        self.assertEqual(len(fake.restore_calls), 1)
+        self.assertNotEqual(uncertain.json()['request_id'], restored.json()['request_id'])
+        for submission, target_id, expected in (
+            (restored, 'dir-b', 'completed'), (uncertain, 'dir-a', 'manual_review'),
+        ):
+            with self.subTest(target_id=target_id):
+                request_id = submission.json()['request_id']
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual((row['gy_target_dir'], row['status']), (target_id, expected))
+                receipt = self.client.get(f'/api/share/requests/{request_id}')
+                self.assertEqual(receipt.status_code, 200, f"{expected}: {receipt.text}")
+                self.assertEqual(receipt.json()['status'], expected)
+                self.assertTrue(receipt.json()['terminal'])
+                self.assertEqual(receipt.json()['success'], expected == 'completed')
+        self.assertEqual([call[2] for call in fake.restore_calls], ['dir-a', 'dir-b'])
+
+    def test_historical_receipt_without_owner_requires_original_signed_session_entry(self):
+        import base64
+        import json
+        from itsdangerous import TimestampSigner
+        from app.modules.web_secret import get_web_secret
+        from app.web import web_session_credential
+
+        request_id, _ = download_requests_repo.create_share_transfer_request(
+            "historical-share", title="电影", origin="web",
+        )
+        url = f"/api/share/requests/{request_id}"
+        self.assertEqual(self.client.get(url).status_code, 404)
+        old_session = {
+            "logged_in": web_session_credential(web_credentials()),
+            "share_transfer_requests": [request_id],
+        }
+        payload = base64.b64encode(json.dumps(old_session).encode())
+        cookie = TimestampSigner(get_web_secret()).sign(payload).decode()
+        receipt = self.client.get(url, headers={"Cookie": f"session={cookie}"})
+        self.assertEqual(receipt.status_code, 200, receipt.text)
+        self.assertEqual(receipt.json()["request_id"], request_id)
 
     def test_web_and_agent_share_preview_cannot_write_after_switching_accounts(self):
         before, after = FakeShareClient(), FakeShareClient()

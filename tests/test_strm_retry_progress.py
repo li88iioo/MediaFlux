@@ -1785,7 +1785,9 @@ class StubNode {
   querySelector(selector){
     if(selector==='input')return this.input;
     if(selector==='span')return new StubNode('span');
-    return new StubNode(selector);
+    const target=new StubNode(selector);
+    target.disabled=selector==='[data-config-fields]';
+    return target;
   }
   querySelectorAll(selector){
     if(selector.includes('input'))return this.children.map(node=>node.input).filter(Boolean);
@@ -1802,9 +1804,7 @@ globalThis.document={
 globalThis.window=globalThis;
 globalThis.setInterval=()=>1;
 globalThis.clearInterval=()=>{};
-globalThis.loadAppConfig=()=>new Promise(()=>{});
-globalThis.fillConfigFields=()=>{};
-globalThis.saveAppConfig=async()=>{};
+globalThis.bindAppConfigForm=()=>{};
 globalThis.createDraftRequestGate=()=>({});
 globalThis.openGuangYaDirectoryPicker=()=>{};
 globalThis.appConfirm=async()=>true;

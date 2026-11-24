@@ -4,6 +4,7 @@
 {% block body_class %}persistent-savebar-page{% endblock %}
 {% block content %}
 <section class="standalone-settings offline-settings-shell" id="offlineForm">
+    <fieldset data-config-fields aria-label="离线转存设置" disabled style="min-width:0;margin:0;padding:0;border:0">
     <div class="offline-settings-grid">
         <!-- Left Column: Protocols & Directory Routing -->
         <div class="settings-section offline-settings-section">
@@ -206,9 +207,11 @@
             </div>
         </div>
     </div>
+    </fieldset>
     <div class="settings-savebar workspace-savebar">
-        <span id="offlineSaveState" aria-live="polite">尚未修改</span>
-        <button type="button" class="btn btn-primary" id="saveOfflineBtn"><i data-lucide="save"></i>保存离线转存设置</button>
+        <span id="offlineSaveState" data-config-state aria-live="polite">正在读取配置…</span>
+        <div data-config-save><button type="button" class="btn btn-primary" id="saveOfflineBtn" disabled aria-disabled="true"><i data-lucide="save"></i>保存离线转存设置</button></div>
+        <div data-config-retry hidden><button type="button" class="btn btn-primary"><i data-lucide="refresh-cw"></i>重试读取配置</button></div>
     </div>
 </section>
 {% endblock %}
@@ -222,7 +225,6 @@
     const saveState=document.getElementById('offlineSaveState');
     const excludeInput=document.getElementById('offlineExcludeKeywords');
     const secondaryKeywordsInput=document.getElementById('offlineSecondaryKeywords');
-    let busy=true;
     const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 
     function initTagInput(boxEl, hiddenInputEl, options={}){
@@ -362,22 +364,16 @@
                 valEl.innerHTML=`<div class="offline-dir-badge is-empty"><span class="offline-dir-icon"><i data-lucide="folder-search"></i></span><div class="offline-dir-text"><strong>${esc(fallback)}</strong><span class="offline-dir-id">未选择关联目录</span></div></div>`;
             }
         });
-        window.renderLucideIcons?.(document.getElementById('offlineConfigForm'));
+        window.renderLucideIcons?.(form);
     }
     function syncSecondary(){
-        const disabled=busy||!secondary.checked;
         secondaryRows.classList.toggle('is-disabled',!secondary.checked);
-        secondaryRows.querySelectorAll('input,button').forEach(element=>element.disabled=disabled);
-        document.getElementById('offlineSecondaryTagField').disabled=disabled;
-    }
-    function setBusy(value){
-        busy=value;
-        saveButton.disabled=value;
-        form.querySelector('[data-offline-dir="primary"]').disabled=value;
-        syncSecondary();
+        secondaryRows.querySelectorAll('input,button').forEach(element=>{
+            element.disabled=!secondary.checked||element.dataset.managedByEnvironment==='true';
+        });
     }
     function markDirty(){
-        if(busy)return;
+        if(saveButton.disabled)return;
         saveState.className='is-dirty';
         saveState.textContent='尚未保存';
     }
@@ -391,47 +387,26 @@
         }});
     }
 
-    // Quick tag chips helper
     document.querySelectorAll('#offlinePresetChips [data-chip]').forEach(chip=>{
-        chip.addEventListener('click', ()=>{
-            if(busy) return;
-            excludeTagInput.addTags(chip.dataset.chip);
-        });
+        chip.addEventListener('click',()=>excludeTagInput.addTags(chip.dataset.chip));
     });
-    setBusy(true);
-    loadAppConfig().then(config=>{
-        fillConfigFields(form,config);
-        excludeTagInput.setTagsFromString(config.OFFLINE_EXCLUDE_KEYWORDS || '');
-        allowedExtsTagInput.setTagsFromString(config.OFFLINE_ALLOWED_EXTS || '');
-        secondaryTagInput.setTagsFromString(config.OFFLINE_SECONDARY_KEYWORDS || '');
-        renderDirs();
-    }).catch(error=>{
-        saveState.className='is-error';
-        saveState.textContent=error.message;
-    }).finally(()=>setBusy(false));
-
     document.querySelectorAll('[data-offline-dir]').forEach(button=>button.addEventListener('click',()=>pick(button.dataset.offlineDir)));
     form.addEventListener('input',markDirty);
-    form.addEventListener('change',event=>{
-        if(event.target===secondary)syncSecondary();
-        markDirty();
-    });
-    saveButton.addEventListener('click',async()=>{
-        if(busy)return;
-        setBusy(true);
-        saveState.className='';
-        saveState.textContent='保存中...';
-        try{
+    secondary.addEventListener('change',syncSecondary);
+    bindAppConfigForm(form,{
+        requiredKey:'OFFLINE_MIN_FILE_MB',
+        hydrate(config){
+            excludeTagInput.setTagsFromString(config.OFFLINE_EXCLUDE_KEYWORDS);
+            allowedExtsTagInput.setTagsFromString(config.OFFLINE_ALLOWED_EXTS);
+            secondaryTagInput.setTagsFromString(config.OFFLINE_SECONDARY_KEYWORDS);
+            renderDirs();
+            syncSecondary();
+        },
+        async persist(){
             const result=await saveAppConfig(form);
-            const hasPendingChanges=result?.__hasPendingConfigChanges===true;
-            saveState.className=hasPendingChanges?'is-dirty':'is-success';
-            saveState.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':'离线转存设置已保存';
-        }catch(error){
-            saveState.className='is-error';
-            saveState.textContent=error.message;
-        }finally{
-            setBusy(false);
-        }
+            const pending=result.__hasPendingConfigChanges;
+            return {pending,message:pending?'':'离线转存设置已保存'};
+        },
     });
 })();
 </script>

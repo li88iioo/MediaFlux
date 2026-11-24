@@ -803,7 +803,7 @@
         return data;
     };
 
-    window.fillConfigFields = function (root, config) {
+    window.fillConfigFields = function (root, config, hydrate) {
         const managedFields = new Set(
             Array.isArray(config.__managed_fields) ? config.__managed_fields : []
         );
@@ -844,6 +844,7 @@
                 }
             }
         });
+        hydrate?.(config);
         root.querySelectorAll('[data-key]').forEach((field) => {
             field.dataset.configInitialValue = field.type === 'checkbox'
                 ? (field.checked ? '1' : '0')
@@ -861,6 +862,58 @@
                 ? `部署环境已锁定 ${managed.length} 个字段`
                 : '';
         });
+    };
+
+    window.bindAppConfigForm = function (root, {requiredKey, hydrate, persist}) {
+        const fields = root.querySelectorAll('[data-config-fields]');
+        const save = root.querySelector('[data-config-save] button');
+        const retry = root.querySelector('[data-config-retry] button');
+        const state = root.querySelector('[data-config-state]');
+        const show = (message, tone = '') => { state.textContent = message; state.className = tone; };
+        const disableSave = (disabled) => {
+            save.disabled = disabled;
+            save.setAttribute('aria-disabled', String(disabled));
+        };
+        const showRetry = (failed) => { save.parentElement.hidden = failed; retry.parentElement.hidden = !failed; };
+        async function load() {
+            showRetry(false);
+            show('正在读取配置…');
+            try {
+                const config = await window.loadAppConfig();
+                if (!Array.isArray(config?.__managed_fields) || typeof config[requiredKey] !== 'string') {
+                    throw new Error('配置响应无效');
+                }
+                fields.forEach(group => { group.disabled = false; });
+                window.fillConfigFields(root, config, hydrate);
+                disableSave(false);
+                show('尚未修改');
+            } catch (error) {
+                fields.forEach(group => { group.disabled = true; });
+                show(error instanceof SyntaxError ? '配置响应无效' : error.message, 'is-error');
+                showRetry(true);
+            }
+        }
+        retry.addEventListener('click', () => { if (!retry.parentElement.hidden) void load(); });
+        save.addEventListener('click', async () => {
+            if (save.disabled) return;
+            const invalid = root.querySelector('[data-config-fields] [data-key]:invalid');
+            if (invalid) {
+                show(invalid.validationMessage, 'is-error');
+                invalid.reportValidity();
+                return;
+            }
+            disableSave(true);
+            show('保存中…');
+            try {
+                const {pending, message} = await persist();
+                show(message || '上一版已保存，仍有未保存更改', pending ? 'is-dirty' : 'is-success');
+            } catch (error) {
+                show(error.message, 'is-error');
+            } finally {
+                disableSave(false);
+            }
+        });
+        void load();
     };
 
     window.collectConfigFields = function (root) {

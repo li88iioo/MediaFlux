@@ -376,7 +376,7 @@ class StrmStatusPollingLifecycleTests(unittest.TestCase):
             let statusAbortController = null;
             let lastStatusProgressText = '最近状态';
             let activeStrmTab = 'schedule';
-            let strmConfigReady = true;
+            const configReady = () => true;
             const setTag = () => {{throw new Error('background failure must preserve the stable tag');}};
             const renderStatus = () => {{statusShouldPoll = true; lastStatusProgressText = '最近状态'; progress.textContent = '最近状态';}};
             let fetchImpl;
@@ -515,6 +515,8 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
         self.assertIn("上一版已保存，仍有未保存更改", settings_source)
 
     def test_every_config_save_surface_reports_in_flight_edits(self):
+        config_form = _extract((ROOT / "app/static/js/app.js").read_text(encoding="utf-8"),
+                               "    window.bindAppConfigForm =", "\n    window.collectConfigFields =")
         paths = (
             ROOT / "app/templates/dashboard.html",
             ROOT / "app/templates/guangya_offline.html",
@@ -528,7 +530,8 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
                 source = path.read_text(encoding="utf-8")
                 self.assertIn("saveAppConfig(", source)
                 self.assertIn("__hasPendingConfigChanges", source)
-                self.assertIn("上一版已保存，仍有未保存更改", source)
+                self.assertIn("上一版已保存，仍有未保存更改",
+                              config_form if "bindAppConfigForm(" in source else source)
 
         dashboard = paths[0].read_text(encoding="utf-8")
         pending_branch = dashboard.index("if(hasPendingChanges)")

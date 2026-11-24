@@ -377,6 +377,102 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(self.config_posts[-1][1]["GY_ORGANIZE_SCHEDULE_CRON"], "30 5 * * *")
         self.assertEqual(config.get("GY_ORGANIZE_SCHEDULE_CRON"), "30 5 * * *")
 
+    def test_guangya_forms_lock_until_config_retry_and_save_only_the_draft(self):
+        from playwright.sync_api import expect
+
+        loads, saves = [], []
+
+        def hold_config(route):
+            (loads if route.request.method == "GET" else saves).append(route)
+
+        self.context.route("**/api/config", hold_config)
+        cases = (
+            ("/guangya/strm", "strm", "STRM_SKIP_THRESHOLD_MB"),
+            ("/guangya/offline", "offline", "OFFLINE_MIN_FILE_MB"),
+        )
+        for width, status, response in ((1440, 503, {"error": "配置暂不可用"}),
+                                        (390, 200, {"__managed_fields": []})):
+            for path, prefix, key in cases:
+                with self.subTest(path=path, width=width):
+                    self._write(**{key: "250", "OFFLINE_EXCLUDE_KEYWORDS": "CAM,sample",
+                                   "GY_STRM_BASE_URL": "http://saved.example.invalid:1258"})
+                    before = len(self.config_posts)
+                    page = self.context.new_page()
+                    page.set_viewport_size({"width": width, "height": 900})
+                    page.on("pageerror", lambda error: self.errors.append(str(error)))
+                    page.set_default_timeout(5000)
+                    with page.expect_request("**/api/config"):
+                        page.goto(ORIGIN + path, wait_until="domcontentloaded")
+                    field = page.locator(f'[data-key="{key}"]')
+                    save = page.locator(f"#save{prefix.title()}Btn")
+                    state = page.locator(f"#{prefix}SaveState")
+                    retry = page.get_by_role("button", name="重试读取配置")
+                    expect(field).to_be_disabled()
+                    expect(save).to_be_disabled()
+                    loads.pop().fulfill(status=status, json=response)
+                    expect(state).to_have_class("is-error")
+                    expect(field).to_be_disabled()
+                    expect(save).to_be_disabled()
+                    save.evaluate("button => button.dispatchEvent(new MouseEvent('click'))")
+                    self.assertEqual(saves, [])
+
+                    with page.expect_request("**/api/config"):
+                        retry.click()
+                    expect(field).to_be_disabled()
+                    loads.pop().fallback()
+                    expect(field).to_be_editable()
+                    expect(field).to_have_value("250")
+                    expect(save).to_be_enabled()
+                    expect(state).not_to_have_class("is-error")
+
+                    field.fill("-1")
+                    save.click()
+                    expect(state).to_have_class("is-error")
+                    expect(field).to_have_value("-1")
+                    self.assertEqual(saves, [])
+
+                    field.fill("1")
+                    with page.expect_request("**/api/config"):
+                        save.click()
+                    expect(save).to_be_disabled()
+                    field.fill("0")
+                    saves.pop().fulfill(status=503, json={"error": "配置暂时无法保存"})
+                    expect(state).to_have_text("配置暂时无法保存")
+                    expect(field).to_be_editable()
+                    expect(field).to_have_value("0")
+                    with page.expect_request("**/api/config"):
+                        save.click()
+                    saves.pop().fallback()
+                    expect(state).to_have_class("is-success")
+                    self.assertEqual(self.config_posts[before:], [(200, {key: "0"})])
+                    page.close()
+
+    def test_strm_diagnostics_load_while_config_is_pending_and_survive_failure(self):
+        from playwright.sync_api import expect
+
+        config_requests = []
+        diagnostics = []
+        ledger = []
+        self.context.route("**/api/config", lambda route: config_requests.append(route))
+        self.context.route("**/api/strm/index-diagnostics", lambda route: diagnostics.append(route))
+        self.context.route("**/api/strm/failures*", lambda route: ledger.append(route))
+        page = self.context.new_page()
+        page.on("pageerror", lambda error: self.errors.append(str(error)))
+        page.set_default_timeout(5000)
+        with page.expect_request("**/api/strm/index-diagnostics"), page.expect_request("**/api/strm/failures*"):
+            page.goto(ORIGIN + "/guangya/strm#diagnostics", wait_until="domcontentloaded")
+        total = page.locator('[data-strm-diagnostic="video.total"]')
+        expect(total).to_have_text("—")
+        diagnostics.pop().fulfill(json={"video": {"total": 7, "existing": 7, "missing": 0}})
+        ledger.pop().fulfill(json={"items": [], "summary": {}, "pagination": {"page": 1}})
+        expect(total).to_have_text("7")
+        expect(page.locator("#strmFailureList")).to_have_attribute("aria-busy", "false")
+        config_requests.pop().fulfill(status=503, json={"error": "配置暂不可用"})
+        expect(page.locator("#strmSaveState")).to_have_class("is-error")
+        expect(total).to_have_text("7")
+        expect(page.locator("#refreshStrmIndexDiagnosticBtn")).to_be_enabled()
+        self.assertEqual(self.config_posts, [])
+
     def test_strm_threshold_defaults_to_10_and_saved_zero_survives_reload(self):
         page = self._open("/guangya/strm")
         threshold = page.locator('[data-key="STRM_SKIP_THRESHOLD_MB"]')

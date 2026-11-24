@@ -13,6 +13,7 @@ from app.clients.guangya import (
     GuangYaClient,
     GuangYaFile,
     close_guangya_client,
+    read_guangya_credential_generation,
 )
 from app.logger import get_logger
 from app.modules.directory_scrape_errors import (
@@ -366,7 +367,7 @@ def file_change(request: Request, data: dict | None = None):
     payload = data or {}
     operation = payload.get("operation")
     labels = {"copy": "复制光鸭目录项", "move": "移动光鸭目录项", "mkdir": "新建光鸭目录"}
-    if not isinstance(operation, str) or operation not in labels:
+    if operation not in tuple(labels):
         return JSONResponse({"error": "请选择复制、移动或新建目录"}, status_code=400)
     target_dir_id = payload.get("target_dir_id")
     if not isinstance(target_dir_id, str) or not target_dir_id.strip():
@@ -379,10 +380,10 @@ def file_change(request: Request, data: dict | None = None):
         except GuangYaFSChangeError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
-        file_id = payload.get("file_id")
-        if not isinstance(file_id, str) or not file_id.strip() or file_id.strip() == "0":
+        raw_file_id = payload.get("file_id")
+        file_id = raw_file_id.strip() if isinstance(raw_file_id, str) else ""
+        if file_id in {"", "0"}:
             return JSONResponse({"error": "请选择具体文件或目录作为源项目"}, status_code=400)
-        file_id = file_id.strip()
         if file_id == target_dir_id:
             return JSONResponse({"error": "不能把项目复制或移动到自身"}, status_code=400)
         expected_parent_id = payload.get("expected_parent_id")
@@ -394,9 +395,13 @@ def file_change(request: Request, data: dict | None = None):
             return JSONResponse({"error": "缺少源项目的父目录或名称，请刷新后重试"}, status_code=400)
         expected_parent_id = expected_parent_id.strip()
 
+    generation = read_guangya_credential_generation()
+
     def execute() -> dict:
         client = GuangYaClient()
         try:
+            if client.credential_generation != generation:
+                raise DirectoryScrapeStateError("光鸭登录已变化，请刷新目录后重试")
             return execute_browser_file_change(
                 client, operation, target_dir_id=target_dir_id, name=name,
                 file_id=file_id, expected_parent_id=expected_parent_id, expected_name=expected_name,
@@ -404,7 +409,9 @@ def file_change(request: Request, data: dict | None = None):
         finally:
             close_guangya_client(client)
 
-    identity = json.dumps([operation, target_dir_id, file_id, expected_parent_id, expected_name, name])
+    identity = json.dumps([
+        generation, operation, target_dir_id, file_id, expected_parent_id, expected_name, name,
+    ])
     result = get_organize_manager().start_operation(
         labels[operation], name or expected_name, execute,
         dedupe_key=f"guangya-browser-file-change:{identity}",

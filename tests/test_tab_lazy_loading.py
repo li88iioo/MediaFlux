@@ -46,13 +46,13 @@ class TabLazyLoadingTests(unittest.TestCase):
         self.assertIn("rssPanelLoadPromise", self.rss)
         self.assertNotIn("\nloadSubs();\nloadEntries();\n", self.rss)
 
-    def test_strm_secondary_panels_load_after_config_and_activation(self) -> None:
-        self.assertIn("if(strmConfigReady){", self.strm)
-        self.assertIn("void ensureStrmTabLoaded(normalized)", self.strm)
-        self.assertIn("if(normalized==='schedule'&&alreadyLoaded)void loadStatus()", self.strm)
-        self.assertIn("if(tab==='schedule')return Promise.all([validateCron(),loadStatus()])", self.strm)
-        self.assertIn("if(tab==='diagnostics')return Promise.all([loadIndexDiagnostics(),loadFailures()])", self.strm)
-        self.assertIn("void ensureStrmTabLoaded(activeStrmTab)", self.strm)
+    def test_strm_tabs_load_on_activation_and_diagnostics_bypass_config(self) -> None:
+        self.assertIn("if(tab!=='diagnostics'&&!configReady())return", self.strm)
+        self.assertIn("ensureStrmTabLoaded(normalized)", self.strm)
+        self.assertIn("if(tab==='schedule')void loadStatus()", self.strm)
+        self.assertIn("if(tab==='schedule'){void validateCron();void loadStatus();}", self.strm)
+        self.assertIn("if(tab==='diagnostics'){void loadIndexDiagnostics();void loadFailures();}", self.strm)
+        self.assertIn("ensureStrmTabLoaded(activeStrmTab)", self.strm)
 
     def test_media_proxy_records_wait_for_records_tab(self) -> None:
         self.assertIn("async function loadProxyBase(background=false)", self.proxy)

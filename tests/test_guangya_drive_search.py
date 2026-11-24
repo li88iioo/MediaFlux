@@ -17,7 +17,7 @@ from tests.support import authenticated_session
 
 @pytest.fixture
 def search_transport(tmp_path, monkeypatch):
-    transport = Mock(spec=["request"])
+    transport = Mock(spec=["request", "fs_files"])
     monkeypatch.setattr(GuangYaClient, "raw", property(lambda _: transport))
     client = GuangYaClient(tmp_path / "guangya_token.json")
     try:
@@ -151,6 +151,29 @@ def test_search_api_matches_directory_items_and_reports_next_page(search_api):
     provider.list_dir.assert_called_once_with("nested")
     provider.file_info.assert_not_called()
     assert provider.close.call_count == 2
+
+
+def test_directory_api_keeps_first_page_total_when_middle_page_omits_it(
+    search_api, search_transport, monkeypatch,
+):
+    web, _, provider_factory = search_api
+    client, transport = search_transport
+    monkeypatch.setattr(GuangYaClient, "logged_in", property(lambda _: True))
+    provider_factory.return_value = client
+    transport.fs_files.side_effect = [
+        {"data": {"total": 3, "list": [{"fileId": "1", "fileName": "第一项"}]}},
+        {"data": {"list": [{"fileId": "2", "fileName": "第二项"}]}},
+        {"data": {"list": [{"fileId": "3", "fileName": "第三项"}]}},
+    ]
+    web.post("/__test/login")
+
+    response = web.get("/api/guangya/dirs", params={"parent_id": "nested"})
+
+    assert response.status_code == 200, response.text
+    assert [(row["file_id"], row["parent_id"]) for row in response.json()] == [
+        (file_id, "nested") for file_id in ("1", "2", "3")
+    ]
+    assert [request.kwargs["page"] for request in transport.fs_files.call_args_list] == [0, 1, 2]
 
 
 def test_search_api_returns_empty_page_with_no_continuation(search_api):

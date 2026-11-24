@@ -39,6 +39,7 @@
 
     <!-- Tab 1: Configuration (INTJ UI/UX Refined Two-Card Layout) -->
     <div class="strm-tab-panel" id="strmTab_config" role="tabpanel" aria-labelledby="strmTabButton_config">
+        <fieldset data-config-fields aria-label="同步源与规则" disabled style="min-width:0;margin:0;padding:0;border:0">
         <div class="strm-settings-grid">
             <!-- Left Card: Source Dirs, Server URL & Storage Paths -->
             <section class="card settings-section strm-settings-section strm-source-section">
@@ -198,6 +199,7 @@
                 </div>
             </section>
         </div>
+        </fieldset>
     </div>
 
     <!-- Tab 2: Scheduler & Runtime Status (50/50 Grid) -->
@@ -212,7 +214,7 @@
                     </div>
                 </header>
 
-                <div class="strm-card-body">
+                <fieldset data-config-fields class="strm-card-body" aria-label="定时计划" disabled style="min-width:0;margin:0;padding:0;border:0">
                     <div class="strm-toggle-card">
                         <div class="strm-toggle-copy">
                             <label for="strmScheduleEnabledSwitch">启用定时扫描</label>
@@ -245,7 +247,7 @@
                         </div>
                         <a class="jump-btn" href="/settings#telegram"><i data-lucide="settings"></i>前往设置</a>
                     </div>
-                </div>
+                </fieldset>
             </section>
 
             <!-- Right Card: Modern Dashboard Runtime Status Monitoring -->
@@ -335,7 +337,7 @@
                                 <span class="stat-label">视频 STRM 总数</span>
                                 <i data-lucide="video" class="stat-icon-subtle is-blue"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="video.total">0</div>
+                            <div class="stat-value" data-strm-diagnostic="video.total">—</div>
                             <div class="stat-foot">视频 .strm 索引条目</div>
                         </div>
                         <div class="stat-card">
@@ -343,7 +345,7 @@
                                 <span class="stat-label">STRM 已落盘</span>
                                 <i data-lucide="check-circle-2" class="stat-icon-subtle is-green"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="video.existing">0</div>
+                            <div class="stat-value" data-strm-diagnostic="video.existing">—</div>
                             <div class="stat-foot">本地 .strm 文件存在</div>
                         </div>
                         <div class="stat-card">
@@ -351,7 +353,7 @@
                                 <span class="stat-label">STRM 文件缺失</span>
                                 <i data-lucide="alert-triangle" class="stat-icon-subtle is-amber"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="video.missing">0</div>
+                            <div class="stat-value" data-strm-diagnostic="video.missing">—</div>
                             <div class="stat-foot">数据库索引对应的本地 .strm 不存在</div>
                         </div>
                         <div class="stat-card">
@@ -359,7 +361,7 @@
                                 <span class="stat-label">元数据索引</span>
                                 <i data-lucide="file-text" class="stat-icon-subtle is-purple"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="metadata.total">0</div>
+                            <div class="stat-value" data-strm-diagnostic="metadata.total">—</div>
                             <div class="stat-foot">海报/NFO等元数据</div>
                         </div>
                         <div class="stat-card">
@@ -367,7 +369,7 @@
                                 <span class="stat-label">元数据未落盘</span>
                                 <i data-lucide="clock" class="stat-icon-subtle is-blue"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="metadata.missing">0</div>
+                            <div class="stat-value" data-strm-diagnostic="metadata.missing">—</div>
                             <div class="stat-foot">数据库索引对应的本地元数据文件不存在</div>
                         </div>
                         <div class="stat-card">
@@ -375,7 +377,7 @@
                                 <span class="stat-label">配置来源目录</span>
                                 <i data-lucide="folder-kanban" class="stat-icon-subtle is-blue"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="configured_source_count">0</div>
+                            <div class="stat-value" data-strm-diagnostic="configured_source_count">—</div>
                             <div class="stat-foot">个已生效来源目录</div>
                         </div>
                         <div class="stat-card">
@@ -383,7 +385,7 @@
                                 <span class="stat-label">归属有效来源</span>
                                 <i data-lucide="folder-check" class="stat-icon-subtle is-green"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="real_source">0</div>
+                            <div class="stat-value" data-strm-diagnostic="real_source">—</div>
                             <div class="stat-foot">有效来源索引条数</div>
                         </div>
                         <div class="stat-card">
@@ -391,7 +393,7 @@
                                 <span class="stat-label">确认测试残留</span>
                                 <i data-lucide="shield-alert" class="stat-icon-subtle is-red"></i>
                             </div>
-                            <div class="stat-value" data-strm-diagnostic="confirmed_test_artifact">0</div>
+                            <div class="stat-value" data-strm-diagnostic="confirmed_test_artifact">—</div>
                             <div class="stat-foot">可安全清理的隔离项</div>
                         </div>
                     </div>
@@ -417,8 +419,8 @@
                     <div class="strm-failure-head-left">
                         <h3><i data-lucide="alert-triangle"></i>失败台账</h3>
                         <div class="strm-failure-summary-badges" id="strmFailureSummary">
-                            <span class="strm-stat-badge open"><i data-lucide="alert-circle"></i>待处理 <strong>0</strong></span>
-                            <span class="strm-stat-badge resolved"><i data-lucide="check-circle-2"></i>已解决 <strong>0</strong></span>
+                            <span class="strm-stat-badge open"><i data-lucide="alert-circle"></i>待处理 <strong>—</strong></span>
+                            <span class="strm-stat-badge resolved"><i data-lucide="check-circle-2"></i>已解决 <strong>—</strong></span>
                         </div>
                     </div>
                     <button type="button" class="jump-btn" id="refreshStrmFailuresBtn"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
@@ -484,10 +486,9 @@
 
     <!-- Bottom Savebar -->
     <div class="strm-settings-savebar settings-savebar workspace-savebar">
-        <span id="strmSaveState" aria-live="polite">尚未修改</span>
-        <button type="button" class="btn btn-primary" id="saveStrmBtn" disabled aria-disabled="true">
-            <i data-lucide="save"></i>保存 STRM 设置
-        </button>
+        <span id="strmSaveState" data-config-state aria-live="polite">正在读取配置…</span>
+        <div data-config-save><button type="button" class="btn btn-primary" id="saveStrmBtn" disabled aria-disabled="true"><i data-lucide="save"></i>保存 STRM 设置</button></div>
+        <div data-config-retry hidden><button type="button" class="btn btn-primary"><i data-lucide="refresh-cw"></i>重试读取配置</button></div>
     </div>
 </div>
 {% endblock %}

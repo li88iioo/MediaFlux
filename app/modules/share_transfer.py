@@ -444,6 +444,11 @@ def get_share_transfer_store() -> ShareTransferPreviewStore:
     return _store
 
 
+def share_receipt_owner(chat_id: str | int, user_id: str | int = "") -> str:
+    owner_key = ShareTransferPreviewStore.owner_key(chat_id, user_id)
+    return hashlib.sha256(owner_key.encode()).hexdigest()
+
+
 def share_request_key(
     share_id: str,
     selected_ids: list[str] | tuple[str, ...],
@@ -667,7 +672,7 @@ def accept_share_request(
     key = share_request_key(
         *identity, account_key=snapshot.account_key,
     )
-    receipt_owner = hashlib.sha256(snapshot.owner_key.encode()).hexdigest()
+    receipt_owner = share_receipt_owner(chat_id, user_id)
     names = [redact_sensitive_text(file["name"] or "未命名项目") for file in snapshot.files]
     title = redact_sensitive_text(f"分享转存 {len(names)} 项: {', '.join(names[:3])}")
     request_id, created = download_requests_repo.create_share_transfer_request(
@@ -864,22 +869,19 @@ def execute_share_request(
                 )
                 success = bool(result.get("success"))
                 retry_safe = bool(result.get("retry_safe", False))
-                failure_status = "failed" if retry_safe else "manual_review"
-                error = "" if success else (
-                    "光鸭分享转存失败，可重新确认后重试"
-                    if retry_safe
-                    else "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
-                )
             except ShareTransferAccountChanged:
                 raise
             except Exception as exc:
-                if not restore_started:
-                    _require_share_generation(runtime_client, snapshot.credential_generation)
+                success = retry_safe = False
                 logger.warning("光鸭分享转存请求 #%s 失败 (%s)", request_id, type(exc).__name__)
-                success = False
-                failure_status = "manual_review"
-                error = "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
 
+            if not success and not restore_started:
+                _require_share_generation(runtime_client, snapshot.credential_generation)
+            failure_status = "failed" if retry_safe else "manual_review"
+            error = "" if success else (
+                "光鸭分享转存失败，可重新确认后重试"
+                if retry_safe else "光鸭转存结果不确定，为避免重复转存已停止重试，请到目标目录核对"
+            )
             stale = finish(
                 success=success,
                 target_dir_id=effective_target_id,

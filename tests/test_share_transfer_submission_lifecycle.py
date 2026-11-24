@@ -9,7 +9,7 @@ import unittest
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 
@@ -345,6 +345,32 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         third = self.submit()
         self.assertTrue(third["duplicate"])
         self.assertEqual(len(self.client.restore_calls), 1)
+
+    def test_restore_credential_timeout_before_provider_write_can_retry_once(self):
+        raw = Mock()
+        raw.share_restore.return_value = {"code": 0}
+        self.client.restore_share = GuangYaClient.__new__(GuangYaClient).restore_share
+        with patch.object(
+            GuangYaClient, "raw", new_callable=PropertyMock,
+            side_effect=[TimeoutError("credential refresh timed out"), raw],
+        ):
+            first = self.submit()
+            raw.share_restore.assert_not_called()
+            self.tracker.reload.assert_not_called()
+            self.assertEqual(first["status"], "failed")
+            row = self.request()
+            self.assertEqual((row["status"], row["gy_status"], row["gy_target_dir"]),
+                             ("failed", "failed", "staging-target"))
+
+            second = self.submit()
+            self.assertTrue(second["success"] and second["retried"])
+            self.assertEqual(second["request_id"], first["request_id"])
+            self.assertEqual(len(self.client.create_dir_calls), 1)
+            raw.share_restore.assert_called_once()
+            self.assertEqual(raw.share_restore.call_args.kwargs["parent_id"], "staging-target")
+            self.tracker.reload.assert_called_once()
+            self.assertTrue(self.submit()["duplicate"])
+            raw.share_restore.assert_called_once()
 
     def test_first_submission_is_visible_to_live_timeout_recovery(self):
         recovered_counts = []

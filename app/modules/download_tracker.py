@@ -109,15 +109,17 @@ class _QBTaskIndex:
 class _GYTaskIndex:
     def __init__(self, tasks: list[dict]):
         self.by_id: dict[str, dict] = {}
-        self.by_source: dict[str, dict] = {}
+        self.unique_source: dict[str, dict | None] = {}
         self.unique_target: dict[str, dict | None] = {}
         for task in tasks:
             task_id = str(task.get("id") or "")
             self.by_id.setdefault(task_id, task)
             raw = task.get("raw") if isinstance(task.get("raw"), dict) else {}
-            self.by_source.setdefault(str(raw.get("url") or raw.get("sourceUrl") or ""), task)
+            source = str(raw.get("url") or raw.get("sourceUrl") or "")
             target = str(task.get("target_dir") or "")
-            self.unique_target[target] = None if target in self.unique_target else task
+            for key, matches in ((source, self.unique_source), (target, self.unique_target)):
+                if key:
+                    matches[key] = None if key in matches else task
 
 
 class DownloadTracker:
@@ -1315,19 +1317,12 @@ class DownloadTracker:
     def _match_gy(row, tasks: list[dict] | _GYTaskIndex):
         index = tasks if isinstance(tasks, _GYTaskIndex) else _GYTaskIndex(tasks)
         task_id = str(row_value(row, "gy_task_id", "") or "")
-        source_value = str(row_value(row, "source_value", "") or "")
-        target_dir = str(row_value(row, "gy_target_dir", "") or "")
-        isolated = bool(int(row_value(row, "gy_isolated", 0) or 0))
         if task_id:
             return index.by_id.get(task_id)
-        # 隔离目录只能唯一匹配；历史非隔离任务按来源/独有目录核验，不凭标题认领。
-        if isolated:
-            return index.unique_target.get(target_dir) if target_dir else None
-        if source_value and source_value in index.by_source:
-            return index.by_source[source_value]
-        if target_dir and index.unique_target.get(target_dir) is not None:
-            return index.unique_target[target_dir]
-        return None
+        # 只有请求独占的暂存目录能证明任务归属，历史共享目录必须按来源唯一匹配。
+        if int(row_value(row, "gy_isolated", 0) or 0):
+            return index.unique_target.get(str(row_value(row, "gy_target_dir", "") or ""))
+        return index.unique_source.get(str(row_value(row, "source_value", "") or ""))
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
