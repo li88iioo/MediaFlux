@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import re
-import shutil
-import subprocess
 import unittest
 from pathlib import Path
 
@@ -261,36 +259,26 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
         overview = self.client.get("/api/logs/overview").json()["timeline"]
         self.assertEqual((overview["failed"], overview["deleted"], overview["success"]), (24, 1, 0))
 
-    @unittest.skipUnless(shutil.which("node"), "需要 Node 验证日志页链接参数")
-    def test_log_deep_link_restores_only_supported_origin_and_status(self):
-        script = Path("app/static/js/logs.js").read_text(encoding="utf-8")
-        self.assertLess(script.index("restoreOrganizeFiltersFromUrl();"), script.index("const initialTab ="))
-        program = r"""
-const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
-const source=fs.readFileSync('app/static/js/logs.js','utf8');
-const html=fs.readFileSync('app/templates/logs.html','utf8');
-const helper=source.slice(source.indexOf('function restoreOrganizeFiltersFromUrl()'),source.indexOf('// 初次加载：'));
-for(const [search,origin,status] of [
- ['?origin=guangya&status=issues','guangya','issues'],
- ['?origin=guangya&status=deleted','guangya','deleted'],
- ['?origin=local&status=manual','local','manual'],
- ['?origin=unknown&status=%3Cscript%3E','all',''],
- ['', 'all',''],
-]) {
- const fields={};
- for(const [id,value] of [['orgOrigin','all'],['orgStatus','']]) {
-  const block=html.match(new RegExp('<select[^>]*id="'+id+'"[^>]*>(.*?)</select>', 's'))[1];
-  fields[id]={value,options:[...block.matchAll(/<option value="([^"]*)"/g)].map(m=>({value:m[1]}))};
- }
- const context=vm.createContext({URLSearchParams,window:{location:{search}},document:{getElementById:id=>fields[id]}});
- vm.runInContext(helper,context);context.restoreOrganizeFiltersFromUrl();
- assert.deepEqual([fields.orgOrigin.value,fields.orgStatus.value],[origin,status]);
-}
-"""
-        node = shutil.which("node")
-        assert node is not None
-        result = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_log_deep_link_renders_supported_filters_before_scripts(self):
+        from bs4 import BeautifulSoup
+
+        for origin, status, expected in (
+            ('guangya', 'issues', ('guangya', 'issues')),
+            ('guangya', 'deleted', ('guangya', 'deleted')),
+            ('local', 'manual', ('local', 'manual')),
+            ('unknown', '<script>', ('all', '')),
+            ('', '', ('all', '')),
+        ):
+            with self.subTest(origin=origin, status=status):
+                page = self.client.get('/logs', params={'origin': origin, 'status': status})
+                self.assertEqual(page.status_code, 200)
+                html = BeautifulSoup(page.text, 'html.parser')
+                selected = []
+                for field in ('orgOrigin', 'orgStatus'):
+                    option = html.select_one(f'#{field} option[selected]') or html.select_one(f'#{field} option')
+                    assert option is not None
+                    selected.append(option['value'])
+                self.assertEqual(tuple(selected), expected)
 
     def test_guangya_manual_record_is_not_counted_as_skipped(self):
         log_id = db.add_organize_log(

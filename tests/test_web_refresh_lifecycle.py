@@ -837,7 +837,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             function control(dataset = {}) {
               return {
                 dataset, value: '', disabled: false, readOnly: false,
-                tagName: 'INPUT', type: 'text', isConnected: true,
+                tagName: dataset.key ? 'INPUT' : 'BUTTON', type: 'text', isConnected: true,
                 attributes: {}, handlers: {},
                 setAttribute(name, value) {this.attributes[name] = String(value);},
                 addEventListener(name, handler) {this.handlers[name] = handler;},
@@ -867,7 +867,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               addEventListener(name, handler) {modalHandlers[name] = handler;},
               querySelectorAll(selector) {
                 if (selector === '[data-tab-panel]') return [panel];
-                if (selector === '[data-key]') return [urlField, tokenField];
+                if (selector === '[data-key],[data-test-media],[data-save-media]') return [urlField, tokenField, testButton, saveButton];
                 if (selector === '[data-test-media],[data-save-media]') return [testButton, saveButton];
                 if (selector === '[data-media-detected]') return [detected];
                 if (selector === '[data-test-media]') return [testButton];

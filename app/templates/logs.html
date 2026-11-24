@@ -46,20 +46,14 @@
 <section class="card card-pad logs-panel" id="organizePanel">
     <div class="logs-filterbar">
         <select class="form-select" id="orgOrigin" onchange="loadOrganize(1)" aria-label="整理来源">
-            <option value="all">全部来源</option>
-            <option value="guangya">光鸭整理</option>
-            <option value="local">本地整理</option>
+            {% for value, label in [('all', '全部来源'), ('guangya', '光鸭整理'), ('local', '本地整理')] %}
+            <option value="{{ value }}"{% if value == organize_origin %} selected{% endif %}>{{ label }}</option>
+            {% endfor %}
         </select>
         <select class="form-select" id="orgStatus" onchange="loadOrganize(1)" aria-label="整理状态">
-            <option value="">全部状态</option>
-            <option value="success">成功</option>
-            <option value="failed">失败</option>
-            <option value="deleted">已移入回收站</option>
-            <option value="issues">异常历史</option>
-            <option value="skipped">跳过</option>
-            <option value="manual">待确认</option>
-            <option value="processing">处理中</option>
-            <option value="reverted">已回退</option>
+            {% for value, label in [('', '全部状态'), ('success', '成功'), ('failed', '失败'), ('deleted', '已移入回收站'), ('issues', '异常历史'), ('skipped', '跳过'), ('manual', '待确认'), ('processing', '处理中'), ('reverted', '已回退')] %}
+            <option value="{{ value }}"{% if value == organize_status %} selected{% endif %}>{{ label }}</option>
+            {% endfor %}
         </select>
         <div class="logs-search-row">
             <div class="logs-searchbox">
@@ -123,6 +117,19 @@
     </div>
     <pre class="runtime-log-view" id="runtimeLogView" aria-live="polite"></pre>
 </section>
+
+<script>
+function displayLogTab(tab) {
+    const runtime = tab === 'runtime';
+    document.getElementById('tabOrganize').classList.toggle('active', !runtime);
+    document.getElementById('tabRuntime').classList.toggle('active', runtime);
+    document.getElementById('organizePanel').style.display = runtime ? 'none' : '';
+    document.getElementById('runtimePanel').style.display = runtime ? '' : 'none';
+    return runtime ? 'runtime' : 'organize';
+}
+let activeTab = displayLogTab(location.hash.slice(1));
+if (location.hash && location.hash !== '#' + activeTab) history.replaceState(history.state, '', '#' + activeTab);
+</script>
 
 <div class="app-modal confirmation-review-modal" id="confirmationReviewModal" hidden>
     <div class="card confirmation-review-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmationReviewTitle" aria-describedby="confirmationReviewHelp">

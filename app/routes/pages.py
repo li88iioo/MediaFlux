@@ -406,7 +406,9 @@ def tools(request: Request):
 
 @router.get("/logs", name="pages.logs")
 def logs(request: Request):
-    return _page(request, "logs.html", "logs", organize_keyword=request.query_params.get("q", "").strip())
+    filters = request.query_params
+    return _page(request, "logs.html", "logs", organize_keyword=filters.get("q", "").strip(),
+                 organize_origin=filters.get("origin", "all"), organize_status=filters.get("status", ""))
 
 
 @router.get("/settings", name="pages.settings")

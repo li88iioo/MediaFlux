@@ -323,6 +323,64 @@ class MediaSnapshotBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate("window.__snapshotRequests.length"), 0)
         self.assertEqual(page.locator(".dashboard-status-value").inner_text(), "正常")
 
+    def test_dashboard_config_load_error_follows_active_tab_and_clears_on_reopen(self):
+        from playwright.sync_api import expect
+
+        html = self.dashboard_html(self.board())
+        message = "暂时无法读取媒体配置，请稍后重试"
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                page = self.open_page(html, width=width)
+                requests = []
+                page.route("**/api/config", lambda route: requests.append(route))
+                trigger = page.get_by_role("button", name="配置媒体服务器", exact=True)
+                modal = page.locator("#mediaConfigModal")
+                jellyfin_tab = modal.get_by_role("tab", name="Jellyfin", exact=True)
+                compatible_tab = modal.get_by_role("tab", name="兼容节点")
+                jellyfin_state = modal.locator('[data-tab-panel="jellyfin"] [data-save-state]')
+                compatible_panel = modal.locator('[data-tab-panel="emby"]')
+                compatible_state = compatible_panel.locator("[data-save-state]")
+                compatible_save = compatible_panel.get_by_role("button", name="保存兼容节点")
+
+                with page.expect_request("**/api/config"):
+                    trigger.click()
+                expect(modal).to_have_attribute("aria-busy", "true")
+                compatible_tab.click()
+                footer = compatible_panel.locator(".media-config-footer")
+                footer_rect = footer.bounding_box()
+                expect(compatible_save).to_be_disabled()
+                self.assertEqual(len(requests), 1)
+                requests[0].fulfill(status=503, json={"error": message})
+                expect(modal).to_have_attribute("aria-busy", "false")
+                expect(compatible_state).to_be_visible()
+                self.assertEqual(compatible_state.inner_text(), message)
+                expect(jellyfin_state).to_be_hidden()
+                expect(compatible_save).to_be_disabled()
+                self.assertEqual(footer.bounding_box(), footer_rect)
+
+                jellyfin_tab.click()
+                expect(jellyfin_state).to_be_visible()
+                expect(jellyfin_state).to_have_text(message)
+                expect(compatible_state).to_be_hidden()
+                modal.get_by_role("button", name="关闭", exact=True).click()
+                with page.expect_request("**/api/config"):
+                    trigger.click()
+                expect(modal).to_have_attribute("aria-busy", "true")
+                expect(modal.locator("[data-save-state].is-error")).to_have_count(0)
+
+                self.assertEqual(len(requests), 2)
+                requests[1].fulfill(json={
+                    "JELLYFIN_URL": "http://jellyfin.test:8096", "EMBY_URL": "http://emby.test:8096",
+                })
+                expect(modal).to_have_attribute("aria-busy", "false")
+                expect(modal.locator('[data-key="JELLYFIN_URL"]')).to_have_value("http://jellyfin.test:8096")
+                compatible_tab.click()
+                expect(compatible_panel.locator('[data-key="EMBY_URL"]')).to_have_value("http://emby.test:8096")
+                expect(compatible_save).to_be_enabled()
+                expect(jellyfin_state).to_be_empty()
+                expect(compatible_state).to_be_empty()
+                page.close()
+
     def test_recent_has_no_standalone_sync_notice_or_timestamp(self):
         for width in (1440, 390):
             with self.subTest(width=width):

@@ -807,8 +807,6 @@ class ScrapePreviewTemplateTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, html + script)
         self.assertFalse(Path("app/static/css/scrape-preview.css").exists())
-        self.assertIn("initialTab === 'runtime'", script)
-        self.assertIn("已退场的 #scrape", script)
 
     def test_operation_history_uses_compact_conditional_sections(self):
         html = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))

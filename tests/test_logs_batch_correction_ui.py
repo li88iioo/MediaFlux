@@ -265,6 +265,17 @@ class LogsBrowserCase(unittest.TestCase):
 
 
 class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
+    def test_deep_link_selects_its_panel_before_the_main_script(self):
+        self.page.route("**/static/js/logs.js", lambda route: route.abort())
+        for fragment, panel, button in (('runtime', 'runtimePanel', 'tabRuntime'),
+                                        ('scrape', 'organizePanel', 'tabOrganize')):
+            with self.subTest(fragment=fragment):
+                self.page.goto(f"http://mediaflux.test/logs?initial={fragment}#{fragment}")
+                self.assertTrue(self.page.locator(f'#{panel}').is_visible())
+                self.assertEqual(self.page.locator('.tab-bar .active').get_attribute('id'), button)
+                self.assertEqual(self.page.locator('.logs-panel:visible').count(), 1)
+                self.assertTrue(self.page.url.endswith('#runtime' if fragment == 'runtime' else '#organize'))
+
     def enable_batch_delete_fixture(self, task_status='completed', task_result=None, *, rows=None):
         if rows is None:
             rows = [{**row, "status": "skipped", "error": "未识别，跳过整理"} for row in ROWS]

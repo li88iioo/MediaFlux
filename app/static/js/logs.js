@@ -1,4 +1,3 @@
-let activeTab = 'organize';
 let loadingOrg = false;
 let organizeRequestSerial = 0;
 let overviewRequestSerial = 0;
@@ -44,14 +43,9 @@ function animateLogSummary(values) {
 }
 
 function switchTab(tab) {
-    const normalizedTab = tab === 'runtime' ? 'runtime' : 'organize';
-    activeTab = normalizedTab;
-    document.getElementById('tabOrganize').classList.toggle('active', normalizedTab === 'organize');
-    document.getElementById('tabRuntime').classList.toggle('active', normalizedTab === 'runtime');
-    document.getElementById('organizePanel').style.display = normalizedTab === 'organize' ? '' : 'none';
-    document.getElementById('runtimePanel').style.display = normalizedTab === 'runtime' ? '' : 'none';
-    if (normalizedTab === 'runtime') startRuntimeLogs(); else stopRuntimeLogs();
-    window.history.replaceState(null, '', `#${normalizedTab}`);
+    activeTab = displayLogTab(tab);
+    if (activeTab === 'runtime') startRuntimeLogs(); else stopRuntimeLogs();
+    window.history.replaceState(history.state, '', `#${activeTab}`);
     refreshActive();
 }
 
@@ -1237,33 +1231,9 @@ async function clearRuntimeLogs(){
 document.getElementById('runtimeClearBtn').addEventListener('click',clearRuntimeLogs);
 window.addEventListener('beforeunload',stopRuntimeLogs);
 
-function restoreOrganizeFiltersFromUrl() {
-    const params = new URLSearchParams(window.location.search);
-    for (const [key, id] of [['origin', 'orgOrigin'], ['status', 'orgStatus']]) {
-        const field = document.getElementById(id);
-        const value = params.get(key);
-        if (field && [...field.options].some(option => option.value === value)) {
-            field.value = value;
-        }
-    }
-}
-
-// 初次加载：已退场的 #scrape 及未知书签统一回落到整理日志。
-restoreOrganizeFiltersFromUrl();
-const initialTab = window.location.hash.slice(1);
-if (initialTab === 'runtime') {
-    switchTab('runtime');
-} else {
-    if (initialTab) {
-        window.history.replaceState(
-            window.history.state,
-            '',
-            `${window.location.pathname}${window.location.search}#organize`,
-        );
-    }
-    loadOverview();
-    loadOrganize();
-}
+window.addEventListener('hashchange', () => switchTab(location.hash.slice(1)));
+if (activeTab === 'runtime') startRuntimeLogs();
+else { loadOverview(); loadOrganize(); }
 
 // 媒体组待确认队列独立于日志页的 50 条纠正/回收操作。
 (() => {
