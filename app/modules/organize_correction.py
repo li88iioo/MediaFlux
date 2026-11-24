@@ -375,8 +375,6 @@ class OrganizeCorrectionService:
                         (member, target_dir, planned["to_name"])
                         for member, planned in zip(members, preview["items"])
                     ])
-                if preview["match"]["media_type"] == "tv" and preview.get("episode") is None:
-                    raise ValueError("无法确定该文件集号，请先在单条详情中修正季集后再批量处理")
                 for member in preview["items"]:
                     file_id = str(member["file_id"])
                     target = (str(preview["target_root_id"]), preview["target_path"].casefold(), member["to_name"].casefold())
@@ -684,12 +682,11 @@ class OrganizeCorrectionService:
             parsed["season"] = normalize_media_number(season)
         if episode is not None:
             parsed["episode"] = normalize_media_number(episode)
-        if (
-            match.media_type == "tv"
-            and parsed.get("episode") is not None
-            and parsed.get("season") is None
-        ):
-            parsed["season"] = 1
+        if match.media_type == "tv":
+            if parsed.get("episode") is None:
+                raise ValueError("无法确定该文件集号，请在单条详情中补填集号后重新预览")
+            if parsed.get("season") is None:
+                parsed["season"] = 1
         if Organizer._match_provider(match) == "tmdb" and isinstance(self.scraper, TMDBScraper) and match.media_type == "tv":
             tmdb_detail = self.scraper.get_detail(match.tmdb_id, match.media_type)
             validation = self.scraper.validate_position(

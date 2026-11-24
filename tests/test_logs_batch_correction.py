@@ -980,6 +980,62 @@ def test_batch_api_requires_auth_accepts_preview_and_rejects_legacy_implicit_req
     assert harness.cloud.write_calls == []
 
 
+def test_single_web_correction_requires_episode_before_retry(
+    logs_api_client, harness: _Harness, archive_rules, monkeypatch,
+):
+    from app.clients.tmdb import TMDBClient
+    from app.modules import organize_correction, organize_tasks
+
+    archive_rules.clean_empty = archive_rules.link_strm = archive_rules.notify_enabled = False
+    monkeypatch.setattr(TMDBClient, "detail", lambda self, tmdb_id, media_type: {
+        "id": int(tmdb_id), "name": "Selected Series", "first_air_date": "2024-01-01",
+        "seasons": [{"season_number": 2, "episode_count": 8}],
+    })
+    scraper = TMDBScraper()
+    monkeypatch.setattr(harness, "scraper", scraper)
+    monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", harness.service)
+    manager = organize_tasks.OrganizeTaskManager()
+    monkeypatch.setattr(organize_tasks, "get_organize_manager", lambda: manager)
+
+    filename = "Series.S02.mkv"
+    log_id = _add_log(harness.cloud, filename, status="failed")
+    original = harness.cloud.files["file-1"]["path"]
+    content = original.read_bytes()
+    sibling = harness.cloud.add_file("sibling", "Series.S02E04.mkv")
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    url = f"/api/logs/organize/{log_id}/reorganize"
+    before = dict(assert_present(db.get_organize_log(log_id)))
+    blocked = client.post(f"{url}/preview", json=CANDIDATE)
+    assert blocked.status_code == 400, blocked.text
+    assert "集号" in blocked.json()["error"]
+    stale = client.post(url, json={
+        **CANDIDATE, "operation_token": "old-preview", "expected_version": before["version"],
+        "preview_digest": "obsolete",
+    })
+    assert stale.status_code == 400 and "集号" in stale.json()["error"]
+    assert dict(assert_present(db.get_organize_log(log_id))) == before
+    assert not harness.cloud.write_calls
+
+    candidate = {**CANDIDATE, "episode": 3}
+    preview = client.post(f"{url}/preview", json=candidate).json()
+    assert (preview["season"], preview["episode"]) == (2, 3)
+    accepted = client.post(url, json={
+        **candidate, "operation_token": "correct-episode", "expected_version": preview["version"],
+        "preview_digest": preview["preview_digest"],
+    })
+    assert accepted.status_code == 200, accepted.text
+    assert manager.shutdown(timeout=5)
+    receipt = assert_present(manager.task_result(accepted.json()["task_id"]))
+    assert receipt["result"]["success"], receipt
+    row = assert_present(db.get_organize_log(log_id))
+    assert (row["status"], row["season"], row["episode"]) == ("success", 2, 3)
+    target = harness.cloud.directories["archive"] / preview["target_path"] / preview["file_name"]
+    assert "S02E03" in target.name and target.name == row["current_name"]
+    assert target.read_bytes() == content and not original.exists()
+    assert sibling.is_file()
+
+
 def test_single_web_confirmation_binds_the_preview_through_execution(
     logs_api_client, harness: _Harness, archive_rules, monkeypatch: pytest.MonkeyPatch,
 ):
