@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from functools import partial
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TypedDict
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
 import anyio
@@ -56,7 +56,7 @@ from app.logger import get_logger, log_throttled
 from app.modules.media_proxy_forwarding import media_proxy_forwarding_config
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
 from app.modules.media_proxy_safety import safe_media_name as _safe_media_name
-from app.modules.media_server_profiles import media_server_upstream_identity, resolve_proxy_instance
+from app.modules.media_server_profiles import media_server_upstream_identity, resolve_proxy_instance, system_info_response
 
 logger = get_logger(__name__)
 _MEDIA_MIME_OVERRIDES = {
@@ -2603,27 +2603,29 @@ def _pin_signed_media_target(value: str) -> _PinnedUpstreamTarget:
     )
 
 
+class _MediaProxyProbeResult(TypedDict):
+    status_code: int
+    latency_ms: int
+    connection_status: str
+
+
 async def probe_media_proxy_instance(
-    instance_id: int,
+    resolved: dict[str, Any],
     *,
     timeout_seconds: float = 8.0,
-) -> dict[str, int]:
-    """安全探测一个已保存实例；固定 DNS 快照且不返回地址或凭据。"""
-    row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
-    if row is None:
-        raise LookupError("media proxy instance not found")
-    resolved = resolve_proxy_instance(row)
+) -> _MediaProxyProbeResult:
+    """探测已保存实例的系统信息，保留原始 HTTP 状态且不返回响应内容。"""
     credential = str(resolved.get("api_key") or "").strip()
     probe_path = "/System/Info" if credential else "/System/Info/Public"
     pinned = await asyncio.to_thread(
         _pin_upstream_target,
-        str(resolved.get("upstream_url") or ""),
+        resolved.get("upstream_url", ""),
         probe_path,
     )
     headers = _apply_upstream_credential(
         {"Accept": "application/json"},
         credential,
-        str(resolved.get("server_type") or ""),
+        resolved.get("server_type", ""),
     )
     headers["Host"] = pinned.host_header
 
@@ -2642,15 +2644,20 @@ async def probe_media_proxy_instance(
         )
         response = await _send_pinned_request(client, request, pinned, stream=True)
         try:
-            await _read_bounded_upstream_body(
+            body = await _read_bounded_upstream_body(
                 response, _playback_info_response_limit()
             )
             status_code = response.status_code
         finally:
             await response.aclose()
+    status, _ = system_info_response(status_code, lambda: json.loads(body), require_server_identity=True)
+    connection_status = "upstream_error" if status_code >= 500 else {
+        "success": "reachable", "authentication": "authentication_failed", "not_found": "http_error",
+    }.get(status, status)
     return {
         "status_code": status_code,
         "latency_ms": max(0, round((time.monotonic() - started) * 1000)),
+        "connection_status": connection_status,
     }
 
 
@@ -6491,18 +6498,18 @@ def test_playback_proxy(instance_id: int) -> dict:
     from app.concurrency import run_awaitable_sync
 
     _proxy_instance_id(instance_id)
-    result: dict[str, int | bool | str] = {"instance_id": instance_id, "network_accessed": True, "status_code": 0, "latency_ms": 0}
+    result: dict[str, int | bool | str] = {"instance_id": instance_id, "network_accessed": False, "status_code": 0, "latency_ms": 0}
     error = ""
     try:
-        probe = run_awaitable_sync(probe_media_proxy_instance(instance_id, timeout_seconds=8.0))
-        result.update(probe)
-        code = probe["status_code"]
-        state = ("reachable" if 200 <= code < 300 else "authentication_failed" if code in {401, 403} else
-                 "redirect_not_allowed" if 300 <= code < 400 else "upstream_error" if code >= 500 else "http_error")
+        resolved = resolve_proxy_instance(media_proxy_repo.get_media_proxy_instance(instance_id))
+        result["network_accessed"] = True
+        probe = run_awaitable_sync(probe_media_proxy_instance(resolved, timeout_seconds=8.0))
+        result.update(status_code=probe["status_code"], latency_ms=probe["latency_ms"])
+        state = probe["connection_status"]
     except (httpx.TimeoutException, TimeoutError):
         state = "timeout"
     except LookupError:
-        state, result["network_accessed"] = "not_configured", False
+        state = "not_configured"
     except Exception as exc:
         state, error = "connection_failed", type(exc).__name__
     result.update(connection_status=state, error_type=error)

@@ -276,6 +276,33 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
 
 
 class MediaProxyProbeApiTests(unittest.TestCase):
+    def test_probe_endpoint_rejects_html_with_success_status(self):
+        from app.modules import media_proxy
+        from app.routes import media_proxy_api
+
+        real_client = httpx.AsyncClient
+
+        def upstream(request):
+            self.assertEqual(request.url.path, "/System/Info/Public")
+            return httpx.Response(200, text="<html>fixture login page</html>")
+
+        row = {"id": 7, "config_source": "custom", "server_type": "jellyfin",
+               "upstream_url": "http://127.0.0.1:8096", "enabled": 1}
+        with (
+            patch.object(media_proxy_api, "require_api_login", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row) as get_instance,
+            patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kwargs: real_client(
+                transport=httpx.MockTransport(upstream), **kwargs,
+            )),
+        ):
+            response = asyncio.run(media_proxy_api.test_instance(7, cast(Request, SimpleNamespace())))
+
+        get_instance.assert_called_once_with(7)
+        payload = json.loads(bytes(response.body))
+        self.assertEqual((response.status_code, payload["success"], payload["status_code"]), (502, False, 200))
+        self.assertEqual(payload["error"], "上游未返回有效的媒体服务器系统信息")
+        self.assertGreaterEqual(payload["elapsed_ms"], 0)
+
     def test_probe_endpoint_does_not_treat_login_redirect_as_success(self):
         from app.routes import media_proxy_api
 
@@ -284,7 +311,9 @@ class MediaProxyProbeApiTests(unittest.TestCase):
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={"id": 7}),
             patch.object(
                 media_proxy_api, "probe_media_proxy_instance",
-                new=AsyncMock(return_value={"status_code": 302, "latency_ms": 37}),
+                new=AsyncMock(return_value={
+                    "status_code": 302, "latency_ms": 37, "connection_status": "redirect_not_allowed",
+                }),
             ),
         ):
             response = asyncio.run(media_proxy_api.test_instance(7, cast(Request, SimpleNamespace())))
@@ -301,12 +330,16 @@ class MediaProxyProbeApiTests(unittest.TestCase):
 
         from app.routes import media_proxy_api
 
+        row = {"id": 7, "config_source": "custom", "server_type": "jellyfin",
+               "upstream_url": "http://127.0.0.1:8096"}
         with (
             patch.object(media_proxy_api, "require_api_login", return_value=None),
-            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={"id": 7}),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row),
             patch.object(
                 media_proxy_api, "probe_media_proxy_instance",
-                new=AsyncMock(return_value={"status_code": 204, "latency_ms": 37}),
+                new=AsyncMock(return_value={
+                    "status_code": 200, "latency_ms": 37, "connection_status": "reachable",
+                }),
             ) as probe,
         ):
             response = asyncio.run(media_proxy_api.test_instance(7, cast(Request, SimpleNamespace())))
@@ -314,9 +347,9 @@ class MediaProxyProbeApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             json.loads(bytes(response.body)),
-            {"success": True, "status_code": 204, "elapsed_ms": 37},
+            {"success": True, "status_code": 200, "elapsed_ms": 37},
         )
-        probe.assert_awaited_once_with(7, timeout_seconds=10.0)
+        probe.assert_awaited_once_with(row, timeout_seconds=10.0)
 
     def test_probe_endpoint_maps_oversize_upstream_to_stable_error(self):
         import json

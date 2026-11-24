@@ -158,14 +158,22 @@ def test_failures_read_all_stored_facts_in_pages_without_top_eight_loss(backend)
             sdk.playback.failures()
 
 
-@pytest.mark.parametrize("code,expected", [(204, "reachable"), (401, "authentication_failed"),
-                                          (302, "redirect_not_allowed"), (503, "upstream_error")])
-def test_native_probe_uses_original_fixed_probe_http_boundary(backend, code, expected):
+@pytest.mark.parametrize(("code", "body", "expected"), [
+    (200, b'{"Id":"fixture-server","Version":"12.2.0"}', "reachable"),
+    (200, b"<html>fixture login page</html>", "invalid_response"),
+    (200, b"{}", "invalid_response"),
+    (200, b'{"Id":"fixture-server","Version":" "}', "invalid_response"),
+    (204, b"", "invalid_response"),
+    (401, b"diagnostic", "authentication_failed"),
+    (302, b"diagnostic", "redirect_not_allowed"),
+    (503, b"diagnostic", "upstream_error"),
+], ids=["system_info", "html", "empty_object", "missing_version", "no_content", "auth", "redirect", "upstream_error"])
+def test_native_probe_uses_original_fixed_probe_http_boundary(backend, code, body, expected):
     identifier = add()
     requests = []
     def handler(request):
         requests.append(request)
-        return httpx.Response(code, headers={"Location": "http://no-follow.invalid"}, content=b"diagnostic")
+        return httpx.Response(code, headers={"Location": "http://no-follow.invalid"}, content=body)
     factory = httpx.AsyncClient
     with (patch.object(service, "_pin_upstream_target", return_value=SimpleNamespace(
             connect_url="http://127.0.0.1/System/Info", host_header="upstream.invalid:8096", sni_hostname="upstream.invalid", addresses=("127.0.0.1",))),
@@ -173,7 +181,9 @@ def test_native_probe_uses_original_fixed_probe_http_boundary(backend, code, exp
         result = sdk.playback.test(identifier)
     assert result["data"]["instance_id"] == identifier
     assert result["data"]["connection_status"] == expected and result["data"]["status_code"] == code
-    assert result["ok"] == (code == 204)
+    assert result["data"]["network_accessed"] is True
+    assert result["ok"] == (expected == "reachable")
+    assert result["status"] == ("ready" if result["ok"] else expected)
     assert len(requests) == 1 and requests[0].url.path == "/System/Info"
     assert requests[0].headers["Authorization"] == 'MediaBrowser Token="NATIVE_PROXY_PRIVATE_KEY"'
     assert "PRIVATE_KEY" not in json.dumps(result)
@@ -182,11 +192,25 @@ def test_native_probe_uses_original_fixed_probe_http_boundary(backend, code, exp
 
 def test_probe_timeout_and_missing_target_preserve_unknown_not_healthy(backend):
     identifier = add()
-    with patch.object(service, "probe_media_proxy_instance", new=AsyncMock(side_effect=httpx.ReadTimeout("PRIVATE target"))):
+    repository.update_media_proxy_instance(identifier, {"upstream_url": "http://127.0.0.1:8096"})
+    with patch.object(service, "_send_pinned_request", side_effect=httpx.ReadTimeout("PRIVATE target")) as send:
         result = sdk.playback.test(identifier)
+    send.assert_awaited_once()
     assert result["status"] == "timeout" and not result["ok"] and "PRIVATE" not in json.dumps(result)
+    assert result["data"]["network_accessed"] is True
     result = sdk.playback.test(identifier + 999)
     assert result["status"] == "not_configured" and not result["data"]["network_accessed"]
+
+
+def test_disabled_config_source_stops_probe_before_network_access(backend, monkeypatch):
+    identifier = add(config_source="configured:jellyfin")
+    monkeypatch.setenv("JELLYFIN_ENABLED", "0")
+    with patch.object(service, "_pin_upstream_target") as pin:
+        result = sdk.playback.test(identifier)
+
+    pin.assert_not_called()
+    assert result["status"] == "connection_failed" and not result["ok"]
+    assert result["data"]["network_accessed"] is False
 
 
 @pytest.mark.parametrize("operation", ["set_enabled", "restart"])

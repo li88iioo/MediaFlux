@@ -678,7 +678,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_saved_instance_probe_pins_host_sni_and_bounds_response(self):
         upstream = _FakeUpstreamResponse(
-            body=b"{}", content_type="application/json"
+            body=b'{"Id":"jellyfin-fixture","Version":"12.2.0"}', content_type="application/json"
         )
         _FakeAsyncClient.responses = [upstream]
         row = {
@@ -687,13 +687,13 @@ class HybridMediaProxyTests(unittest.TestCase):
             "api_key": "server-token", "enabled": 1,
         }
         with (
-            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row),
             patch("app.modules.media_proxy._resolve_upstream_addresses", return_value=("203.0.113.7",)),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
         ):
-            result = asyncio.run(media_proxy.probe_media_proxy_instance(7))
+            result = asyncio.run(media_proxy.probe_media_proxy_instance(row))
 
         self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["connection_status"], "reachable")
         self.assertEqual(_FakeAsyncClient.send_streams, [True])
         request = _FakeAsyncClient.requests[0]
         self.assertEqual(str(request.url), "https://203.0.113.7:8920/System/Info")
@@ -709,7 +709,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_saved_emby_instance_probe_keeps_legacy_token_header(self):
         upstream = _FakeUpstreamResponse(
-            body=b"{}", content_type="application/json"
+            body=b'{"Id":"emby-fixture","Version":"4.9.0.0"}', content_type="application/json"
         )
         _FakeAsyncClient.responses = [upstream]
         row = {
@@ -720,19 +720,11 @@ class HybridMediaProxyTests(unittest.TestCase):
             "api_key": "emby-token",
             "enabled": 1,
         }
-        with (
-            patch(
-                "app.repositories.media_proxy.get_media_proxy_instance",
-                return_value=row,
-            ),
-            patch(
-                "app.modules.media_proxy.httpx.AsyncClient",
-                _FakeAsyncClient,
-            ),
-        ):
-            result = asyncio.run(media_proxy.probe_media_proxy_instance(7))
+        with patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient):
+            result = asyncio.run(media_proxy.probe_media_proxy_instance(row))
 
         self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["connection_status"], "reachable")
         request = _FakeAsyncClient.requests[0]
         self.assertEqual(
             str(request.url),
@@ -753,15 +745,16 @@ class HybridMediaProxyTests(unittest.TestCase):
             attempts.append(request)
             if request.url.host == "::1":
                 raise httpx.ConnectError("isolated IPv6 refusal")
-            return httpx.Response(200, json={"ServerName": "fixture"})
+            return httpx.Response(200, json={"Id": "fixture", "Version": "12.2.0"})
 
         row = {**self._instance(), "upstream_url": "http://localhost:8096"}
-        with patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row), \
-                patch.object(socket, "getaddrinfo", return_value=addresses) as dns, \
+        with patch.object(socket, "getaddrinfo", return_value=addresses) as dns, \
                 patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kw: original_client(transport=httpx.MockTransport(upstream), **kw)):
-            result = asyncio.run(media_proxy.probe_media_proxy_instance(7))
+            result = asyncio.run(media_proxy.probe_media_proxy_instance(row))
         self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["connection_status"], "reachable")
         self.assertEqual([r.url.host for r in attempts], ["::1", "127.0.0.1"])
+        self.assertTrue(all(r.url.path == "/System/Info/Public" for r in attempts))
         self.assertTrue(all(r.headers["host"] == "localhost:8096" and r.extensions["sni_hostname"] == "localhost" for r in attempts))
         dns.assert_called_once()
 
@@ -803,12 +796,11 @@ class HybridMediaProxyTests(unittest.TestCase):
             "enabled": 1,
         }
         with (
-            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._playback_info_response_limit", return_value=4),
         ):
             with self.assertRaises(media_proxy.ProxyUpstreamBodyTooLarge):
-                asyncio.run(media_proxy.probe_media_proxy_instance(7))
+                asyncio.run(media_proxy.probe_media_proxy_instance(row))
         self.assertTrue(upstream.closed)
 
     def _client(self, *, base_url: str = "http://testserver"):

@@ -33,6 +33,10 @@ from app.database import row_value
 
 router = APIRouter(prefix="/api/media-proxy")
 _MASK = "********"
+_PROBE_ERROR_PAYLOADS = {
+    "redirect_not_allowed": {"error": "上游返回重定向，尚未验证媒体服务连接"},
+    "invalid_response": {"error": "上游未返回有效的媒体服务器系统信息"},
+}
 
 
 def _manager(request: Request):
@@ -393,10 +397,9 @@ async def reload_instance(instance_id: int, request: Request):
 @router.post("/{instance_id}/test")
 async def test_instance(instance_id: int, request: Request):
     require_api_login(request)
-    if not await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id):
-        return api_error("媒体反代实例不存在", 404)
     try:
-        result = await probe_media_proxy_instance(instance_id, timeout_seconds=10.0)
+        row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
+        result = await probe_media_proxy_instance(resolve_proxy_instance(row), timeout_seconds=10.0)
     except LookupError:
         return api_error("媒体反代实例不存在", 404)
     except ProxyUpstreamBodyTooLarge:
@@ -405,16 +408,14 @@ async def test_instance(instance_id: int, request: Request):
         return api_error(str(exc), 400)
     except Exception as exc:
         return api_error(f"连接失败：{exc}", 502)
-    status_code = result["status_code"]
-    success = 200 <= status_code < 300
-    payload: dict[str, Any] = {
+    connection_status = result["connection_status"]
+    success = connection_status == "reachable"
+    return api_response({
         "success": success,
-        "status_code": status_code,
+        "status_code": result["status_code"],
         "elapsed_ms": result["latency_ms"],
-    }
-    if 300 <= status_code < 400:
-        payload["error"] = "上游返回重定向，尚未验证媒体服务连接"
-    return api_response(payload, 200 if success else 502)
+        **_PROBE_ERROR_PAYLOADS.get(connection_status, {}),
+    }, 200 if success else 502)
 
 
 @router.get("/{instance_id}/bindings")

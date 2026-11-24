@@ -138,6 +138,27 @@ public sealed class StrmFastStartTests
     }
 
     [Fact]
+    public async Task UnreadableLedgerUsesNativeProbeOnFirstPlayback()
+    {
+        using var h = new Harness();
+        var item = h.Strm();
+        var file = Path.Combine(h.F.Root, "config", "MediaFlux.Jellyfin.strm-probe.tsv");
+        var line = $"2\t{item.Id:N}\t{StrmProbeLedger.Fingerprint(item.Path)}";
+        File.WriteAllLines(file, [line]);
+        h.Streams = PlayableStreams;
+
+        using (File.Open(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            await h.Play(item);
+            Assert.Equal([true], h.Probes);
+            await h.Play(item);
+            Assert.Equal([true, false], h.Probes);
+        }
+
+        Assert.Equal([line], File.ReadAllLines(file));
+    }
+
+    [Fact]
     public async Task LegacyUnverifiedRecordsRequireASuccessfulProbeAndThenSurviveReload()
     {
         using var h = new Harness();

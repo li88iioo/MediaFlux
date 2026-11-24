@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -247,6 +247,25 @@ def _connection_node(slot, profile=None):
             "reason_code": reason, "error": error, "network_accessed": False}
 
 
+def system_info_response(
+    code: int, decode: Callable[[], object], *, require_server_identity: bool = False,
+) -> tuple[str, dict[str, Any] | None]:
+    """区分 HTTP 失败和系统信息解析失败，反代连通性还要求服务 ID 和版本。"""
+    if 300 <= code < 400:
+        return "redirect_not_allowed", None
+    if not 200 <= code < 300:
+        return {401: "authentication", 403: "authentication", 404: "not_found"}.get(code, "http_error"), None
+    try:
+        info = decode()
+    except (ValueError, TypeError, RecursionError):
+        return "invalid_response", None
+    if not isinstance(info, dict) or (require_server_identity and not all(
+        isinstance(value, str) and value.strip() for value in (info.get("Id"), info.get("Version"))
+    )):
+        return "invalid_response", None
+    return "success", info
+
+
 def _probe_connection(profile: MediaServerProfile) -> dict[str, Any]:
     node = _connection_node(profile.server_type, profile)
     if not node["configured"]:
@@ -259,15 +278,11 @@ def _probe_connection(profile: MediaServerProfile) -> dict[str, Any]:
     try:
         response = requests.get(profile.url.strip().rstrip("/") + "/System/Info", headers=headers,
                                 params=None, timeout=(3.5, 8), allow_redirects=False)
-        if 300 <= response.status_code < 400:
-            status = "redirect_not_allowed"
-        else:
-            response.raise_for_status()
-            info = response.json()
-            if not isinstance(info, dict):
-                raise ValueError("invalid response")
-            products = [_identity(info.get(key), profile, limit=40) for key in ("ProductName", "Product")]
-            hints = " ".join(p for p in products if p).casefold()
+        status, info = system_info_response(response.status_code, response.json)
+        if info is not None:
+            products = [name for key in ("ProductName", "Product")
+                        if (name := _identity(info.get(key), profile, limit=40))]
+            hints = " ".join(products).casefold()
             product = "jellyfin" if "jellyfin" in hints else "emby" if "emby" in hints else "unknown"
             version = _identity(info.get("Version") or info.get("ServerVersion"), profile, limit=64)
             matched = _VERSION_RE.fullmatch(version or "")
@@ -275,7 +290,7 @@ def _probe_connection(profile: MediaServerProfile) -> dict[str, Any]:
             compatibility, reason = _compatibility(profile.server_type, product, major)
             node.update(online=True, connection_status="success", error="",
                         server_name=_identity(info.get("ServerName") or info.get("Name"), profile, limit=120),
-                        product=product, product_name=next((p for p in products if p), None), product_detected=product != "unknown",
+                        product=product, product_name=next(iter(products), None), product_detected=product != "unknown",
                         version=version if matched else None, major_version=major, compatibility=compatibility, reason_code=reason,
                         latency_ms=max(1, min(round((time.perf_counter() - started) * 1000), 11_500)))
             return node
@@ -283,9 +298,6 @@ def _probe_connection(profile: MediaServerProfile) -> dict[str, Any]:
         status = "timeout"
     except requests.ConnectionError:
         status = "connection"
-    except requests.HTTPError as exc:
-        code = getattr(exc.response, "status_code", None)
-        status = "authentication" if code in {401, 403} else "not_found" if code == 404 else "http_error"
     except (ValueError, TypeError):
         status = "invalid_response"
     except Exception:  # noqa: BLE001 - 上游异常只转固定错误，禁止回显凭据或响应正文。
@@ -361,8 +373,10 @@ def connection(server: str = "all") -> dict:
             "error": "" if ok else summary}
 
 
-def resolve_proxy_instance(row: Mapping[str, Any] | Row, *, require_available: bool = True) -> dict[str, Any]:
+def resolve_proxy_instance(row: Mapping[str, Any] | Row | None, *, require_available: bool = True) -> dict[str, Any]:
     """解析当前上游；配置凭据仅供管理探测，不替代下游用户令牌。"""
+    if row is None:
+        raise LookupError("media proxy instance not found")
     resolved = dict(row)
     source = str(row_value(row, "config_source", "custom") or "custom").strip()
     resolved["config_source"] = source
