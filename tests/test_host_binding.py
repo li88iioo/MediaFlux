@@ -69,7 +69,7 @@ class MainHostBindingTests(unittest.TestCase):
         importlib.reload(database)
         importlib.reload(web_secret)
         importlib.reload(first_run)
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         import app.main as main
         self.main = importlib.reload(main)
 

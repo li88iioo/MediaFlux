@@ -328,12 +328,6 @@ def _initialize_runtime_storage() -> None:
         initialize_runtime_fence()
 
 
-def _resolve_bind_host(host: str | None) -> str:
-    external_host = os.getenv("WEB_HOST", "")
-    requested_host = host if host is not None else (external_host or None)
-    return first_run.resolve_bind_host(requested_host)
-
-
 def start_background_services() -> None:
     """启动进程内后台服务；重复调用安全。"""
     from app.modules.agent_download_verification_scheduler import (
@@ -598,7 +592,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                 )
         if recovered:
             config.reload_after_restore()
-            first_run.refresh_startup_state_after_restore()
+            first_run.refresh_startup_state()
         fresh_install = not os.path.lexists(database.resolve_db_path()) and first_run.needs_initialization()
         if fresh_install:
             # 表单渲染只读配置，不能由普通config.get晋升未完成的恢复备份。
@@ -996,9 +990,11 @@ def create_app(*, start_background: bool = False) -> FastAPI:
 
 
 def run(*, host: str | None = None, port: int | None = None) -> None:
-    """兼容 ASGI 直接启动，并始终保持单 worker。"""
-    effective_host = _resolve_bind_host(host)
-    effective_port = config.flask_port() if port is None else port
+    serve_on(first_run.resolve_bind_host(host), config.flask_port() if port is None else port)
+
+
+def serve_on(effective_host: str, effective_port: int) -> None:
+    """在已确定的监听地址运行唯一 ASGI 服务，并释放启动预留。"""
     logger.info(f"MediaFlux FastAPI 启动于 {effective_host}:{effective_port}")
     try:
         uvicorn.run(

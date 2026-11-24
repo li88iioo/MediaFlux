@@ -262,12 +262,12 @@ def initialized_web_runtime(paths=None):
             os.environ.pop("MEDIAFLUX_TEST_DB_PATH", None)
             settings = dict(credentials, ENV_WEB_PASSWORD="fixture-install-password", AGENT_LLM_ENABLED="1")
             initialize_paths(paths, settings)
-            first_run._reset_startup_state_for_tests()
+            first_run.refresh_startup_state()
             # Preserve legacy login credentials using the real controlled
             # config publisher after the installation has completed.
             config.set_and_save(credentials)
         db.configure_database(paths.database_path, test_mode=False)
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         try:
             yield paths
         finally:

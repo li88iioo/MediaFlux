@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal, Sequence
 
 from app.defaults import DEFAULT_WEB_PORT
-from app.runtime_paths import RuntimePaths
+from app.runtime_paths import RuntimePaths, ffprobe_command
 
 DiagnosticStatus = Literal["ok", "warning", "error"]
 DEFAULT_SERVICE_HOST = "0.0.0.0"
@@ -467,29 +467,13 @@ def _port_check(host: str, port: int) -> DiagnosticCheck:
 
 
 def _ffprobe_check() -> DiagnosticCheck:
-    configured = (
-        os.environ.get("MEDIAFLUX_FFPROBE")
-        or ""
-    ).strip()
-    if configured:
-        candidate = Path(configured).expanduser()
-        if candidate.is_file() or shutil.which(configured):
-            return DiagnosticCheck(
-                "ffprobe", "ok", f"已找到显式配置的 ffprobe：{candidate}。"
-            )
-        return DiagnosticCheck(
-            "ffprobe",
-            "warning",
-            f"显式配置的 ffprobe 不可用：{candidate}。",
-            "修正 MEDIAFLUX_FFPROBE，或移除配置后使用系统 PATH。",
-        )
-    if shutil.which("ffprobe"):
-        return DiagnosticCheck("ffprobe", "ok", "在当前执行身份的 PATH 中已找到 ffprobe。")
+    command = ffprobe_command()
+    executable = shutil.which(command)
+    if executable:
+        return DiagnosticCheck("ffprobe", "ok", f"已找到可执行的 ffprobe：{executable}。")
     return DiagnosticCheck(
-        "ffprobe",
-        "warning",
-        "在当前执行身份的 PATH 中未找到 ffprobe，媒体信息探测功能可能不可用。",
-        "安装 FFmpeg，并确保以目标服务账户运行时 ffprobe 位于 PATH 中。",
+        "ffprobe", "warning", f"当前执行身份无法执行 ffprobe：{command}。",
+        "检查 MEDIAFLUX_FFPROBE、文件执行权限，或安装 FFmpeg 并加入 PATH。",
     )
 
 

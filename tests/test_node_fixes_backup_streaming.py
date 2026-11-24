@@ -100,11 +100,12 @@ class BackupStreamingTests(unittest.TestCase):
             paths = self.make_database(Path(raw))
             archive = create_backup(paths)
             original = archive.read_bytes()
-            with patch.object(zipfile.ZipFile, 'write', side_effect=OSError('disk full')):
-                with self.assertRaises(BackupError):
-                    create_backup(paths, output=archive)
-            self.assertEqual(archive.read_bytes(), original)
-            self.assertEqual(list(archive.parent.glob(f'.{archive.name}.*.tmp')), [])
+            for fault, expected in ((OSError('disk full'), BackupError), (KeyboardInterrupt(), KeyboardInterrupt)):
+                with self.subTest(fault=type(fault).__name__), patch.object(zipfile.ZipFile, 'write', side_effect=fault):
+                    with self.assertRaises(expected):
+                        create_backup(paths, output=archive)
+                self.assertEqual(archive.read_bytes(), original)
+                self.assertEqual(list(archive.parent.glob(f'.{archive.name}.*.tmp')), [])
             verify_backup(archive)
 
     def test_partial_restore_staging_failure_preserves_live_data_and_cleans_partial(self):
@@ -115,21 +116,22 @@ class BackupStreamingTests(unittest.TestCase):
                 conn.execute('DELETE FROM fixture')
             paths.env_file.write_text('WEB_PORT=9000\n')
             real_copy = backup_module._copy_stream
-            faults = []
 
             def fail_staging(source, target):
-                if '.restore.' in str(target.name):
+                if f'.{paths.database_path.name}.restore.' in str(target.name):
                     target.write(b'partial database')
-                    faults.append(True)
-                    raise OSError('disk full while staging restore')
+                    raise fault
                 return real_copy(source, target)
 
-            with patch.object(backup_module, '_copy_stream', side_effect=fail_staging):
-                with self.assertRaises(BackupError):
-                    restore_backup(paths, archive)
-            self.assertEqual(faults, [True])
-            with sqlite3.connect(paths.database_path) as conn:
-                self.assertEqual(conn.execute('SELECT COUNT(*) FROM fixture').fetchone()[0], 0)
-            self.assertEqual(paths.env_file.read_text(), 'WEB_PORT=9000\n')
-            self.assertEqual(list(Path(raw).rglob('*.restore.*')), [])
-            self.assertFalse((paths.data_dir / '.mediaflux-restore.journal.json').exists())
+            for fault, expected in ((OSError('staging aborted'), BackupError), (KeyboardInterrupt('staging aborted'), KeyboardInterrupt)):
+                with (
+                    self.subTest(fault=type(fault).__name__),
+                    patch.object(backup_module, '_copy_stream', side_effect=fail_staging),
+                ):
+                    with self.assertRaisesRegex(expected, "staging aborted"):
+                        restore_backup(paths, archive)
+                    with sqlite3.connect(paths.database_path) as conn:
+                        self.assertEqual(conn.execute('SELECT COUNT(*) FROM fixture').fetchone()[0], 0)
+                    self.assertEqual(paths.env_file.read_text(), 'WEB_PORT=9000\n')
+                    self.assertEqual(list(Path(raw).rglob('*.restore.*')), [])
+                    self.assertFalse(backup_module.recover_pending_restore(paths))

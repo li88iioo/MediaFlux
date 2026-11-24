@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -17,6 +16,7 @@ from types import SimpleNamespace
 from typing import Protocol
 
 from app.repositories import media_probe as media_probe_repo
+from app.runtime_paths import ffprobe_command
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 
 
@@ -25,15 +25,6 @@ class CancelSignal(Protocol):
 
 
 logger = get_logger(__name__)
-
-
-def resolve_ffprobe_executable() -> str:
-    """解析 ffprobe 可执行文件；安装包显式路径优先于系统 PATH。"""
-    for key in ("MEDIAFLUX_FFPROBE",):
-        configured = (os.environ.get(key) or "").strip()
-        if configured:
-            return str(Path(configured).expanduser())
-    return shutil.which("ffprobe") or "ffprobe"
 
 
 def _sanitize_probe_error(value: object, *, limit: int = 320) -> str:
@@ -673,7 +664,7 @@ def probe_media_profile(
     if budget is not None and not budget.consume():
         return None
 
-    executable = resolve_ffprobe_executable()
+    executable = ffprobe_command()
     attempts = 0
     last_reason = "probe_failed"
     last_detail = ""
@@ -976,7 +967,7 @@ def probe_local_media_profile(
     if budget is not None and not budget.consume():
         return None
 
-    executable = resolve_ffprobe_executable()
+    executable = ffprobe_command()
     cache_file = SimpleNamespace(
         file_id=stable_id,
         etag=version,

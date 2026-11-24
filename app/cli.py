@@ -13,9 +13,8 @@ import sys
 import webbrowser
 from pathlib import Path
 from typing import Sequence
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
-import uvicorn
 
 from app.defaults import DEFAULT_WEB_PORT
 from app.runtime_paths import RuntimePaths, configure_runtime_paths, get_runtime_paths
@@ -36,9 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--data-dir", default=None)
 
     status = sub.add_parser("status")
-    status.add_argument("--port", type=int, default=None)
     open_web = sub.add_parser("open")
-    open_web.add_argument("--port", type=int, default=None)
+    for command in (open_web, status):
+        command.add_argument("--host", default=None)
+        command.add_argument("--port", type=int, default=None)
+    status.add_argument("--ready", action="store_true", help="检查后台服务是否就绪")
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--source", action="append", type=Path, default=[])
@@ -120,25 +121,23 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
             config.reload_after_restore()
             from app.modules import first_run
 
-            first_run.refresh_startup_state_after_restore()
+            first_run.refresh_startup_state()
 
         # 在任何配置读取或首次运行检查前安装脱敏 handler，避免启动早期异常旁路。
         get_logger(__name__)
 
-        external_host = os.getenv("WEB_HOST", "")
-        requested_host = host if host is not None else (external_host or None)
         from app.modules.first_run import (
             UnsafeFirstRunBindingError,
             resolve_bind_host,
         )
 
         try:
-            effective_host = resolve_bind_host(requested_host)
+            effective_host = resolve_bind_host(host)
         except UnsafeFirstRunBindingError as exc:
             print(f"MediaFlux refused unsafe first-run binding: {exc}", file=sys.stderr)
             return 2
 
-        from app.main import app as web_app
+        from app.main import serve_on
 
         effective_port = port if port is not None else config.flask_port()
         pid_file = paths.pid_file
@@ -149,26 +148,8 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
             pass
 
         try:
-            uvicorn.run(
-                web_app,
-                host=effective_host,
-                port=effective_port,
-                workers=1,
-                reload=False,
-                log_level="info",
-                log_config=None,
-                access_log=False,
-            )
+            serve_on(effective_host, effective_port)
         finally:
-            # Uvicorn 在进入 lifespan 前失败或测试替换 uvicorn.run 时，也必须
-            # 释放应用构造期的启动预留锁；正常 shutdown 后该回调是幂等的。
-            release_guard = getattr(
-                getattr(web_app, "state", None),
-                "release_startup_lifecycle_guard",
-                None,
-            )
-            if callable(release_guard):
-                release_guard()
             try:
                 if (
                     pid_file.is_file()
@@ -180,54 +161,38 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
         return 0
 
 
-def _status(port: int | None = None) -> int:
-    """按当前运行配置探测本机 HTTP 健康检查端点。"""
+def _local_service_url(host: str | None, port: int | None) -> str:
     from app.runtime_paths import get_runtime_paths
 
     try:
-        paths = get_runtime_paths()
-        _, effective_port, runtime_config_check = _resolve_doctor_endpoint(paths, None, port)
+        host, port, error = _resolve_doctor_endpoint(get_runtime_paths(), host, port)
+        if error:
+            host, port = "127.0.0.1", DEFAULT_WEB_PORT
     except (OSError, ValueError):
-        runtime_config_check = object()
-        effective_port = DEFAULT_WEB_PORT
+        host, port = "127.0.0.1", DEFAULT_WEB_PORT
+    host = host.strip("[]")
+    host = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    authority = f"[{host}]" if ":" in host else host
+    return f"http://{authority}:{port}/"
 
-    if runtime_config_check is not None:
-        # 保持旧版 status 在损坏配置下仍探测默认端口；doctor 负责详细报告配置错误。
-        effective_port = DEFAULT_WEB_PORT
 
+def _status(url: str, ready: bool) -> int:
+    endpoint, expected = ("readyz", "ready") if ready else ("healthz", "ok")
     try:
-        with urlopen(f"http://127.0.0.1:{effective_port}/healthz", timeout=1) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(url + endpoint, timeout=3 if ready else 1) as response:
+            payload = json.load(response)
+        healthy = isinstance(payload, dict) and payload.get("status") == expected
     except (OSError, ValueError):
-        print("MediaFlux health check failed")
-        return 1
-
-    if isinstance(payload, dict) and payload.get("status") == "ok":
-        print("MediaFlux is healthy")
-        return 0
-
-    print("MediaFlux health check failed")
-    return 1
+        healthy = False
+    print("MediaFlux is healthy" if healthy else "MediaFlux health check failed")
+    return 0 if healthy else 1
 
 
-def _open_web(port: int | None = None) -> int:
-    """使用当前配置端口打开本机控制台。"""
-    from app.runtime_paths import get_runtime_paths
-
-    try:
-        paths = get_runtime_paths()
-        _, effective_port, runtime_config_check = _resolve_doctor_endpoint(paths, None, port)
-    except (OSError, ValueError):
-        runtime_config_check = object()
-        effective_port = DEFAULT_WEB_PORT
-    if runtime_config_check is not None:
-        effective_port = DEFAULT_WEB_PORT
-    url = f"http://127.0.0.1:{effective_port}/"
-    if not webbrowser.open(url, new=2):
-        print(url)
-        return 1
+def _open_web(url: str) -> int:
+    opened = webbrowser.open(url, new=2)
     print(url)
-    return 0
+    return 0 if opened else 1
 
 
 def _resolve_doctor_endpoint(
@@ -502,9 +467,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"MediaFlux runtime layout: {exc}", file=sys.stderr)
             return 2
     if args.command == "status":
-        return _status(args.port)
+        return _status(_local_service_url(args.host, args.port), args.ready)
     if args.command == "open":
-        return _open_web(args.port)
+        return _open_web(_local_service_url(args.host, args.port))
     if args.command == "doctor":
         return _doctor(
             args.json,

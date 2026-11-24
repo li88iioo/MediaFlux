@@ -188,7 +188,7 @@ class IndexerAPITests(unittest.TestCase):
         self.os_patch.start()
         from app.modules import first_run
 
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         self.request_lookup_patch = patch(
             "app.repositories.download_requests.get_download_request_by_request_key",
             return_value=None,
@@ -214,7 +214,7 @@ class IndexerAPITests(unittest.TestCase):
         self.os_patch.stop()
         from app.modules import first_run
 
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         self.cache_patch.stop()
         self.env_patch.stop()
         self.temp.cleanup()

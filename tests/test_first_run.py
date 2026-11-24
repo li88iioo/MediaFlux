@@ -76,7 +76,7 @@ class FirstRunTests(unittest.TestCase):
         importlib.reload(database)
         database.configure_database((paths or self.paths).database_path, test_mode=False)
         importlib.reload(first_run)
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         self.config = config
         self.database = database
         self.first_run = first_run
@@ -204,8 +204,7 @@ class FirstRunTests(unittest.TestCase):
                 before = self.paths.env_file.read_bytes() if self.paths.env_file.exists() else None
                 self._reload_runtime_modules()
                 self.assertTrue(self.first_run.needs_initialization())
-                from app.main import _resolve_bind_host
-                self.assertEqual(_resolve_bind_host(None), '127.0.0.1')
+                self.assertEqual(self.first_run.resolve_bind_host(None), '127.0.0.1')
                 if name == 'database_only':
                     from app.agent.feature_gate import RuntimeFenceError
                     with self.assertRaises(RuntimeFenceError):

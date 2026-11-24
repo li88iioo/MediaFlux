@@ -183,11 +183,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertEqual(completed.stdout.strip(), str(strm_dir))
 
     def test_healthcheck_uses_fixed_container_port_and_readiness(self) -> None:
-        self.assertIn("127.0.0.1:1258/readyz", self.dockerfile)
-        self.assertIn(
-            "127.0.0.1:1258/readyz', timeout=3)\" >/dev/null 2>&1",
-            self.dockerfile,
-        )
+        self.assertIn("CMD python mediaflux.py status --ready --port 1258", self.dockerfile)
         self.assertNotIn("/healthz", self.dockerfile)
         self.assertNotIn("flask_port", self.dockerfile)
         self.assertNotIn("healthcheck", self.compose["services"]["mediaflux"])

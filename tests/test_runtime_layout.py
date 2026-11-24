@@ -310,7 +310,7 @@ class RuntimeLayoutTests(unittest.TestCase):
                     patch("app.modules.backup.recover_pending_restore", return_value=False),
                     patch("app.modules.first_run.resolve_bind_host", return_value="127.0.0.1"),
                     patch.object(app.main, "app", SimpleNamespace(state=SimpleNamespace())),
-                    patch("app.cli.uvicorn.run", side_effect=serve),
+                    patch("uvicorn.run", side_effect=serve),
                     redirect_stderr(io.StringIO()),
                 ):
                     if fail:

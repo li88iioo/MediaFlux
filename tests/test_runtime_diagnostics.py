@@ -66,10 +66,14 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
     def test_ffprobe_diagnostic_honors_explicit_packaged_path(self) -> None:
         from app.modules.runtime_diagnostics import _ffprobe_check
 
-        executable = self.root / "tools" / "ffprobe"
+        executable = self.root / "tools" / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
         executable.parent.mkdir()
         executable.write_bytes(b"binary")
         with patch.dict(os.environ, {"MEDIAFLUX_FFPROBE": str(executable)}, clear=False):
+            if os.name == "posix":
+                executable.chmod(0o600)
+                self.assertEqual(_ffprobe_check().status, "warning")
+                executable.chmod(0o700)
             check = _ffprobe_check()
         self.assertEqual(check.status, "ok")
         self.assertIn(str(executable), check.message)

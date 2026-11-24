@@ -159,7 +159,7 @@ sys.addaudithook(audit)
             import app.cli as cli
 
             app_main_before_start = "app.main" in sys.modules
-            with patch("app.cli.uvicorn.run") as uvicorn_run:
+            with patch("uvicorn.run") as uvicorn_run:
                 exit_code = cli.main(json.loads(os.environ["TASK3_ARGS"]))
 
             from app import config, database, logger
@@ -290,7 +290,7 @@ sys.addaudithook(audit)
         with patch.dict(os.environ, {"WEB_HOST": "0.0.0.0", "MEDIAFLUX_CONTAINER": "",
                                     "MEDIAFLUX_ALLOW_REMOTE_SETUP": ""}, clear=False), patch(
             "app.modules.first_run.needs_initialization", return_value=True
-        ), patch("app.cli.uvicorn.run") as run:
+        ), patch("uvicorn.run") as run:
             exit_code = cli._start(None, 1258, None)
 
         self.assertEqual(exit_code, 2)
@@ -335,7 +335,7 @@ sys.addaudithook(audit)
             side_effect=lambda: events.append("config-reload"),
         ), patch.object(
             first_run,
-            "refresh_startup_state_after_restore",
+            "refresh_startup_state",
             side_effect=lambda: events.append("first-run-refresh"),
         ), patch.object(
             first_run,
@@ -347,9 +347,8 @@ sys.addaudithook(audit)
             side_effect=lambda: events.append("port") or 1258,
         ), patch.object(
             app.main, "app", web_app
-        ), patch.object(
-            cli.uvicorn,
-            "run",
+        ), patch(
+            "uvicorn.run",
             side_effect=lambda *_args, **_kwargs: events.append("uvicorn"),
         ):
             self.assertEqual(cli._start(None, None, None), 0)
@@ -411,53 +410,24 @@ sys.addaudithook(audit)
         self.assertEqual(result["workers"], 1)
         self.assertTrue(result["log_config_is_none"])
         self.assertFalse(result["access_log"])
-    def test_status_uses_project_default_port_when_unconfigured(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            paths = RuntimePaths(
-                program_dir=root / "program",
-                data_dir=root / "data",
-                config_dir=root / "config",
-                cache_dir=root / "cache",
-                log_dir=root / "logs",
-                strm_dir=root / "strm-data",
-                trash_dir=root / "trash",
-            )
-            output = io.StringIO()
+
+    def test_status_and_open_use_the_same_reachable_address(self) -> None:
+        for host, expected in (("", "127.0.0.1"), ("0.0.0.0", "127.0.0.1"),
+                               ("::", "[::1]"), ("::1", "[::1]"), ("127.0.0.9", "127.0.0.9")):
             with (
-                patch("app.runtime_paths.get_runtime_paths", return_value=paths),
-                patch("app.cli.urlopen", return_value=_Response(b'{"status":"ok"}')) as request,
-                redirect_stdout(output),
+                tempfile.TemporaryDirectory() as root,
+                self.subTest(host=host),
+                patch.dict(os.environ, {"WEB_HOST": host, "MEDIAFLUX_CONFIG_DIR": root}, clear=True),
+                patch("urllib.request.OpenerDirector.open", return_value=_Response(b'{"status":"ok"}')) as request,
+                patch("app.cli.webbrowser.open", return_value=True) as browser,
+                redirect_stdout(io.StringIO()) as output,
             ):
-                exit_code = main(["status"])
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(request.call_args.args[0], "http://127.0.0.1:1258/healthz")
-        self.assertEqual(output.getvalue().strip(), "MediaFlux is healthy")
-
-    def test_open_uses_project_default_port_when_unconfigured(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            paths = RuntimePaths(
-                program_dir=root / "program",
-                data_dir=root / "data",
-                config_dir=root / "config",
-                cache_dir=root / "cache",
-                log_dir=root / "logs",
-                strm_dir=root / "strm-data",
-                trash_dir=root / "trash",
-            )
-            output = io.StringIO()
-            with (
-                patch("app.runtime_paths.get_runtime_paths", return_value=paths),
-                patch("app.cli.webbrowser.open", return_value=True) as open_browser,
-                redirect_stdout(output),
-            ):
-                exit_code = main(["open"])
-
-        self.assertEqual(exit_code, 0)
-        open_browser.assert_called_once_with("http://127.0.0.1:1258/", new=2)
-        self.assertEqual(output.getvalue().strip(), "http://127.0.0.1:1258/")
+                self.assertEqual(main(["status"]), 0)
+                self.assertEqual(main(["open"]), 0)
+            url = f"http://{expected}:1258/"
+            self.assertEqual(request.call_args.args[0], url + "healthz")
+            browser.assert_called_once_with(url, new=2)
+            self.assertEqual(output.getvalue().splitlines(), ["MediaFlux is healthy", url])
 
     def test_status_uses_source_config_port_or_container_internal_port(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -472,25 +442,36 @@ sys.addaudithook(audit)
                 trash_dir=root / "trash",
             )
             paths.config_dir.mkdir(parents=True)
-            paths.env_file.write_text("WEB_PORT=24567\n", encoding="utf-8")
+            paths.env_file.write_text("WEB_HOST=127.0.0.9\nWEB_PORT=24567\n", encoding="utf-8")
             for container, expected_port in (("0", 24567), ("1", 1258)):
                 output = io.StringIO()
                 with (
                     self.subTest(container=container),
                     patch.dict(os.environ, {"MEDIAFLUX_CONTAINER": container}, clear=True),
                     patch("app.runtime_paths.get_runtime_paths", return_value=paths),
-                    patch("app.cli.urlopen", return_value=_Response(b'{"status":"ok"}')) as request,
+                    patch("urllib.request.OpenerDirector.open", return_value=_Response(b'{"status":"ok"}')) as request,
                     redirect_stdout(output),
                 ):
                     self.assertEqual(main(["status"]), 0)
-                    self.assertEqual(request.call_args.args[0], f"http://127.0.0.1:{expected_port}/healthz")
+                    self.assertEqual(request.call_args.args[0], f"http://127.0.0.9:{expected_port}/healthz")
                     self.assertEqual(output.getvalue().strip(), "MediaFlux is healthy")
+
+    def test_readiness_distinguishes_background_startup_from_health(self) -> None:
+        for status, result in (("starting", 1), ("ok", 1), ("ready", 0)):
+            body = json.dumps({"status": status}).encode()
+            with (
+                self.subTest(status=status),
+                patch("urllib.request.OpenerDirector.open", return_value=_Response(body)) as request,
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(["status", "--ready", "--host", "::1", "--port", "1258"]), result)
+                self.assertEqual(request.call_args.args[0], "http://[::1]:1258/readyz")
 
     def test_status_rejects_non_object_and_malformed_responses_uniformly(self) -> None:
         for body in (b"[]", b"not-json"):
             with self.subTest(body=body):
                 output = io.StringIO()
-                with patch("app.cli.urlopen", return_value=_Response(body)), redirect_stdout(output):
+                with patch("urllib.request.OpenerDirector.open", return_value=_Response(body)), redirect_stdout(output):
                     exit_code = main(["status"])
 
                 self.assertEqual(exit_code, 1)
@@ -973,7 +954,7 @@ sys.addaudithook(audit)
     def test_dockerfile_marks_container_and_uses_fixed_internal_healthcheck(self) -> None:
         dockerfile = (self.PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("MEDIAFLUX_CONTAINER=1", dockerfile)
-        self.assertIn("http://127.0.0.1:1258/readyz", dockerfile)
+        self.assertIn("python mediaflux.py status --ready --port 1258", dockerfile)
         self.assertNotRegex(dockerfile, r"os\.environ.*WEB_PORT")
         self.assertNotIn("127.0.0.1:1258/healthz", dockerfile)
 

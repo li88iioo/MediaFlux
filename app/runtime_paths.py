@@ -11,6 +11,11 @@ from typing import Mapping
 _configured_paths: RuntimePaths | None = None
 
 
+def ffprobe_command() -> str:
+    """提供给系统进程的 ffprobe 命令，保留显式相对路径的目录前缀。"""
+    return os.path.expanduser(os.environ.get("MEDIAFLUX_FFPROBE", "").strip() or "ffprobe")
+
+
 class RuntimeLayoutError(RuntimeError):
     """旧锁布局必须在停服后迁移，不能在线切换互斥对象。"""
 

@@ -86,15 +86,8 @@ def _startup_snapshot() -> _StartupState:
         return _startup_state
 
 
-def _reset_startup_state_for_tests() -> None:
-    """私有测试钩子：按当前 RuntimePaths 重新抓取生命周期前的状态。"""
-    global _startup_state
-    with _state_lock:
-        _startup_state = _capture_startup_state()
-
-
-def refresh_startup_state_after_restore() -> None:
-    """恢复事务替换配置后，重新冻结首启状态。"""
+def refresh_startup_state() -> None:
+    """从当前运行目录重新冻结安装状态。"""
     global _startup_state
     with _state_lock:
         _startup_state = _capture_startup_state()
@@ -130,6 +123,8 @@ def _remote_setup_allowed() -> bool:
 
 def resolve_bind_host(requested: str | None, *, initialized_default: str = "0.0.0.0") -> str:
     """源码首启仅监听回环；官方容器默认开放一次性 Web 初始化。"""
+    if requested is None:
+        requested = os.getenv("WEB_HOST") or None
     if needs_initialization():
         if requested and not _is_loopback_host(requested) and not _remote_setup_allowed():
             raise UnsafeFirstRunBindingError(

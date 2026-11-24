@@ -12,7 +12,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -181,39 +181,30 @@ def _create_backup_unlocked(
         }
         manifest_payload = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
-        temporary_name: str = ""
+        temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent, delete=False
             ) as handle:
-                temporary_name = handle.name
-            temporary_path = Path(temporary_name)
-            try:
-                os.chmod(temporary_path, 0o600)
-            except OSError:
-                pass
-            with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("manifest.json", manifest_payload)
-                for name in sorted(payloads):
-                    archive.write(payloads[name], name)
-            descriptor = os.open(
-                temporary_path,
-                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0),
-            )
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+                temporary_path = Path(handle.name)
+                try:
+                    os.chmod(temporary_path, 0o600)
+                except OSError:
+                    pass
+                with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr("manifest.json", manifest_payload)
+                    for name in sorted(payloads):
+                        archive.write(payloads[name], name)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary_path, destination)
-            try:
-                os.chmod(destination, 0o600)
-            except OSError:
-                pass
+            temporary_path = None
             _fsync_directory(destination.parent)
         except (OSError, zipfile.BadZipFile) as exc:
-            if temporary_name:
-                Path(temporary_name).unlink(missing_ok=True)
             raise BackupError(str(exc)) from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return destination
 
 
@@ -434,10 +425,6 @@ def _fingerprint(payload: bytes) -> dict[str, Any]:
     return {"size": len(payload), "sha256": _sha256_bytes(payload)}
 
 
-def _same_fingerprint(actual: dict[str, Any] | None, expected: dict[str, Any] | None) -> bool:
-    return actual == expected
-
-
 def _write_private_file(path: Path, payload: bytes | Path) -> dict[str, Any]:
     with path.open("xb") as handle:
         if isinstance(payload, Path):
@@ -569,7 +556,7 @@ def _unlink_matching(path: Path, expected: dict[str, Any] | None) -> None:
     actual = _regular_file_fingerprint(path)
     if actual is None:
         return
-    if not _same_fingerprint(actual, expected):
+    if actual != expected:
         raise BackupError(f"拒绝删除内容不匹配的恢复临时文件：{path}")
     path.unlink()
     _fsync_directory(path.parent)
@@ -600,25 +587,25 @@ def _recover_prepared(paths: RuntimePaths, journal: dict[str, Any]) -> None:
         new = entry["new"]
         if entry["had_target"]:
             if previous is not None:
-                if not _same_fingerprint(previous, old):
+                if previous != old:
                     raise BackupError(f"恢复旧文件副本内容不匹配：{backup}")
-                if current is None or _same_fingerprint(current, new):
+                if current is None or current == new:
                     os.replace(backup, target)
                     _fsync_directory(target.parent)
-                elif _same_fingerprint(current, old):
+                elif current == old:
                     backup.unlink()
                     _fsync_directory(backup.parent)
                 else:
                     raise BackupError(f"恢复目标已被外部修改：{target}")
-            elif not _same_fingerprint(current, old):
-                if _same_fingerprint(current, new):
+            elif current != old:
+                if current == new:
                     raise BackupError(f"恢复目标旧版本缺失，无法安全回滚：{target}")
                 raise BackupError(f"恢复目标状态无法判定：{target}")
         else:
             if previous is not None:
                 raise BackupError(f"原本不存在的恢复目标出现旧副本：{backup}")
             if current is not None:
-                if not _same_fingerprint(current, new):
+                if current != new:
                     raise BackupError(f"恢复目标已被外部创建或修改：{target}")
                 target.unlink()
                 _fsync_directory(target.parent)
@@ -633,7 +620,7 @@ def _recover_committed(paths: RuntimePaths, journal: dict[str, Any]) -> None:
     for entry in journal["entries"]:
         target = mapping[entry["name"]]
         temporary, backup = _restore_artifacts(target, transaction_id)
-        if not _same_fingerprint(_regular_file_fingerprint(target), entry["new"]):
+        if _regular_file_fingerprint(target) != entry["new"]:
             raise BackupError(f"已提交的恢复目标内容不匹配：{target}")
         _unlink_matching(temporary, entry["new"])
         if entry["had_target"]:
@@ -837,7 +824,7 @@ def _transactional_restore_files(
             temporary, backup = _restore_artifacts(target, transaction_id)
             current = _regular_file_fingerprint(target)
             if entry["had_target"]:
-                if not _same_fingerprint(current, entry["old"]):
+                if current != entry["old"]:
                     raise BackupError(f"恢复目标在发布前被修改：{target}")
                 os.replace(target, backup)
                 _fsync_directory(target.parent)
@@ -857,15 +844,14 @@ def _transactional_restore_files(
                 raise BackupError(
                     f"恢复失败且自动回滚未完成：{type(recovery_exc).__name__}"
                 ) from exc
-        else:
-            for temporary in staged:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
         if isinstance(exc, BackupError):
             raise
         raise BackupError(f"恢复过程中发生错误：{exc}") from exc
+    finally:
+        if not journal_written:
+            for temporary in staged:
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)
 
 
 def restore_backup(paths: RuntimePaths, archive_path: Path) -> BackupManifest:

@@ -48,7 +48,7 @@ class WebSecretTests(unittest.TestCase):
         importlib.reload(database)
         importlib.reload(web_secret)
         importlib.reload(first_run)
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         if os.name == "nt":
             permissions_patcher = patch.object(config, "_apply_private_permissions")
             permissions_patcher.start()

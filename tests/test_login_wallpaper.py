@@ -300,7 +300,7 @@ class LoginWallpaperPageTests(unittest.TestCase):
         os.environ["ENV_WEB_PASSPORT"] = "admin"
         os.environ["ENV_WEB_PASSWORD"] = "123456"
         from app.modules import first_run
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
         self.client = TestClient(create_app(), raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
@@ -311,7 +311,7 @@ class LoginWallpaperPageTests(unittest.TestCase):
             else:
                 os.environ[key] = value
         from app.modules import first_run
-        first_run._reset_startup_state_for_tests()
+        first_run.refresh_startup_state()
 
     @staticmethod
     def _csrf_token(response) -> str:
