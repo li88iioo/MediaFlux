@@ -1015,6 +1015,7 @@ def replace_media_subscription_candidates(
     episode: int | None,
     candidates: Iterable[dict[str, Any]],
     expires_at: str,
+    unavailable_sites: Iterable[str] = (),
 ) -> list[sqlite3.Row]:
     stamp = now()
     published: list[sqlite3.Row] = []
@@ -1033,12 +1034,12 @@ def replace_media_subscription_candidates(
             )
         conn.execute(
             "UPDATE media_subscription_candidates SET status='expired',updated_at=? "
-            "WHERE subscription_id=? AND media_key=? AND status='available'",
-            (stamp, subscription_id, media_key),
+            "WHERE subscription_id=? AND media_key=? AND status='available' "
+            "AND site_id NOT IN (SELECT value FROM json_each(?))",
+            (stamp, subscription_id, media_key, json.dumps(sorted(unavailable_sites))),
         )
         for item in candidates:
-            result_id = str(item.get("result_id") or "")
-            conn.execute(
+            row = conn.execute(
                 "INSERT INTO media_subscription_candidates("
                 "subscription_id,media_key,season,episode,result_id,site_id,site_name,title,"
                 "size_text,size_bytes,seeders,published_at,relevance_score,download_state,"
@@ -1052,24 +1053,19 @@ def replace_media_subscription_candidates(
                 "download_state=excluded.download_state,match_reasons_json=excluded.match_reasons_json,"
                 "status=CASE WHEN media_subscription_candidates.status IN ('submitted','dismissed') "
                 "THEN media_subscription_candidates.status ELSE 'available' END,"
-                "expires_at=excluded.expires_at,updated_at=excluded.updated_at",
+                "expires_at=excluded.expires_at,updated_at=excluded.updated_at "
+                "RETURNING id,result_id,status",
                 (
                     subscription_id, media_key, season, episode,
-                    result_id, str(item.get("site_id") or ""),
+                    str(item.get("result_id") or ""), str(item.get("site_id") or ""),
                     str(item.get("site_name") or ""), str(item.get("title") or ""),
                     str(item.get("size_text") or ""), item.get("size_bytes"), item.get("seeders"),
                     str(item.get("published_at") or "") or None, item.get("relevance_score"),
                     str(item.get("download_state") or "unavailable"),
                     _json(item.get("match_reasons") or [], []), expires_at, stamp, stamp,
                 ),
-            )
-            row = conn.execute(
-                "SELECT id,result_id,status FROM media_subscription_candidates "
-                "WHERE subscription_id=? AND media_key=? AND result_id=?",
-                (subscription_id, media_key, result_id),
             ).fetchone()
-            if row is not None:
-                published.append(row)
+            published.append(row)
     return published
 
 

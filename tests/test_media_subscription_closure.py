@@ -638,7 +638,8 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         subscription_id, candidate_id = self._seed()
         request_id, _ = download_requests_repo.create_download_request("both-key", "magnet", title="闭环资源")
         download_requests_repo.update_download_request(request_id, targets="both", status="submitted", qb_status="submitted", gy_status="submitted")
-        async def submit(_service, _result_id, _target, *, admission_id):
+        async def submit(_service, _result_id, _target, *, admission_id, before_submit):
+            self.assertEqual(before_submit(), "")
             download_requests_repo.bind_media_download_admission_request(admission_id, request_id)
             return downloader.return_value
 
@@ -722,7 +723,8 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             targets="qb", status="manual_review", qb_status="manual_review",
             error="提交结果未知，请人工核验",
         )
-        async def submit(_service, _result_id, _target, *, admission_id):
+        async def submit(_service, _result_id, _target, *, admission_id, before_submit):
+            self.assertEqual(before_submit(), "")
             download_requests_repo.bind_media_download_admission_request(admission_id, request_id)
             return downloader.return_value
 

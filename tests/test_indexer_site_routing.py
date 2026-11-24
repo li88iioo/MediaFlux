@@ -106,6 +106,7 @@ class ResolveSearchSitesTests(unittest.TestCase):
     def test_explicit_subscription_sites_win_over_routing(self):
         service = SimpleNamespace(
             media_site_route=lambda **_kwargs: ("btbtla",),
+            site_ids_for_scope=lambda _scope: ("nyaa", "btbtla"),
         )
 
         sites = _resolve_search_sites(["nyaa"], {"genres": [{"id": 16}]}, service)

@@ -790,7 +790,8 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             error="guangya: 磁力资源连续 4 次未解析到可验证文件列表 api_key=super-secret",
         )
 
-        async def submit_failure(_service, _result_id, _target, *, admission_id):
+        async def submit_failure(_service, _result_id, _target, *, admission_id, before_submit):
+            self.assertEqual(before_submit(), "")
             # 真实下载入口在副作用前绑定准入；替身也必须保留这一事务契约。
             download_requests_repo.bind_media_download_admission_request(admission_id, request_id)
             return {

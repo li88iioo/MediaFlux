@@ -391,9 +391,11 @@ def _public_run(row: Any) -> dict[str, Any]:
 def _resolve_search_sites(
     configured: list | None, detail: dict[str, Any], service: Any,
 ) -> list | None:
-    """订阅显式配置的站点优先；否则按动漫/真人与原产语言自动路由。"""
+    """显式选择只搜索仍启用的站点；空结果保留原选择的边界。"""
     if configured:
-        return list(configured)
+        allowed = set(service.site_ids_for_scope("manual"))
+        saved = [str(site).strip().lower() for site in configured]
+        return [site for site in saved if site in allowed]
     try:
         routed = service.media_site_route(
             is_animation=tmdb_detail_is_animation(detail),
@@ -893,7 +895,7 @@ class MediaSubscriptionService:
                 result, detail, targets = await self._check_movie(row, cancel_event=cancel_event, identity_batch=identity_batch)
             if targets and str(row["action"]) != "notify":
                 service = get_indexer_service()
-                sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service) if tv else None
+                sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service)
                 if tv:
                     targets, result["_search_rotation"] = _rotated_missing_targets(
                         targets, result["_search_rotation"], revision=revision, limit=_MAX_SEARCH_EPISODES,
@@ -901,7 +903,7 @@ class MediaSubscriptionService:
                 for target in targets:
                     self._ensure_active_check(subscription_id, revision, cancel_event)
                     aggregated = await self._search_resources(
-                        row, detail, service, sites=sites, target=target if tv else None,
+                        row, detail, service, sites=sites, season=target.season, episode=target.episode,
                         revision=revision, cancel_event=cancel_event,
                     )
                     if aggregated is None:
@@ -911,6 +913,7 @@ class MediaSubscriptionService:
                         subscription_id, target.media_key, revision=revision, run_id=run_id,
                         season=target.season, episode=target.episode,
                         candidates=candidates, expires_at=self._candidate_expiry(),
+                        unavailable_sites=set(aggregated.sites_attempted).difference(aggregated.sites_succeeded),
                     )
                     result["candidate_count"] += len(published)
                     if str(row["action"]) != "auto":
@@ -1608,26 +1611,30 @@ class MediaSubscriptionService:
         }
 
     async def _search_resources(
-        self, row, detail, service, *, target: _ExpectedMedia | None = None,
-        sites=None, revision: int | None = None, cancel_event=None,
+        self, row, detail, service, *, sites: list[str] | None,
+        season: int | None = None, episode: int | None = None,
+        revision: int | None = None, cancel_event=None,
     ) -> AggregatedIndexerResult | None:
         """统一检索与诊断；库存状态和候选投影仍由调用方决定。"""
-        original_key = "original_name" if target is not None else "original_title"
+        media_type = str(row["media_type"])
+        original_key, sort_mode = (
+            ("original_name", "published_desc") if media_type == "tv"
+            else ("original_title", "relevance_desc")
+        )
         request = IndexerMediaSearchRequest.create(
             title=str(row["title"]), original_title=str(detail.get(original_key) or row["original_title"] or ""),
-            year=row["year"], media_type="tv" if target is not None else "movie",
-            sort_mode="published_desc" if target is not None else "relevance_desc",
-            season=target.season if target is not None else None,
-            episode=target.episode if target is not None else None,
+            year=row["year"], media_type=media_type, sort_mode=sort_mode, season=season, episode=episode,
         )
         failure = None
         phase = "site_selection"
         try:
-            selected = (sites or None) if target is not None else _resolve_search_sites(
-                _loads(row["sites_json"], []), detail, service,
-            )
+            if sites == []:
+                raise MediaSubscriptionError(
+                    "所选资源站均不可用，请编辑订阅并选择已启用的站点",
+                    status_code=409, code="sites_unavailable",
+                )
             phase = "search"
-            aggregated = await run_indexer_awaitable(service.search_media(request, selected))
+            aggregated = await run_indexer_awaitable(service.search_media(request, sites))
             if revision is not None:
                 phase = "check_validity"
                 self._ensure_active_check(int(row["id"]), revision, cancel_event)
@@ -1691,7 +1698,7 @@ class MediaSubscriptionService:
         for target in targets:
             assert target.season is not None and target.episode is not None
             aggregated = await self._search_resources(
-                row, detail, service, sites=sites, target=target,
+                row, detail, service, sites=sites, season=target.season, episode=target.episode,
             )
             if aggregated is None:
                 partial = True
@@ -1743,8 +1750,9 @@ class MediaSubscriptionService:
         limit_per_media: int,
     ) -> dict[str, Any]:
         service = get_indexer_service()
+        sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service)
         aggregated = await self._search_resources(
-            row, detail, service,
+            row, detail, service, sites=sites,
         )
         if aggregated is None:
             return self._empty_preview_search("unavailable")
@@ -1901,9 +1909,10 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError("媒体订阅已暂停", status_code=409, code="paused")
         revision = int(subscription["revision"] or 1)
         normalized_target = _choice(target or subscription["download_target"], DOWNLOAD_TARGETS, MEDIA_SUBSCRIPTION_DEFAULTS["download_target"])
+        stop_requested = cancel_event.is_set if cancel_event is not None else lambda: False
         if require_active_check:
             self._ensure_active_check(int(subscription["id"]), revision, cancel_event)
-        elif cancel_event is not None and cancel_event.is_set():
+        elif stop_requested():
             raise MediaSubscriptionError(
                 "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
             )
@@ -1914,13 +1923,14 @@ class MediaSubscriptionService:
                 status_code=409,
                 code="already_present",
             )
+        check_run_id = _ACTIVE_CHECK_RUN_ID.get() if require_active_check else None
         admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key=str(candidate["media_key"]), tmdb_id=str(subscription["tmdb_id"]),
             media_type=str(subscription["media_type"]), subscription_id=int(subscription["id"]),
             candidate_id=int(candidate["id"]), season=candidate["season"], episode=candidate["episode"],
             subscription_revision=revision,
             require_active_check=require_active_check,
-            check_run_id=_ACTIVE_CHECK_RUN_ID.get() if require_active_check else None,
+            check_run_id=check_run_id,
         )
         if admission_id == 0:
             raise MediaSubscriptionError(
@@ -1931,38 +1941,28 @@ class MediaSubscriptionService:
                 "ok": False, "duplicate": True, "status": "duplicate",
                 "error": "该媒体已在下载或入库处理中",
             }
-        if cancel_event is not None and cancel_event.is_set():
-            media_subscriptions_repo.update_media_download_admission(
+
+        def begin_submission() -> str:
+            if stop_requested():
+                reason = "应用正在停止，下载提交已取消"
+                media_subscriptions_repo.update_media_download_admission(
+                    admission_id,
+                    expected_statuses=("claimed",),
+                    status="cancelled",
+                    error=reason,
+                    completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                return reason
+            if not media_subscriptions_repo.begin_media_download_dispatch(
                 admission_id,
-                expected_statuses=("claimed",),
-                status="cancelled",
-                error="应用正在停止，下载提交已取消",
-                completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            raise MediaSubscriptionError(
-                "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
-            )
-        if not media_subscriptions_repo.begin_media_download_dispatch(
-            admission_id,
-            subscription_id=int(subscription["id"]),
-            subscription_revision=revision,
-            require_active_check=require_active_check,
-            check_run_id=_ACTIVE_CHECK_RUN_ID.get() if require_active_check else None,
-        ):
-            raise MediaSubscriptionError(
-                "订阅已暂停、删除或配置已变更", status_code=409, code="cancelled"
-            )
-        if cancel_event is not None and cancel_event.is_set():
-            media_subscriptions_repo.update_media_download_admission(
-                admission_id,
-                expected_statuses=("dispatching",),
-                status="cancelled",
-                error="应用正在停止，下载提交已取消",
-                completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            raise MediaSubscriptionError(
-                "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
-            )
+                subscription_id=int(subscription["id"]),
+                subscription_revision=revision,
+                require_active_check=require_active_check,
+                check_run_id=check_run_id,
+            ):
+                return "订阅已暂停、删除或配置已变更"
+            return ""
+
         try:
             result = await run_indexer_awaitable(
                 download_indexer_result_public(
@@ -1970,6 +1970,7 @@ class MediaSubscriptionService:
                     str(candidate["result_id"]),
                     normalized_target,
                     admission_id=admission_id,
+                    before_submit=begin_submission,
                 )
             )
         except asyncio.CancelledError:
@@ -1984,14 +1985,14 @@ class MediaSubscriptionService:
             ) from exc
         request_id = int(result.get("request_id") or 0)
         request_row = download_requests_repo.get_download_request(request_id) if request_id else None
-        request_status = str(request_row["status"] or "") if request_row else ""
+        request_status = request_row["status"] if request_row else result.get("status")
         if request_status == "cancelled":
-            # pending 请求可在准入绑定与后端认领之间取消；duplicate 不是提交证据。
-            # 也同步取消后才绑定的准入，候选仍保持 available，允许用户重新选择。
-            media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
-            raise MediaSubscriptionError(
-                "下载请求已取消，可重新选择候选资源", status_code=409, code="cancelled"
-            )
+            message = "下载请求已取消，可重新选择候选资源"
+            if request_row is None:
+                message = str(result.get("error") or message)
+            else:
+                media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
+            raise MediaSubscriptionError(message, status_code=409, code="cancelled")
         manual_review = str(result.get("status") or "") == "manual_review"
         accepted = bool(result.get("ok") or result.get("duplicate") or manual_review)
         if accepted:
@@ -2018,7 +2019,7 @@ class MediaSubscriptionService:
                 released = media_subscriptions_repo.fail_unbound_media_download_admission(admission_id, message)
                 if require_active_check:
                     self._ensure_active_check(int(subscription["id"]), revision, cancel_event)
-                elif cancel_event is not None and cancel_event.is_set():
+                elif stop_requested():
                     raise MediaSubscriptionError(
                         "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
                     )

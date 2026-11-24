@@ -443,6 +443,11 @@ class MediaSubscriptionCandidateFailoverTests(IsolatedDatabaseTestCase):
 
         def bind_before_resolver_failure(item):
             admission = self.admissions(subscription_id)[0]
+            # 模拟竞争方已经到达提交边界，实际绑定仍须先原子认领。
+            self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
+                admission["id"], subscription_id=subscription_id,
+                subscription_revision=admission["subscription_revision"],
+            ))
             created = download_dispatcher.create_request(
                 download_dispatcher.normalize_download_url(item.magnet),
                 "", "", origin="indexer:nyaa", admission_id=admission["id"],

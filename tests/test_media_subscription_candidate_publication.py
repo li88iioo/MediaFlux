@@ -42,10 +42,13 @@ def test_late_candidate_publication_cannot_cross_check_ownership(media_type, mut
             match_reasons=("title_exact",),
             download_kinds=("magnet",), magnet="magnet:?xt=urn:btih:" + "1" * 40,
         ).with_result_id("old-run-resource")
-        indexer = SimpleNamespace(search_media=AsyncMock(return_value=AggregatedIndexerResult(
-            query="Publication Fixture", page=1, items=[item],
-            sites_attempted=("nyaa",), sites_succeeded=("nyaa",),
-        )))
+        indexer = SimpleNamespace(
+            site_ids_for_scope=lambda _scope: ("nyaa",),
+            search_media=AsyncMock(return_value=AggregatedIndexerResult(
+                query="Publication Fixture", page=1, items=[item],
+                sites_attempted=("nyaa",), sites_succeeded=("nyaa",),
+            )),
+        )
         service = MediaSubscriptionService()
         stack.enter_context(patch("app.modules.media_subscriptions.config.get_bool", return_value=True))
         stack.enter_context(patch("app.modules.media_subscriptions._tmdb_detail", return_value={

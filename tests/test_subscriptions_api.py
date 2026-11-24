@@ -148,6 +148,24 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
             expect(page.locator("#filterSub")).to_have_value(str(feed_id))
             expect(page.locator("#entryList")).to_contain_text("选定来源的条目")
 
+    def test_subscription_form_can_replace_legacy_sites_without_changing_legacy_interval(self):
+        from playwright.sync_api import expect
+
+        media_subscriptions_repo.update_media_subscription_config(
+            self.subscription_id, sites_json='["1lou","mikan"]', check_interval_minutes=60,
+        )
+        with patch("app.routes.subscriptions_api._wake_scheduler"):
+            self._open()
+            self.page.get_by_role("button", name="编辑媒体订阅").click()
+            sites = self.page.get_by_label("限定资源站")
+            expect(sites).to_have_value("1lou, mikan")
+            expect(self.page.get_by_label("检查间隔")).to_have_value("60")
+            sites.fill("nyaa")
+            self.page.get_by_role("button", name="保存订阅").click()
+            expect(self.page.locator("#appMessageTitle")).to_have_text("媒体订阅已更新")
+        stored = self.client.get(f"/api/subscriptions/media/{self.subscription_id}").json()
+        self.assertEqual((stored["sites"], stored["check_interval_minutes"]), (["nyaa"], 60))
+
     def test_check_receipt_uses_nested_result_and_error_semantics(self):
         from app.modules.media_subscriptions import MediaSubscriptionError, MediaSubscriptionService
         from playwright.sync_api import expect
@@ -333,6 +351,227 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
 
 
 class SubscriptionAPITests(IsolatedDatabaseTestCase):
+    def test_pause_during_indexer_resolution_prevents_candidate_submission(self):
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from app.modules import download_dispatcher, media_subscriptions
+        from tests.test_indexer_service import FakeAdapter, item
+
+        headers = self.login()
+        subscription_id = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="471", tmdb_id="471", media_type="movie",
+            title="Paused Signal", year="2020", sites=["nyaa"], action="confirm", download_target="qb",
+        )
+        endpoint = f"/api/subscriptions/media/{subscription_id}"
+        result = item("nyaa", "Paused Signal 2020 1080p", magnet="magnet:?xt=urn:btih:" + "a" * 40)
+        adapter = FakeAdapter("nyaa", [result])
+        indexer = IndexerService(
+            registry=IndexerRegistry({"nyaa": adapter}), result_store=IndexerResultStore(),
+        )
+        self.addCleanup(lambda: asyncio.run(indexer.aclose()))
+        candidate_id, = seed_media_subscription_candidates(
+            subscription_id, "tmdb:471:movie", season=None, episode=None,
+            candidates=[{**result.to_public_dict(), "result_id": indexer.result_store.put(result)}],
+            expires_at="2099-01-01 00:00:00",
+        )
+        with db.get_conn() as conn:
+            request_count = conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0]
+
+        do_resolve = adapter.resolve
+
+        async def resolve_after_pause(stored_result):
+            paused = await asyncio.to_thread(
+                self.client.put, endpoint, json={"enabled": False}, headers=headers,
+            )
+            self.assertEqual(paused.status_code, 200, paused.text)
+            self.assertFalse(paused.json()["enabled"])
+            return await do_resolve(stored_result)
+
+        with (
+            patch.object(adapter, "resolve", side_effect=resolve_after_pause) as resolve,
+            patch.object(media_subscriptions, "get_indexer_service", return_value=indexer),
+            patch.object(media_subscriptions, "_tmdb_detail", return_value={"release_date": "2020-01-01"}),
+            patch.object(media_subscriptions, "inspect_media_identity_sources", return_value=[{"status": "not_found"}]),
+            patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "offline-qb"}) as submit,
+            patch("app.modules.media_subscription_notifications.drain_media_subscription_notifications"),
+            patch("app.routes.subscriptions_api._wake_scheduler"),
+        ):
+            download = self.client.post(
+                f"{endpoint}/download", json={"candidate_id": candidate_id, "target": "qb"}, headers=headers,
+            )
+            self.assertEqual(len(adapter.resolve_calls), 1)
+            self.assertEqual(
+                (download.status_code, download.json().get("code"), submit.call_count),
+                (409, "cancelled", 0), download.text,
+            )
+            with db.get_conn() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], request_count)
+                admission = conn.execute(
+                    "SELECT status,request_id FROM media_download_admissions WHERE candidate_id=?", (candidate_id,),
+                ).fetchone()
+            self.assertEqual(tuple(admission), ("cancelled", None))
+
+            resolve.side_effect = do_resolve
+            resumed = self.client.put(endpoint, json={"enabled": True}, headers=headers)
+            self.assertEqual(resumed.status_code, 200, resumed.text)
+            checked = self.client.post(f"{endpoint}/check", headers=headers)
+            self.assertEqual(checked.status_code, 200, checked.text)
+            self.assertEqual(checked.json()["result"]["candidate_count"], 1)
+            [candidate] = self.client.get(f"{endpoint}/candidates").json()
+            self.assertNotEqual(candidate["id"], candidate_id)
+            retried = self.client.post(
+                f"{endpoint}/download", json={"candidate_id": candidate["id"], "target": "qb"}, headers=headers,
+            )
+            self.assertEqual(retried.status_code, 200, retried.text)
+            self.assertEqual(retried.json()["succeeded"], ["qb"])
+            submit.assert_called_once()
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], request_count + 1)
+
+    def test_search_outage_keeps_unexpired_candidate_for_manual_download(self):
+        from datetime import datetime, timedelta, timezone
+
+        from app.indexers.errors import IndexerUnavailable
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from app.modules import download_dispatcher, media_subscriptions
+        from tests.support import isolated_test_database
+        from tests.test_indexer_service import FakeAdapter, HASH, item
+
+        self.enterContext(isolated_test_database())
+        headers = self.login()
+        subscription_id = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="472", tmdb_id="472", media_type="movie",
+            title="Harbor Signal", year="2020", sites=["nyaa", "btbtla"], action="confirm", download_target="qb",
+        )
+        endpoint = f"/api/subscriptions/media/{subscription_id}"
+        resource = item("nyaa", "Harbor Signal 2020 1080p", magnet=f"magnet:?xt=urn:btih:{HASH}")
+        adapter = FakeAdapter("nyaa", [resource])
+        peer = FakeAdapter("btbtla", [
+            item("btbtla", "Harbor Signal 2020 2160p", magnet="magnet:?xt=urn:btih:" + "b" * 40),
+        ])
+        clock = datetime.now(timezone.utc)
+        indexer = IndexerService(
+            registry=IndexerRegistry({"nyaa": adapter, "btbtla": peer}),
+            result_store=IndexerResultStore(clock=lambda: clock),
+            clock=lambda: clock, cache_ttl_seconds=5,
+        )
+        self.addCleanup(lambda: asyncio.run(indexer.aclose()))
+
+        def recheck(expected_count):
+            nonlocal clock
+            clock += timedelta(seconds=6)
+            response = self.client.post(f"{endpoint}/check", headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["result"]["candidate_count"], expected_count)
+            listed = self.client.get(f"{endpoint}/candidates")
+            self.assertEqual(listed.status_code, 200, listed.text)
+            return {row["site_id"]: row for row in listed.json()}
+
+        def download(candidate):
+            return self.client.post(
+                f"{endpoint}/download", json={"candidate_id": candidate["id"], "target": "qb"}, headers=headers,
+            )
+
+        with (
+            patch.object(media_subscriptions, "get_indexer_service", return_value=indexer),
+            patch.object(media_subscriptions, "_tmdb_detail", return_value={"release_date": "2020-01-01"}),
+            patch.object(media_subscriptions, "inspect_media_identity_sources", return_value=[{"status": "not_found"}]),
+            patch("app.modules.media_subscription_notifications.drain_media_subscription_notifications"),
+            patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "offline-qb"}) as submit,
+        ):
+            selected = recheck(2)
+            adapter.error = peer.error = IndexerUnavailable()
+            offline = recheck(0)
+
+            peer.error = None
+            peer.items.clear()
+            recovered = recheck(0)
+            rejected = download(selected["btbtla"])
+            self.assertEqual((rejected.status_code, rejected.json()["code"]), (409, "unavailable"))
+            submit.assert_not_called()
+
+            candidate = selected["nyaa"]
+            self.assertEqual(indexer.result_store.get(candidate["result_id"]).magnet, resource.magnet)
+            accepted = download(candidate)
+            self.assertEqual((accepted.status_code, submit.call_count), (200, 1), accepted.text)
+            self.assertEqual(accepted.json()["succeeded"], ["qb"])
+            self.assertEqual(offline, selected)
+            self.assertEqual(recovered, {"nyaa": candidate})
+            [submitted] = self.client.get(f"{endpoint}/candidates").json()
+            self.assertEqual(
+                (submitted["id"], submitted["status"], submitted["request_id"]),
+                (candidate["id"], "submitted", accepted.json()["request_id"]),
+            )
+            repeated = download(candidate)
+            self.assertEqual((repeated.status_code, repeated.json()["code"], submit.call_count), (409, "unavailable", 1))
+
+    def test_saved_site_selection_recovers_without_expanding_after_sites_become_unavailable(self):
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from app.modules import media_subscriptions
+        from tests.test_indexer_service import FakeAdapter, item
+
+        headers = self.login()
+        selected = FakeAdapter("nyaa", [
+            item("nyaa", "Offline Signal 2020 1080p", magnet="magnet:?xt=urn:btih:" + "a" * 40),
+            item("nyaa", "Archive Signal S01E01 1080p", magnet="magnet:?xt=urn:btih:" + "b" * 40),
+        ])
+        disabled, unselected = FakeAdapter("mikan"), FakeAdapter("btbtla")
+        indexer = IndexerService(
+            registry=IndexerRegistry({adapter.site_id: adapter for adapter in (selected, disabled, unselected)}),
+            result_store=IndexerResultStore(), enabled_site_ids=("nyaa", "btbtla"),
+        )
+        old_sites = ["1lou", "mikan", "NYAA"]
+        with (
+            patch.object(media_subscriptions, "get_indexer_service", return_value=indexer),
+            patch.object(media_subscriptions, "_tmdb_detail", return_value={"release_date": "2020-01-01"}),
+            patch.object(media_subscriptions, "inspect_media_identity_sources", return_value=[{"status": "not_found"}]),
+            patch.object(media_subscriptions, "inspect_series_episode_sources", return_value=[{"status": "not_found"}]),
+            patch.object(media_subscriptions.MediaSubscriptionService, "_expected_tv", return_value=(
+                [media_subscriptions._ExpectedMedia("tmdb:42:tv:S01E001", 1, 1)], 0, 0,
+            )),
+            patch("app.modules.media_subscription_notifications.drain_media_subscription_notifications"),
+            patch("app.routes.subscriptions_api._wake_scheduler"),
+        ):
+            for media_type, tmdb_id, title in (("movie", "41", "Offline Signal"), ("tv", "42", "Archive Signal")):
+                with self.subTest(media_type=media_type):
+                    subscription_id = media_subscriptions_repo.add_media_subscription(
+                        provider="tmdb", external_id=tmdb_id, tmdb_id=tmdb_id, media_type=media_type,
+                        title=title, year="2020", sites=old_sites,
+                    )
+                    endpoint = f"/api/subscriptions/media/{subscription_id}"
+                    checked = self.client.post(f"{endpoint}/check", headers=headers)
+                    self.assertEqual(checked.status_code, 200, checked.text)
+                    self.assertGreater(checked.json()["result"]["candidate_count"], 0, checked.text)
+                    self.assertEqual(self.client.get(endpoint).json()["sites"], old_sites)
+                    [candidate] = self.client.get(f"{endpoint}/candidates").json()
+                    self.assertEqual(candidate["site_id"], "nyaa")
+
+                    no_sites = self.client.put(endpoint, headers=headers, json={"sites": ["1lou", "mikan"]})
+                    self.assertEqual(no_sites.status_code, 200, no_sites.text)
+                    call_count = selected.calls
+                    conflict = self.client.post(f"{endpoint}/check", headers=headers)
+                    self.assertEqual(conflict.status_code, 409, conflict.text)
+                    self.assertEqual(conflict.json()["code"], "sites_unavailable")
+                    self.assertIn("编辑订阅", conflict.json()["error"])
+                    self.assertEqual(selected.calls, call_count)
+                    self.assertEqual(self.client.get(endpoint).json()["sites"], ["1lou", "mikan"])
+                    self.assertEqual(self.client.get(
+                        "/api/subscriptions/runs", params={"subscription_id": subscription_id},
+                    ).json()[0]["status"], "failed")
+
+                    recovered = self.client.put(endpoint, headers=headers, json={"sites": ["nyaa"]})
+                    self.assertEqual(recovered.status_code, 200, recovered.text)
+                    retry = self.client.post(f"{endpoint}/check", headers=headers)
+                    self.assertEqual(retry.status_code, 200, retry.text)
+                    self.assertGreater(retry.json()["result"]["candidate_count"], 0)
+        self.assertGreater(selected.calls, 0)
+        self.assertEqual((disabled.calls, unselected.calls), (0, 0))
+
     def test_watchlist_remains_manageable_when_discovery_page_is_disabled(self):
         from app.discovery.service import DiscoveryService
         from app.routes.discovery_image import encode_poster_token

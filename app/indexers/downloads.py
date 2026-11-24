@@ -1045,9 +1045,13 @@ async def _resolve_indexer_download(service, result_id: str, target: str, *, sco
     return _ResolvedIndexerDownload(item, snapshot, destination)
 
 
-async def _submit_indexer_download(service, resolved: _ResolvedIndexerDownload, *,
-                                   scope: str, origin_namespace: str,
-                                   check_cancelled: Callable[[], None] | None = None, **options) -> dict[str, Any]:
+async def _submit_indexer_download(
+    service, resolved: _ResolvedIndexerDownload, *,
+    scope: str, origin_namespace: str,
+    check_cancelled: Callable[[], None] | None = None,
+    before_submit: Callable[[], str] | None = None,
+    **options,
+) -> dict[str, Any]:
     if check_cancelled is not None:
         check_cancelled()
         options["check_cancelled"] = check_cancelled
@@ -1055,6 +1059,11 @@ async def _submit_indexer_download(service, resolved: _ResolvedIndexerDownload, 
     target = snapshot["target"]
     if preflight_indexer_download(service, snapshot["result_id"], target, scope=scope) != snapshot:
         raise DownloadSnapshotChanged()
+    if before_submit is not None:
+        # 解析和预检均已结束，订阅在此原子认领才进入不可撤销的提交阶段。
+        rejection = before_submit()
+        if rejection:
+            return {**_failed_download_result(snapshot["result_id"], target, rejection), "status": "cancelled"}
     if "guangya_credential_generation" in snapshot:
         options["guangya_credential_generation"] = snapshot["guangya_credential_generation"]
     submitted = await asyncio.to_thread(
@@ -1139,6 +1148,7 @@ async def download_indexer_result(
     expected_snapshot: dict | None = None,
     verification_targets: list[dict] | None = None,
     verification_owner: str = "",
+    before_submit: Callable[[], str] | None = None,
     _public_errors: bool = False,
 ) -> dict[str, Any]:
     """单项入口与整批下载共用只读解析、冻结复验和真实提交。"""
@@ -1159,7 +1169,7 @@ async def download_indexer_result(
         admission_options: _RequestOptions = {"admission_id": admission_id} if admission_id is not None else {}
         response = await _submit_indexer_download(service, resolved, scope=scope, origin_namespace=namespace,
             chat_id=chat_id, user_id=user_id, message_id=message_id,
-            **admission_options,
+            before_submit=before_submit, **admission_options,
             verification_targets=verification_targets, verification_owner=verification_owner)
     if verification_targets:
         _attach_download_verification([response], verification_owner)
@@ -1180,6 +1190,7 @@ async def download_indexer_result_public(
     expected_snapshot: dict | None = None,
     verification_targets: list[dict] | None = None,
     verification_owner: str = "",
+    before_submit: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     """返回适合 Web/TG/Agent 展示的稳定错误契约，不泄露上游细节。"""
     try:
@@ -1195,8 +1206,9 @@ async def download_indexer_result_public(
             expected_snapshot=expected_snapshot,
             verification_targets=verification_targets,
             verification_owner=verification_owner,
+            admission_id=admission_id,
+            before_submit=before_submit,
             _public_errors=True,
-            **({"admission_id": admission_id} if admission_id is not None else {}),
         )
     except Exception as exc:
         return _indexer_download_error(result_id, target, exc)

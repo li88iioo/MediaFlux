@@ -104,7 +104,8 @@ class CancelledDownloadAdmissionTests(unittest.TestCase):
                 before_claim(request, target, kwargs)
             return real_dispatch(request, target, **kwargs)
 
-        async def resolve(_service, _result_id, target, *, admission_id):
+        async def resolve(_service, _result_id, target, *, admission_id, before_submit):
+            self.assertEqual(before_submit(), "")
             # 与真实资源站提交相同：先复用/绑定请求，再由 dispatcher 认领。
             result = downloads.submit_download_input(
                 self.item, target, origin="indexer", admission_id=admission_id,

@@ -81,7 +81,8 @@ class AdmissionCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_after_atomic_bind_preserves_unknown_request_lock(self):
         entered = asyncio.Event()
         request_ids = []
-        async def bound_submit(*args, admission_id, **kwargs):
+        async def bound_submit(*args, admission_id, before_submit, **kwargs):
+            self.assertEqual(before_submit(), "")
             rid, _ = download_requests_repo.create_download_request("bound-cancel", "magnet", admission_id=admission_id)
             download_requests_repo.update_download_request(rid, status="manual_review", qb_status="outcome_unknown")
             request_ids.append(rid)
@@ -116,7 +117,8 @@ class AdmissionCancellationTests(unittest.IsolatedAsyncioTestCase):
                 errors.append(exc)
             finally:
                 finished.set()
-        async def submit(*args, admission_id, **kwargs):
+        async def submit(*args, admission_id, before_submit, **kwargs):
+            self.assertEqual(before_submit(), "")
             await asyncio.to_thread(late_submit, admission_id)
         with patch("app.modules.media_subscriptions.get_indexer_service", return_value=object()), \
              patch("app.modules.media_subscriptions.download_indexer_result_public", side_effect=submit):
