@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -58,14 +59,15 @@ def _retry_in_process(
         _wait_for_phase(release, token + " execute release", timeout=15)
         return original_execute(*args, **kwargs)
 
+    @contextmanager
     def claim_after_gate(*args, **kwargs):
         if collide:
             # Both callers have passed retry_task's real failed-item precheck.
             gates.before_claim.set()
             _wait_for_phase(claim_release, token + " CAS release")
-        claimed = original_claim(*args, **kwargs)
-        claims.put((token, claimed))
-        return claimed
+        with original_claim(*args, **kwargs) as claimed:
+            claims.put((token, claimed))
+            yield claimed
 
     try:
         db.configure_database(database_path, test_mode=True)
@@ -132,7 +134,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
         self.assertEqual(again["status"], "failed")
         self.assertEqual(len(fake.calls), 1)
 
-    def test_running_task_is_not_retried_or_advertised_as_retryable(self):
+    def test_orphaned_task_is_not_retried_or_advertised_as_retryable(self):
         task_id = self._task()
         db.update_gcid_import_task(task_id, status="running")
         fake = FakeImporter()
@@ -142,7 +144,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(fake.calls, [])
         self.assertTrue(replayed)
-        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["status"], "interrupted")
         self.assertFalse(current["can_retry"])
         get_gcid_import_task_result = db.get_gcid_import_task(task_id)
         assert get_gcid_import_task_result is not None
@@ -153,7 +155,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
 
         def claimed_between_reads(selected_id, token):
             self.assertTrue(
-                gcid_import._claim_task_for_run(selected_id, retry_token=token)
+                self.enterContext(gcid_import._claim_task_for_run(selected_id, retry_token=token))
             )
             return True
 
@@ -279,6 +281,7 @@ class GCIDRetryDurabilityAuditTests(IsolatedDatabaseTestCase):
                 get_gcid_import_task_result_3 = db.get_gcid_import_task(task_id)
                 assert get_gcid_import_task_result_3 is not None
                 self.assertEqual(get_gcid_import_task_result_3["status"], "running")
+                self.assertEqual(gcid_import.list_tasks()[0]["status"], "running")
                 self.assertFalse(Path(marker).exists())
                 if not collide:
                     self.assertEqual(_process_result(claims, "A real CAS"), (winner, True))

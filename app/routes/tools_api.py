@@ -7,13 +7,14 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import perf_counter
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, urlparse
 
 import httpx
 import requests
-from fastapi import APIRouter, Body, Path, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 
 from app import config
 from app.defaults import INT_SETTING_BOUNDS
@@ -46,7 +47,12 @@ from app.clients.openai_compatible import (
 from app.logger import get_logger, redact_sensitive_text
 from app.modules import gcid_import, recognition_preprocess_rules, tmdb_regex_rules
 from app.modules.gcid_exports import ExportError
-from app.modules.gcid_manifest import ManifestValidationError, validate_manifest
+from app.modules.gcid_manifest import (
+    MAX_GCID_REQUEST_BYTES,
+    MAX_TARGET_DIR_ID_LENGTH,
+    ManifestValidationError,
+    validate_manifest,
+)
 from app.modules.policy_config import POLICY_BY_KEY, policy_int
 from app.modules.scraper import (
     Candidate,
@@ -731,12 +737,32 @@ def acknowledge_gcid_export(request: Request, job_id: str):
     return api_response({"ok": True})
 
 
-@router.post("/gcid/validate")
-def validate_gcid_manifest(request: Request, data: dict | None = Body(default=None)):
-    """校验上传的 JSON 清单；不执行任何云端写操作。"""
+async def _read_gcid_json(request: Request) -> dict | None:
     require_api_login(request)
-    if _gcid_content_too_large(request):
-        return api_error("清单不能超过 20 MB", 413)
+    too_large = HTTPException(413, f"清单请求不能超过 {MAX_GCID_REQUEST_BYTES // 1024 ** 2} MiB")
+    try:
+        declared = int(request.headers.get("content-length", "0"))
+    except ValueError as exc:
+        raise too_large from exc
+    if declared > MAX_GCID_REQUEST_BYTES:
+        raise too_large
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_GCID_REQUEST_BYTES:
+            raise too_large
+        body.extend(chunk)
+    try:
+        data = await run_in_threadpool(json.loads, body) if body else None
+    except (ValueError, RecursionError) as exc:
+        raise HTTPException(422, "清单请求不是有效的 JSON") from exc
+    if data is not None and not isinstance(data, dict):
+        raise HTTPException(422, "清单请求必须是 JSON 对象")
+    return data
+
+
+@router.post("/gcid/validate")
+def validate_gcid_manifest(data: Annotated[dict | None, Depends(_read_gcid_json)]):
+    """校验上传的 JSON 清单；不执行任何云端写操作。"""
     try:
         return api_response(validate_manifest(data))
     except ManifestValidationError as exc:
@@ -747,13 +773,6 @@ def _gcid_owner_id(request: Request) -> str:
     return str(request.session.get("csrf_token") or "").strip()
 
 
-def _gcid_content_too_large(request: Request) -> bool:
-    try:
-        return int(request.headers.get("content-length") or 0) > 20 * 1024 * 1024
-    except (TypeError, ValueError):
-        return True
-
-
 def _require_gcid_confirmation(data: dict) -> Response | None:
     if str(data.get("confirm") or "") != "GCID":
         return api_error("请输入 GCID 确认导入操作", 400)
@@ -761,21 +780,17 @@ def _require_gcid_confirmation(data: dict) -> Response | None:
 
 
 @router.post("/gcid/import/preview")
-def preview_gcid_import(request: Request, data: dict | None = Body(default=None)):
+def preview_gcid_import(request: Request, data: Annotated[dict | None, Depends(_read_gcid_json)]):
     """只读解析 v2 清单并创建 owner/target/digest 绑定预览。"""
-    require_api_login(request)
-    if _gcid_content_too_large(request):
-        return api_error("清单不能超过 20 MB", 413)
     data = data or {}
     if set(data) - {"manifest", "target_dir_id"}:
         return api_error("请求包含不允许的字段", 400)
     target_dir_id = str(data.get("target_dir_id") or "").strip()
-    if not target_dir_id or len(target_dir_id) > 256:
+    if not target_dir_id or len(target_dir_id) > MAX_TARGET_DIR_ID_LENGTH:
         return api_error("请选择有效的目标目录", 400)
     try:
-        manifest: Any = data.get("manifest")
         return api_response(gcid_import.create_preview(
-            manifest,
+            data.get("manifest"),
             target_dir_id=target_dir_id,
             owner_id=_gcid_owner_id(request),
         ))

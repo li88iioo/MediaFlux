@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 import sqlite3
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
@@ -20,6 +23,20 @@ from tests.test_gcid_import_api import (
 )
 
 
+def _exit_during_retry(database_path: Path, task_id: int, marker: Path) -> None:
+    class Importer:
+        def import_file(self, *, path, **kwargs):
+            marker.write_text(path, encoding="utf-8")
+            os._exit(73)
+
+    db.configure_database(database_path, test_mode=True)
+    with (
+        mock_importer(Importer()),
+        patch.object(gcid_import.notifier, "notify_gcid_import_started"),
+    ):
+        gcid_import.retry_task(task_id, operation_token="interrupted")
+
+
 class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(
@@ -30,30 +47,24 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
         self.enterContext(patch.object(gcid_import.notifier, "notify_gcid_import_finished"))
 
     @staticmethod
-    def _task():
+    def _task(*, extra_failure=False):
+        items = [
+            {
+                "path": "Film/A.mkv", "size": 1, "gcid": "a", "status": "success",
+                "remote_file_id": "existing-a",
+            },
+            {"path": "Film/B.mkv", "size": 1, "gcid": "b", "md5": TEST_FILE_MD5, "status": "failed"},
+        ]
+        if extra_failure:
+            items.append({"path": "Film/C.mkv", "size": 1, "gcid": "c", "status": "failed"})
         task_id = db.create_gcid_import_task(
             operation_token="historical-initial",
             manifest_digest="a" * 64,
             target_dir_id="target",
             target_account_key=TEST_ACCOUNT_KEY,
-            file_count=2,
-            total_size=2,
-        )
-        db.replace_gcid_import_items(
-            task_id,
-            [
-                {
-                    "path": "Film/A.mkv",
-                    "size": 1,
-                    "gcid": "a",
-                    "status": "success",
-                    "remote_file_id": "existing-a",
-                },
-                {
-                    "path": "Film/B.mkv", "size": 1, "gcid": "b",
-                    "md5": TEST_FILE_MD5, "status": "failed",
-                },
-            ],
+            file_count=len(items),
+            total_size=len(items),
+            items=items,
         )
         gcid_import._finish_task(task_id)
         return task_id
@@ -112,34 +123,36 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
                 dict(db.list_gcid_import_items(task_id)[0]), dict(original_items[0])
             )
 
-    def test_interruption_after_private_call_keeps_unknown_running_without_replay(self):
-        class InterruptedImporter:
-            calls = 0
-
-            def import_file(self, **kwargs):
-                self.calls += 1
-                raise KeyboardInterrupt("synthetic interruption after possible write")
-
-        with isolated_test_database("mediaflux.db"):
-            task_id = self._task()
-            fake = InterruptedImporter()
-            with mock_importer(fake):
-                with self.assertRaises(KeyboardInterrupt):
-                    gcid_import.retry_task(task_id, operation_token="interrupted")
-                gcid_import.reset_runtime_state()
-                db.init_db()
-                for token in ("interrupted", "different-token"):
-                    with self.subTest(token=token):
-                        current, replayed = gcid_import.retry_task(
-                            task_id, operation_token=token
-                        )
-                        self.assertTrue(replayed)
-                        self.assertEqual(current["status"], "running")
-                        self.assertFalse(current["can_retry"])
-            self.assertEqual(fake.calls, 1)
+    def test_interrupted_retry_keeps_unknown_and_unattempted_previous_failure_without_replay(self):
+        with isolated_test_database("mediaflux.db") as database_path:
+            task_id = self._task(extra_failure=True)
+            marker = database_path.with_suffix(".provider")
+            worker = multiprocessing.get_context("spawn").Process(
+                target=_exit_during_retry, args=(database_path, task_id, marker),
+            )
+            worker.start()
+            try:
+                worker.join(15)
+                self.assertEqual(worker.exitcode, 73)
+            finally:
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(5)
+                worker.close()
+            self.assertEqual(marker.read_text(encoding="utf-8"), "Film/B.mkv")
+            gcid_import.reset_runtime_state()
+            db.init_db()
+            current, = gcid_import.list_tasks()
+            self.assertEqual(current["status"], "interrupted")
+            self.assertEqual((current["success_count"], current["unknown_count"], current["failed_count"]), (1, 1, 1))
+            self.assertFalse(current["can_retry"])
+            for token in ("interrupted", "different-token"):
+                with self.subTest(token=token):
+                    self.assertEqual(gcid_import.retry_task(task_id, operation_token=token), (current, True))
+            self.assertEqual(gcid_import.clear_finished_tasks(), {"deleted": 0, "retained": 1})
             self.assertEqual(
                 [row["status"] for row in db.list_gcid_import_items(task_id)],
-                ["success", "running"],
+                ["success", "running", "failed"],
             )
 
     def test_retry_receipt_write_failure_rolls_back_admission_before_private_call(self):
@@ -175,6 +188,21 @@ class GCIDHistoryRecoveryAuditTests(unittest.TestCase):
             self.assertFalse(replayed)
             self.assertEqual(final["status"], "success")
             self.assertEqual(len(fake.calls), 1)
+
+    def test_item_intent_failure_leaves_prior_failure_without_a_provider_write(self):
+        with isolated_test_database("mediaflux.db"):
+            task_id = self._task()
+            with db.get_conn() as conn:
+                conn.execute(
+                    "CREATE TRIGGER reject_gcid_intent BEFORE UPDATE OF status ON gcid_import_items "
+                    "WHEN NEW.status='running' BEGIN SELECT RAISE(ABORT, 'intent failed'); END"
+                )
+            writer = FakeImporter()
+            with mock_importer(writer), self.assertRaisesRegex(sqlite3.IntegrityError, "intent failed"):
+                gcid_import.retry_task(task_id, operation_token="no-item-intent")
+            self.assertEqual(writer.calls, [])
+            current, = gcid_import.list_tasks()
+            self.assertEqual((current["status"], current["unknown_count"], current["failed_count"]), ("interrupted", 0, 1))
 
     def test_corrupted_historical_retry_ledger_is_not_overwritten_or_bypassed(self):
         with isolated_test_database("mediaflux.db"):

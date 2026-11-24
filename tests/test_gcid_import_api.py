@@ -24,6 +24,7 @@ from app.modules import gcid_import
 from app.clients.guangya import GuangYaFile
 from app.modules.gcid_manifest import FORMAT_NAME, export_manifest
 from app.modules.telegram_notification_center import NotificationPublishResult
+from app.routes import tools_api
 
 
 TEST_ACCOUNT_KEY = "a" * 64
@@ -155,10 +156,10 @@ class GCIDImportAPITests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 302)
         return {"X-CSRF-Token": self._csrf(client.get("/guangya/more?view=gcid"))}
 
-    def preview(self, headers: dict[str, str], *, target: str = "target-1") -> dict:
+    def preview(self, headers: dict[str, str], *, target: str = "target-1", manifest: dict | None = None) -> dict:
         response = self.client.post(
             "/api/tools/gcid/import/preview",
-            json={"manifest": _manifest(), "target_dir_id": target},
+            json={"manifest": _manifest() if manifest is None else manifest, "target_dir_id": target},
             headers=headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -198,6 +199,20 @@ class GCIDImportAPITests(InitializedWebTestCase):
             json={"manifest": _manifest(), "target_dir_id": "target-1"},
         )
         self.assertEqual(denied.status_code, 403)
+
+    def test_manifest_request_limit_applies_to_actual_bytes_and_content_length(self):
+        headers = {**self.authenticate(), "Content-Type": "application/json"}
+        payload = _manifest()
+        for endpoint, data in (
+            ("validate", payload),
+            ("import/preview", {"manifest": payload, "target_dir_id": "0"}),
+        ):
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            url = "/api/tools/gcid/" + endpoint
+            with self.subTest(endpoint=endpoint), patch.object(tools_api, "MAX_GCID_REQUEST_BYTES", len(body)):
+                self.assertEqual(self.client.post(url, content=body, headers=headers).status_code, 200)
+                for oversized in (body + b" ", iter((body, b" "))):
+                    self.assertEqual(self.client.post(url, content=oversized, headers=headers).status_code, 413)
 
     def test_preview_is_read_only_and_returns_safe_tree_bound_to_owner_target_digest(self):
         headers = self.authenticate()
@@ -245,6 +260,23 @@ class GCIDImportAPITests(InitializedWebTestCase):
             )
         self.assertEqual(wrong_owner.status_code, 409)
         self.assertIn("当前用户", wrong_owner.json()["error"])
+
+    def test_deep_valid_path_is_sampled_for_display_and_imported_in_full(self):
+        headers = self.authenticate()
+        path = "a/" * 509 + "x.mkv"
+        manifest = _manifest([{"path": path, "size": 1, "gcid": "deep"}])
+        preview = self.preview(headers, manifest=manifest)
+        self.assertEqual(preview["file_count"], 1)
+        self.assertTrue(preview["tree_truncated"])
+        writer = FakeImporter()
+        with mock_importer(writer):
+            result = self.client.post(
+                "/api/tools/gcid/import/run",
+                json=self._run_body(preview, "deep-path"),
+                headers=headers,
+            )
+        self.assertEqual(result.json()["task"]["status"], "success")
+        self.assertEqual([call["path"] for call in writer.calls], [path])
 
     def test_preview_rejects_unverified_target_before_storing_snapshot(self):
         headers = self.authenticate()
@@ -565,6 +597,39 @@ class GCIDImportAPITests(InitializedWebTestCase):
         self.assertEqual(second.status_code, 200, second.text)
         self.assertTrue(second.json()["replayed"])
         self.assertEqual(len(fake.calls), 2)
+
+    def test_interrupted_run_reports_committed_unknown_and_unsubmitted_items(self):
+        class InterruptedImporter(FakeImporter):
+            def import_file(self, **kwargs):
+                outcome = super().import_file(**kwargs)
+                if kwargs["path"] == "B.mkv":
+                    raise OSError("synthetic lost response after write")
+                return outcome
+
+        headers = self.authenticate()
+        manifest = _manifest([{"path": f"{name}.mkv", "size": 1, "gcid": name} for name in "ABC"])
+        run = "/api/tools/gcid/import/run"
+        preview = self.preview(headers, manifest=manifest)
+        token = "interrupted-initial-run"
+        writer = InterruptedImporter()
+        with mock_importer(writer):
+            response = self.client.post(run, json=self._run_body(preview, token), headers=headers)
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual([call["path"] for call in writer.calls], ["A.mkv", "B.mkv"])
+
+        gcid_import.reset_runtime_state()
+        db.init_db()
+        task, = self.client.get("/api/tools/gcid/import/tasks").json()["tasks"]
+        self.assertEqual(task["status"], "interrupted")
+        self.assertEqual((task["success_count"], task["unknown_count"], task["pending_count"]), (1, 1, 1))
+        self.assertFalse(task["can_retry"])
+        self.assertEqual(
+            [item["status"] for item in db.list_gcid_import_items(task["id"])],
+            ["success", "running", "previewed"],
+        )
+        same_manifest = self.preview(headers, manifest=manifest)
+        replay = self.client.post(run, json=self._run_body(same_manifest, token), headers=headers)
+        self.assertEqual(replay.json(), {"task": task, "replayed": True})
 
     def test_run_and_retry_require_exact_confirmation_text(self):
         headers = self.authenticate()

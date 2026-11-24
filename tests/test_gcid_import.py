@@ -115,6 +115,15 @@ class GCIDManifestV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestValidationError, "total_size"):
             normalize_manifest_v2(_manifest(total_size=99))
 
+    def test_manifest_sizes_fit_persisted_sqlite_integers(self):
+        max_sqlite_integer = (1 << 63) - 1
+        file = {"path": "A.mkv", "size": max_sqlite_integer, "gcid": "gcid-a"}
+        self.assertEqual(normalize_manifest_v2(_manifest([file])).total_size, max_sqlite_integer)
+        with self.assertRaisesRegex(ManifestValidationError, r"files\[0\] size"):
+            normalize_manifest_v2(_manifest([{**file, "size": max_sqlite_integer + 1}]))
+        with self.assertRaisesRegex(ManifestValidationError, "total_size"):
+            normalize_manifest_v2(_manifest([file, {**file, "path": "B.mkv", "size": 1}]))
+
     def test_import_limit_is_ten_thousand_files(self):
         files = [
             {"path": f"A/{index}.mkv", "size": 1, "gcid": f"gcid-{index}"}
@@ -172,7 +181,7 @@ class GCIDImportPreviewStoreTests(unittest.TestCase):
             ttl_seconds=1800, max_entries=2, clock=lambda: now[0]
         )
         manifest = normalize_manifest_v2(_manifest())
-        preview_id = store.create(manifest, target_dir_id="target-1", owner_id="user-1")
+        preview_id = store.create(manifest, target_dir_id="target-1", owner_id="user-1").preview_id
 
         snapshot = store.consume(
             preview_id,
@@ -180,8 +189,10 @@ class GCIDImportPreviewStoreTests(unittest.TestCase):
             owner_id="user-1",
             manifest_digest=manifest.digest,
         )
-        self.assertEqual(snapshot.manifest_digest, manifest.digest)
+        self.assertIs(snapshot.manifest, manifest)
         self.assertEqual(snapshot.target_dir_id, "target-1")
+        with self.assertRaisesRegex(PreviewBindingError, "摘要"):
+            store.consume(preview_id, target_dir_id="target-1", owner_id="user-1", manifest_digest="0" * 64)
         with self.assertRaises(PreviewBindingError):
             store.consume(preview_id, target_dir_id="target-2", owner_id="user-1")
         with self.assertRaises(PreviewBindingError):
@@ -197,7 +208,7 @@ class GCIDImportPreviewStoreTests(unittest.TestCase):
         store.create(manifest, target_dir_id="2", owner_id="u")
         store.create(manifest, target_dir_id="3", owner_id="u")
         with self.assertRaises(PreviewBindingError):
-            store.consume(first, target_dir_id="1", owner_id="u")
+            store.consume(first.preview_id, target_dir_id="1", owner_id="u")
 
 
 class GCIDImportDatabaseTests(IsolatedDatabaseTestCase):
@@ -307,8 +318,8 @@ class GCIDImportDatabaseTests(IsolatedDatabaseTestCase):
             ("running", 1, 0, False),
             ("running", 1, 1, False),
             ("running", 1, 2, False),
-            ("running", 1, 0, False),
-            ("running", 2, 0, False),
+            ("running", 1, 2, False),
+            ("running", 2, 1, False),
             ("running", 2, 1, False),
         ])
         self.assertEqual(stored, [(0, 0)] * 4 + [(1, 3)] * 3)

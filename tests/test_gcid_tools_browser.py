@@ -392,7 +392,9 @@ class GCIDToolsBrowserTests(InitializedWebTestCase):
 
     def test_export_is_restored_after_leaving_page_and_ready_download_works_offline(self) -> None:
         page = self.open_page()
-        self.export_manifest = manifest({"path": "影片.mkv", "size": 42, "gcid": "file-gcid", "md5": "a" * 32})
+        self.export_manifest = manifest({
+            "path": "影片.mkv", "size": (1 << 53) + 1, "gcid": "file-gcid", "md5": "a" * 32,
+        })
         self.pick_directory(page, "gcidChooseDir", "gcidDirModal", "导出目录")
         page.get_by_role("button", name="生成清单", exact=True).click()
         message = page.locator("#gcidExportMessage")
@@ -676,6 +678,33 @@ class GCIDToolsBrowserTests(InitializedWebTestCase):
         self.held_gcid_requests[retry_endpoint].fulfill(json={"task": task, "replayed": False})
         page.locator("#gcidImportProgress").get_by_text("成功", exact=True).wait_for()
         self.assertEqual(len(self.calls[retry_endpoint]), 1)
+
+    def test_interrupted_history_stops_polling_without_retry_or_cleanup(self) -> None:
+        task = {
+            "id": 24, "status": "running", "file_count": 3, "total_size": 3,
+            "success_count": 1, "failed_count": 0, "can_retry": False,
+        }
+        self.history[:] = [task]
+        page = self.open_page()
+        page.clock.install()
+        page.reload()
+        history = page.locator("#gcidImportHistory")
+        history.locator('[data-status="running"]').wait_for()
+        task.update(status="interrupted", unknown_count=1, pending_count=1, error="请核对原光鸭账号的目标目录")
+        page.clock.fast_forward(5000)
+        interrupted = history.locator('[data-status="interrupted"]')
+        interrupted.get_by_text("结果未知 1 · 尚未提交 1", exact=False).wait_for()
+        self.assertEqual(interrupted.get_by_role("button", name="重试失败项").count(), 0)
+        reads = len(self.calls["/import/tasks"])
+        page.clock.run_for(15_000)
+        self.assertEqual(len(self.calls["/import/tasks"]), reads)
+
+        page.locator("#gcidImportClear").click()
+        modal = page.get_by_role("alertdialog", name="清除 GCID 导入记录")
+        with page.expect_response(lambda response: response.request.method == "DELETE"):
+            modal.locator("#appConfirmSubmit").click()
+        interrupted.wait_for()
+        self.assertEqual(self.history, [task])
 
     def test_clear_import_history_preserves_running_tasks_on_narrow_screen(self) -> None:
         common = {"file_count": 3, "total_size": 126, "can_retry": False}

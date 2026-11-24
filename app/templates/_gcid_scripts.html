@@ -86,7 +86,19 @@
         return node;
     }
 
-    function clientValidateManifest(data) {
+    async function readManifest(file) {
+        if (file.size > manifestSchema.max_bytes) {
+            throw new Error('清单不能超过 ' + manifestSchema.max_bytes / 1048576 + ' MiB');
+        }
+        const text = await file.text().catch(() => {
+            throw new Error('读取清单失败，请重新选择文件');
+        });
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch {
+            throw new Error('清单不是有效的 JSON');
+        }
         if (!data || typeof data !== 'object' || Array.isArray(data)) {
             throw new Error('清单根节点必须是 JSON 对象');
         }
@@ -98,24 +110,8 @@
             throw new Error('文件数量超过 ' + manifestSchema.max_files.toLocaleString('en-US') + ' 上限');
         }
         if (data.file_count !== data.files.length) throw new Error('file_count 与 files 数量不一致');
-        // 逐文件 MD5 可选。预览接口负责校验各项内容及完整性摘要。
-        return data;
-    }
-
-    async function readManifest(file) {
-        let text;
-        try {
-            text = await file.text();
-        } catch {
-            throw new Error('读取清单失败，请重新选择文件');
-        }
-        let manifest;
-        try {
-            manifest = JSON.parse(text);
-        } catch {
-            throw new Error('清单不是有效的 JSON');
-        }
-        return clientValidateManifest(manifest);
+        // 保留原文，避免重新编码时丢失大整数精度。
+        return {text, file_count: data.file_count};
     }
 
     function setDirectoryLabel(id, directory) {
@@ -370,7 +366,7 @@
             const manifest = await readManifest(file);
             const result = await jsonRequest('/api/tools/gcid/validate', {
                 method: 'POST',
-                body: JSON.stringify(manifest),
+                body: manifest.text,
             });
             if (!result.valid) throw new Error(result.error || '校验失败');
             const summary = '校验通过 · ' + result.file_count + ' 个文件 · ' + formatBytes(result.total_size);
@@ -475,7 +471,7 @@
         });
     });
 
-    function renderTree(nodes) {
+    function renderTree(nodes, truncated) {
         const host = byId('gcidImportTree');
         host.replaceChildren();
         if (!nodes.length) {
@@ -483,11 +479,8 @@
             return;
         }
         const list = appendText(host, 'ul', '', 'gcid-tree-root');
-        let budget = 600;
         function addNodes(items, depth) {
             for (const item of items) {
-                if (budget <= 0) return;
-                budget -= 1;
                 const row = appendText(list, 'li', '', 'gcid-tree-node');
                 row.style.setProperty('--gcid-depth', String(depth));
                 const isDirectory = item.type === 'directory';
@@ -503,8 +496,8 @@
             }
         }
         addNodes(nodes, 0);
-        if (budget <= 0) {
-            appendText(host, 'div', '界面仅展示前 600 个节点，导入按完整清单执行', 'gcid-tree-truncated');
+        if (truncated) {
+            appendText(host, 'div', '仅展示部分节点，导入按完整清单执行', 'gcid-tree-truncated');
         }
     }
 
@@ -520,7 +513,7 @@
         try {
             const preview = await jsonRequest('/api/tools/gcid/import/preview', {
                 method: 'POST',
-                body: JSON.stringify({manifest, target_dir_id: targetId}),
+                body: '{"manifest":' + manifest.text + ',"target_dir_id":' + JSON.stringify(targetId) + '}',
                 signal: request.signal,
             });
             if (state.previewRequest !== request) return;
@@ -530,7 +523,7 @@
             }
             byId('gcidImportPreviewTitle').textContent = '摘要 ' + preview.manifest_digest.slice(0, 12) + '…';
             setPreviewCounts(preview.file_count, formatBytes(preview.total_size));
-            renderTree(preview.tree);
+            renderTree(preview.tree, preview.tree_truncated);
             state.preview = preview;
             if (preview.file_count === 0) {
                 setImportStatus('清单没有文件，无法执行导入');
@@ -588,7 +581,10 @@
                 }),
             });
             const task = result.task;
-            const labels = {success: '导入成功', partial_success: '部分成功', failed: '导入失败', running: '正在导入'};
+            const labels = {
+                success: '导入成功', partial_success: '部分成功', failed: '导入失败',
+                running: '正在导入', interrupted: '导入已中断',
+            };
             const label = labels[task?.status];
             if (!label) throw new Error('未收到可确认的任务结果');
             const counts = '成功 ' + task.success_count + ' · 失败 ' + task.failed_count;
@@ -620,7 +616,10 @@
     });
 
     function statusLabel(status) {
-        return {previewed: '已预览', running: '执行中', success: '成功', partial_success: '部分成功', failed: '失败'}[status] || status;
+        return {
+            previewed: '已预览', running: '执行中', success: '成功',
+            partial_success: '部分成功', failed: '失败', interrupted: '已中断',
+        }[status] || status;
     }
 
     function taskCard(task) {
@@ -641,6 +640,10 @@
             const item = appendText(stats, 'div', '');
             appendText(item, 'span', label);
             appendText(item, 'strong', String(value));
+        }
+        if (task.status === 'interrupted') {
+            appendText(article, 'div', '结果未知 ' + task.unknown_count +
+                ' · 尚未提交 ' + task.pending_count + ' · ' + task.error, 'gcid-failure-samples');
         }
         if (task.failed_samples?.length) {
             const samples = appendText(article, 'div', '', 'gcid-failure-samples');
@@ -743,7 +746,7 @@
             });
             const current = result.task;
             // 已确认终态后，下次主动重试才创建新的操作令牌。
-            if (['success', 'partial_success', 'failed'].includes(current.status)) state.retryTokens.delete(task.id);
+            if (current.status !== 'running') state.retryTokens.delete(task.id);
             renderProgress(
                 statusLabel(current.status),
                 '成功 ' + current.success_count + ' · 失败 ' + current.failed_count,
@@ -767,7 +770,7 @@
         if (state.historyClearing || !state.historyTasks?.length) return;
         const confirmed = await appConfirm({
             title: '清除 GCID 导入记录',
-            message: '将清除全部已结束的导入记录，包括未显示的记录。已预览和执行中的记录以及云盘文件会保留。',
+            message: '将清除全部已确认结果的导入记录，包括未显示的记录。已预览、执行中和中断的记录以及云盘文件会保留。',
             confirmText: '清除记录',
             danger: true,
             trigger: event.currentTarget,
@@ -787,7 +790,7 @@
         indicator.title = '';
         try {
             const {deleted, retained} = await jsonRequest(historyEndpoint, {method: 'DELETE'});
-            const active = retained ? state.historyTasks.filter(task => task.status === 'previewed' || task.status === 'running') : [];
+            const active = retained ? state.historyTasks.filter(task => ['previewed', 'running', 'interrupted'].includes(task.status)) : [];
             renderHistory(retained && !active.length ? null : active);
             window.showToast('已清除 ' + deleted + ' 条记录，保留 ' + retained + ' 条', 'success');
         } catch (error) {

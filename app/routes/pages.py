@@ -317,12 +317,15 @@ def organize_rules(request: Request):
 
 @router.get("/guangya/more", name="pages.guangya_more")
 def guangya_more(request: Request, view: str = "share"):
-    from app.modules.gcid_manifest import FORMAT_NAME, FORMAT_VERSION, MAX_MANIFEST_FILES
+    from app.modules.gcid_manifest import FORMAT_NAME, FORMAT_VERSION, MAX_GCID_REQUEST_BYTES, MAX_MANIFEST_FILES
 
     more_view = "gcid" if view == "gcid" else "share"
     return _page(
         request, "guangya_more.html", "guangya_more", more_view=more_view,
-        gcid_manifest_schema={"format": FORMAT_NAME, "version": FORMAT_VERSION, "max_files": MAX_MANIFEST_FILES},
+        gcid_manifest_schema={
+            "format": FORMAT_NAME, "version": FORMAT_VERSION,
+            "max_files": MAX_MANIFEST_FILES, "max_bytes": MAX_GCID_REQUEST_BYTES,
+        },
     )
 
 

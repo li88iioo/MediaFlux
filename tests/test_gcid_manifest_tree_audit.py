@@ -117,14 +117,15 @@ class GCIDManifestTreeAuditTests(TestCase):
         detail = replace(listed, etag="gcid-a")
         client = Mock()
         client.list_dir.return_value = [listed]
-        client.file_info.return_value = detail
-
-        payload = export_manifest(client, "root")
-
-        client.file_info.assert_called_once_with("a")
-        self.assertEqual(payload["files"], [
-            {"path": "A.mkv", "size": 1, "gcid": "gcid-a", "md5": "a" * 32},
-        ])
+        for detail_md5 in (listed.md5, "", "invalid"):
+            with self.subTest(md5=detail_md5):
+                client.file_info.reset_mock()
+                client.file_info.return_value = replace(detail, md5=detail_md5)
+                payload = export_manifest(client, "root")
+                client.file_info.assert_called_once_with("a")
+                self.assertEqual(normalize_manifest_v2(payload).files[0].to_dict(), {
+                    "path": "A.mkv", "size": 1, "gcid": "gcid-a", "md5": listed.md5,
+                })
 
         client.file_info.return_value = replace(detail, md5="b" * 32)
         with self.assertRaisesRegex(ValueError, r"身份不一致.*A\.mkv"):

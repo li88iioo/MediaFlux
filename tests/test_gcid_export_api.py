@@ -1,6 +1,7 @@
 """GCID 后台导出的会话归属、任务进度与下载确认契约。"""
 from __future__ import annotations
 
+import json
 import os
 from threading import Event
 from time import monotonic, sleep
@@ -10,7 +11,8 @@ from fastapi.testclient import TestClient
 
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.main import create_app
-from app.modules.gcid_manifest import export_manifest
+from app.modules import gcid_import
+from app.modules.gcid_manifest import MAX_GCID_REQUEST_BYTES, export_manifest
 from app.routes import tools_api
 from tests.support import InitializedWebTestCase
 from tests.test_config_empty_values_api import login
@@ -171,6 +173,46 @@ class GCIDExportAPITests(InitializedWebTestCase):
         repeated_ack = self.client.delete(task_path, headers=headers)
         self.assertEqual(repeated_ack.status_code, 200, repeated_ack.text)
         self.cloud.generate_gcid_json.assert_called_once()
+
+    def test_large_export_and_legacy_indented_manifest_can_be_imported_directly(self):
+        remote = {
+            parent: [GuangYaFile(f"dir-{i}", "目录" * 35 + str(i), True, parent_id=parent)]
+            for i, parent in enumerate(["source-1", *[f"dir-{j}" for j in range(9)]])
+        }
+        remote["dir-9"] = [
+            GuangYaFile(str(i), f"{i:05d}.mkv", False, 42, "gcid-episode", "dir-9", md5=MD5)
+            for i in range(10_000)
+        ]
+        self.cloud.list_dir.side_effect = remote.__getitem__
+        self.cloud.share_account_key.return_value = "a" * 64
+        headers = {**login(self.client), "Content-Type": "application/json"}
+
+        task = self._start(headers)
+        self._wait_for_terminal("ready")
+        downloaded = self.client.get(f"{EXPORT}/{task['id']}/download")
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertGreater(len(downloaded.content), 20 * 1024 * 1024)
+        manifest = downloaded.json()
+        legacy = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        self.assertLess(len(downloaded.content), len(legacy))
+
+        with patch.object(gcid_import, "GuangYaClient", return_value=self.cloud):
+            for content in (downloaded.content, legacy):
+                with self.subTest(byte_count=len(content)):
+                    wrapped = b'{"manifest":' + content + b',"target_dir_id":"0"}'
+                    self.assertLess(len(wrapped), MAX_GCID_REQUEST_BYTES)
+                    preview = self.client.post("/api/tools/gcid/import/preview", content=wrapped, headers=headers)
+                    self.assertEqual(preview.status_code, 200, preview.text)
+                    result = preview.json()
+                    self.assertEqual(result["manifest_digest"], manifest["integrity"]["digest"])
+                    self.assertEqual(result["file_count"], 10_000)
+                    self.assertTrue(result["tree_truncated"])
+                    children = result["tree"]
+                    for _ in range(10):
+                        directory, = children
+                        self.assertEqual(directory["file_count"], 10_000)
+                        children = directory["children"]
+                    self.assertEqual(len(children), 590)
 
     def test_failed_worker_can_be_retried_by_post(self):
         headers = login(self.client)

@@ -1,7 +1,6 @@
 """后台生成 GCID 清单，由发起导出的 Web 会话领取临时文件。"""
 from __future__ import annotations
 
-import json
 import secrets
 import tempfile
 import threading
@@ -12,6 +11,7 @@ from typing import BinaryIO
 
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
+from app.modules.gcid_manifest import iter_manifest_bytes
 
 logger = get_logger(__name__)
 
@@ -103,7 +103,7 @@ class GCIDExports:
         try:
             manifest = client.generate_gcid_json(job.source_dir_id, job.source_name, on_progress=progress)
             artifact = tempfile.TemporaryFile(mode="w+b")
-            artifact.write(json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+            artifact.writelines(iter_manifest_bytes(manifest))
             artifact.flush()
         except ValueError as exc:
             error = str(exc) or "清单生成失败，请重新生成"
