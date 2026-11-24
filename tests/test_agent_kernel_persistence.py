@@ -524,9 +524,8 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
                 ("owner", "other", lease.request_id, lease.turn_id),
                 ("owner", "session", "other", lease.turn_id), ("owner", "session", lease.request_id, "other")):
             self.assertEqual(await self.store.list_events(owner=owner, session_id=sid, request_id=request, turn_id=turn), [])
-        for request, turn in ((lease.request_id, ""), ("", lease.turn_id)):
-            with self.assertRaises(ValueError):
-                await self.store.list_events(owner="owner", session_id="session", request_id=request, turn_id=turn)
+        with self.assertRaises(ValueError):
+            await self.store.list_events(owner="owner", session_id="session", turn_id=lease.turn_id)
         forged = AgentEvent(AgentEventType.MODEL_DELTA, "session", "other-turn", "other-request", 4, {"delta": "private"})
         await self.store.append(forged, owner="owner")
         with db.get_conn() as conn:
@@ -536,6 +535,10 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
         restored = await self.store.list_events(owner="owner", session_id="session",
             request_id=lease.request_id, turn_id=lease.turn_id)
         self.assertEqual([event["sequence"] for event in restored], [1, 3])
+        request_tail = await self.store.list_events(
+            owner="owner", session_id="session", request_id=lease.request_id, limit=5,
+        )
+        self.assertEqual([event["sequence"] for event in request_tail], [3, 1])
 
     async def test_session_listing_reset_and_delete_are_owner_scoped(self) -> None:
         lease, _ = await self.store.begin_turn(

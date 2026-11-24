@@ -45,6 +45,7 @@ from app.repositories.telegram_notifications import (
     get_agent_continuation_group,
     purge_notifications,
     recover_notifications,
+    reject_notification_message,
     retry_notification,
     suppress_notification,
     suppress_agent_continuation_group,
@@ -734,18 +735,15 @@ def _dispatch_item(item: dict) -> bool:
     if message_thread_id is not None:
         send_kwargs["message_thread_id"] = message_thread_id
     outcome: TelegramSendResult
-    fallback_to_new_message = False
-
     def send_event(_delivery):
-        nonlocal fallback_to_new_message
         if message_id > 0:
             result = edit_event_result(event, chat_id=chat_id, message_id=message_id)
-            if not result.ok and _edit_can_fallback_to_new_message(result):
-                # 旧消息身份已被 Telegram 明确拒绝；后续新发送若结果未知，
-                # 绝不能继续沿用旧 message_id 或自动重放。
-                fallback_to_new_message = True
-                result = send_event_result(event, **send_kwargs)
-            return result
+            if result.ok or not _edit_can_fallback_to_new_message(result):
+                return result
+            if not reject_notification_message(
+                notification_id, lease_generation=generation, message_id=message_id,
+            ):
+                return TelegramSendResult(ok=False, error="NotificationLeaseLost")
         return send_event_result(event, **send_kwargs)
 
     try:
@@ -785,11 +783,7 @@ def _dispatch_item(item: dict) -> bool:
             notification_id,
             lease_generation=generation,
             claimed_revision=claimed_revision,
-            message_id=(
-                outcome.message_id
-                or (0 if fallback_to_new_message else message_id)
-                or 0
-            ),
+            message_id=outcome.message_id or 0,
         )
     if (
         not outcome.outcome_unknown
@@ -801,7 +795,6 @@ def _dispatch_item(item: dict) -> bool:
             lease_generation=generation,
             claimed_revision=claimed_revision,
             error=outcome.error or "TelegramRequestRejected",
-            clear_message_id=fallback_to_new_message,
         )
         return False
     retry_notification(
@@ -810,7 +803,6 @@ def _dispatch_item(item: dict) -> bool:
         claimed_revision=claimed_revision,
         error=outcome.error or "TelegramUnavailable",
         retry_after_seconds=outcome.retry_after_seconds,
-        clear_message_id=fallback_to_new_message,
         outcome_unknown=outcome.outcome_unknown,
         message_id=(outcome.message_id or 0),
     )

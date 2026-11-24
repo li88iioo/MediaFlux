@@ -688,27 +688,27 @@ async def get_session(request: Request, session_id: str):
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
         owner = _owner()
         draft_scope = _draft_scope(owner)
-        activity_before = await runtime.web.activity(owner=owner, session_id=normalized)
         # 终态事件在会话结果提交之后发布：先读事件再读状态，避免
         # 空→活动→空的快速轮次返回“新完成事件 + 旧对话”。
-        events = await runtime.store.list_events(
-            owner=owner, session_id=normalized, limit=500 if activity_before else 64,
-        )
-        turn_events = (await runtime.store.list_events(owner=owner, session_id=normalized,
-            request_id=activity_before["request_id"], turn_id=activity_before["turn_id"])) if activity_before else []
-        state = await runtime.store.load(owner=owner, session_id=normalized)
-        activity_after = await runtime.web.activity(owner=owner, session_id=normalized)
-        if activity_before != activity_after:
-            events = await runtime.store.list_events(
-                owner=owner, session_id=normalized, limit=500 if activity_after else 64,
-            )
-            turn_events = (await runtime.store.list_events(owner=owner, session_id=normalized,
-                request_id=activity_after["request_id"], turn_id=activity_after["turn_id"])) if activity_after else []
-            state = await runtime.store.load(owner=owner, session_id=normalized)
+        scope = {"owner": owner, "session_id": normalized}
 
-        active_turn = active_turn_view(activity_after, events)
+        async def read_snapshot(activity):
+            events = await runtime.store.list_events(
+                **scope, limit=64, request_id=observed_request,
+            )
+            journal = await runtime.store.list_events(
+                **scope, request_id=activity["request_id"], turn_id=activity["turn_id"],
+            ) if activity else []
+            return events, journal, await runtime.store.load(**scope)
+
+        activity = await runtime.web.activity(**scope)
+        events, journal, state = await read_snapshot(activity)
+        current = await runtime.web.activity(**scope)
+        if activity != current:
+            events, journal, state = await read_snapshot(current)
+        active_turn = active_turn_view(current, journal)
         if active_turn:
-            active_turn["events"] = public_active_turn_events(turn_events, active_turn)
+            active_turn["events"] = public_active_turn_events(journal, active_turn)
         candidate_view = await current_candidate_view(
             state=state, store=runtime.store,
         )
@@ -737,12 +737,8 @@ async def get_session(request: Request, session_id: str):
                         activity["status"] = "approval_required"
                 if activities:
                     pending_approval["activities"] = activities
-        last_turn = last_turn_view(
-            [event for event in events if not observed_request or event.get("request_id") == observed_request],
-            active_turn,
-        )
-        terminal_payload = next((event.get("payload", {}) for event in reversed(events)
-                                 if last_turn and event.get("turn_id") == last_turn["turn_id"]), {})
+        last_turn = last_turn_view(events, active_turn)
+        terminal_payload = events[-1].get("payload", {}) if last_turn else {}
         if not active_turn and last_turn and last_turn["status"] == "waiting":
             # 等待提示属于公开响应，不写入原任务的模型历史；恢复沿用同一文本投影。
             answer = public_conversation_messages([{"role": "assistant", "content": terminal_payload.get("answer", "")}])

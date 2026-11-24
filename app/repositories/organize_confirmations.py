@@ -5,7 +5,7 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app import database as db
 from app.repositories import telegram_notifications
@@ -18,7 +18,7 @@ _MAX_CORRECTION_LOGS = 50
 # review_status / review_result_json 是每组的“建议槽”，Agent 复核与人工审阅共用：
 # - Agent：waiting → pending → running → approved / abstained / failed；
 # - 人工保存选择直接写 approved，review_result_json.source='human'，不认领、不执行；
-# - 模型结果只在 review_status='running' 时写回，因此迟到的复核不会覆盖人工选择。
+# - 模型结果只在对应领取仍为 running 时写回，迟到结果不能覆盖新领取或人工选择。
 # 真正执行的候选只看 selected_index 与 status，建议槽不代表已确认。
 
 
@@ -316,15 +316,22 @@ def query_organize_confirmations(
             ).fetchone()[0]
             if 0 < video_count <= _MAX_CORRECTION_LOGS:
                 log_ids = _pending_reorganize_log_ids(conn, rows, timestamp)
-        # 执行关联沿用唯一操作令牌，待审组则取整组原日志。
-        operations = {f"recognition-confirm:{row['token']}": row["token"] for row in rows
-                      if row["status"] != "pending"}
-        if operations:
-            for log in conn.execute(
-                "SELECT id,operation_token FROM organize_log WHERE operation_token!='' AND operation_token IN ("
-                + ",".join("?" for _ in operations) + ") ORDER BY id", list(operations),
-            ):
-                log_ids.setdefault(operations[log["operation_token"]], []).append(log["id"])
+        finished = json.dumps([row["token"] for row in rows if row["status"] != "pending"])
+        for token, log_id in conn.execute("""
+            WITH cards AS (
+                SELECT token, status, CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END AS receipt
+                FROM organize_confirmations WHERE token IN (SELECT value FROM json_each(?))
+            )
+            SELECT c.token, l.id FROM cards c JOIN organize_log l ON l.operation_token='recognition-confirm:'||c.token
+            WHERE l.operation_token!=''
+            UNION
+            SELECT c.token, l.id FROM cards c, json_each(c.receipt, '$.organize_log_ids') i
+            JOIN organize_log l ON l.id=i.value AND l.source='guangya'
+            WHERE c.status='completed' AND json_extract(c.receipt,'$.resolution')='reorganized'
+              AND json_type(c.receipt,'$.organize_log_ids')='array' AND i.type='integer'
+            ORDER BY 2
+        """, (finished,)):
+            log_ids.setdefault(token, []).append(log_id)
     return {"rows": rows, "tokens": [row["token"] for row in selected],
             "total": total, "counts": counts, "log_ids": log_ids}
 
@@ -420,45 +427,35 @@ def activate_organize_confirmation_reviews(tokens: list[str]) -> int:
         return cursor.rowcount
 
 
-def recover_interrupted_organize_confirmation_reviews() -> int:
-    """进程重启后恢复未决复核；连续中断三次后永久回退人工。"""
-    timestamp = db.now()
+def recover_interrupted_organize_confirmation_reviews() -> tuple[int, list[sqlite3.Row]]:
+    """恢复未决复核，回读仍待人工的中断回执以补发原消息。"""
     with db.get_conn() as conn:
-        failed = conn.execute(
-            "UPDATE organize_confirmations SET review_status='failed',"
-            "review_result_json=?,review_completed_at=?,updated_at=? "
-            "WHERE review_status='running' AND status='pending' "
-            "AND review_attempts>=3",
-            (
-                json.dumps(
-                    {
-                        "reason_code": "repeated_interruption",
-                        "summary": "Agent 复核连续中断，已保留人工确认",
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-                timestamp,
-                timestamp,
-            ),
-        )
-        recovered = conn.execute(
-            "UPDATE organize_confirmations SET review_status='pending',"
-            "review_started_at=NULL,updated_at=? "
-            "WHERE review_status='running' AND status='pending' "
-            "AND review_attempts<3",
-            (timestamp,),
-        )
-        return failed.rowcount + recovered.rowcount
+        conn.execute("BEGIN IMMEDIATE")
+        timestamp = db.now()
+        recovered = conn.execute("""
+            UPDATE organize_confirmations
+            SET review_status=CASE WHEN review_attempts>=3 THEN 'failed' ELSE 'pending' END,
+                review_result_json=CASE WHEN review_attempts>=3 THEN :result ELSE review_result_json END,
+                review_completed_at=CASE WHEN review_attempts>=3 THEN :now END, updated_at=:now
+            WHERE review_status='running' AND status='pending'
+        """, {"now": timestamp, "result": json.dumps({
+            "reason_code": "repeated_interruption", "summary": "Agent 复核连续中断，已保留人工确认",
+        }, ensure_ascii=False)}).rowcount
+        failed = conn.execute("""
+            SELECT * FROM organize_confirmations WHERE status='pending' AND expires_at>?
+              AND review_status='failed' AND json_valid(review_result_json)
+              AND json_extract(review_result_json,'$.reason_code')='repeated_interruption'
+        """, (timestamp,)).fetchall()
+        return recovered, failed
 
 
 def claim_next_organize_confirmation_review() -> sqlite3.Row | None:
     """原子领取最早的待确认识别复核；只读模型调用不占用整理写队列。"""
-    timestamp = db.now()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        timestamp = db.now()
         row = conn.execute(
-            "SELECT id FROM organize_confirmations "
+            "SELECT id,review_started_at FROM organize_confirmations "
             "WHERE review_status='pending' AND status='pending' "
             "AND review_attempts<3 AND expires_at>? "
             "ORDER BY id ASC LIMIT 1",
@@ -466,65 +463,43 @@ def claim_next_organize_confirmation_review() -> sqlite3.Row | None:
         ).fetchone()
         if row is None:
             return None
-        cursor = conn.execute(
+        # 保留上次时间，重启或时钟回拨后仍能生成严格更新的领取标记。
+        started = datetime.now()
+        if previous := row["review_started_at"]:
+            started = max(started, datetime.fromisoformat(previous) + timedelta(microseconds=1))
+        return conn.execute(
             "UPDATE organize_confirmations SET review_status='running',"
             "review_attempts=review_attempts+1,review_started_at=?,"
             "review_completed_at=NULL,updated_at=? "
-            "WHERE id=? AND review_status='pending' AND status='pending'",
-            (timestamp, timestamp, int(row["id"])),
-        )
-        if cursor.rowcount != 1:
-            return None
-        return conn.execute(
-            "SELECT * FROM organize_confirmations WHERE id=?",
-            (int(row["id"]),),
+            "WHERE id=? RETURNING *",
+            (started.isoformat(sep=" ", timespec="microseconds"), timestamp, row["id"]),
         ).fetchone()
 
 
-def stage_organize_confirmation_review_result(
-    token: str, result: dict | None = None
-) -> bool:
-    """在 Agent 竞争执行所有权前保存最小审计，不改变确认状态。"""
-    encoded = json.dumps(
-        result or {}, ensure_ascii=False, separators=(",", ":"), default=str
-    )
-    with db.get_conn() as conn:
-        cursor = conn.execute(
-            "UPDATE organize_confirmations SET review_result_json=?,updated_at=? "
-            "WHERE token=? AND review_status='running' AND status='pending'",
-            (encoded, db.now(), (token or "")),
-        )
-        return cursor.rowcount == 1
-
-
-def complete_organize_confirmation_review(
-    token: str,
+def save_organize_confirmation_review(
+    claim: sqlite3.Row,
     *,
     status: str,
-    result: dict | None = None,
+    result: dict,
     discovered_candidates: list[dict] | None = None,
-) -> bool:
-    """保存最小复核回执；模型上下文与工具原始载荷不会持久化。"""
-    normalized_status = (status or "").strip().lower()
-    if normalized_status not in {
-        "approved", "abstained", "failed", "cancelled"
-    }:
+) -> sqlite3.Row | None:
+    """仅当前领取可暂存审计或保存终态；补搜候选与建议同时写入。"""
+    if status not in {"running", "approved", "abstained", "failed", "cancelled"}:
         raise ValueError("Agent 复核状态无效")
-    encoded = json.dumps(
-        result or {}, ensure_ascii=False, separators=(",", ":"), default=str
-    )
     candidate_update = ""
     discovery_guard = ""
-    bindings: dict[str, str] = {"status": normalized_status, "result": encoded, "token": token}
+    bindings = {
+        "status": status, "result": json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str),
+        "token": claim["token"], "started_at": claim["review_started_at"],
+    }
     if discovered_candidates:
         # 补搜结果与建议同时可见，永远不能覆盖已有候选或复活已处理/过期的卡。
-        index = (result or {}).get("candidate_index")
-        if normalized_status != "approved" or type(index) is not int or not 0 <= index < len(discovered_candidates):
+        index = result.get("candidate_index")
+        if status != "approved" or type(index) is not int or not 0 <= index < len(discovered_candidates):
             raise ValueError("补搜作品与复核建议不一致")
         candidate_update = ",payload_json=json_set(payload_json,'$.candidates',json(:candidates))"
         bindings["candidates"] = json.dumps(discovered_candidates, ensure_ascii=False)
         discovery_guard = (
-            " AND status='pending' AND expires_at>:now"
             " AND json_extract(payload_json,'$.review_only')=1"
             " AND json_extract(payload_json,'$.discover_candidates')=1"
             " AND COALESCE(json_array_length(payload_json,'$.candidates'),0)=0"
@@ -532,12 +507,12 @@ def complete_organize_confirmation_review(
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         bindings["now"] = db.now()
-        cursor = conn.execute(
+        return conn.execute(
             "UPDATE organize_confirmations SET review_status=:status,review_result_json=:result,"
-            f"review_completed_at=:now,updated_at=:now{candidate_update} "
-            f"WHERE token=:token AND review_status='running'{discovery_guard}", bindings,
-        )
-        return cursor.rowcount == 1
+            "review_completed_at=CASE WHEN :status!='running' THEN :now END,"
+            f"updated_at=:now{candidate_update} WHERE token=:token AND status='pending' AND expires_at>:now "
+            f"AND review_status='running' AND review_started_at=:started_at{discovery_guard} RETURNING *", bindings,
+        ).fetchone()
 
 
 def list_organize_confirmations_for_task(
@@ -659,7 +634,7 @@ def _require_no_running_correction(conn: sqlite3.Connection, payload_json: str) 
 def claim_organize_confirmation(
     token: str, *, chat_id: str, selected_index: int, actor: str = "human",
     event_json: str = "", message_id: int | None = None, explicit_approval: bool = False,
-    expected_snapshot: tuple[str, str] | None = None,
+    expected_snapshot: tuple[str, str] | None = None, expected_review_started_at: str | None = None,
 ) -> sqlite3.Row:
     """原子保存确认选择与接纳回执；过期、越权和重放统一拒绝。"""
     normalized_actor = (actor or "human").strip().lower()
@@ -708,14 +683,14 @@ def claim_organize_confirmation(
                 "WHEN ?='human' AND review_status IN ('waiting','pending','running') THEN ? "
                 "ELSE review_completed_at END,updated_at=? "
                 "WHERE id=? AND status='pending' "
-                "AND (?<>'agent' OR ? OR (review_status='running' "
+                "AND (?<>'agent' OR ? OR (review_status='running' AND review_started_at=? "
                 "AND COALESCE(json_extract(payload_json,'$.review_only'),0)=0))",
                 (
                     selected_index, explicit_approval, queued_at, normalized_actor, f"queue-{int(row['id']):06d}",
                     normalized_actor, normalized_actor,
                     normalized_actor, timestamp,
                     normalized_actor, timestamp,
-                    timestamp, int(row["id"]), normalized_actor, explicit_approval,
+                    timestamp, int(row["id"]), normalized_actor, explicit_approval, expected_review_started_at,
                 ),
             )
             if cursor.rowcount != 1:

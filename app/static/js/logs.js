@@ -1317,13 +1317,8 @@ else { loadOverview(); loadOrganize(); }
         for(let offset=0;offset<tokens.length;offset+=100){
             const query={confirmation_ids:tokens.slice(offset,offset+100),status:'all',page_size:100,
                 ...(includeCorrectionLogs?{include_correction_logs:true}:{})};
-            let page=1,pages=1;
-            do{
-                const data=await request('/query',{...query,page});
-                items.push(...(data.items||[]));
-                pages=Number(data.pages)||0;
-                page++;
-            }while(page<=pages);
+            const data=await request('/query',query);
+            items.push(...(data.items||[]));
         }
         return items;
     }
@@ -1534,16 +1529,22 @@ else { loadOverview(); loadOrganize(); }
         if(skipped.size)await Promise.all([loadOverview(),loadOrganize(organizePage)]);
     }
     async function next(){
-        const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.confirmation_id);
-        const index=order.indexOf(state.active), token=order[index+1];
+        const scope=el('Scope');
+        const order=scope.value==='selected'?state.tokens:
+            state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.confirmation_id);
+        const token=order[order.indexOf(state.active)+1];
         if(token){
-            merge(await snapshot([token]));state.active=token;render();
-            if(el('Scope').value==='selected'||(!state.items.some(item=>item.confirmation_id===token)&&state.selected.has(token))){
-                el('Scope').value='selected';
-                state.page=Math.floor((index+1)/pageSize)+1;
+            const items=await snapshot([token]);
+            if(!state.items.some(item=>item.confirmation_id===token)){
+                const selected=scope.value==='selected'?state.tokens:(await request('/query',{
+                    confirmation_ids:[...state.selected],status:'all',page_size:1,
+                })).confirmation_ids;
+                scope.value='selected';
+                state.page=Math.max(1,Math.floor(selected.indexOf(token)/pageSize)+1);
                 // 外层 act 解锁后再加载新页。
                 setTimeout(()=>load(state.page),0);
             }
+            merge(items);state.active=token;
         }else if(state.page<state.pages){state.active='';setTimeout(()=>load(state.page+1),0);}
         else say('已到本次列表末尾；未选择的媒体组继续保留待确认。');
     }
@@ -1638,7 +1639,7 @@ else { loadOverview(); loadOrganize(); }
         const tokens=[...state.selected],items=await snapshot(tokens);merge(items);
         const pending=items.filter(item=>item.status==='pending');
         const reviewable=pending.filter(canReview);
-        const eligible=reviewable.filter(item=>item.suggestion?.source!=='human'&&!activeReviewStatuses.has(item.review_status));
+        const eligible=reviewable.filter(item=>item.suggestion?.source!=='human');
         if(!eligible.length){
             say(pending.length&&!reviewable.length?'所选待确认组无法由 Agent 搜索候选，可用「纠正识别」查找作品。':
                 '没有需要复核的待确认项；人工选择、已排队及已完成项已保留。');

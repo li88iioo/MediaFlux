@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import replace
 from datetime import datetime, timedelta
 from sqlite3 import Row
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -338,6 +339,73 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
                             for token in (first, second, empty, discoverable)))
         self.dispatch.assert_not_called()
 
+    def test_web_search_updates_an_existing_single_card_with_the_review_result(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.modules.agent_recognition_review import RecognitionReviewDecision
+        from app.routes import logs_api
+
+        app = FastAPI()
+        app.include_router(logs_api.router)
+        self.enterContext(patch.object(logs_api, "require_api_login"))
+        client = self.enterContext(TestClient(app))
+        self.review_enabled.return_value = True
+        outcomes = {
+            "abstained": "TMDB 未找到匹配的作品", "failed": "搜索失败，请稍后重试",
+            "approved": "已核验候选，等待人工确认",
+        }
+        for index, (status, summary) in enumerate(outcomes.items()):
+            with self.subTest(status=status):
+                approved = status == "approved"
+                group = self._group(index)
+                group.pop("_confirmation_batch")
+                candidate, _ = group["candidates"]
+                group["candidates"] = []
+                self.assertTrue(Organizer._deliver_task_confirmation_groups([group], self.rules, chat_id="100"))
+                [token] = service.list_confirmations(q=group["directory"], chat_id="100")["confirmation_ids"]
+                thread = f"confirmation:{token}"
+                before = notifications.get_notification_thread_snapshot(thread, topic=NotificationTopic.CONFIRMATION, chat_id="100")
+                assert before is not None
+                self.assertEqual(before.message_id, 77)
+                self.assertIn("暂无候选", render_event(before.event))
+                self.assertEqual([action.callback_data for action in before.event.actions], [f"orgc:{token}:skip"])
+
+                request = {"confirmation_ids": [token]}
+                offered = client.post("/api/logs/organize/confirmations/review", json=request)
+                self.assertEqual(offered.status_code, 200, offered.text)
+                self.assertEqual(offered.json()["requested"], 1)
+                claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+                assert claimed is not None
+                self.assertEqual(claimed["token"], token)
+                decision = RecognitionReviewDecision(
+                    status=status, candidate_index=0 if approved else None, summary=summary,
+                    discovered_candidates=[candidate] if approved else [],
+                )
+                with patch("app.modules.agent_recognition_review.review_confirmation_payload", return_value=decision):
+                    self.assertEqual(confirmations._process_recognition_review_row(claimed), decision.status)
+                [view] = client.post("/api/logs/organize/confirmations/query", json=request).json()["items"]
+                self.assertEqual((view["status"], view["review_status"], view["review_summary"]),
+                                 ("pending", decision.status, decision.summary))
+                self.assertIsNone(view["selected_index"])
+
+                after = notifications.get_notification_thread_snapshot(thread, topic=NotificationTopic.CONFIRMATION, chat_id="100")
+                assert after is not None
+                self.assertEqual(after.revision, before.revision + 1)
+                self.assertEqual(after.message_id, before.message_id)
+                self.assertIn(decision.summary, render_event(after.event))
+                expected = [f"orgc:{token}:0"] if approved else []
+                self.assertEqual([action.callback_data for action in after.event.actions], [*expected, f"orgc:{token}:skip"])
+                if approved:
+                    self.assertIn(candidate["title"], render_event(after.event))
+                    self.assertNotIn("暂无候选", render_event(after.event))
+                key = notifications.notification_thread_event_key(thread, topic=NotificationTopic.CONFIRMATION, chat_id="100")
+                self.assertEqual(notifications.drain_telegram_notifications(limit=1, event_key=key), 1)
+                self.assertEqual(self.edited.call_args.kwargs["message_id"], before.message_id)
+        self.assertEqual(self.sent.call_count, len(outcomes))
+        self.assertEqual(self.edited.call_count, len(outcomes))
+        self.dispatch.assert_not_called()
+
     def test_empty_group_discovery_reports_progress_and_keeps_no_match_pending(self):
         self.review_enabled.return_value = True
         group = self._group(0)
@@ -377,8 +445,8 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self._callback(self._action("刷新摘要"))
         self.assertIn("查找候选进行中", render_event(self._snapshot().event))
         no_match = "本轮未找到可核验的候选，仍待确认。"
-        self.assertTrue(organize_confirmations_repo.complete_organize_confirmation_review(
-            token, status="abstained", result={"reason_code": "no_candidate", "summary": no_match},
+        self.assertIsNotNone(organize_confirmations_repo.save_organize_confirmation_review(
+            claimed, status="abstained", result={"reason_code": "no_candidate", "summary": no_match},
         ))
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
         summary = self._snapshot().event
@@ -411,8 +479,8 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
         assert claimed is not None
         self.assertEqual(claimed["token"], token)
-        self.assertTrue(organize_confirmations_repo.complete_organize_confirmation_review(
-            token, status="approved", result={"candidate_index": 1, "summary": "找到并核验候选"},
+        self.assertIsNotNone(organize_confirmations_repo.save_organize_confirmation_review(
+            claimed, status="approved", result={"candidate_index": 1, "summary": "找到并核验候选"},
             discovered_candidates=self._group(0)["candidates"],
         ))
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
@@ -420,6 +488,44 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self._callback(self._action("查看"))
         self.assertEqual(self._action("选择 2 · 候选 0-1"), f"orgc:{token}:1")
         self.assertEqual(self._confirmation(token)["status"], "pending")
+        self.dispatch.assert_not_called()
+
+    def test_startup_updates_interrupted_reviews_on_the_original_batch_message(self):
+        self.review_enabled.return_value = True
+        tokens = [confirmations.create_confirmation_actions(
+            {**self._group(index), "candidates": []}, self.rules, chat_id="100",
+        )[0].callback_data.split(":")[1] for index in range(2)]
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True))
+        self._callback(self._action("请求 Agent"))
+        before = self._snapshot()
+        self.assertIn("查找候选已排队", render_event(before.event))
+
+        # 第一组的终态已由旧进程保存。第二组在最后一次领取中被打断。
+        for token in tokens:
+            for attempt in range(1, 4):
+                claimed = organize_confirmations_repo.claim_next_organize_confirmation_review()
+                assert claimed is not None
+                self.assertEqual((claimed["token"], claimed["review_attempts"]), (token, attempt))
+                if token == tokens[0] or attempt < 3:
+                    organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews()
+
+        stop = Event()
+        stop.set()
+        confirmations._recognition_review_loop(stop_event=stop)
+        after = self._snapshot()
+        self.assertEqual((after.message_id, after.revision), (before.message_id, before.revision + 1))
+        self.assertEqual(render_event(after.event).count("Agent 复核连续中断"), 2)
+        self.assertTrue(all(self._confirmation(token)["review_status"] == "failed" for token in tokens))
+        self.assertTrue(all(self._confirmation(token)["status"] == "pending" for token in tokens))
+        confirmations._recognition_review_loop(stop_event=stop)
+        self.assertEqual(self._snapshot().revision, after.revision)
+        key = notifications.notification_thread_event_key(
+            f"confirmation-batch:{self.batch_id}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+        )
+        self.edited.reset_mock()
+        self.assertEqual(notifications.drain_telegram_notifications(limit=1, event_key=key), 1)
+        self.assertEqual(self.edited.call_args.kwargs["message_id"], before.message_id)
+        self.sent.assert_called_once()
         self.dispatch.assert_not_called()
 
     def test_group_scope_preserves_seasons_and_gaps_from_saved_positions(self):

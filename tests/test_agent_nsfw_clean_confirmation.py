@@ -77,11 +77,15 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
             expires_at=(
                 datetime.now(timezone.utc).astimezone() + timedelta(hours=1)
             ).strftime("%Y-%m-%d %H:%M:%S"),
+            review_requested=True,
+            review_ready=True,
         )
-        organize_confirmations_repo.update_organize_confirmation(token, review_status="running")
+        claim = organize_confirmations_repo.claim_next_organize_confirmation_review()
+        assert claim is not None and claim["token"] == token
         if running:
             organize_confirmations_repo.claim_organize_confirmation(
-                token, chat_id="100", selected_index=0, actor=actor
+                token, chat_id="100", selected_index=0, actor=actor,
+                expected_review_started_at=claim["review_started_at"],
             )
             assert (organize_confirmations_repo.claim_queued_organize_confirmation(token)) is not None
         return token

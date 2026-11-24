@@ -86,10 +86,11 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_manual_draft_survives_late_model_result_without_executing(self):
         self.create("one", review=True)
-        organize_confirmations_repo.claim_next_organize_confirmation_review()
+        claim = organize_confirmations_repo.claim_next_organize_confirmation_review()
+        assert claim is not None
         batches.save_selection("one", 1)
-        self.assertFalse(organize_confirmations_repo.complete_organize_confirmation_review(
-            "one", status="approved", result={"candidate_index": 0},
+        self.assertIsNone(organize_confirmations_repo.save_organize_confirmation_review(
+            claim, status="approved", result={"candidate_index": 0},
         ))
         view = batches.list_confirmations()["items"][0]
         self.assertEqual(view["status"], "pending")
@@ -509,12 +510,14 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
     def test_read_only_request_revokes_automatic_claim_even_if_worker_already_read_payload(self):
         self.create("one", review=True)
         row = organize_confirmations_repo.claim_next_organize_confirmation_review()
-        self.assertIsNotNone(row)
+        assert row is not None
         with patch.object(feature_gate, "recognition_review_enabled", return_value=True):
             result = batches.request_reviews(["one"])
         self.assertEqual(result["unchanged"], 1)
         with self.assertRaises(ValueError):
-            organize_confirmations_repo.claim_organize_confirmation("one", chat_id="chat", selected_index=0, actor="agent")
+            organize_confirmations_repo.claim_organize_confirmation(
+                "one", chat_id="chat", selected_index=0, actor="agent", expected_review_started_at=row["review_started_at"],
+            )
         self.assertEqual(self.row("one")["status"], "pending")
         preview = batches.preview_choices([{"confirmation_id": "one", "candidate_index": 1}])
         result = batches.submit_choices(preview["entries"], preview["digest"], actor="agent")

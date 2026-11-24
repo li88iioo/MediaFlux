@@ -436,6 +436,15 @@ class _AgentEpisodeWriteBoundary:
             raise DirectoryScrapeConflictError("伴随文件写前发现同名目标，未授权覆盖")
 
 
+def _confirmation_actions(token: str, candidates: list[dict], allow_skip: bool) -> tuple[NotificationAction, ...]:
+    label, action = ("跳过此组", "skip") if allow_skip else ("暂不处理", "cancel")
+    return (
+        *(NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
+          for index, candidate in enumerate(candidates)),
+        NotificationAction(label, f"orgc:{token}:{action}"),
+    )
+
+
 def _persist_confirmation_actions(
     payload: dict,
     *,
@@ -472,15 +481,7 @@ def _persist_confirmation_actions(
     )
     if review_ready:
         wake_recognition_review_dispatcher()
-    actions = [
-        NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
-        for index, candidate in enumerate(candidates)
-    ]
-    if allow_skip_terminal:
-        actions.append(NotificationAction("跳过此组", f"orgc:{token}:skip"))
-    else:
-        actions.append(NotificationAction("暂不处理", f"orgc:{token}:cancel"))
-    return tuple(actions)
+    return _confirmation_actions(token, candidates, allow_skip_terminal)
 
 
 def _persist_confirmation_retry(
@@ -1615,63 +1616,83 @@ def _confirmation_dispatch_loop(
         wakeup_event.clear()
 
 
+def _publish_recognition_review(completed: Row) -> None:
+    token = str(completed["token"])
+    row = organize_confirmations_repo.get_organize_confirmation(token)
+    if (row is None or row["status"] != "pending" or row["expires_at"] <= db.now()
+            or any(row[key] != completed[key] for key in ("review_status", "review_started_at", "review_result_json"))):
+        return
+    payload = decode_row(row)
+    if not payload.get("review_only") or not _confirmation_delivery_enabled(payload):
+        return
+    chat_id = str(row["chat_id"] or "")
+    if batch_id := str(payload.get("_confirmation_batch") or ""):
+        from app.modules.telegram_confirmation_batch import publish_batch_summary
+        publish_batch_summary(batch_id, chat_id=chat_id, update_existing_only=True)
+        return
+    if not payload.get("discover_candidates"):
+        return
+
+    from app.modules.telegram_notification_center import get_notification_thread_snapshot
+    from app.modules.telegram_notification_policy import NotificationTopic
+
+    snapshot = get_notification_thread_snapshot(f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id=chat_id)
+    if snapshot is None or confirmation_token_from_event(snapshot.event) != token:
+        return
+    actions = _confirmation_actions(token, payload.get("candidates") or [], bool(payload.get("allow_skip_terminal")))
+    review = decode_json_object(row["review_result_json"])
+    event = _render_confirmation_card(replace(snapshot.event, actions=actions), payload, summary=review.get("summary") or "")
+    publish_confirmation_event(event, token=token, chat_id=chat_id, deliver_now=False, expected_revision=snapshot.revision)
+
+
+def _notify_recognition_review(row: Row) -> None:
+    try:
+        _publish_recognition_review(row)
+    except Exception as exc:
+        logger.warning("Agent 复核回执更新失败 token=%s type=%s", str(row["token"])[:6], type(exc).__name__)
+
+
+def _finish_recognition_review(claim: Row, status: str, result: dict, *, candidates: list[dict] | None = None) -> str:
+    row = organize_confirmations_repo.save_organize_confirmation_review(
+        claim, status=status, result=result, discovered_candidates=candidates,
+    )
+    if row is None:
+        return "ownership_lost"
+    _notify_recognition_review(row)
+    return status
+
+
 def _process_recognition_review_row(row, *, discovery_scraper: TMDBScraper | None = None) -> str:
     """处理一条已领取记录；只返回审计状态，不暴露模型上下文。"""
     token = str(row["token"] or "")
     if not feature_gate.recognition_review_enabled():
-        organize_confirmations_repo.complete_organize_confirmation_review(
-            token,
-            status="cancelled",
-            result={
-                "reason_code": "disabled",
-                "summary": "Agent 主动复核已关闭，保留人工确认",
-            },
-        )
-        return "cancelled"
+        return _finish_recognition_review(row, "cancelled", {
+            "reason_code": "disabled", "summary": "Agent 主动复核已关闭，保留人工确认",
+        })
     payload = decode_row(row)
     from app.modules.agent_recognition_review import review_confirmation_payload
 
     decision = (review_confirmation_payload(payload, discovery_scraper=discovery_scraper)
                 if discovery_scraper is not None else review_confirmation_payload(payload))
     audit = decision.audit_payload()
+    readonly_result = {**audit, "summary": redact_sensitive_text(decision.summary)[:500]}
     current = organize_confirmations_repo.get_organize_confirmation(token)
     if decision.discovered_candidates or (current is not None and decode_row(current).get("review_only")):
-        # 批量审阅只保存建议，批准与候选入队由用户的同一份预览决定。
-        saved = organize_confirmations_repo.complete_organize_confirmation_review(
-            token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
-            discovered_candidates=decision.discovered_candidates,
-        )
-        batch_id = str(payload.get("_confirmation_batch") or "")
-        if saved and batch_id and _confirmation_delivery_enabled(payload):
-            from app.modules.telegram_confirmation_batch import publish_batch_summary
-            publish_batch_summary(batch_id, chat_id=str(row["chat_id"] or ""))
-        return decision.status if saved else "ownership_lost"
+        return _finish_recognition_review(row, decision.status, readonly_result, candidates=decision.discovered_candidates)
     if not decision.approved:
-        organize_confirmations_repo.complete_organize_confirmation_review(
-            token, status=decision.status, result=audit
-        )
-        return decision.status
+        return _finish_recognition_review(row, decision.status, audit)
 
     # 用户可能在模型复核期间关闭开关。执行所有权竞争前再读取一次配置，
     # 保证关闭动作立即阻止新的自动确认，而不是等下一条任务才生效。
     if not feature_gate.recognition_review_enabled():
-        organize_confirmations_repo.complete_organize_confirmation_review(
-            token,
-            status="cancelled",
-            result={
-                **audit,
-                "reason_code": "disabled_before_confirmation",
-                "summary": "Agent 主动复核已关闭，保留人工确认",
-            },
-        )
-        return "cancelled"
+        return _finish_recognition_review(row, "cancelled", {
+            **audit, "reason_code": "disabled_before_confirmation",
+            "summary": "Agent 主动复核已关闭，保留人工确认",
+        })
 
     # 先保存不含工具原始载荷的最小审计，再由数据库原子竞争 pending
     # 所有权。人工若已确认，Agent 会安全退出。
-    if not organize_confirmations_repo.stage_organize_confirmation_review_result(token, audit):
-        logger.info(
-            "Agent 识别复核审计落库时已失去所有权 token=%s", token[:6]
-        )
+    if organize_confirmations_repo.save_organize_confirmation_review(row, status="running", result=audit) is None:
         return "ownership_lost"
     assert decision.candidate_index is not None
     try:
@@ -1680,28 +1701,16 @@ def _process_recognition_review_row(row, *, discovery_scraper: TMDBScraper | Non
             decision.candidate_index,
             chat_id=str(row["chat_id"] or ""),
             actor="agent",
+            expected_review_started_at=row["review_started_at"],
         )
     except ValueError as exc:
         current = organize_confirmations_repo.get_organize_confirmation(token)
         if (current is not None and current["status"] == "pending"
                 and decode_row(current).get("review_only")):
-            organize_confirmations_repo.complete_organize_confirmation_review(
-                token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
-            )
-            return decision.status
-        if (
-            current is not None
-            and str(current["review_status"] or "") == "running"
-        ):
-            organize_confirmations_repo.complete_organize_confirmation_review(
-                token,
-                status="cancelled",
-                result={
-                    **audit,
-                    "reason_code": "ownership_lost",
-                    "summary": "人工操作或快照变化已先完成，Agent 未执行",
-                },
-            )
+            return _finish_recognition_review(row, decision.status, readonly_result)
+        _finish_recognition_review(row, "cancelled", {
+            **audit, "reason_code": "ownership_lost", "summary": "人工操作或快照变化已先完成，Agent 未执行",
+        })
         logger.info(
             "Agent 识别复核未取得执行权 token=%s reason=%s",
             token[:6],
@@ -1724,9 +1733,11 @@ def _recognition_review_loop(
     stop_event = stop_event or _review_stop
     wakeup_event = wakeup_event or _review_wakeup
     try:
-        recovered = organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews()
+        recovered, failed = organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews()
         if recovered:
             logger.info("恢复 Agent 主动识别复核 count=%s", recovered)
+        for row in failed:
+            _notify_recognition_review(row)
     except Exception as exc:  # noqa: BLE001 - 启动恢复失败不影响人工确认
         logger.warning(
             "恢复 Agent 主动识别复核失败 type=%s", type(exc).__name__
@@ -1736,10 +1747,9 @@ def _recognition_review_loop(
     batch_scraper = None
     with ExitStack() as resources:
         while not stop_event.is_set():
-            token: str = ""
+            row = None
             try:
                 row = organize_confirmations_repo.claim_next_organize_confirmation_review()
-                token = str(row["token"]) if row is not None else ""
                 # 旧版本可能把同剧每集拆成一张卡。只复用本批次的 TMDB 查询缓存，
                 # 每张卡仍按自己的原文件和季集核验、保存建议。
                 payload = decode_row(row) if row is not None else {}
@@ -1763,21 +1773,16 @@ def _recognition_review_loop(
                     type(exc).__name__,
                     exc_info=True,
                 )
-                if token:
+                if row is not None:
                     try:
-                        organize_confirmations_repo.complete_organize_confirmation_review(
-                            token,
-                            status="failed",
-                            result={
-                                "reason_code": "worker_error",
-                                "summary": "Agent 复核异常，已保留人工确认",
-                                "failure_code": type(exc).__name__,
-                            },
-                        )
+                        _finish_recognition_review(row, "failed", {
+                            "reason_code": "worker_error", "summary": "Agent 复核异常，已保留人工确认",
+                            "failure_code": type(exc).__name__,
+                        })
                     except Exception:
                         logger.warning(
                             "Agent 复核失败回执保存异常 token=%s",
-                            token[:6],
+                            str(row["token"])[:6],
                             exc_info=True,
                         )
             wakeup_event.wait(_DISPATCH_POLL_SECONDS)
@@ -1903,6 +1908,7 @@ def start_confirmation(
     explicit_approval: bool = False,
     dispatch: bool = True,
     expected_snapshot: tuple[str, str] | None = None,
+    expected_review_started_at: str | None = None,
 ) -> dict:
     """持久化确认选择；人工与 Agent 竞争同一个一次性 pending 所有权。"""
     normalized_actor = (actor or "human").strip().lower()
@@ -1916,6 +1922,9 @@ def start_confirmation(
         raise ValueError("确认操作不存在或已失效")
     if expected_snapshot is not None and (preview["payload_json"], preview["review_result_json"]) != expected_snapshot:
         raise ValueError("确认材料已变化，请重新预览")
+    if expected_review_started_at is not None and (preview["review_status"] != "running"
+            or preview["review_started_at"] != expected_review_started_at):
+        raise ValueError("复核领取已变化")
     _raise_if_confirmation_expired(preview)
 
     payload = decode_row(preview)
@@ -1967,6 +1976,7 @@ def start_confirmation(
             actor=normalized_actor,
             explicit_approval=explicit_approval,
             expected_snapshot=expected_snapshot,
+            expected_review_started_at=expected_review_started_at,
             event_json=(
                 serialize_notification_event(_confirmation_selected_event(preview, payload, candidate))
                 if _confirmation_delivery_enabled(payload) else ""
@@ -1977,7 +1987,7 @@ def start_confirmation(
         # 两个相同回调可同时读到 pending；数据库只允许一个认领成功。
         # 失败方重新读取真实状态，同候选按幂等重放处理，不误报“已处理”。
         current = organize_confirmations_repo.get_organize_confirmation(token)
-        if current is not None and str(current["status"] or "") in {"queued", "running", "completed"}:
+        if expected_review_started_at is None and current is not None and current["status"] in {"queued", "running", "completed"}:
             if (
                 normalized_actor == "agent"
                 and str(current["confirmation_actor"] or "") != "agent"
@@ -3168,34 +3178,26 @@ def confirmation_event(
     actions = create_confirmation_actions(
         group, rules, source_name=source_name, chat_id=chat_id
     )
-    lines = _candidate_summary_lines(group) if actions else ()
-    reason = str(group.get("reason") or "匹配结果需要人工确认").strip()
+    event = NotificationEvent(title, fields=tuple(fields.items()), actions=actions, layout="relaxed")
+    token = confirmation_token_from_event(event)
+    row = organize_confirmations_repo.get_organize_confirmation(token) if token else None
+    return _render_confirmation_card(event, decode_row(row) if row is not None else group)
+
+
+def _render_confirmation_card(event: NotificationEvent, payload: dict, *, summary: str = "") -> NotificationEvent:
+    lines = _candidate_summary_lines(payload) if event.actions else ()
+    reason = str(payload.get("reason") or "匹配结果需要人工确认").strip()
     validity = "候选" if lines else "待确认"
     expiry_hint = (
         f"{validity}有效期为 {_CONFIRMATION_TTL_HOURS} 小时，到期未处理将自动结束，"
         "源文件保持原位。"
     )
-    if lines:
-        footer = (
-            f"{reason}\n\n请选择候选继续整理，或跳过此组。"
-            f"\n\n{expiry_hint}"
-        )
-    else:
-        agent_hint = ""
-        if actions and feature_gate.recognition_review_enabled():
-            token = actions[0].callback_data.split(":", 2)[1]
-            row = organize_confirmations_repo.get_organize_confirmation(token)
-            if row is not None and organize_confirmations_repo.can_discover_candidates(decode_row(row)):
-                agent_hint = "\n也可在同一页面点击「Agent 只读复核」查找候选，仍需人工确认。"
-        footer = (
-            f"{reason}\n\n暂无候选。{WEB_CORRECTION_GUIDE}{agent_hint}"
-            f"\n\n跳过此组会结束本次待确认，源文件保持原位。\n\n{expiry_hint}"
-        )
-    return NotificationEvent(
-        title=title,
-        fields=tuple(fields.items()),
-        lines=lines,
-        footer=footer,
-        actions=actions,
-        layout="relaxed",
-    )
+    instructions = "请选择候选继续整理，或跳过此组。"
+    if not lines:
+        agent_hint = ("\n也可在同一页面点击「Agent 只读复核」查找候选，仍需人工确认。"
+                      if event.actions and feature_gate.recognition_review_enabled()
+                      and organize_confirmations_repo.can_discover_candidates(payload) else "")
+        instructions = f"暂无候选。{WEB_CORRECTION_GUIDE}{agent_hint}\n\n跳过此组会结束本次待确认，源文件保持原位。"
+    if summary:
+        lines = (*lines, f"Agent 复核：{summary}")
+    return replace(event, lines=lines, footer=f"{reason}\n\n{instructions}\n\n{expiry_hint}")

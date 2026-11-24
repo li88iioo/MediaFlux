@@ -884,6 +884,51 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertEqual(sender.call_count, 2)
         self.assertEqual(editor.call_count, 1)
 
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_restart_does_not_replay_replacement_after_rejected_edit(self, sender, editor):
+        class WorkerInterrupted(BaseException):
+            pass
+
+        delivered = []
+
+        def send(event, **_kwargs):
+            delivered.append(event.title)
+            if delivered == ["已入队", "整理完成"]:
+                raise WorkerInterrupted
+            return TelegramSendResult(ok=True, message_id=192 + len(delivered))
+
+        sender.side_effect = send
+        editor.return_value = TelegramSendResult(
+            ok=False, status_code=400, error="Bad Request: message to edit not found",
+        )
+        options = {"topic": NotificationTopic.CONFIRMATION, "chat_id": "100"}
+        first = publish_notification_thread("confirmation:restart", NotificationEvent("已入队"), **options)
+        self.assertTrue(first.delivered)
+        result = publish_notification_thread(
+            "confirmation:restart", NotificationEvent("整理完成"), **options, deliver_now=False,
+        )
+        with self.assertRaises(WorkerInterrupted):
+            drain_telegram_notifications(event_key=result.event_key)
+        self.assertEqual(notification_center.recover_notifications(), 1)
+        publish_notification_thread(
+            "confirmation:restart", NotificationEvent("整理完成，已核验"),
+            **options, preferred_message_id=193, deliver_now=False,
+        )
+        drain_telegram_notifications(event_key=result.event_key)
+        self.assertEqual(delivered, ["已入队", "整理完成"])
+        recovered = get_notification(result.event_key)
+        assert recovered is not None
+        self.assertEqual(recovered["status"], "outcome_unknown")
+        editor.return_value = TelegramSendResult(ok=True, message_id=194)
+        replacement = publish_notification_thread(
+            "confirmation:restart", NotificationEvent("整理完成，已核验"),
+            **options, preferred_message_id=194,
+        )
+        self.assertTrue(replacement.delivered)
+        self.assertEqual(editor.call_args.kwargs["message_id"], 194)
+        self.assertEqual(delivered, ["已入队", "整理完成"])
+
     @patch("app.modules.telegram_notification_center.send_event_result")
     def test_thread_is_bounded_to_one_editable_text_message(self, sender) -> None:
         sender.return_value = TelegramSendResult(ok=True, message_id=93)

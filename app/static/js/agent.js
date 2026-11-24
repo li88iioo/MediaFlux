@@ -9,6 +9,7 @@
     const transcript = document.getElementById('agentTranscript');
     const composer = document.getElementById('agentComposer');
     const promptInput = document.getElementById('agentPrompt');
+    const emptyPlaceholder = promptInput?.placeholder;
     const sendButton = document.getElementById('agentSend');
     const sessionStopButton = document.getElementById('agentStopSession');
     const submitSlot = sessionStopButton?.parentElement;
@@ -346,11 +347,7 @@
         if (!initialRestore) {
             try { localStorage.setItem(LAYOUT_KEY, JSON.stringify({session_id: sessionId, mode: empty ? 'empty' : 'conversation'})); } catch (_) { /* 可选布局提示。 */ }
         }
-        if (promptInput) {
-            promptInput.placeholder = empty
-                ? (promptInput.dataset.emptyPlaceholder || '询问 MediaFlux')
-                : (promptInput.dataset.activePlaceholder || '继续描述或调整任务');
-        }
+        if (promptInput) promptInput.placeholder = empty ? emptyPlaceholder : promptInput.dataset.activePlaceholder;
         resizePrompt();
     }
 

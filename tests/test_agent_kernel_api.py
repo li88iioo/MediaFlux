@@ -121,14 +121,15 @@ class FakeStore:
         return self.state
 
     async def list_events(self, *, owner, session_id, limit=200, request_id="", turn_id=""):
-        self.event_calls.append((owner, session_id, limit, request_id, turn_id) if turn_id else (owner, session_id, limit))
+        self.event_calls.append((owner, session_id, limit, request_id, turn_id) if request_id else (owner, session_id, limit))
         scoped = [
             event for event_owner, event_session, event in self.events
             if event_owner == owner and event_session == session_id
+            and (not request_id or event.get("request_id") == request_id)
         ]
         if turn_id:
-            return sorted((event for event in scoped if event.get("request_id") == request_id
-                           and event.get("turn_id") == turn_id), key=lambda event: event.get("sequence", 0))
+            return sorted((event for event in scoped if event.get("turn_id") == turn_id),
+                          key=lambda event: event.get("sequence", 0))
         return scoped[-limit:]
 
     async def reset_session(self, *, owner, session_id):
@@ -466,7 +467,7 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         self.assertNotIn("private.tool", response.text)
         self.assertNotIn("private-argument", response.text)
         self.assertEqual(self.web.activity_calls, [(owner, session_id)] * 2)
-        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 500),
+        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 64),
             (owner, session_id, 200, request_id, turn_id)])
 
     def test_active_restore_keeps_current_public_events_and_honors_original_stream_flag(self):
@@ -569,7 +570,7 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         )
         self.assertNotIn("private event body", response.text)
         self.assertEqual(self.runtime.store.load.await_count, 2)
-        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 500),
+        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 64),
             (owner, session_id, 200, request_id, turn_id), (owner, session_id, 64)])
 
     def test_session_restore_reloads_current_scope_when_request_changes_during_journal_read(self):
@@ -604,8 +605,8 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         self.assertNotIn("old-marker", response.text)
         self.assertEqual(self.web.activity_calls, [(owner, sid)] * 2)
         self.assertEqual(self.runtime.store.event_calls, [
-            (owner, sid, 500), (owner, sid, 200, first["request_id"], first["turn_id"]),
-            (owner, sid, 500), (owner, sid, 200, second["request_id"], second["turn_id"])])
+            (owner, sid, 64), (owner, sid, 200, first["request_id"], first["turn_id"]),
+            (owner, sid, 64), (owner, sid, 200, second["request_id"], second["turn_id"])])
 
     def test_session_snapshot_is_uncached_and_draft_scope_matches_list(self):
         history = self.client.get("/api/agent/sessions")
@@ -660,6 +661,41 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["last_turn"]["request_id"], "current")
         self.assertEqual(response.json()["last_turn"]["status"], "completed")
+
+    def test_reconnected_observer_reads_retained_cancellation_beyond_recent_session_events(self):
+        from app.agent.kernel.events import AgentEvent, AgentEventType
+        from app.agent.kernel.persistence import SQLiteKernelStore
+
+        owner = "webk:v1:" + "a" * 64
+        sid = "session_1234567890"
+        store = SQLiteKernelStore()
+        self.runtime.store = store
+
+        async def write_journal():
+            await store.append(
+                AgentEvent(AgentEventType.TURN_CANCELLED, sid, "old-turn", "old-request", 1),
+                owner=owner,
+            )
+            for sequence in range(1, 66):
+                await store.append(
+                    AgentEvent(AgentEventType.MODEL_DELTA, sid, "new-turn", "new-request", sequence,
+                               {"delta": "later"}),
+                    owner=owner,
+                )
+            await store.append(
+                AgentEvent(AgentEventType.TURN_COMPLETED, sid, "new-turn", "new-request", 66),
+                owner=owner,
+            )
+
+        asyncio.run(write_journal())
+        url = f"/api/agent/sessions/{sid}"
+        response = self.client.get(url, headers={"X-Agent-Request-Id": "old-request"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["last_turn"], {
+            "request_id": "old-request", "turn_id": "old-turn",
+            "status": "cancelled", "message": "本轮已取消",
+        })
+        self.assertEqual(self.client.get(url).json()["last_turn"]["request_id"], "new-request")
 
     def test_fast_completed_turn_between_two_idle_activity_samples_returns_new_result(self):
         session_id = "session_1234567890"

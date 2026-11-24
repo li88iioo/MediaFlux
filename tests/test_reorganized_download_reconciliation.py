@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from app import database as db
+from app.sdk import activity
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.modules import download_staging_reconcile as worker
@@ -115,6 +116,8 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         self.assertIsNone(card['selected_index'])
         self.assertEqual(stats['previous_confirmation']['status'], 'failed')
         self.assertEqual(stats['organize_log_ids'], [self.log_id])
+        [item] = activity.organize_confirmations(confirmation_ids=['card'], status='all')['items']
+        self.assertEqual((item['status'], item['log_ids']), ('completed', [self.log_id]))
         delivery = assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         event = notifications.deserialize_notification_event(delivery['event_json'])
         self.assertIn('Web', str(event.title))
@@ -142,6 +145,10 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         self.assertEqual(cloud.deleted, ['stage'])
         self.assertFalse(confirmations._dispatch_due_confirmation_delivery('card'))
         self.assertEqual(get_notification(key), delivered)
+        db.clear_organize_logs(origin='guangya', status='success')
+        [after] = activity.organize_confirmations(confirmation_ids=['card'], status='all')['items']
+        self.assertEqual(after['log_ids'], [])
+        self.assertEqual(after['execution'], item['execution'])
 
     def test_completed_reorganized_card_repairs_existing_initial_message_on_next_reconcile(self):
         key = self.show_card()

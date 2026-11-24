@@ -75,8 +75,14 @@ CONFIRMATION_API = r"""
             return response;
         }
         if(suffix==='/review'){
-            body.confirmation_ids.forEach(token=>{const item=config.items.find(item=>item.confirmation_id===token);item.review_status='pending';});
-            const response=reply({requested:body.confirmation_ids.length,unchanged:0,unavailable:0});
+            let requested=0, unchanged=0;
+            for(const token of body.confirmation_ids){
+                const item=config.items.find(item=>item.confirmation_id===token);
+                item.review_only=true;
+                if(['pending','running','approved'].includes(item.review_status))unchanged++;
+                else{item.review_status='pending';requested++;}
+            }
+            const response=reply({requested,unchanged,unavailable:0});
             if(config.holdReview)return new Promise(resolve=>window.__heldConfirmationReviews.push(()=>resolve(response)));
             return response;
         }
@@ -515,16 +521,21 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.assertEqual(self.page.locator('.organize-row-select:checked').count(), 2)
 
     def test_agent_is_read_only_and_poll_preserves_unsaved_choice_and_evidence(self):
-        self.open(groups(3))
+        items = groups(3)
+        items[1]['review_status'] = 'running'
+        self.open(items)
         self.select_all()
         self.page.locator('#confirmationReviewAgent').click()
         self.idle()
         self.assertEqual(len(self.calls('/review')), 1)
         self.assertEqual(self.calls('/review')[0]['body']['confirmation_ids'], ['group-001', 'group-002', 'group-003'])
+        self.assertTrue(self.page.evaluate('window.__confirmationConfig.items[1].review_only'))
+        self.assertEqual(self.page.evaluate('window.__confirmationConfig.items[1].review_status'), 'running')
         self.assertIn('复核排队中', self.page.locator('#confirmationReviewList').inner_text())
         self.page.locator('#confirmationReviewAgent').click()
         self.idle()
-        self.assertEqual(len(self.calls('/review')), 1)
+        self.assertEqual(len(self.calls('/review')), 2)
+        self.assertIn('3 组保持原状态', self.page.locator('#confirmationReviewState').inner_text())
         self.page.locator('#confirmationReviewDetail input[value="0"]').check()
         self.page.evaluate("""() => {
             const items=window.__confirmationConfig.items;
@@ -595,6 +606,34 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.idle()
         self.assertEqual(self.calls('/preview'), [])
         self.assertIn('没有可确认项', self.page.locator('#confirmationReviewState').inner_text())
+
+    def test_save_and_next_stays_on_the_server_ordered_selection_page(self):
+        self.open(groups(25))
+        self.page.locator('#confirmationReviewNext').click()
+        self.idle()
+        self.page.locator('#confirmationReviewSelectPage').check()
+        self.page.locator('#confirmationReviewPrev').click()
+        self.idle()
+        self.page.locator('#confirmationReviewSelectPage').check()
+        self.page.select_option('#confirmationReviewScope', 'selected')
+        self.idle()
+        self.page.get_by_role('button', name='审阅 媒体组 018', exact=True).click()
+        self.page.locator('#confirmationReviewDetail input[value="0"]').check()
+        self.page.get_by_role('button', name='保存并下一条', exact=True).click()
+        self.idle()
+        self.assertEqual(self.calls('/selection')[0]['body'], {
+            'confirmation_id': 'group-018', 'candidate_index': 0,
+        })
+        self.assertEqual(self.page.locator('#confirmationReviewDetail h3').inner_text(), '媒体组 019')
+        self.assertEqual(self.page.locator('#confirmationReviewPageInfo').inner_text(), '共 25 组 · 1 / 2 页')
+        current = self.page.locator('#confirmationReviewList button[aria-current="true"]')
+        self.assertEqual(current.get_attribute('data-token'), 'group-019')
+        self.page.get_by_role('button', name='审阅 媒体组 020', exact=True).click()
+        self.page.locator('#confirmationReviewDetail button[data-review-action="next"]').click()
+        self.page.locator('#confirmationReviewList button[data-token="group-021"][aria-current="true"]').wait_for()
+        self.idle()
+        self.assertEqual(self.page.locator('#confirmationReviewDetail h3').inner_text(), '媒体组 021')
+        self.assertEqual(self.page.locator('#confirmationReviewPageInfo').inner_text(), '共 25 组 · 2 / 2 页')
 
     def test_late_preview_cannot_enable_confirmation_after_close_reopen(self):
         self.open(groups(1))

@@ -462,6 +462,7 @@ def _publish_batch_view(
     batch_id: str, *, chat_id: str = "", message_id: int | None = None,
     deliver_now: bool = False, expected_confirmation_delivery: tuple[int, int] | None = None,
     expected_revision: int | None = None, page: int | None = None, detail_token: str | None = None,
+    update_existing_only: bool = False,
 ) -> bool:
     if not _BATCH_ID.fullmatch(batch_id):
         return False
@@ -472,6 +473,8 @@ def _publish_batch_view(
         snapshot = get_notification_thread_snapshot(
             _thread_key(batch_id), topic=NotificationTopic.CONFIRMATION, chat_id=target,
         )
+        if snapshot is None and update_existing_only:
+            return False
         previous = snapshot.event.lifecycle.get("confirmation_batch", {}) if snapshot else {}
         result = _batch_items(batch_id, target)
         items = result["items"]
@@ -518,11 +521,13 @@ def publish_batch_summary(
     batch_id: str, *, chat_id: str = "", message_id: int | None = None,
     deliver_now: bool = False, expected_confirmation_delivery: tuple[int, int] | None = None,
     expected_revision: int | None = None,
+    update_existing_only: bool = False,
 ) -> bool:
     """沿通知中心 outbox 原位更新摘要，保留用户当前页或媒体详情。"""
     return _publish_batch_view(
         batch_id, chat_id=chat_id, message_id=message_id, deliver_now=deliver_now,
         expected_confirmation_delivery=expected_confirmation_delivery, expected_revision=expected_revision,
+        update_existing_only=update_existing_only,
     )
 
 

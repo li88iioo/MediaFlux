@@ -372,8 +372,8 @@ class SQLiteKernelStore:
         request_id: str = "",
         turn_id: str = "",
     ) -> list[dict[str, Any]]:
-        if bool(request_id) != bool(turn_id):
-            raise ValueError("event turn scope requires request_id and turn_id")
+        if turn_id and not request_id:
+            raise ValueError("event turn scope requires request_id")
         return await session_io(
             self._list_events_sync,
             owner,
@@ -1178,15 +1178,18 @@ class SQLiteKernelStore:
         self, owner: str, session_id: str, limit: int, request_id: str = "", turn_id: str = "",
     ) -> list[dict[str, Any]]:
         owner_digest, session_digest = self._scope(owner, session_id)
-        bounded = max(1, min(limit, 500))
+        scope = {column: value for column, value in (("request_id", request_id), ("turn_id", turn_id)) if value}
+        query = "SELECT event_id,event_json,event_hmac FROM agent_kernel_events WHERE owner_digest=? AND session_digest=?"
+        query += "".join(f" AND {column}=?" for column in scope)
+        params = (owner_digest, session_digest, *scope.values())
         with db.get_conn() as conn:
-            query = "SELECT event_id,event_json,event_hmac FROM agent_kernel_events WHERE owner_digest=? AND session_digest=? "
             if turn_id:
-                rows = conn.execute(query + "AND request_id=? AND turn_id=? ORDER BY sequence",
-                                    (owner_digest, session_digest, request_id, turn_id)).fetchall()
+                rows = conn.execute(query + " ORDER BY sequence", params).fetchall()
             else:
-                rows = list(reversed(conn.execute(query + "ORDER BY created_at DESC,rowid DESC LIMIT ?",
-                                                 (owner_digest, session_digest, bounded)).fetchall()))
+                rows = conn.execute(
+                    query + " ORDER BY created_at DESC,rowid DESC LIMIT ?",
+                    (*params, max(1, min(limit, 500))),
+                ).fetchall()[::-1]
         result: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -1198,7 +1201,7 @@ class SQLiteKernelStore:
                 )
             except ValueError:
                 continue
-            if turn_id and (value.get("request_id"), value.get("turn_id")) != (request_id, turn_id):
+            if any(value.get(column) != expected for column, expected in scope.items()):
                 continue
             result.append(value)
         return result

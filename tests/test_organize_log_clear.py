@@ -165,7 +165,7 @@ class OrganizeLogClearTests(unittest.TestCase):
             self.assertEqual((card["status"], card["review_status"]), ("completed", "cancelled"))
             self.assertEqual(json.loads(card["result_json"])["organize_log_ids"], [log_id])
             self.assertTrue(card["review_completed_at"])
-            self.assertFalse(organize_confirmations_repo.stage_organize_confirmation_review_result(file_id, {}))
+            self.assertIsNone(organize_confirmations_repo.save_organize_confirmation_review(card, status="running", result={}))
         snapshots = [dict(assert_present(organize_confirmations_repo.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")]
         db.init_db()
         self.assertEqual([dict(assert_present(organize_confirmations_repo.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")], snapshots)

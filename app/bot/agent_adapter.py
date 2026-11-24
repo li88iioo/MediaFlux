@@ -1017,15 +1017,14 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             bot.answer_callback_query(call.id, "当前计划暂时无法核对，请稍后重试。", show_alert=True)
             return
     if match.group("action") == "e":
-        bot.answer_callback_query(call.id, "只解释，不执行或修改计划")
+        bot.answer_callback_query(call.id, "只解释，不执行或修改计划，有效期不延长")
         try:
             view = asyncio.run(runtime.telegram.explain(ExplainEnvelope(
                 owner=envelope.owner, session_id=envelope.session_id, plan_id=envelope.plan_id,
                 request_id=envelope.request_id, channel="telegram",
                 message="请只解释这张冻结计划的影响、范围和可撤销性，不执行或修改计划。",
             )))
-            body = _render_turn(view) + "\n\n原确认按钮仍可使用（有效期不延长）。普通讨论保留本卡；明确取消或新的写入预检会使本卡失效。"
-            for text in split_telegram_html(body, limit=_MAX_MESSAGE):
+            for text in split_telegram_html(_render_turn(view), limit=_MAX_MESSAGE):
                 bot.send_message(call.message.chat.id, text, parse_mode="HTML", message_thread_id=message_thread_id)
         except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
             logger.warning("Telegram Agent 解释失败 type=%s", type(exc).__name__)

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
@@ -296,7 +297,8 @@ def test_web_security_cold_confirm_and_tool_rejection(agent_llm_enabled, monkeyp
             assert '原任务目标（后续解释问题不是新任务）："改名一个对象"' in final_system
 
 
-def test_telegram_actual_callback_preserves_card(agent_llm_enabled, monkeypatch):
+@pytest.mark.parametrize("expired", [False, True], ids=["active", "expired"])
+def test_telegram_actual_callback_preserves_card(agent_llm_enabled, monkeypatch, expired):
     from app.bot import agent_adapter
     from tests.test_agent_kernel_telegram_adapter import TELEBOT
 
@@ -336,8 +338,14 @@ def test_telegram_actual_callback_preserves_card(agent_llm_enabled, monkeypatch)
             message=message,
             from_user=SimpleNamespace(id=456),
         )
+        if expired:
+            frozen = asyncio.run(runtime.session.pipeline.get_pending_plan(owner=owner, session_id=session_id))
+            assert frozen is not None
+            runtime.now = frozen.expires_at + 1
         agent_adapter.handle_agent_callback(bot, call)
-        assert bot.send_message.called
+        bot.send_message.assert_called_once()
+        chat, reply = bot.send_message.call_args.args
+        assert chat == 123 and bot.send_message.call_args.kwargs["message_thread_id"] == 7
         assert (
             not bot.edit_message_text.called
             and not bot.edit_message_reply_markup.called
@@ -345,6 +353,13 @@ def test_telegram_actual_callback_preserves_card(agent_llm_enabled, monkeypatch)
         assert [
             button.callback_data for button in message.reply_markup.buttons
         ] == callbacks
+        if expired:
+            assert runtime.writes == [] and len(runtime.prepares) == len(runtime.wires) == 1
+            assert asyncio.run(runtime.session.pipeline.get_pending_plan(owner=owner, session_id=session_id)) is None
+            assert "已过期或已被使用" in reply
+            assert "仍可使用" not in reply
+            return
+        assert "只影响一个对象" in reply
         assert (
             runtime.writes == []
             and len(runtime.prepares) == 1

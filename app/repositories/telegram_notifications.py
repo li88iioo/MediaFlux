@@ -78,9 +78,7 @@ def upsert_notification(
                         or delivery["chat_id"] != chat_id or delivery["confirmation_chat_id"] != chat_id):
                     return None
         row = conn.execute(
-            "SELECT id,status,revision,delivered_revision,message_id,event_json,"
-            "thread_key,topic,importance,chat_id FROM "
-            "telegram_notification_outbox WHERE event_key=?",
+            "SELECT status,revision,message_id,event_json FROM telegram_notification_outbox WHERE event_key=?",
             (key,),
         ).fetchone()
         if expected_revision is not None and (row["revision"] if row is not None else 0) != expected_revision:
@@ -121,8 +119,9 @@ def upsert_notification(
                 ),
             )
         elif replace:
-            existing_message_id = int(row["message_id"] or 0)
-            message_id = existing_message_id or (preferred_message_id or 0)
+            message_id = int(row["message_id"] or 0)
+            if message_id <= 0 < preferred_message_id and preferred_message_id != -message_id:
+                message_id = preferred_message_id
             if str(row["event_json"] or "") == payload:
                 status = str(row["status"] or "")
                 revive = status in {"failed", "suppressed"} or (
@@ -198,7 +197,12 @@ def get_notification(event_key: str) -> dict[str, Any] | None:
             "SELECT * FROM telegram_notification_outbox WHERE event_key=?",
             ((event_key or ""),),
         ).fetchone()
-        return dict(row) if row is not None else None
+    if row is None:
+        return None
+    notification = dict(row)
+    if (notification["message_id"] or 0) < 0:
+        notification["message_id"] = None
+    return notification
 
 
 def list_recovered_organize_refresh_notifications(
@@ -259,7 +263,7 @@ def claim_due_notifications(
             "UPDATE telegram_notification_outbox SET status='outcome_unknown',"
             "lease_generation=lease_generation+1,last_error='DeliveryOutcomeUnknown',"
             "updated_at=? WHERE status='sending' AND updated_at<=? "
-            "AND COALESCE(message_id,0)=0",
+            "AND COALESCE(message_id,0)<=0",
             (stamp, stale_before),
         )
         clauses = [
@@ -343,6 +347,17 @@ def complete_notification(
         return bool(cur.rowcount)
 
 
+def reject_notification_message(notification_id: int, *, lease_generation: int, message_id: int) -> bool:
+    """补发前持久作废编辑目标。负值记住被拒 ID，避免后续发布重新绑定它。"""
+    with db.get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE telegram_notification_outbox SET message_id=-message_id,updated_at=? "
+            "WHERE id=? AND status='sending' AND lease_generation=? AND message_id=? AND message_id>0",
+            (db.now(), notification_id, lease_generation, message_id),
+        )
+        return bool(cursor.rowcount)
+
+
 def retry_notification(
     notification_id: int,
     *,
@@ -350,7 +365,6 @@ def retry_notification(
     claimed_revision: int,
     error: str,
     retry_after_seconds: int = 0,
-    clear_message_id: bool = False,
     outcome_unknown: bool = False,
     message_id: int = 0,
 ) -> str:
@@ -365,10 +379,10 @@ def retry_notification(
         ).fetchone()
         if row is None:
             return "stale"
-        known_message_id = 0 if clear_message_id else int(row["message_id"] or message_id or 0)
+        known_message_id = int(row["message_id"] or message_id or 0)
         attempts = int(row["attempts"] or 0)
         next_attempt = stamp
-        if outcome_unknown and not known_message_id:
+        if outcome_unknown and known_message_id <= 0:
             # 包括编辑被明确拒绝后转为新发送的未知结果；不能拿旧 ID 盲目重放。
             status = "outcome_unknown"
         elif int(row["revision"] or 0) != claimed_revision:
@@ -408,7 +422,6 @@ def fail_notification(
     lease_generation: int,
     claimed_revision: int,
     error: str,
-    clear_message_id: bool = False,
 ) -> bool:
     """记录明确拒绝；迟到 worker 不得把更新后的 revision 一并判死。"""
     stamp = db.now()
@@ -421,31 +434,19 @@ def fail_notification(
         ).fetchone()
         if row is None:
             return False
-        latest_revision = int(row["revision"] or 0)
-        if latest_revision != claimed_revision:
-            cur = conn.execute(
-                "UPDATE telegram_notification_outbox SET status='pending',attempts=0,"
-                "message_id=CASE WHEN ? THEN NULL ELSE message_id END,"
-                "last_error=?,next_attempt_at=?,updated_at=? "
-                "WHERE id=? AND status='sending' AND lease_generation=?",
-                (
-                    int(clear_message_id),
-                    ("PriorRevisionRejected:" + (error or "TelegramRequestRejected"))[:300],
-                    stamp,
-                    stamp,
-                    notification_id,
-                    lease_generation,
-                ),
-            )
-            return bool(cur.rowcount)
+        current_revision = row["revision"] == claimed_revision
+        error = error or "TelegramRequestRejected"
+        if not current_revision:
+            error = "PriorRevisionRejected:" + error
         cur = conn.execute(
-            "UPDATE telegram_notification_outbox SET status='failed',"
-            "attempts=attempts+1,message_id=CASE WHEN ? THEN NULL ELSE message_id END,"
+            "UPDATE telegram_notification_outbox SET status=?,"
+            "attempts=CASE WHEN ? THEN attempts+1 ELSE 0 END,"
             "last_error=?,next_attempt_at=?,updated_at=? "
             "WHERE id=? AND status='sending' AND lease_generation=?",
             (
-                int(clear_message_id),
-                (error or "TelegramRequestRejected")[:300],
+                "failed" if current_revision else "pending",
+                current_revision,
+                error[:300],
                 stamp,
                 stamp,
                 notification_id,
@@ -599,7 +600,7 @@ def _recover_deliveries(conn: sqlite3.Connection, stamp: str) -> int:
     """启动和数据库重开共用恢复规则；保留预算，不重放没有回执的新发送。"""
     cur = conn.execute(
         "UPDATE telegram_notification_outbox SET status=CASE "
-        "WHEN COALESCE(message_id,0)=0 THEN 'outcome_unknown' "
+        "WHEN COALESCE(message_id,0)<=0 THEN 'outcome_unknown' "
         "WHEN attempts>=? THEN 'failed' ELSE 'retry_wait' END,"
         "lease_generation=lease_generation+1,next_attempt_at=?,"
         "last_error=CASE WHEN COALESCE(message_id,0)>0 "

@@ -237,10 +237,13 @@ class NotificationReceiptRecoveryAuditTests(unittest.TestCase):
         repository.recover_notifications()
         current = repository.claim_due_notifications(event_key=result.event_key)[0]
         before = repository.get_notification(result.event_key)
+        self.assertFalse(repository.reject_notification_message(
+            old["id"], lease_generation=old["lease_generation"], message_id=77,
+        ))
         status = repository.retry_notification(
             old["id"], lease_generation=old["lease_generation"],
             claimed_revision=old["revision"], error="late timeout",
-            outcome_unknown=True, clear_message_id=True,
+            outcome_unknown=True,
         )
         self.assertEqual(status, "stale")
         self.assertEqual(repository.get_notification(result.event_key), before)

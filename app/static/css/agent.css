@@ -1574,7 +1574,7 @@ body.agent-page-body::after { display: none; }
 
 .agent-composer textarea { display: block; width: 100%; min-height: 44px; max-height: 160px; padding: 2px 0 4px; resize: none; overflow-y: auto; color: var(--text-primary); background: transparent; border: 0 !important; box-shadow: none !important; outline: none !important; ring: 0 !important; font: inherit; font-size: 14.5px; line-height: 1.55; }
 .agent-composer textarea:focus { border: 0 !important; box-shadow: none !important; outline: none !important; }
-.agent-composer textarea::placeholder { color: var(--text-muted); opacity: 0.85; }
+.agent-composer textarea::placeholder { color: var(--text-muted); opacity: 0.85; white-space: nowrap; text-overflow: ellipsis; }
 .agent-composer-actions,
 .agent-composer-actions-left { display: flex !important; align-items: center !important; gap: 6px; flex-shrink: 0; }
 .agent-composer-actions-right,

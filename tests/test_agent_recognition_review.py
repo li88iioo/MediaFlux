@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -638,9 +637,9 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(claimed["confirmation_actor"], "human")
         self.assertEqual(claimed["review_status"], "cancelled")
-        self.assertFalse(
-            organize_confirmations_repo.stage_organize_confirmation_review_result(
-                "review-token", {"reason_code": "too_late"}
+        self.assertIsNone(
+            organize_confirmations_repo.save_organize_confirmation_review(
+                row, status="running", result={"reason_code": "too_late"},
             )
         )
 
@@ -728,15 +727,26 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
         first = organize_confirmations_repo.claim_next_organize_confirmation_review()
         assert first is not None
         self.assertEqual(first["review_attempts"], 1)
-        self.assertEqual(organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews(), 1)
+        self.assertEqual(organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews(), (1, []))
         second = organize_confirmations_repo.claim_next_organize_confirmation_review()
         assert second is not None
         self.assertEqual(second["review_attempts"], 2)
-        self.assertEqual(organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews(), 1)
+        self.assertGreater(second["review_started_at"], first["review_started_at"])
+        for status in ("running", "approved"):
+            self.assertIsNone(organize_confirmations_repo.save_organize_confirmation_review(
+                first, status=status, result={"candidate_index": 0},
+            ))
+        with self.assertRaises(ValueError):
+            organize_confirmations_repo.claim_organize_confirmation(
+                "review-token", chat_id="100", selected_index=0, actor="agent",
+                expected_review_started_at=first["review_started_at"],
+            )
+        self.assertEqual(organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews(), (1, []))
         third = organize_confirmations_repo.claim_next_organize_confirmation_review()
         assert third is not None
         self.assertEqual(third["review_attempts"], 3)
-        self.assertEqual(organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews(), 1)
+        count, [failed] = organize_confirmations_repo.recover_interrupted_organize_confirmation_reviews()
+        self.assertEqual((count, failed["token"], failed["review_status"]), (1, "review-token", "failed"))
 
         current = organize_confirmations_repo.get_organize_confirmation("review-token")
         assert current is not None
@@ -749,68 +759,49 @@ class RecognitionReviewDispatcherTests(IsolatedDatabaseTestCase):
     def tearDown(self) -> None:
         organize_confirmations.stop_recognition_review_dispatcher(timeout=1)
 
-    def test_restart_does_not_revive_timed_out_worker_generation(self) -> None:
+    def test_restart_refuses_a_late_result_from_the_timed_out_worker(self) -> None:
         organize_confirmations.stop_recognition_review_dispatcher(timeout=1)
-        processing = threading.Event()
-        release = threading.Event()
-        claims: list[int] = []
-        first_worker: list[int] = []
+        organize_confirmations_repo.create_organize_confirmation(
+            token="restart", fingerprint="restart", chat_id="", source_name="fixture", directory_path="/fixture",
+            payload={**_review_payload(), "review_only": True, "_notification_suppressed": True},
+            expires_at="2099-01-01 00:00:00", review_requested=True, review_ready=True,
+        )
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        workers: list[threading.Thread] = []
 
-        def claim_next():
-            worker = threading.get_ident()
-            claims.append(worker)
-            if not first_worker:
-                first_worker.append(worker)
-                return {"token": "review-token", "payload_json": "{}"}
-            return None
+        def decide(_payload):
+            index = len(workers)
+            workers.append(threading.current_thread())
+            started[index].set()
+            if not release[index].wait(timeout=5):
+                raise TimeoutError("测试未释放复核")
+            return RecognitionReviewDecision(status="abstained", summary=f"第 {index + 1} 轮暂缓")
 
-        def process(_row, *, discovery_scraper=None):
-            self.assertIsNone(discovery_scraper)
-            processing.set()
-            release.wait(timeout=2)
-            return "abstained"
-
-        try:
-            with (
-                patch.object(
-                    organize_confirmations.organize_confirmations_repo,
-                    "recover_interrupted_organize_confirmation_reviews",
-                    return_value=0,
-                ),
-                patch.object(
-                    organize_confirmations.organize_confirmations_repo,
-                    "claim_next_organize_confirmation_review",
-                    side_effect=claim_next,
-                ),
-                patch.object(
-                    organize_confirmations,
-                    "_process_recognition_review_row",
-                    side_effect=process,
-                ),
-                patch.object(organize_confirmations, "_DISPATCH_POLL_SECONDS", 0.01),
-            ):
+        with (
+            patch.object(feature_gate, "recognition_review_enabled", return_value=True),
+            patch("app.modules.agent_recognition_review.review_confirmation_payload", side_effect=decide),
+        ):
+            try:
                 organize_confirmations.start_recognition_review_dispatcher()
-                self.assertTrue(processing.wait(timeout=1))
-                old_worker = first_worker[0]
-                self.assertFalse(
-                    organize_confirmations.stop_recognition_review_dispatcher(
-                        timeout=0
-                    )
-                )
-
+                self.assertTrue(started[0].wait(timeout=2))
+                self.assertFalse(organize_confirmations.stop_recognition_review_dispatcher(timeout=0))
                 organize_confirmations.start_recognition_review_dispatcher()
-                deadline = time.monotonic() + 1
-                while (
-                    not any(worker != old_worker for worker in claims)
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.005)
-                self.assertTrue(any(worker != old_worker for worker in claims))
-
-                release.set()
-                time.sleep(0.05)
-                organize_confirmations.stop_recognition_review_dispatcher(timeout=1)
-
-            self.assertEqual(claims.count(old_worker), 1)
-        finally:
-            release.set()
+                self.assertTrue(started[1].wait(timeout=2))
+                release[0].set()
+                workers[0].join(timeout=2)
+                self.assertFalse(workers[0].is_alive())
+                row = organize_confirmations_repo.get_organize_confirmation("restart")
+                assert row is not None
+                self.assertEqual((row["review_attempts"], row["review_status"]), (2, "running"))
+                self.assertNotIn("第 1 轮", row["review_result_json"])
+            finally:
+                for event in release:
+                    event.set()
+                organize_confirmations.stop_recognition_review_dispatcher(timeout=2)
+                for thread in workers:
+                    thread.join(timeout=2)
+        settled = organize_confirmations_repo.get_organize_confirmation("restart")
+        assert settled is not None
+        self.assertEqual(settled["review_status"], "abstained")
+        self.assertEqual(json.loads(settled["review_result_json"])["summary"], "第 2 轮暂缓")
