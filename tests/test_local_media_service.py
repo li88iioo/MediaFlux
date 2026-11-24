@@ -139,7 +139,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                     owner="admin", media_type="movie",
                 )
                 local_media_repo.upsert_local_library_target(source_id, "movie", str(target_root))
-                task_id = local_media_repo.create_local_media_task(
+                task_id, _created = local_media_repo.admit_local_media_task(
                     source_id, f"{int(restore_fails) + 1:040x}", str(source_root), trigger="qb_completed",
                     operation_token=f"retirement-test-{restore_fails}",
                 )
@@ -551,7 +551,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             movie = source_root / "Movie.2026.mkv"
             movie.write_bytes(b"video")
             source_id = self._source(source_root, target_root, "movie")
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "f" * 40, str(movie), owner="admin", trigger="qb_completed",
             )
             self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
@@ -628,7 +628,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             movie = source_root / "Movie.2026.mkv"
             movie.write_bytes(b"video")
             source_id = self._source(source_root, target_root, "movie")
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "9" * 40, str(movie), owner="admin", trigger="qb_completed",
             )
             self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
@@ -811,7 +811,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                             "ancestor": source_root,
                             "descendant": episode,
                         }[relation]
-                        task_id = local_media_repo.create_local_media_task(
+                        task_id, _created = local_media_repo.admit_local_media_task(
                             source_id, "", str(task_path), owner="admin", trigger="manual",
                         )
                         local_media_repo.update_local_media_task(
@@ -833,7 +833,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 (selected / "Movie.mkv").write_bytes(b"movie")
                 sibling = source_root / "Other.mkv"
                 sibling.write_bytes(b"other")
-                sibling_task = local_media_repo.create_local_media_task(
+                sibling_task, _created = local_media_repo.admit_local_media_task(
                     source_id, "", str(sibling), owner="admin", trigger="manual",
                 )
                 info = selected.lstat()
@@ -877,9 +877,9 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             second_file.write_bytes(b"second-version")
             source_id = self._source(source_root, target_root, "movie")
             task_ids = [
-                local_media_repo.create_local_media_task(
+                local_media_repo.admit_local_media_task(
                     source_id, "", str(path), owner="admin", trigger="scan",
-                )
+                )[0]
                 for path in (first_file, second_file)
             ]
             self.assertTrue(all(
@@ -1386,9 +1386,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                     LocalMediaServiceError, "检查记录不存在或已过期"
                 ):
                     service.preview("admin", inspection["inspection_id"])
-                self.assertTrue(local_media_repo.claim_local_media_task(
-                    task_id, expected="waiting_stable", owner="admin"
-                ))
                 result = service.execute_task("admin", task_id)
 
             self.assertEqual(result["status"], "completed")
@@ -1563,7 +1560,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 "admin", inspection["inspection_id"],
                 preview_digest=preview["preview_digest"],
             )
-            self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
             result = service.execute_task("admin", task_id)
             self.assertEqual(result["status"], "completed")
             self.assertIn("S02E07", result["preview"]["plans"][0]["target_name"])
@@ -1619,7 +1615,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 "admin", inspection["inspection_id"],
                 preview_digest=preview["preview_digest"],
             )
-            self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
             expected_target = Path(preview["plans"][0]["target_path"])
             result = service.execute_task("admin", task_id)
             self.assertEqual(result["status"], "completed")
@@ -1793,7 +1788,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 "admin", inspection["inspection_id"],
                 preview_digest=preview["preview_digest"],
             )
-            self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
 
             result = service.execute_task("admin", task_id)
 
@@ -1841,7 +1835,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             task_id = service.create_manual_task(
                 "admin", inspection["inspection_id"], preview_digest=preview["preview_digest"],
             )
-            self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
             with patch("app.modules.local_media_service.LocalMoveTransaction.execute") as execute:
                 result = service.execute_task("admin", task_id)
             execute.assert_not_called()
@@ -1893,7 +1886,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 episode = source_root / "Show.S02E999.mkv"
                 episode.write_bytes(b"video")
                 source_id = self._source(source_root, target_root, "tv")
-                task_id = local_media_repo.create_local_media_task(
+                task_id, _created = local_media_repo.admit_local_media_task(
                     source_id, "", str(source_root if directory else episode),
                     owner="admin", trigger="scan",
                 )
@@ -1925,7 +1918,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             episode = source_root / "Show.mkv"
             episode.write_bytes(b"video")
             source_id = self._source(source_root, target_root, "tv")
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(episode), owner="admin", trigger="scan",
             )
             self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
@@ -2020,7 +2013,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 preview_digest=preview["preview_digest"],
             )
             if execute:
-                self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
                 service.execute_task("admin", task_id)
         return service, task_id
 
@@ -2071,7 +2063,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                         execute=False, refresh=True,
                     )
                     try:
-                        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
                         result = service.execute_task("admin", task_id)
                         self.assertEqual(result["media_refresh_status"], "skipped")
                         task = _require_task(task_id)
@@ -2191,7 +2182,6 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                 self.assertEqual(first_row["revision"], 1)
                 self.assertNotIn("已归档", first_row["event_json"])
 
-                self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
                 service.execute_task("admin", task_id)
                 with db.get_conn() as conn:
                     reconcile_local_media_downloads(conn, task_id=task_id)
@@ -2279,7 +2269,7 @@ def create_web_task(case):
     )
 
 
-@pytest.mark.parametrize("phase", ["before_create", "queued", "restart"])
+@pytest.mark.parametrize("phase", ["before_create", "after_create", "restart"])
 def test_web_new_sibling_requires_repreview_without_file_writes(local_preview, phase):
     case = local_preview
     task_id = None
@@ -2293,7 +2283,6 @@ def test_web_new_sibling_requires_repreview_without_file_writes(local_preview, p
     if phase == "restart":
         case.service.close()
         case.service = LocalMediaService(scraper=case.scraper)
-    assert local_media_repo.claim_local_media_task(task_id, owner="admin")
     result = case.service.execute_task("admin", task_id)
     assert result["status"] == "requires_manual", result
     assert result["repreview_required"] is True
@@ -2324,7 +2313,6 @@ def test_web_source_target_companion_and_rules_changes_do_not_write(local_previe
         rules = json.loads(case.preview["rules_snapshot"])
         rules["clean_empty"] = True
         local_media_repo.update_local_media_task(task_id, rules_snapshot=json.dumps(rules))
-    assert local_media_repo.claim_local_media_task(task_id, owner="admin")
     result = case.service.execute_task("admin", task_id)
     assert result["status"] == "requires_manual", result
     assert result["repreview_required"]
@@ -2350,7 +2338,6 @@ def test_web_restart_preserves_plan_and_frozen_rules(local_preview):
     case.service = LocalMediaService(scraper=case.scraper)
     case.rules.naming_scope = "file"
     case.rules.year_split = True
-    assert local_media_repo.claim_local_media_task(task_id, owner="admin")
     result = case.service.execute_task("admin", task_id)
     assert result["status"] == "completed", result
     assert set(result["moved"]) == {p["target_path"] for p in case.preview["plans"]}
@@ -2362,7 +2349,6 @@ def test_web_retry_keeps_binding_until_new_preview_confirmation(local_preview):
     task_id = create_web_task(case)
     added = case.source / "Example.Show.S01E02.mkv"
     added.write_bytes(b"new episode")
-    assert local_media_repo.claim_local_media_task(task_id)
     assert case.service.execute_task("admin", task_id)["repreview_required"]
     assert local_media_repo.reset_local_media_task(task_id)
     get_local_media_task_result_6 = local_media_repo.get_local_media_task(task_id)
@@ -2375,7 +2361,6 @@ def test_web_retry_keeps_binding_until_new_preview_confirmation(local_preview):
         "admin", case.inspection["inspection_id"], tmdb_id="42", media_type="tv"
     )
     assert create_web_task(case) == task_id
-    assert local_media_repo.claim_local_media_task(task_id)
     result = case.service.execute_task("admin", task_id)
     assert result["status"] == "completed", result
     assert len(result["moved"]) == 3  # 两个视频及已确认的字幕。
@@ -2383,10 +2368,10 @@ def test_web_retry_keeps_binding_until_new_preview_confirmation(local_preview):
 
 def test_legacy_manual_task_keeps_history_and_requires_new_preview(local_preview):
     case = local_preview
-    old_id = local_media_repo.create_local_media_task(case.source_id, "", str(case.source / "old"), trigger="manual")
+    old_id, _created = local_media_repo.admit_local_media_task(case.source_id, "", str(case.source / "old"), trigger="manual")
     local_media_repo.update_local_media_task(old_id, status="completed", title="历史", completed_at=db.now())
     old = local_media_repo.get_local_media_task(old_id)
-    task_id = local_media_repo.create_local_media_task(case.source_id, "", str(case.source), trigger="manual")
+    task_id, _created = local_media_repo.admit_local_media_task(case.source_id, "", str(case.source), trigger="manual")
     local_media_repo.update_local_media_task(task_id, snapshot_digest=case.inspection["digest"])
     local_media_repo.add_local_media_task_item(task_id, str(case.video), "/historical-target", role="video")
     items = local_media_repo.list_local_media_task_items(task_id)
@@ -2401,7 +2386,6 @@ def test_legacy_manual_task_keeps_history_and_requires_new_preview(local_preview
     case.inspection = case.service.inspect_source("admin", case.source_id, case.source)
     case.preview = case.service.preview("admin", case.inspection["inspection_id"], "42", "tv")
     assert create_web_task(case) == task_id
-    assert local_media_repo.claim_local_media_task(task_id)
     assert case.service.execute_task("admin", task_id)["status"] == "completed"
     assert local_media_repo.get_local_media_task(old_id) == old
 
@@ -2409,7 +2393,7 @@ def test_legacy_manual_task_keeps_history_and_requires_new_preview(local_preview
 @pytest.mark.parametrize("trigger", ["scan", "qb_completed"])
 def test_automatic_tasks_still_plan_latest_directory(local_preview, trigger):
     case = local_preview
-    task_id = local_media_repo.create_local_media_task(case.source_id, "", str(case.source), trigger=trigger)
+    task_id, _created = local_media_repo.admit_local_media_task(case.source_id, "", str(case.source), trigger=trigger)
     local_media_repo.update_local_media_task(task_id, snapshot_digest=case.inspection["digest"])
     (case.source / "Example.Show.S01E02.mkv").write_bytes(b"new episode")
     assert local_media_repo.claim_local_media_task(task_id)
@@ -2424,7 +2408,7 @@ def test_web_reuses_failed_automatic_task_with_manual_preview_semantics(local_pr
     from unittest.mock import Mock
     case = local_preview
     qb_hash = "fake-qb-hash" if trigger == "qb_completed" else ""
-    task_id = local_media_repo.create_local_media_task(case.source_id, qb_hash, str(case.source), trigger=trigger)
+    task_id, _created = local_media_repo.admit_local_media_task(case.source_id, qb_hash, str(case.source), trigger=trigger)
     local_media_repo.update_local_media_task(task_id, status="failed", error="prior failure")
     case.scraper.result.confidence = 0.82
     case.preview = case.service.preview(
@@ -2439,7 +2423,6 @@ def test_web_reuses_failed_automatic_task_with_manual_preview_semantics(local_pr
     assert stored.trigger == trigger and stored.qb_hash == qb_hash
     assert stored is not None
     assert stored.season_override == (2 if fixed_candidate else None)
-    assert local_media_repo.claim_local_media_task(task_id)
     qb = Mock()
     with patch.object(case.service, "preview", wraps=case.service.preview) as replan:
         result = case.service.execute_task("admin", task_id, qb_client=qb if qb_hash else None)
@@ -2464,7 +2447,6 @@ def test_actor_flag_cannot_bypass_existing_web_ticket(local_preview, actor):
 def test_web_io_failure_preserves_diagnostic_instead_of_claiming_plan_changed(local_preview):
     case = local_preview
     task_id = create_web_task(case)
-    assert local_media_repo.claim_local_media_task(task_id)
     with patch.object(case.service, "inspect_source", side_effect=OSError("isolated disk I/O error")):
         with pytest.raises(OSError, match="isolated disk I/O error"):
             case.service.execute_task("admin", task_id)

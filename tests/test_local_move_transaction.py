@@ -31,9 +31,9 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
             name=f"source-{uuid.uuid4().hex}", qb_profile="", qb_path_prefix="",
             local_root=str(source_root), owner="admin",
         )
-        return local_media_repo.create_local_media_task(
+        return local_media_repo.admit_local_media_task(
             source_id, "", str(source_root), owner="admin", trigger="manual"
-        )
+        )[0]
 
     def test_same_filesystem_uses_atomic_no_replace_publish_and_records_steps(self):
         with tempfile.TemporaryDirectory() as root_raw:

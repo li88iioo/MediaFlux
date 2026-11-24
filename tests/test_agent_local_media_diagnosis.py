@@ -52,7 +52,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         owner: str = "admin",
         suffix: str = "one",
     ) -> int:
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id,
             f"HASH_SECRET_{suffix}",
             f"/private/TITLE_SECRET_{suffix}.mkv",

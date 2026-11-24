@@ -60,7 +60,7 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         return service
 
     def _task(self, source_id, path, *, owner="admin"):
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", str(path), owner=owner, trigger="scan",
         )
         self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner=owner))
@@ -75,7 +75,7 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         status="completed", step_status="completed", group=None,
     ):
         path = source / f"history-{len(local_media_repo.list_local_media_tasks(owner=owner))}.mp4"
-        task_id = local_media_repo.create_local_media_task(source_id, "", str(path), owner=owner, trigger="scan")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, "", str(path), owner=owner, trigger="scan")
         local_media_repo.add_local_media_task_item(
             task_id, str(path), str(target), role="video", owner=owner,
             media_group=f"movie:{identity}:__root__" if group is None else group,

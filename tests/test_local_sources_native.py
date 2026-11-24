@@ -140,7 +140,7 @@ def test_crud_preserves_subdirectories_target_identity_and_permissions(backend):
 
 def test_active_tasks_keep_web_transaction_guard_and_qb_takeover_config(backend):
     identifier = source(backend)
-    task_id = repository.create_local_media_task(identifier, "torrent-hash", str(backend.directory / "来源" / "Show.mkv"), trigger="qb_completed")
+    task_id, _created = repository.admit_local_media_task(identifier, "torrent-hash", str(backend.directory / "来源" / "Show.mkv"), trigger="qb_completed")
     task_before = repository.get_local_media_task(task_id)
     assert task_before is not None
     assert sdk.local.update_source(identifier, name="只改名称")["ok"]
@@ -322,6 +322,13 @@ def test_scan_query_filters_titles_and_keeps_empty_failure_and_skip_distinct(bac
     assert result["status"] == "accepted" and result["data"]["candidate_count"] == 1
     task = repository.get_local_media_task(result["data"]["task_ids"][0])
     assert task is not None and task.source_id == selected and "Alpha.Show" in task.content_path
+    query = "Alpha.Show"
+    plan = service.prepare_local_source_scan([selected], query)
+    repeated = service.scan_local_sources([selected], query, expected_fingerprint=plan["fingerprint"])
+    assert repeated["status"] == "accepted"
+    assert (repeated["data"]["queued_count"], repeated["data"]["reused_count"]) == (0, 1)
+    assert repeated["data"]["task_ids"] == [task.id]
+    assert repeated["effect_metadata"]["completion"]["scan_ref"] == repeated["data"]["scan_ref"]
     for query in ("/private/media", "access_token=secret", "https://private.invalid", "x" * 121):
         with pytest.raises(ValueError):
             sdk.local.scan_sources(query=query)

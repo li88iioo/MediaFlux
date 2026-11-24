@@ -540,8 +540,6 @@ def execute_media(request: Request, data: dict | None = Body(default=None)):
             preview_digest=payload_text(payload, "preview_digest", max_length=144),
         )
         notification_task_id = task_id
-        if not local_media_repo.claim_local_media_task(task_id, expected="waiting_stable", owner=_OWNER):
-            raise LocalMediaServiceError("任务已被其他操作认领")
         task = local_media_repo.get_local_media_task(task_id, owner=_OWNER)
         if task is None:
             raise LocalMediaServiceError("本地媒体任务不存在")

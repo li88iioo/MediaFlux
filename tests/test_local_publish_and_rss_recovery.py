@@ -68,7 +68,7 @@ incoming.mkdir(); library.mkdir()
 source, target = incoming / "Movie.mkv", library / "Movie.mkv"
 source.write_bytes(b"process-only-copy")
 sid = local_media_repo.create_local_media_source(name="interrupted-link", qb_profile="", qb_path_prefix="", local_root=str(incoming), owner="admin")
-task = local_media_repo.create_local_media_task(sid, "", str(source), trigger="manual")
+task, _created = local_media_repo.admit_local_media_task(sid, "", str(source), trigger="manual")
 assert local_media_repo.claim_local_media_task(task, owner="admin")
 local_media_repo.update_local_media_task(task, status="moving")
 (root / "local-manifest.json").write_text(json.dumps({"task":task, "source":str(source), "target":str(target)}))

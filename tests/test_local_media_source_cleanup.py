@@ -54,7 +54,7 @@ class LocalMediaSourceCleanupTests(IsolatedDatabaseTestCase):
         )
 
     def _create_task(self, *, selected_path=None, qb_hash=""):
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             self.source_id, qb_hash, str(selected_path or self.selected), owner="admin",
             trigger="qb_completed" if qb_hash else "scan",
         )

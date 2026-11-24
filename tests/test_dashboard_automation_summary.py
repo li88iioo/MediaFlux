@@ -56,7 +56,7 @@ class DashboardAutomationSummaryTests(IsolatedDatabaseTestCase):
             root = str(database_path.parent)
             source_id = local_media_repo.create_local_media_source("本地来源", "default", root, root)
             for index, status in enumerate(["completed"] * 24 + ["failed", "requires_manual"]):
-                task_id = local_media_repo.create_local_media_task(source_id, "", f"{root}/task-{index}")
+                task_id, _created = local_media_repo.admit_local_media_task(source_id, "", f"{root}/task-{index}")
                 local_media_repo.update_local_media_task(task_id, status=status)
             summary = build_automation_summary()
             self.assertEqual(summary["organize_issues"], 0)

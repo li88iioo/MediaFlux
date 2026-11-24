@@ -88,7 +88,6 @@ class ReleaseChainNamingTests(IsolatedDatabaseTestCase):
                                 "admin", inspection["inspection_id"],
                                 preview_digest=preview["preview_digest"],
                             )
-                            self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
                             result = service.execute_task("admin", task_id)
                         self.assertEqual(result["status"], "completed")
                         self.assertFalse(video.exists())

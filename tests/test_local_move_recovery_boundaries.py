@@ -92,7 +92,6 @@ class LocalMoveRecoveryBoundariesTests(IsolatedDatabaseTestCase):
                     task_id = service.create_manual_task(
                         'admin', inspection['inspection_id'], preview_digest=preview['preview_digest'],
                     )
-                    self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner='admin'))
                     with self.assertRaises(LocalMoveError) as caught:
                         service.execute_task('admin', task_id)
             finally:

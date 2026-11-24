@@ -33,7 +33,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             source_id = local_media_repo.create_local_media_source(
                 name="dynamic-path", qb_profile="", qb_path_prefix="", local_root=str(root),
             )
-            task_id = local_media_repo.create_local_media_task(source_id, "", str(first / "Movie.mkv"))
+            task_id, _created = local_media_repo.admit_local_media_task(source_id, "", str(first / "Movie.mkv"))
             with db.get_conn() as conn:
                 conn.execute("UPDATE local_media_tasks SET content_path=? WHERE id=?", (str(alias / "Movie.mkv"), task_id))
                 match = repository._active_local_media_task_for_path(conn, source_id=source_id, owner="admin", content_path=str(first / "Movie.mkv"))
@@ -94,13 +94,13 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             local_root="/tmp/queue-order", owner=owner,
         )
         task_ids = [
-            local_media_repo.create_local_media_task(
+            local_media_repo.admit_local_media_task(
                 source_id,
                 "",
                 f"/tmp/queue-order/Movie-{index:03d}.mkv",
                 owner=owner,
                 trigger="manual",
-            )
+            )[0]
             for index in range(501)
         ]
 
@@ -144,7 +144,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             provider="jellyfin", library_name="电影", library_id="movies",
             server_path="//NAS/Media/Movies", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "hash-1", "/mnt/downloads/1/Movie.mkv", owner="admin"
         )
 
@@ -176,14 +176,14 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
         workers = 8
         barrier = threading.Barrier(workers + 1)
-        task_ids: list[int] = []
+        admissions: list[tuple[int, bool]] = []
         errors: list[BaseException] = []
         result_lock = threading.Lock()
 
         def create_task() -> None:
             barrier.wait()
             try:
-                task_id = local_media_repo.create_local_media_task(
+                admission = local_media_repo.admit_local_media_task(
                     source_id, "", "/tmp/concurrent-scan/Movie.mkv",
                     owner="admin", trigger="scan",
                 )
@@ -192,7 +192,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
                     errors.append(exc)
             else:
                 with result_lock:
-                    task_ids.append(task_id)
+                    admissions.append(admission)
 
         threads = [threading.Thread(target=create_task) for _ in range(workers)]
         for thread in threads:
@@ -203,43 +203,45 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
 
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
-        self.assertEqual(len(task_ids), workers)
-        self.assertEqual(len(set(task_ids)), 1)
+        self.assertEqual(len(admissions), workers)
+        task_ids = {task_id for task_id, _created in admissions}
+        [task_id] = task_ids
+        self.assertEqual(sum(created for _task_id, created in admissions), 1)
         with db.get_conn() as conn:
             rows = conn.execute(
                 "SELECT id FROM local_media_tasks WHERE source_id=? AND content_path=?",
                 (source_id, "/tmp/concurrent-scan/Movie.mkv"),
             ).fetchall()
-        self.assertEqual([int(row["id"]) for row in rows], [task_ids[0]])
+        self.assertEqual([int(row["id"]) for row in rows], [task_id])
 
     def test_active_task_admission_rejects_ancestor_and_descendant_overlap(self):
         source_id = local_media_repo.create_local_media_source(
             name="path-overlap", qb_profile="", qb_path_prefix="",
             local_root="/tmp/path-overlap", owner="admin",
         )
-        parent_id = local_media_repo.create_local_media_task(
+        parent_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/path-overlap/Show", owner="admin", trigger="manual",
         )
 
         with self.assertRaisesRegex(ValueError, "范围重叠"):
-            local_media_repo.create_local_media_task(
+            local_media_repo.admit_local_media_task(
                 source_id, "", "/tmp/path-overlap/Show/E01.mkv",
                 owner="admin", trigger="manual",
             )
 
         local_media_repo.update_local_media_task(parent_id, owner="admin", status="completed")
-        child_id = local_media_repo.create_local_media_task(
+        child_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/path-overlap/Show/E01.mkv",
             owner="admin", trigger="manual",
         )
         with self.assertRaisesRegex(ValueError, "范围重叠"):
-            local_media_repo.create_local_media_task(
+            local_media_repo.admit_local_media_task(
                 source_id, "", "/tmp/path-overlap/Show",
                 owner="admin", trigger="manual",
             )
 
         local_media_repo.update_local_media_task(child_id, owner="admin", status="failed")
-        retried_parent = local_media_repo.create_local_media_task(
+        retried_parent, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/path-overlap/Show",
             owner="admin", trigger="manual",
         )
@@ -250,7 +252,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="immutable-task-path", qb_profile="", qb_path_prefix="",
             local_root="/tmp/immutable-task-path", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/immutable-task-path/Movie.mkv", owner="admin",
         )
 
@@ -272,7 +274,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="manual-qb-single-track", qb_profile="configured:qb",
             qb_path_prefix="/downloads", local_root="/tmp/single-track", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/single-track/season/../Movie.mkv",
             owner="admin", trigger="manual", operation_token="manual-operation-token",
         )
@@ -377,7 +379,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             "/tmp/qb-manual/Movie.mkv",
             owner="admin",
         )
-        manual_task_id = local_media_repo.create_local_media_task(
+        manual_task_id, _created = local_media_repo.admit_local_media_task(
             source_id,
             "",
             "/tmp/qb-manual/subdir/../Movie.mkv",
@@ -401,7 +403,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="path-owner-two", qb_profile="", qb_path_prefix="",
             local_root="/tmp/shared-path/subdir", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             first_source,
             "",
             "/tmp/shared-path/Movie.mkv",
@@ -410,7 +412,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "其他本地媒体来源"):
-            local_media_repo.create_local_media_task(
+            local_media_repo.admit_local_media_task(
                 second_source,
                 "",
                 "/tmp/shared-path/child/../Movie.mkv",
@@ -431,7 +433,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             for task_status in ("completed", "failed", "requires_manual", "planned"):
                 with self.subTest(request_status=request_status, task_status=task_status):
                     content_path = f"/tmp/terminal-projection/{index}-{task_status}.mkv"
-                    task_id = local_media_repo.create_local_media_task(
+                    task_id, _created = local_media_repo.admit_local_media_task(
                         source_id, "", content_path, owner="admin", trigger="manual",
                     )
                     request_id, _ = download_requests_repo.create_download_request(
@@ -554,7 +556,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="projection-owner", qb_profile="", qb_path_prefix="",
             local_root="/tmp/projection-owner", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/projection-owner/Movie.mkv", owner="admin",
         )
         request_id, _ = download_requests_repo.create_download_request("projection-owner-request", "magnet")
@@ -588,7 +590,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             local_root="/tmp/projection-rollback", owner="admin",
         )
         content_path = "/tmp/projection-rollback/Movie.mkv"
-        task_id = local_media_repo.create_local_media_task(source_id, "", content_path, owner="admin")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, "", content_path, owner="admin")
         request_id, _ = download_requests_repo.create_download_request("projection-rollback-request", "magnet")
         self.assertTrue(download_requests_repo.link_download_request_to_local_media_task(
             request_id, task_id, content_path,
@@ -653,7 +655,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             legacy_cases
         ):
             content_path = f"/tmp/startup-projection/{index}.mkv"
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", content_path, owner="admin", trigger="scan",
             )
             request_id, _ = download_requests_repo.create_download_request(
@@ -756,7 +758,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         local_media_repo.update_local_media_task(
             terminal_id, owner="admin", status="completed", completed_at=db.now()
         )
-        active_id = local_media_repo.create_local_media_task(
+        active_id, _created = local_media_repo.admit_local_media_task(
             source_id,
             "",
             "/tmp/hash-transfer/./Movie.mkv",
@@ -816,7 +818,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         def admit_manual() -> None:
             barrier.wait()
             try:
-                task_id = local_media_repo.create_local_media_task(
+                task_id, _created = local_media_repo.admit_local_media_task(
                     source_id,
                     "",
                     "/tmp/concurrent-manual-qb/a/../Movie.mkv",
@@ -973,8 +975,8 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="source-idempotent", qb_profile="qb", qb_path_prefix="/downloads",
             local_root="/mnt/downloads", owner="admin",
         )
-        first = local_media_repo.create_local_media_task(source_id, "HASH", "/mnt/downloads/A", owner="admin")
-        second = local_media_repo.create_local_media_task(source_id, "hash", "/mnt/downloads/A", owner="admin")
+        first, _created = local_media_repo.admit_local_media_task(source_id, "HASH", "/mnt/downloads/A", owner="admin")
+        second, _created = local_media_repo.admit_local_media_task(source_id, "hash", "/mnt/downloads/A", owner="admin")
         self.assertEqual(first, second)
         self.assertIsNone(local_media_repo.get_local_media_source(source_id, owner="other"))
         self.assertIsNone(local_media_repo.get_local_media_task(first, owner="other"))
@@ -985,7 +987,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="source-items", qb_profile="", qb_path_prefix="",
             local_root="/tmp/downloads-items", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/downloads/A.mkv", owner="admin", trigger="manual"
         )
         item_id = local_media_repo.add_local_media_task_item(
@@ -1014,7 +1016,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="source-clear", qb_profile="", qb_path_prefix="",
             local_root="/tmp/downloads-clear", owner="admin",
         )
-        completed_id = local_media_repo.create_local_media_task(
+        completed_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/downloads-clear/Done.mkv", owner="admin", trigger="manual",
         )
         local_media_repo.add_local_media_task_item(
@@ -1027,7 +1029,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             completed_id, completed.operation_token, 0, "move", owner="admin",
         )
         local_media_repo.update_local_media_task(completed_id, owner="admin", status="completed")
-        busy_id = local_media_repo.create_local_media_task(
+        busy_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/downloads-clear/Busy.mkv", owner="admin", trigger="scan",
         )
 
@@ -1048,7 +1050,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             local_media_repo.upsert_local_library_target(source_id, "music", "/tmp/music", owner="admin")
         with self.assertRaisesRegex(LookupError, "来源"):
             local_media_repo.upsert_local_library_target(source_id, "movie", "/tmp/movies", owner="other")
-        task_id = local_media_repo.create_local_media_task(source_id, "x", "/tmp/downloads/x", owner="admin")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, "x", "/tmp/downloads/x", owner="admin")
         with self.assertRaisesRegex(ValueError, "状态"):
             local_media_repo.update_local_media_task(task_id, owner="admin", status="running")
 
@@ -1084,7 +1086,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             owner="admin",
             targets=[{"category": "movie", "path": "/tmp/library/movies"}],
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/active-source/Movie.mkv", owner="admin",
         )
 
@@ -1181,7 +1183,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="interrupted-write", qb_profile="", qb_path_prefix="",
             local_root="/tmp/interrupted-write", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/interrupted-write/Movie.mkv", owner="admin",
         )
         local_media_repo.add_local_media_task_item(
@@ -1216,7 +1218,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="live-writer", qb_profile="", qb_path_prefix="",
             local_root="/tmp/live-writer", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "a" * 40, "/tmp/live-writer/Movie.mkv", owner="admin",
         )
         task = local_media_repo.get_local_media_task(task_id, owner="admin")
@@ -1256,7 +1258,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
         task_ids = []
         for status in ("moving", "verifying", "refreshing", "rolling_back"):
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", f"/tmp/postwrite/{status}.mkv", owner="admin",
             )
             local_media_repo.add_local_media_task_item(
@@ -1284,7 +1286,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
         task_ids = []
         for status in ("recognizing", "planned"):
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", f"/tmp/prewrite/{status}.mkv", owner="admin",
             )
             local_media_repo.update_local_media_task(task_id, owner="admin", status=status)
@@ -1304,7 +1306,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="recognition-summary", qb_profile="", qb_path_prefix="",
             local_root="/tmp/recognition-summary", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/recognition-summary/Show.S02E08.mkv",
             owner="admin", trigger="scan",
         )
@@ -1327,7 +1329,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             name="telegram-confirm", qb_profile="", qb_path_prefix="",
             local_root="/tmp/telegram-confirm", media_type="movie", owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/tmp/telegram-confirm/Movie.mkv",
             owner="admin", trigger="scan",
         )
@@ -1373,6 +1375,8 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             source_id, content_path, snapshot_digest="preview:fixture", owner="admin", tmdb_id="1", media_type="movie",
         )
         original = local_media_repo.get_local_media_task(task_id, owner="admin")
+        assert original is not None
+        self.assertEqual((original.status, original.attempts, original.version), ("recognizing", 1, 2))
         local_media_repo.add_local_media_task_item(
             task_id, content_path, "/tmp/library/Movie.mkv", role="video", owner="admin",
         )
@@ -1380,6 +1384,8 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             task_id, owner="admin", status="failed", error="move failed",
             title="旧电影", year="2025",
         )
+        failed = local_media_repo.get_local_media_task(task_id, owner="admin")
+        assert failed is not None
 
         reused_id = local_media_repo.prepare_manual_local_media_task(
             source_id, content_path, snapshot_digest="preview:fixture", owner="admin", tmdb_id="2", media_type="movie",
@@ -1387,10 +1393,10 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         retried = local_media_repo.get_local_media_task(reused_id, owner="admin")
         self.assertEqual(reused_id, task_id)
         assert retried is not None
-        self.assertEqual(retried.status, "waiting_stable")
+        self.assertEqual(retried.status, "recognizing")
         self.assertEqual(retried.tmdb_id, "2")
         self.assertEqual((retried.title, retried.year), ("", ""))
-        assert original is not None
+        self.assertEqual((retried.attempts, retried.version), (failed.attempts + 1, failed.version + 2))
         self.assertNotEqual(retried.operation_token, original.operation_token)
         self.assertEqual(local_media_repo.list_local_media_task_items(task_id, owner="admin"), [])
 
@@ -1401,7 +1407,6 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         task_id = local_media_repo.prepare_manual_local_media_task(
             source_id, "/tmp/manual/Movie.mkv", snapshot_digest="preview:fixture", owner="admin", tmdb_id="1", media_type="movie"
         )
-        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
         with self.assertRaisesRegex(ValueError, "正在处理中"):
             local_media_repo.prepare_manual_local_media_task(
                 source_id, "/tmp/manual/Movie.mkv", snapshot_digest="preview:fixture", owner="admin", tmdb_id="2", media_type="movie"

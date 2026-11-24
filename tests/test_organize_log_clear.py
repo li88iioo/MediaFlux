@@ -33,7 +33,7 @@ class OrganizeLogClearTests(unittest.TestCase):
 
     def local(self, status="failed", name="Match", owner="admin"):
         source = local_media_repo.create_local_media_source(f"local-{status}-{name}", "", "", "/downloads", owner=owner)
-        task = local_media_repo.create_local_media_task(source, "", f"/downloads/{status}-{name}", owner=owner, trigger="manual")
+        task, _created = local_media_repo.admit_local_media_task(source, "", f"/downloads/{status}-{name}", owner=owner, trigger="manual")
         local_media_repo.update_local_media_task(task, owner=owner, status=status)
         return task
 

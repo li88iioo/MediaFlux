@@ -2323,7 +2323,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             local_root="/downloads",
             owner="admin",
         )
-        self.task_id = local_media_repo.create_local_media_task(
+        self.task_id, _created = local_media_repo.admit_local_media_task(
             self.source_id,
             "",
             "/downloads/Movie.2026.mkv",

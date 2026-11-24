@@ -34,7 +34,7 @@ class LocalMediaSummaryUnitTests(IsolatedDatabaseTestCase):
             local_root=f"/private/local/{suffix}",
             owner=owner,
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id,
             f"PRIVATE-HASH-{suffix}",
             f"/private/TITLE-{suffix}.mkv",

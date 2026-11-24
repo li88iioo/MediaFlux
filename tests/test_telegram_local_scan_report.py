@@ -27,7 +27,7 @@ class TelegramLocalScanReportTests(IsolatedDatabaseTestCase):
             name=f"下载-{name}", qb_profile="", qb_path_prefix="", local_root="/private/downloads"
         )
         path = f"/private/downloads/{name}"
-        task_id = local_media_repo.create_local_media_task(source_id, "", path, trigger="scan")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, "", path, trigger="scan")
         local_media_repo.update_local_media_task(task_id, status=status, title="示例剧集")
         if action:
             local_media_repo.add_local_media_task_item(task_id, path, f"/private/library/{name}", role="video", action=action)

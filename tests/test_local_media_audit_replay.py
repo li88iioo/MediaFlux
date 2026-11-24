@@ -33,7 +33,6 @@ def test_completed_task_replay_preserves_result_and_new_source(tmp_path, recreat
                 "admin", inspection["inspection_id"],
                 preview_digest=preview["preview_digest"],
             )
-            assert local_media_repo.claim_local_media_task(task_id, owner="admin")
             first = service.execute_task("admin", task_id)
             assert first["status"] == "completed"
             target = Path(first["moved"][0])

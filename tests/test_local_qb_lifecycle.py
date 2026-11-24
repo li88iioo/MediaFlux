@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from typing import cast
 from app.modules.scraper import TMDBScraper
 
@@ -16,6 +17,7 @@ from app.notifier import TelegramSendResult
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import (
+    LocalMediaPostMoveError,
     LocalMediaService,
     LocalMovePlan,
 )
@@ -50,7 +52,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
             local_root=str(source), stable_seconds=0, owner="admin",
         )
         local_media_repo.upsert_local_library_target(source_id, "movie", str(target), owner="admin")
-        task_id = local_media_repo.create_local_media_task(source_id, "hash-1", str(source), owner="admin")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, "hash-1", str(source), owner="admin")
         local_media_repo.claim_local_media_task(task_id, expected="waiting_stable", owner="admin")
         scraper = FakeScraper(MatchResult(tmdb_id="1", title="Movie", year="2025", media_type="movie", confidence=1))
         return root, source, target, task_id, LocalMediaService(scraper=cast(TMDBScraper, scraper))
@@ -172,6 +174,37 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
             get_local_media_task_result_2.status,
             "requires_manual",
         )
+
+    def test_step_audit_failure_does_not_interrupt_rollback_or_resume_qb(self):
+        root, source, target, task_id, service = self._fixture()
+        self.addCleanup(root.cleanup)
+        video = source / "Movie.2025.mkv"
+        subtitle = source / "Movie.2025.zh.srt"
+        subtitle.write_bytes(b"subtitle")
+        qb = FakeQB()
+        update_step = local_media_repo.update_local_media_operation_step
+        started_steps: list[int] = []
+
+        def update(step_id, status, **fields):
+            if status == "running":
+                started_steps.append(step_id)
+            elif len(started_steps) == 2 and step_id == started_steps[-1]:
+                raise sqlite3.OperationalError("injected step audit outage")
+            return update_step(step_id, status, **fields)
+
+        with patch.object(local_media_repo, "update_local_media_operation_step", side_effect=update):
+            with self.assertRaises(Exception) as raised:
+                service.execute_task("admin", task_id, qb_client=qb)
+
+        task = local_media_repo.get_local_media_task(task_id)
+        assert task is not None
+        self.assertEqual(len(started_steps), 2)
+        self.assertEqual(
+            (video.exists(), subtitle.exists(), [p.name for p in target.rglob("*.mkv")], qb.calls, task.status),
+            (True, True, [], [("pause", "hash-1")], "requires_manual"),
+        )
+        self.assertIsInstance(raised.exception, LocalMediaPostMoveError)
+        self.assertIn("injected step audit outage", task.error)
 
     def test_all_skipped_after_qb_delete_failure_never_resumes_and_requires_manual(self):
         root, source, target, task_id, service = self._fixture()

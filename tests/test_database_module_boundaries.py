@@ -107,8 +107,8 @@ with patch("sqlite3.connect", side_effect=AssertionError("import opened database
         import_module(name)
 from app import database
 from app.repositories import local_media
-assert callable(local_media.create_local_media_task)
-assert not hasattr(database, "create_local_media_task")
+assert callable(local_media.admit_local_media_task)
+assert not hasattr(database, "admit_local_media_task")
 '''
                 completed = subprocess.run(
                     [sys.executable, "-c", code],

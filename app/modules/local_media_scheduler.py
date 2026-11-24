@@ -306,7 +306,7 @@ class LocalMediaScheduler:
             return None
         source, mapping, local_path = actual_matches[0]
         if request_id is None:
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source.id, task.hash, str(local_path), owner=self.owner,
                 trigger="qb_completed",
             )
@@ -336,48 +336,39 @@ class LocalMediaScheduler:
         仅预览来源和未配置归档目标的来源不会被移动。
         """
         scan_started_at = db.now()
-        task_ids: list[int] = []
+        admitted_tasks: dict[int, bool] = {}
         source_results: list[dict[str, Any]] = []
         error_codes: set[str] = set()
-        selected_source_ids = (
-            {item for item in source_ids} if source_ids is not None else None
-        )
+        selected_source_ids = frozenset(source_ids) if source_ids is not None else None
+        prefix = SILENT_MANUAL_SCAN_TOKEN_PREFIX if silent else MANUAL_SCAN_TOKEN_PREFIX
         seen_source_ids: set[int] = set()
         for source in local_media_repo.list_local_media_sources(owner=self.owner):
             if selected_source_ids is not None and source.id not in selected_source_ids:
                 continue
             seen_source_ids.add(source.id)
+            source_result = {
+                "id": source.id, "name": source.name, "candidates": 0,
+                "queued": 0, "reused": 0, "skipped": True, "reason": "", "error": "",
+            }
+            source_results.append(source_result)
             if expected_sources is not None:
                 from app.repositories.local_media import local_media_source_snapshot
                 with db.get_conn() as conn:
                     current = local_media_source_snapshot(conn, source.id, owner=self.owner)
                 if current != expected_sources.get(source.id) or (cancelled is not None and cancelled()):
                     error_codes.add("source_changed")
-                    source_results.append({"id": source.id, "name": source.name, "candidates": 0, "queued": 0,
-                                           "skipped": True, "reason": "", "error": "来源配置已变化或扫描已取消"})
+                    source_result["error"] = "来源配置已变化或扫描已取消"
                     continue
             source_error = _source_path_error(source)
             if source_error:
                 error_codes.add("source_unavailable")
-                source_results.append({
-                    "id": source.id, "name": source.name, "candidates": 0,
-                    "queued": 0, "skipped": True, "reason": "",
-                    "error": source_error,
-                })
+                source_result["error"] = source_error
                 continue
             if source.mode == "preview_only":
-                source_results.append({
-                    "id": source.id, "name": source.name, "candidates": 0,
-                    "queued": 0, "skipped": True, "reason": "来源处于仅预览模式",
-                    "error": "",
-                })
+                source_result["reason"] = "来源处于仅预览模式"
                 continue
             if not local_media_repo.list_local_library_targets(source.id, owner=self.owner):
-                source_results.append({
-                    "id": source.id, "name": source.name, "candidates": 0,
-                    "queued": 0, "skipped": True, "reason": "尚未配置归档目标",
-                    "error": "",
-                })
+                source_result["reason"] = "尚未配置归档目标"
                 continue
             candidates, error = self._source_candidates(source)
             if candidate_query:
@@ -387,22 +378,15 @@ class LocalMediaScheduler:
                 ]
             if error and not candidates:
                 error_codes.add("source_unavailable")
-                source_results.append({
-                    "id": source.id, "name": source.name, "candidates": 0,
-                    "queued": 0, "skipped": True, "reason": "", "error": error,
-                })
+                source_result["error"] = error
                 continue
-            source_task_ids: list[int] = []
+            source_tasks: dict[int, bool] = {}
             enqueue_failures = 0
             if error:
                 error_codes.add("scan_incomplete")
             for candidate in candidates:
                 try:
-                    prefix = (
-                        SILENT_MANUAL_SCAN_TOKEN_PREFIX
-                        if silent else MANUAL_SCAN_TOKEN_PREFIX
-                    )
-                    task_id = local_media_repo.create_local_media_task(
+                    task_id, created = local_media_repo.admit_local_media_task(
                         source.id,
                         "",
                         str(candidate),
@@ -412,41 +396,38 @@ class LocalMediaScheduler:
                         **({"expected_source_snapshot": expected_sources[source.id], "cancelled": cancelled}
                            if expected_sources is not None else {}),
                     )
-                    source_task_ids.append(task_id)
+                    source_tasks[task_id] = created or source_tasks.get(task_id, False)
                 except Exception as exc:
                     logger.warning("本地媒体手动扫描入队失败 %s: %s", candidate.name, exc)
                     enqueue_failures += 1
             if enqueue_failures:
                 error_codes.add("enqueue_failed")
                 error = error or SCAN_FAILURE_MESSAGES["enqueue_failed"]
-            task_ids.extend(source_task_ids)
-            source_results.append({
-                "id": source.id,
-                "name": source.name,
-                "candidates": len(candidates),
-                "queued": len(set(source_task_ids)),
-                "enqueue_failures": enqueue_failures,
-                "skipped": False,
-                "reason": "",
-                "error": error,
-            })
+            admitted_tasks.update(source_tasks)
+            source_queued = sum(source_tasks.values())
+            source_result.update(
+                candidates=len(candidates), queued=source_queued,
+                reused=len(source_tasks) - source_queued, enqueue_failures=enqueue_failures,
+                skipped=False, error=error,
+            )
         if expected_sources is not None:
             for missing_id in expected_sources.keys() - seen_source_ids:
                 error_codes.add("source_changed")
-                source_results.append({"id": missing_id, "name": "", "candidates": 0, "queued": 0,
+                source_results.append({"id": missing_id, "name": "", "candidates": 0, "queued": 0, "reused": 0,
                                        "skipped": True, "reason": "", "error": "来源已不存在，请重新预检"})
-        unique_task_ids = list(dict.fromkeys(task_ids))
+        task_ids = list(admitted_tasks)
+        queued_count = sum(admitted_tasks.values())
         failed_sources = sum(bool(item["error"]) for item in source_results)
         useful_sources = sum(
-            not item["skipped"] and (not item["error"] or bool(item["queued"]))
+            not item["skipped"] and (not item["error"] or bool(item["queued"] or item["reused"]))
             for item in source_results
         )
         scan_status = (
             "partial" if useful_sources else "failed"
         ) if failed_sources else "completed"
-        if capture_results and unique_task_ids:
+        if capture_results and task_ids:
             with self._guard:
-                self._capture_result_task_ids.update(unique_task_ids)
+                self._capture_result_task_ids.update(task_ids)
         summary = {
             "ok": scan_status == "completed",
             "scan_status": scan_status,
@@ -454,14 +435,15 @@ class LocalMediaScheduler:
             "source_count": len(source_results),
             "scanned_sources": sum(1 for item in source_results if not item["skipped"]),
             "candidate_count": sum(int(item["candidates"]) for item in source_results),
-            "queued_count": len(unique_task_ids),
+            "queued_count": queued_count,
+            "reused_count": len(task_ids) - queued_count,
             "failed_sources": failed_sources,
             "skipped_sources": sum(
                 bool(item["skipped"] and not item["error"]) for item in source_results
             ),
             "enqueue_failures": sum(int(item.get("enqueue_failures", 0)) for item in source_results),
             "scan_errors": [{"code": code} for code in error_codes],
-            "task_ids": unique_task_ids,
+            "task_ids": task_ids,
             "sources": source_results,
         }
         summary.update(local_media_scan_summary(summary))
@@ -473,7 +455,7 @@ class LocalMediaScheduler:
             logger.warning("本地扫描回执保存失败 type=%s", type(exc).__name__)
             summary["scan_ref"] = UNRECORDED_LOCAL_SCAN
             summary["scan_recorded"] = False
-        if unique_task_ids:
+        if task_ids:
             self.reload()
         return summary
 

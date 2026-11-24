@@ -59,7 +59,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
     def test_task_list_detail_and_clear_preserve_pending_confirmation(self):
         headers = {"X-CSRF-Token": self.login()}
         source = local_media_repo.create_local_media_source("confirmation", "", "", str(self.local_root))
-        task = local_media_repo.create_local_media_task(source, "", str(self.local_root / "Pending.mkv"))
+        task, _created = local_media_repo.admit_local_media_task(source, "", str(self.local_root / "Pending.mkv"))
         local_media_repo.update_local_media_task(task, status="requires_manual")
         organize_confirmations_repo.create_organize_confirmation(
             token="pending", fingerprint="pending", chat_id="", source_name="", directory_path="/",
@@ -83,7 +83,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
     def test_fractional_ids_are_rejected_before_service_or_delete(self):
         headers = {"X-CSRF-Token": self.login()}
         source = local_media_repo.create_local_media_source("fraction", "", "", str(self.local_root))
-        task = local_media_repo.create_local_media_task(source, "", str(self.local_root / "Kept.mkv"))
+        task, _created = local_media_repo.admit_local_media_task(source, "", str(self.local_root / "Kept.mkv"))
         local_media_repo.update_local_media_task(task, status="failed")
         for value in (task + 0.9, True, str(task) + '.9'):
             with self.subTest(value=value):
@@ -100,7 +100,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.login()
         source = local_media_repo.create_local_media_source("shared-source", "", "", str(self.local_root))
         for index in range(12):
-            task = local_media_repo.create_local_media_task(source, "", str(self.local_root / f"{index}.mkv"))
+            task, _created = local_media_repo.admit_local_media_task(source, "", str(self.local_root / f"{index}.mkv"))
             local_media_repo.update_local_media_task(task, status="completed")
         original_connect = db._connect
         queries = []
@@ -121,15 +121,15 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
     def test_task_pagination_reaches_old_manual_task_without_duplicates_after_insert(self):
         self.login()
         source = local_media_repo.create_local_media_source("paged-source", "", "", str(self.local_root))
-        oldest = local_media_repo.create_local_media_task(source, "", str(self.local_root / "Old.mkv"))
+        oldest, _created = local_media_repo.admit_local_media_task(source, "", str(self.local_root / "Old.mkv"))
         local_media_repo.update_local_media_task(oldest, status="requires_manual")
         for index in range(500):
-            task = local_media_repo.create_local_media_task(source, "", str(self.local_root / f"History-{index}.mkv"))
+            task, _created = local_media_repo.admit_local_media_task(source, "", str(self.local_root / f"History-{index}.mkv"))
             local_media_repo.update_local_media_task(task, status="completed")
         first = self.client.get('/api/local-media/tasks').json()
         self.assertEqual(len(first['tasks']), 500)
         self.assertTrue(first['has_more'])
-        newest = local_media_repo.create_local_media_task(source, "", str(self.local_root / "New.mkv"))
+        newest, _created = local_media_repo.admit_local_media_task(source, "", str(self.local_root / "New.mkv"))
         local_media_repo.update_local_media_task(newest, status="completed")
         second = self.client.get('/api/local-media/tasks', params={"before_id": first['next']}).json()
         self.assertEqual([row['id'] for row in second['tasks']], [oldest])
@@ -808,7 +808,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             name="本地下载", qb_profile="", qb_path_prefix="",
             local_root=str(self.local_root), owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", str(self.local_root / "Movie.mkv"), owner="admin",
         )
         local_media_repo.add_local_media_task_item(
@@ -858,7 +858,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         )
         show = self.local_root / "Show (2026)"
         show.mkdir()
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", str(show), owner="admin", trigger="scan",
         )
         local_media_repo.update_local_media_task(
@@ -889,7 +889,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             name="历史本地下载", qb_profile="", qb_path_prefix="",
             local_root=str(self.local_root), owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", str(self.local_root / "Show.S02E08.mp4"),
             owner="admin", trigger="scan",
         )
@@ -931,7 +931,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             name="本地下载", qb_profile="", qb_path_prefix="",
             local_root=str(self.local_root), owner="admin",
         )
-        completed_id = local_media_repo.create_local_media_task(
+        completed_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", str(self.local_root / "Movie.2026.mkv"),
             owner="admin", trigger="manual",
         )
@@ -949,7 +949,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         local_media_repo.update_local_media_task(
             completed_id, owner="admin", status="completed", title="Movie", year="2026",
         )
-        busy_id = local_media_repo.create_local_media_task(
+        busy_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", str(self.local_root / "Busy.mkv"), owner="admin", trigger="scan",
         )
 
@@ -1017,13 +1017,11 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             "status": "planned", "plans": [{"target_name": "Movie.mkv"}],
             "_move_plans": [object()], "_cleanup_candidates": [object()],
         }
-        task_id = local_media_repo.create_local_media_task(source_id, "", "/tmp/source/Example.mkv", owner="admin", trigger="manual")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, "", "/tmp/source/Example.mkv", owner="admin", trigger="manual")
         service.create_manual_task.return_value = task_id
         service.execute_task.return_value = {"status": "completed", "task_id": task_id}
         service.external_hints.return_value = {"items": [{"title": "Example"}], "errors": []}
-        with patch("app.routes.local_media_api.get_local_media_service", return_value=service), patch(
-            "app.repositories.local_media.claim_local_media_task", return_value=True
-        ):
+        with patch("app.routes.local_media_api.get_local_media_service", return_value=service):
             inspected = self.client.post(
                 "/api/local-media/inspect", json={"source_id": source_id}, headers=headers
             )
@@ -1061,6 +1059,67 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             "admin", "inspect-1", "Example", "auto",
         )
 
+    def test_manual_execute_claims_before_scheduler_can_take_the_preview(self):
+        from app.clients.tmdb import TMDBClient
+        from app.modules.local_media_scheduler import LocalMediaScheduler
+        from app.modules.local_media_service import LocalMediaService
+        from app.modules.organize import OrganizeRules
+        from app.modules.scraper import TMDBScraper
+
+        headers = {"X-CSRF-Token": self.login()}
+        source_id = local_media_repo.create_local_media_source(
+            name="本地下载", qb_profile="", qb_path_prefix="", local_root=str(self.local_root),
+        )
+        local_media_repo.upsert_local_library_target(source_id, "default", str(self.default_target))
+        video = self.local_root / "Fixture.Movie.2026.mkv"
+        video.write_bytes(b"fixture video")
+        tmdb = Mock(spec=TMDBClient, api_key="fixture-key", config_error="")
+        tmdb.detail.return_value = {"id": 7654, "title": "Fixture Movie", "release_date": "2026-01-01"}
+        tmdb.get.return_value = tmdb.detail.return_value
+        scraper = TMDBScraper(tmdb)
+        service = LocalMediaService(scraper=scraper)
+        self.addCleanup(scraper.close)
+        self.addCleanup(service.close)
+        scheduler = LocalMediaScheduler(service=service)
+        rules = OrganizeRules(media_info_enabled=False, media_probe_enabled=False, emby_refresh=False)
+        admit = service.create_manual_task
+        competing_runs = []
+
+        def admit_then_poll(*args, **kwargs):
+            task_id = admit(*args, **kwargs)
+            competing_runs.append(scheduler.run_once())
+            return task_id
+
+        endpoint = "/api/local-media"
+        with (
+            patch.object(OrganizeRules, "from_config", return_value=rules),
+            patch("app.routes.local_media_api.get_local_media_service", return_value=service),
+            patch("app.routes.local_media_api.notify_local_media_task"),
+            patch("app.modules.local_media_scheduler.notify_local_media_task"),
+            patch.object(service, "create_manual_task", side_effect=admit_then_poll),
+        ):
+            inspected = self.client.post(
+                f"{endpoint}/inspect", headers=headers, json={"source_id": source_id, "path": str(video)},
+            )
+            self.assertEqual(inspected.status_code, 200, inspected.text)
+            scope = {"inspection_id": inspected.json()["inspection_id"]}
+            previewed = self.client.post(
+                f"{endpoint}/preview", headers=headers, json={**scope, "tmdb_id": "7654", "media_type": "movie"},
+            )
+            self.assertEqual(previewed.status_code, 200, previewed.text)
+            preview = previewed.json()
+            request = {**scope, "preview_digest": preview["preview_digest"]}
+            executed = self.client.post(f"{endpoint}/execute", headers=headers, json=request)
+            self.assertEqual(executed.status_code, 200, executed.text)
+            self.assertEqual(self.client.post(f"{endpoint}/execute", headers=headers, json=request).status_code, 400)
+
+        self.assertEqual(competing_runs, [0])
+        self.assertEqual(executed.json()["status"], "completed")
+        [task] = local_media_repo.list_local_media_tasks()
+        self.assertEqual((task.id, task.attempts, task.status), (executed.json()["task_id"], 1, "completed"))
+        self.assertFalse(video.exists())
+        self.assertEqual(Path(preview["plans"][0]["target_path"]).read_bytes(), b"fixture video")
+
     def test_execute_without_preview_digest_requires_repreview_and_creates_no_task(self):
         csrf = self.login()
         with patch("app.routes.local_media_api.get_local_media_service") as service:
@@ -1080,11 +1139,11 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         )
         path = self.local_root / "Example.mkv"
         path.write_bytes(b"frozen source")
-        task_id = local_media_repo.create_local_media_task(source_id, qb_hash, str(path), owner="admin")
+        task_id, _created = local_media_repo.admit_local_media_task(source_id, qb_hash, str(path), owner="admin")
         local_media_repo.update_local_media_task(task_id, owner="admin", status="requires_manual")
         service = Mock()
-        service.create_manual_task.side_effect = lambda *_args, **_kwargs: local_media_repo.prepare_manual_local_media_task(
-            source_id, str(path), snapshot_digest="preview:fixture", owner="admin", tmdb_id="1", media_type="movie",
+        service.create_manual_task.side_effect = lambda *_args, **kwargs: local_media_repo.prepare_manual_local_media_task(
+            source_id, str(path), snapshot_digest=kwargs["preview_digest"], owner="admin", tmdb_id="1", media_type="movie",
         )
         service.execute_task.return_value = {"status": "completed", "task_id": task_id}
         return task_id, path, service
@@ -1154,16 +1213,18 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
                 self.assertEqual(get_local_media_task_result_3.status, "failed")
                 self.assertEqual(path.read_bytes(), b"frozen source")
 
-    def test_manual_execute_lost_claim_does_not_create_qb_client(self):
+    def test_manual_execute_rejects_an_already_running_task_before_creating_qb_client(self):
         csrf = self.login()
-        _task_id, path, service = self._manual_qb_execute_case()
+        task_id, path, service = self._manual_qb_execute_case()
+        self.assertTrue(local_media_repo.claim_local_media_task(task_id, expected="requires_manual"))
         with patch("app.routes.local_media_api.get_local_media_service", return_value=service), patch(
-            "app.repositories.local_media.claim_local_media_task", return_value=False
-        ), patch("app.routes.local_media_api.get_local_media_scheduler") as scheduler, patch(
+            "app.routes.local_media_api.get_local_media_scheduler"
+        ) as scheduler, patch(
             "app.routes.local_media_api.notify_local_media_task"
         ):
             response = self.client.post("/api/local-media/execute", json={"inspection_id": "fixture", "preview_digest": "preview:fixture", "rules_snapshot": "{}"}, headers={"X-CSRF-Token": csrf})
         self.assertEqual(response.status_code, 400)
+        self.assertIn("正在处理中", response.text)
         scheduler.assert_not_called()
         service.execute_task.assert_not_called()
         self.assertEqual(path.read_bytes(), b"frozen source")

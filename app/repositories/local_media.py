@@ -632,7 +632,7 @@ def replace_local_library_targets(
         return local_library_bindings_revision(_list_local_library_bindings(conn, safe_owner))
 
 
-def create_local_media_task(
+def admit_local_media_task(
     source_id: int,
     qb_hash: str,
     content_path: str,
@@ -642,7 +642,8 @@ def create_local_media_task(
     operation_token: str = "",
     expected_source_snapshot: dict | None = None,
     cancelled=None,
-) -> int:
+) -> tuple[int, bool]:
+    """在准入事务内返回任务 ID 及本次是否新增等待任务。"""
     import uuid
 
     from app.modules.local_media_models import LOCAL_MEDIA_TRIGGERS
@@ -693,14 +694,14 @@ def create_local_media_task(
                         normalized_hash,
                         safe_path,
                         previous_hash_task_id=task_id,
-                    )
+                    ), False
                 if (
                     _canonical_local_media_content_path(hash_task["content_path"])
                     != safe_path
                 ):
                     raise ValueError("相同 qB 任务对应的内容路径不一致")
                 _normalize_local_media_task_path(conn, hash_task, safe_path)
-                return task_id
+                return task_id, False
 
             if (
                 _canonical_local_media_content_path(hash_task["content_path"])
@@ -712,20 +713,20 @@ def create_local_media_task(
                     "同一路径存在多个活动本地媒体任务，请先完成或清理旧任务"
                 )
             _normalize_local_media_task_path(conn, hash_task, safe_path)
-            return task_id
+            return task_id, False
 
         if active is not None:
             if normalized_hash:
                 return _bind_qb_hash_to_active_local_media_task(
                     conn, active, normalized_hash, safe_path
-                )
+                ), False
             _normalize_local_media_task_path(conn, active, safe_path)
-            return int(active["id"])
+            return int(active["id"]), False
 
         return _insert_waiting_task(
             conn, owner=safe_owner, source_id=source_id, qb_hash=normalized_hash,
             content_path=safe_path, trigger=safe_trigger, token=token, timestamp=timestamp,
-        )
+        ), True
 
 
 def create_and_link_qb_local_media_task(
@@ -1067,7 +1068,7 @@ def prepare_manual_local_media_task(
     episode_override: int | None = None,
     numbering_mode: str = "auto",
 ) -> int:
-    """原子创建或重置可重试的手动任务；活动任务绝不被改回等待态。"""
+    """在一次事务内保存已确认的手动预览并认领任务。"""
     from app.modules.local_media_models import renew_local_media_operation_token
 
     if not snapshot_digest.startswith("preview:"):
@@ -1099,8 +1100,6 @@ def prepare_manual_local_media_task(
         raise ValueError("电影任务不能指定季数或集数")
     if normalized_type == "movie":
         normalized_numbering_mode = "auto"
-    timestamp = db.now()
-    token = renew_local_media_operation_token()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         source = conn.execute(
@@ -1123,18 +1122,19 @@ def prepare_manual_local_media_task(
             owner=safe_owner,
             content_path=safe_path,
         )
+        timestamp = db.now()
         if existing and existing["status"] in {"failed", "requires_manual"}:
             if db.is_interrupted_local_media_write_error(existing["error"]):
                 raise ValueError("上次本地整理在写入期间中断，请先核验文件并通过任务重试确认")
-            token = renew_local_media_operation_token(existing["operation_token"])
             task_id = int(existing["id"])
             cur = conn.execute(
-                "UPDATE local_media_tasks SET content_path=?,status='waiting_stable',"
+                "UPDATE local_media_tasks SET content_path=?,status='recognizing',"
                 "stable_since='',snapshot_digest=?,"
                 "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
                 "season_override=?,episode_override=?,numbering_mode=?,title='',year='',"
                 "operation_token=?,confirmation_actor='',error='',warning='',completed_at=NULL,"
-                "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
+                "attempts=attempts+1,version=version+2,updated_at=? "
+                "WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
                 (
                     safe_path,
                     snapshot_digest,
@@ -1144,7 +1144,7 @@ def prepare_manual_local_media_task(
                     season_override,
                     episode_override,
                     normalized_numbering_mode,
-                    token,
+                    renew_local_media_operation_token(existing["operation_token"]),
                     timestamp,
                     task_id,
                     safe_owner,
@@ -1160,13 +1160,13 @@ def prepare_manual_local_media_task(
         cur = conn.execute(
             "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
             "operation_token,snapshot_digest,rules_snapshot,tmdb_id,media_type,season_override,episode_override,"
-            "numbering_mode,created_at,updated_at) "
-            "VALUES(?,?,NULL,?,'manual','waiting_stable',?,?,?,?,?,?,?,?,?,?)",
+            "numbering_mode,attempts,version,created_at,updated_at) "
+            "VALUES(?,?,NULL,?,'manual','recognizing',?,?,?,?,?,?,?,?,1,2,?,?)",
             (
                 safe_owner,
                 source_id,
                 safe_path,
-                token,
+                renew_local_media_operation_token(),
                 snapshot_digest,
                 (rules_snapshot or ""),
                 (tmdb_id or "").strip(),

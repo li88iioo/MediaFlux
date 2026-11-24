@@ -51,7 +51,7 @@ def task(backend: Backend, *, name: str = "one", status: str = "failed", source_
     assert current_source is not None
     video = Path(current_source.local_root) / (name + ".S02E24.mkv")
     video.write_bytes(b"temporary-media")
-    task_id = repository.create_local_media_task(identifier, "qb-" + name, str(video), trigger="qb_completed")
+    task_id, _created = repository.admit_local_media_task(identifier, "qb-" + name, str(video), trigger="qb_completed")
     repository.update_local_media_task(task_id, status=status, title=name, tmdb_id="42", media_type="tv",
         season_override=2, episode_override=24, snapshot_digest="source-digest", error="完整错误" * 1200 + " password=private-password")
     return task_id

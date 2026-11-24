@@ -501,7 +501,7 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             local_root="/downloads",
             owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id,
             "",
             "/downloads/测试动画.S01E01.mkv",

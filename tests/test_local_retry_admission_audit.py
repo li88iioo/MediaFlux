@@ -102,7 +102,7 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                 with self.subTest(prefix=prefix, entry=entry):
                     path = self.incoming_root / f"{prefix.replace(':', '')}-{entry}.mkv"
                     old_token = prefix + "old-attempt"
-                    task_id = local_media_repo.create_local_media_task(
+                    task_id, _created = local_media_repo.admit_local_media_task(
                         self.source_id,
                         "",
                         str(path),
@@ -139,7 +139,7 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
         for status in ("failed", "requires_manual"):
             with self.subTest(status=status):
                 path = self.incoming_root / f"{status}.mkv"
-                task_id = local_media_repo.create_local_media_task(
+                task_id, _created = local_media_repo.admit_local_media_task(
                     self.source_id,
                     "",
                     str(path),
@@ -220,7 +220,6 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
             "admin", inspection["inspection_id"],
             preview_digest=preview["preview_digest"],
         )
-        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
         original_backup = LocalMoveTransaction._backup_replaced_target
 
         def crash_after_backup(transaction, *args, **kwargs):

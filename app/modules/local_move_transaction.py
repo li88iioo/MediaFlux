@@ -340,6 +340,12 @@ class LocalMoveTransaction:
         if step_id is not None:
             local_media_repo.update_local_media_operation_step(step_id, status, error=error)
 
+    def _finish_compensation_step(self, index: int, status: str, error: str, errors: list[str]) -> None:
+        try:
+            self._finish_step(index, status, error)
+        except Exception as exc:
+            errors.append(f"步骤 {index} 的{status}审计未保存: {exc}")
+
     def _verify_target(
         self,
         source_fingerprint: str,
@@ -647,12 +653,15 @@ class LocalMoveTransaction:
                         )
                     except Exception as cleanup_exc:
                         cleanup_errors.append(str(cleanup_exc))
-                error_text = str(exc)
+                self._finish_compensation_step(
+                    index, "failed", "；".join([str(exc), *cleanup_errors]), cleanup_errors,
+                )
                 if cleanup_errors:
-                    error_text += "；失败清理需要人工核验: " + " | ".join(cleanup_errors)
-                    exc = LocalMoveError(error_text, rollback_errors=cleanup_errors)
-                self._finish_step(index, "failed", error_text)
-                raise exc
+                    raise LocalMoveError(
+                        f"{exc}；失败清理需要人工核验: {' | '.join(cleanup_errors)}",
+                        rollback_errors=cleanup_errors,
+                    ) from exc
+                raise
 
     def _restore_one(self, moved: MovedItem) -> None:
         with self._pinned_entry(
@@ -701,7 +710,7 @@ class LocalMoveTransaction:
     def rollback(self) -> list[str]:
         errors: list[str] = []
         for moved in reversed(self._moved):
-            index = self._moved_steps.get(moved.target)
+            index = self._moved_steps[moved.target]
             try:
                 self._restore_one(moved)
                 backup_record = self._replaced_backups.get(moved.target)
@@ -713,12 +722,11 @@ class LocalMoveTransaction:
                         backup_identity,
                         restore_target,
                     )
-                if index is not None:
-                    self._finish_step(index, "rolled_back")
             except Exception as exc:
                 errors.append(f"{moved.target}: {exc}")
-                if index is not None:
-                    self._finish_step(index, "failed", f"回滚失败: {exc}")
+                self._finish_compensation_step(index, "failed", f"回滚失败: {exc}", errors)
+            else:
+                self._finish_compensation_step(index, "rolled_back", "", errors)
         # 备份可能在新目标发布前就因身份复核失败而产生，此时尚没有
         # MovedItem。继续恢复所有剩余记录，避免旧媒体只留在隐藏文件中。
         for target, backup_record in list(self._replaced_backups.items()):

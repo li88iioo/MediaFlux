@@ -150,14 +150,14 @@ def test_candidate_enqueue_errors_are_not_lost_or_confused_with_empty_scan(tmp_p
         for name in ("A.mkv", "B.mkv"):
             (root / name).write_bytes(b"video")
         source(root, target)
-        create = local_media_repo.create_local_media_task
+        admit = local_media_repo.admit_local_media_task
 
         def enqueue(*args, **kwargs):
             if all_fail or str(args[2]).endswith("A.mkv"):
                 raise OSError("private /secret/directory access_token=token")
-            return create(*args, **kwargs)
+            return admit(*args, **kwargs)
 
-        with patch("app.repositories.local_media.create_local_media_task", side_effect=enqueue):
+        with patch("app.repositories.local_media.admit_local_media_task", side_effect=enqueue):
             result = LocalMediaScheduler(service=Mock()).enqueue_manual_scan_candidates()
         assert result["scan_status"] == ("failed" if all_fail else "partial")
         assert result["queued_count"] == (0 if all_fail else 1)

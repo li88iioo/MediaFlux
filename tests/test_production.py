@@ -742,7 +742,7 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     name="linked-source", qb_profile="", qb_path_prefix="",
                     local_root="/downloads", owner="admin",
                 )
-                task_id = local_media_repo.create_local_media_task(source_id, "", "/downloads/Movie.mkv")
+                task_id, _created = local_media_repo.admit_local_media_task(source_id, "", "/downloads/Movie.mkv")
                 tracker = DownloadTracker()
                 scheduler = Mock()
 
@@ -800,7 +800,7 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     name="terminal-source", qb_profile="", qb_path_prefix="",
                     local_root="/downloads", owner="admin",
                 )
-                task_id = local_media_repo.create_local_media_task(source_id, "", "/downloads/Movie.mkv")
+                task_id, _created = local_media_repo.admit_local_media_task(source_id, "", "/downloads/Movie.mkv")
                 download_requests_repo.link_download_request_to_local_media_task(
                     request_id,
                     task_id,
@@ -5082,14 +5082,14 @@ class SecurityTests(InitializedWebTestCase):
                 source_id = local_media_repo.create_local_media_source(
                     "本地测试", "", "", "/downloads", owner="admin"
                 )
-                removable_local = local_media_repo.create_local_media_task(
+                removable_local, _created = local_media_repo.admit_local_media_task(
                     source_id,
                     "",
                     "/downloads/finished.mkv",
                     owner="admin",
                     trigger="manual",
                 )
-                busy_local = local_media_repo.create_local_media_task(
+                busy_local, _created = local_media_repo.admit_local_media_task(
                     source_id,
                     "",
                     "/downloads/running.mkv",

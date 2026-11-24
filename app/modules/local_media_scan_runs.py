@@ -16,7 +16,7 @@ UNRECORDED_LOCAL_SCAN = "LM-UNRECORDED"
 _TASK_NAME = "local_media_scan"
 _SCAN_REF = re.compile(r"LM([1-9][0-9]{0,17})\Z")
 _SCAN_COUNTS = (
-    "source_count", "scanned_sources", "candidate_count", "queued_count",
+    "source_count", "scanned_sources", "candidate_count", "queued_count", "reused_count",
     "failed_sources", "skipped_sources", "enqueue_failures",
 )
 _RESULT_COUNTS = (
@@ -48,7 +48,7 @@ def local_media_scan_summary(summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def _payload(row: Any, *, owner: str) -> dict[str, Any] | None:
-    if row is None or str(row["task_name"]) != _TASK_NAME:
+    if str(row["task_name"]) != _TASK_NAME:
         return None
     try:
         payload = json.loads(str(row["result"] or "{}"))
@@ -98,8 +98,7 @@ def record_local_media_scan(summary: dict[str, Any], *, owner: str = "admin") ->
         return f"LM{cursor.lastrowid}"
 
 
-def resolve_local_media_scan(scan_ref: str = "", *, owner: str = "admin") -> dict[str, Any]:
-    """只解析明确扫描或本工作区最近扫描；旧版本没有回执时绝不用全历史冒充。"""
+def _local_media_scan_snapshot(scan_ref: str, *, owner: str) -> tuple[dict[str, Any], str]:
     scan_ref = (scan_ref or "").strip().upper()
     if scan_ref == UNRECORDED_LOCAL_SCAN:
         raise LookupError("本次扫描回执保存失败，不能使用以前的扫描替代")
@@ -107,46 +106,46 @@ def resolve_local_media_scan(scan_ref: str = "", *, owner: str = "admin") -> dic
         match = _SCAN_REF.fullmatch(scan_ref)
         if not match:
             raise ValueError("scan_ref 必须是通知中的本地扫描编号（如 LM123）")
-        result = _payload(db.get_task_run(int(match.group(1))), owner=owner)
+        rows = [db.get_task_run(int(match.group(1)))]
     else:
-        result = next(
-            (item for row in db.list_task_runs(_TASK_NAME, limit=1000)
-             if (item := _payload(row, owner=owner)) is not None),
-            None,
-        )
-    if result is None:
-        raise LookupError("没有找到本地扫描回执；旧版本通知无法还原准确批次，请勿把全部历史当成本次结果")
-    return result
+        rows = db.list_task_runs(_TASK_NAME, limit=1000)
+    for row in rows:
+        if row is not None and (result := _payload(row, owner=owner)) is not None:
+            return result, row["result"]
+    raise LookupError("没有找到本地扫描回执；旧版本通知无法还原准确批次，请勿把全部历史当成本次结果")
+
+
+def resolve_local_media_scan(scan_ref: str = "", *, owner: str = "admin") -> dict[str, Any]:
+    """只解析明确扫描或本工作区最近扫描；旧版本没有回执时绝不用全历史冒充。"""
+    return _local_media_scan_snapshot(scan_ref, owner=owner)[0]
 
 
 def finish_local_media_scan_report(
     scan_ref: str, summary: dict[str, Any], *, owner: str = "admin"
 ) -> None:
     """冻结通知对应的文件结果，之后重试任务不会改写本条通知的事实。"""
-    run = resolve_local_media_scan(scan_ref, owner=owner)
+    run, original_result = _local_media_scan_snapshot(scan_ref, owner=owner)
+    receipt = run["summary"]
+    if receipt.get("reported_at"):
+        return
     allowed = set(run["task_ids"])
-    outcomes = [
-        dict(item) for item in summary.get("task_outcomes", [])
-        if isinstance(item, dict) and item.get("task_id") in allowed
-    ]
+    receipt.update(
+        {key: int(summary[key] or 0) for key in _RESULT_COUNTS if key in summary},
+        task_outcomes=[
+            dict(item) for item in summary.get("task_outcomes", [])
+            if isinstance(item, dict) and item.get("task_id") in allowed
+        ],
+        reported_at=db.now(),
+    )
+    encoded = json.dumps(
+        {"version": 1, "owner": owner, "task_ids": run["task_ids"], "summary": receipt}, ensure_ascii=False,
+    )
     with db.get_conn() as conn:
-        # 同一批次只冻结第一次终态报告，避免后续任务变化覆盖已送达通知。
-        row = conn.execute("SELECT * FROM task_runs WHERE id=?", (run["id"],)).fetchone()
-        current = _payload(row, owner=owner)
-        if current is None:
-            raise LookupError("本地扫描回执已移除")
-        if current["summary"].get("reported_at"):
-            return
-        payload = {
-            "version": 1, "owner": owner, "task_ids": run["task_ids"],
-            "summary": {
-                **current["summary"],
-                **{key: int(summary[key] or 0) for key in _RESULT_COUNTS if key in summary},
-                "task_outcomes": outcomes,
-                "reported_at": db.now(),
-            },
-        }
-        conn.execute(
-            "UPDATE task_runs SET result=? WHERE id=? AND task_name=?",
-            (json.dumps(payload, ensure_ascii=False), run["id"], _TASK_NAME),
+        saved = conn.execute(
+            "UPDATE task_runs SET result=? WHERE id=? AND task_name=? AND result=?",
+            (encoded, run["id"], _TASK_NAME, original_result),
         )
+        if not saved.rowcount and conn.execute(
+            "SELECT 1 FROM task_runs WHERE id=? AND task_name=?", (run["id"], _TASK_NAME),
+        ).fetchone() is None:
+            raise LookupError("本地扫描回执已移除")

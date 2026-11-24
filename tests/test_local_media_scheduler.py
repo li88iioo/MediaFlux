@@ -104,7 +104,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 stable_seconds=0,
                 owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id,
                 "hash-close-error",
                 str(movie),
@@ -146,7 +146,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 stable_seconds=0,
                 owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id,
                 "hash-post-move-error",
                 str(movie),
@@ -497,7 +497,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         local_media_repo.upsert_local_library_target(
             source_id, "default", str(target_root), owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", r"D:\Downloads\Movie.mkv", owner="admin", trigger="manual",
         )
         scheduler = LocalMediaScheduler(service=FakeService())
@@ -518,7 +518,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             name="旧相对路径来源", qb_profile="", qb_path_prefix="/downloads",
             local_root="relative-downloads", stable_seconds=0, owner="admin",
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "relative-downloads/Movie.mkv",
             owner="admin", trigger="manual",
         )
@@ -540,7 +540,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="legacy-stable", qb_profile="", qb_path_prefix="",
                 local_root=str(source), stable_seconds=300, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
             service = FakeService()
@@ -582,7 +582,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="local", qb_profile="", qb_path_prefix="", local_root=str(source_root),
                 stable_seconds=0, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
             request_id, _ = download_requests_repo.create_download_request("notify-completed", "magnet")
@@ -624,7 +624,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="local", qb_profile="", qb_path_prefix="", local_root=str(source_root),
                 stable_seconds=0, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
             request_id, _ = download_requests_repo.create_download_request("notify-manual", "magnet")
@@ -652,7 +652,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="stable", qb_profile="", qb_path_prefix="", local_root=str(source),
                 stable_seconds=300, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
             scheduler = LocalMediaScheduler(service=FakeService())
@@ -683,7 +683,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source_id = local_media_repo.create_local_media_source(
                 name="move", qb_profile="", qb_path_prefix="", local_root=str(source), owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(source_id, "hash-interrupted", str(source), owner="admin")
+            task_id, _created = local_media_repo.admit_local_media_task(source_id, "hash-interrupted", str(source), owner="admin")
             task = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert task is not None
             step_id = local_media_repo.add_local_media_operation_step(task_id, task.operation_token, 0, "move", owner="admin")
@@ -720,7 +720,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="legacy-scan", qb_profile="", qb_path_prefix="", local_root=str(root),
                 scan_enabled=True, stable_seconds=0, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="scan",
             )
 
@@ -871,7 +871,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             local_media_repo.upsert_local_library_target(
                 source_id, "default", str(target_root), owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="scan",
             )
             local_media_repo.update_local_media_task(
@@ -1131,9 +1131,9 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
             task_ids = [
-                local_media_repo.create_local_media_task(
+                local_media_repo.admit_local_media_task(
                     source_id, "", str(media), owner="admin", trigger="manual",
-                )
+                )[0]
                 for media in files
             ]
             service = ParallelService()
@@ -1200,7 +1200,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="overlap", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
-            parent_task = local_media_repo.create_local_media_task(
+            parent_task, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(root), owner="admin", trigger="manual",
             )
             # Public admission rejects overlapping paths. Insert one legacy row
@@ -1273,7 +1273,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="fallback", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(media), owner="admin", trigger="manual",
             )
             service = FallbackService()
@@ -1332,7 +1332,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 qb_path_prefix="/downloads", local_root=str(root),
                 stable_seconds=0, owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "hash-planning", str(media), owner="admin",
                 trigger="qb_completed",
             )
@@ -1421,9 +1421,9 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
             task_ids = [
-                local_media_repo.create_local_media_task(
+                local_media_repo.admit_local_media_task(
                     source_id, "", str(media), owner="admin", trigger="manual",
-                )
+                )[0]
                 for media in files
             ]
             service = ReviewService()
@@ -1481,7 +1481,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 local_root=str(root), stable_seconds=0, owner="admin",
                 media_type="nsfw",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source_id, "", str(media), owner="admin", trigger="manual",
             )
             service = SerialNsfwService()
@@ -1559,9 +1559,9 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
             task_ids = [
-                local_media_repo.create_local_media_task(
+                local_media_repo.admit_local_media_task(
                     source_id, "", str(media), owner="admin", trigger="manual",
-                )
+                )[0]
                 for media in files
             ]
             service = OwnedParallelService()

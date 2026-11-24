@@ -60,7 +60,7 @@ class OrganizeAuditUnitTests(IsolatedDatabaseTestCase):
             local_root="/private/local",
             owner=owner,
         )
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             source_id,
             f"PRIVATE-HASH-{title}",
             f"/private/{title}.mkv",

@@ -2533,13 +2533,21 @@ def scan_local_sources(source_ids: list[int] | None = None, query: str = "", *, 
     was_running = bool(scheduler.status().get("running"))
     result = scheduler.enqueue_manual_scan_candidates(silent=True, source_ids=set(prepared["eligible_sources"]),
         candidate_query=prepared["arguments"]["query"], expected_sources=prepared["eligible_sources"], cancelled=cancelled)
-    started = False
-    if result["queued_count"] and not was_running:
+    has_tasks = bool(result["task_ids"])
+    started = has_tasks and not was_running
+    if started:
         scheduler.start()
-        started = True
-    return {"ok": bool(result["queued_count"]) or result["scan_status"] == "completed",
-            "status": "accepted" if result["queued_count"] else result["scan_status"],
-            "summary": f"本地扫描状态 {result['scan_status']}：{result['queued_count']} 个持久任务入队，{result['failed_sources']} 个来源失败",
-            "data": {**result, "source_ids": prepared["arguments"]["source_ids"], "operation": "scan_sources", "runtime_started": started,
-                     "queued_tasks": result["queued_count"], "candidates": result["candidate_count"]},
-            "error": "扫描失败，不能判断所选来源没有候选" if result["failed_sources"] and not result["queued_count"] else ""}
+    response = {
+        "ok": has_tasks or result["scan_status"] == "completed",
+        "status": "accepted" if has_tasks else result["scan_status"],
+        "summary": (
+            f"本地扫描状态 {result['scan_status']}，新入队 {result['queued_count']} 个任务，"
+            f"复用 {result['reused_count']} 个任务，{result['failed_sources']} 个来源失败"
+        ),
+        "data": {**result, "source_ids": prepared["arguments"]["source_ids"], "operation": "scan_sources",
+                 "runtime_started": started, "queued_tasks": result["queued_count"], "candidates": result["candidate_count"]},
+        "error": "扫描失败，不能判断所选来源没有候选" if result["failed_sources"] and not has_tasks else "",
+    }
+    if has_tasks:
+        response["effect_metadata"] = {"completion": {"kind": "local_media_scan", "scan_ref": result["scan_ref"]}}
+    return response

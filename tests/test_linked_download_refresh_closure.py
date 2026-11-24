@@ -20,7 +20,7 @@ from tests.support import isolated_test_database
 def notification_case():
     with isolated_test_database('linked-refresh-closure.db'):
         sid = local_media_repo.create_local_media_source(name='audit', qb_profile='', qb_path_prefix='', local_root='/source', owner='admin')
-        tid = local_media_repo.create_local_media_task(sid, '', '/source/Film.mkv', owner='admin', trigger='qb_completed')
+        tid, _created = local_media_repo.admit_local_media_task(sid, '', '/source/Film.mkv', owner='admin', trigger='qb_completed')
         local_media_repo.add_local_media_task_item(tid, '/source/Film.mkv', '/library/Film.mkv', role='video', action='move')
         local_media_repo.update_local_media_task(tid, status='completed', completed_at=db.now())
         rid, _ = download_requests_repo.create_download_request('linked-refresh', 'magnet', title='Film', chat_id='test')

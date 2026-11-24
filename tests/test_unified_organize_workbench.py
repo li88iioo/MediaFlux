@@ -47,7 +47,7 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
             name="qB 动漫", qb_profile="", qb_path_prefix="",
             local_root="/downloads/anime", owner="admin",
         )
-        local_id = local_media_repo.create_local_media_task(
+        local_id, _created = local_media_repo.admit_local_media_task(
             source_id, "", "/downloads/anime/Local.Show.S01E01.mkv",
             owner="admin", trigger="manual",
         )

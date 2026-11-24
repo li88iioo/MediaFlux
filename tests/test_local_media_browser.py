@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import mimetypes
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
@@ -227,29 +228,30 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
             url_for=lambda name: '/' + name.split('.')[-1],
         )
 
+    @contextmanager
     def make_page(self, width):
-        context = self.browser.new_context(viewport={'width': width, 'height': 844},
-                                           reduced_motion='reduce', service_workers='block')
-        self.addCleanup(context.close)
-        errors, unexpected = [], []
+        with self.browser.new_context(
+            viewport={'width': width, 'height': 844}, reduced_motion='reduce', service_workers='block',
+        ) as context:
+            errors, unexpected = [], []
 
-        def route(request):
-            url = urlsplit(request.request.url)
-            path = unquote(url.path)
-            if url.netloc == 'local-media.test' and path == '/local-media':
-                request.fulfill(body=self.html, content_type='text/html')
-                return
-            if url.netloc == 'local-media.test' and path.startswith('/static/'):
-                asset = (browser_support.ROOT / 'app' / path.lstrip('/')).resolve()
-                if asset.is_relative_to(browser_support.ROOT / 'app/static') and asset.is_file():
-                    request.fulfill(body=asset.read_bytes(), content_type=mimetypes.guess_type(str(asset))[0] or 'application/octet-stream')
+            def route(request):
+                url = urlsplit(request.request.url)
+                path = unquote(url.path)
+                if url.netloc == 'local-media.test' and path == '/local-media':
+                    request.fulfill(body=self.html, content_type='text/html')
                     return
-            unexpected.append(request.request.url)
-            request.abort()
+                if url.netloc == 'local-media.test' and path.startswith('/static/'):
+                    asset = (browser_support.ROOT / 'app' / path.lstrip('/')).resolve()
+                    if asset.is_relative_to(browser_support.ROOT / 'app/static') and asset.is_file():
+                        request.fulfill(body=asset.read_bytes(), content_type=mimetypes.guess_type(str(asset))[0] or 'application/octet-stream')
+                        return
+                unexpected.append(request.request.url)
+                request.abort()
 
-        context.route('**/*', route)
-        context.route_web_socket('**/*', lambda websocket: websocket.close())
-        context.add_init_script(r"""(() => {
+            context.route('**/*', route)
+            context.route_web_socket('**/*', lambda websocket: websocket.close())
+            context.add_init_script(r"""(() => {
             const fixture = window.__lmFixture = {
                 calls: [], executes: [], refreshes: [], holdRefresh: false, failResources: [], previewSerial: 0,
                 previews: [], holdPreview: false, retries: [],
@@ -301,13 +303,13 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
                 throw new Error('unexpected fake request: ' + path);
             };
         })();""")
-        page = context.new_page()
-        page.set_default_timeout(3000)
-        page.on('pageerror', lambda error: errors.append(str(error)))
-        page.goto('http://local-media.test/local-media#manual')
-        page.locator('[data-open-item-menu]').first.wait_for()
-        page.evaluate('() => document.fonts.ready')
-        return page, unexpected, errors
+            page = context.new_page()
+            page.set_default_timeout(3000)
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            page.goto('http://local-media.test/local-media#manual')
+            page.locator('[data-open-item-menu]').first.wait_for()
+            page.evaluate('() => document.fonts.ready')
+            yield page, unexpected, errors
 
     @staticmethod
     def open_plan(page, index):
@@ -317,8 +319,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
 
     def test_interrupted_write_retry_requires_user_confirmation_on_both_views(self):
         for width in (390, 1280):
-            with self.subTest(width=width):
-                page, unexpected, errors = self.make_page(width)
+            with self.subTest(width=width), self.make_page(width) as (page, unexpected, errors):
                 page.evaluate("""() => {
                     window.__lmFixture.resources.tasks.tasks = [
                         {id: 7, status: 'requires_manual', interrupted_write: true, content_name: 'Interrupted.mkv', source_name: '来源', clearable: true},
@@ -387,7 +388,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
         }"""), '真实 toast 必须显示在新刮削弹窗上方')
 
     def test_desktop_movie_searchbar_collapses_hidden_episode_column(self):
-        page, unexpected, errors = self.make_page(1440)
+        page, unexpected, errors = self.enterContext(self.make_page(1440))
         self.open_plan(page, 0)
         self.assertTrue(page.locator('#lmScrapeEpisodeFields').is_hidden())
         bar = page.locator('.lm-scrape-searchbar')
@@ -402,8 +403,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
     def test_late_execution_receipts_keep_new_plan_and_focus(self):
         for width in (1280, 390):
             for outcome in ('completed', 'error', 'repreview'):
-                with self.subTest(width=width, outcome=outcome):
-                    page, unexpected, errors = self.make_page(width)
+                with self.subTest(width=width, outcome=outcome), self.make_page(width) as (page, unexpected, errors):
                     self.open_plan(page, 0)
                     self.start_execute(page)
                     page.locator('#lmScrapeCloseBtn').click()
@@ -424,8 +424,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
     def test_old_receipt_cannot_release_another_plan_execution(self):
         for width in (1280, 390):
             for outcome in ('completed', 'error', 'repreview'):
-                with self.subTest(width=width, outcome=outcome):
-                    page, unexpected, errors = self.make_page(width)
+                with self.subTest(width=width, outcome=outcome), self.make_page(width) as (page, unexpected, errors):
                     self.open_plan(page, 0)
                     self.start_execute(page)
                     page.locator('#lmScrapeCloseBtn').click()
@@ -447,8 +446,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
     def test_same_file_reopen_and_new_preview_keep_their_own_plan(self):
         for width in (1280, 390):
             for change in ('reopen', 'preview'):
-                with self.subTest(width=width, change=change):
-                    page, unexpected, errors = self.make_page(width)
+                with self.subTest(width=width, change=change), self.make_page(width) as (page, unexpected, errors):
                     self.open_plan(page, 0)
                     self.start_execute(page)
                     if change == 'reopen':
@@ -475,8 +473,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
     def test_success_refresh_delay_and_resource_failure_keep_new_plan(self):
         for width in (1280, 390):
             for failed in ([], ['sources'], ['sources', 'tasks', 'items']):
-                with self.subTest(width=width, failed=failed):
-                    page, unexpected, errors = self.make_page(width)
+                with self.subTest(width=width, failed=failed), self.make_page(width) as (page, unexpected, errors):
                     self.open_plan(page, 0)
                     self.start_execute(page)
                     page.evaluate('window.__lmFixture.holdRefresh = true')
@@ -504,8 +501,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
     def test_current_repreview_invalidates_plan_and_current_error_restores_retry(self):
         for width in (1280, 390):
             for outcome in ('repreview', 'error'):
-                with self.subTest(width=width, outcome=outcome):
-                    page, unexpected, errors = self.make_page(width)
+                with self.subTest(width=width, outcome=outcome), self.make_page(width) as (page, unexpected, errors):
                     self.open_plan(page, 0)
                     self.start_execute(page)
                     self.release_execute(page, outcome)

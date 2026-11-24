@@ -79,7 +79,6 @@ with patch("app.modules.local_media_service.OrganizeRules.from_config", return_v
  target.parent.mkdir(parents=True); target.write_bytes(b"old-process-media")
  preview = service.preview("admin", inspection["inspection_id"], tmdb_id="1", media_type="movie")
  task = service.create_manual_task("admin", inspection["inspection_id"], preview_digest=preview["preview_digest"])
- assert local_media_repo.claim_local_media_task(task, owner="admin")
  (root / "process-manifest.json").write_text(json.dumps({"task": task, "source": source, "incoming": str(incoming), "target": str(target)}))
  original = LocalMoveTransaction._backup_replaced_target
  def retire_then_exit(transaction, *args, **kwargs):
@@ -132,7 +131,7 @@ raise AssertionError("child did not reach retirement")
                 local_root="/synthetic",
                 owner="admin",
             )
-            task_id = local_media_repo.create_local_media_task(
+            task_id, _created = local_media_repo.admit_local_media_task(
                 source,
                 "",
                 "/synthetic/file.mkv",

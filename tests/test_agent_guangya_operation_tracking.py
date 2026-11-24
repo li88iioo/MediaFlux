@@ -1005,7 +1005,7 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
     def _task(self, status="completed", action="move", *, warning=""):
         self.sequence += 1
         path = f"/private/scan/{self.sequence}.mkv"
-        task_id = local_media_repo.create_local_media_task(
+        task_id, _created = local_media_repo.admit_local_media_task(
             self.source_id, "", path, owner="admin", trigger="scan"
         )
         local_media_repo.update_local_media_task(
