@@ -1233,7 +1233,7 @@ class Media:
         """只读返回已确认的 TMDB 映射或完整候选；候选含真实 tmdb_id、标题、年份、media_type 和评分，不自动保存。"""
         from app.discovery.service import get_discovery_service
 
-        return get_discovery_service().lookup_tmdb_mapping(
+        return get_discovery_service().map_to_tmdb(
             provider, external_id, media_type, title, year,
         )
 

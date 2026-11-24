@@ -207,8 +207,8 @@ async def map_media(request: Request, data: Any = Body(default=None)):
         tmdb_id = _scalar(data, "tmdb_id", max_length=20)
         if tmdb_id and not _TMDB_ID_RE.fullmatch(tmdb_id):
             raise ValueError("TMDB ID 无效")
-        tmdb_title = _scalar(data, "tmdb_title", max_length=300)
-        tmdb_year = _year(_scalar(data, "tmdb_year", max_length=4))
+        _scalar(data, "tmdb_title", max_length=300)
+        _year(_scalar(data, "tmdb_year", max_length=4))
         result = await get_discovery_service().map_to_tmdb_async(
             provider,
             external_id,
@@ -216,8 +216,6 @@ async def map_media(request: Request, data: Any = Body(default=None)):
             title,
             year,
             confirmed_tmdb_id=tmdb_id,
-            confirmed_title=tmdb_title,
-            confirmed_year=tmdb_year,
         )
         return api_response(result)
     except ProviderError as exc:
@@ -281,6 +279,8 @@ def remove_watchlist(request: Request, provider: str, media_type: str, external_
 def _calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
     from app.repositories import discovery as discovery_repo
 
+    profile_providers = discovery_provider_names() or DISCOVERY_PROVIDERS
+
     def media_identity(raw):
         for provider in ("tmdb", "douban"):
             value = str(raw.get(provider + "_id") or "")
@@ -338,7 +338,7 @@ def _calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
         provider, external_id = media_identity(card)
         card["detail_url"] = (
             f"/discovery?detail_provider={provider}&detail_type=tv&detail_id={external_id}"
-            if provider else ""
+            if provider in profile_providers else ""
         )
         # 收藏身份不随海报 CDN 回退变化；跨 provider 的图片 token 绝不冒充身份源。
         card["watchlist"] = ({"provider": provider, "external_id": external_id, "media_type": "tv",

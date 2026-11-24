@@ -275,8 +275,8 @@
         syncPosters(r, item, retryFailed);
         const tmdb = mediaId(item.tmdb_id);
         const detail = detailURL(item.detail_url, item);
-        // 无资料身份时复用封面链接前往平台，不把平台原图或平台 token 当作详情/收藏身份。
-        const originalPage = !tmdb && !mediaId(item.douban_id) && !text(item.detail_url) ? platformURL(item.url, item.source) : '';
+        // 当前没有详情入口时，保留经过平台白名单校验的原页入口。
+        const originalPage = !text(item.detail_url) ? platformURL(item.url, item.source) : '';
         setLink(r.open, detail || originalPage, `${text(item.title)} · ${originalPage ? `前往${names[item.source]}原页（新窗口）` : '媒体详情'}`);
         if (originalPage) {
             delete r.open.dataset.mediaProfileLink; r.open.target = '_blank'; r.open.rel = 'noopener noreferrer';

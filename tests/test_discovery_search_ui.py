@@ -586,7 +586,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "请核对下载列表/目标状态，必要时重新检索后人工处理",
             "提交状态未知，先核对下载列表；不要直接重复提交",
             "资源结果已过期，请刷新或重新检索",
-            "item.error === '资源结果已过期'",
+            "['资源结果已过期', '资源结果不存在'].includes(item.error)",
             "|| summary.review_required > 0",
             "`${countsMessage}；${RESOURCE_MANUAL_REVIEW_MESSAGE}`",
             "normalizeResourceBatchItems(resultIds, payload.items, true)",

@@ -884,6 +884,18 @@ class FreeCalendarBrowserTests(unittest.TestCase):
         self.assertEqual(detail_paths,['/api/discovery/detail/tmdb/tv/12301','/api/discovery/detail/douban/tv/1292052'])
         self.assertFalse(any(urlsplit(call[1]).path in ['/api/discovery/sections','/api/discovery/items'] for call in network.calls))
 
+        from playwright.sync_api import expect
+
+        network.data['days'][2]['items'][1]['detail_url'] = ''
+        network.data['days'][2]['items'][1]['watchlist']['in_watchlist'] = True
+        old_card = page.locator('.wc-card[data-stable-id="tencent:fixture-2"]')
+        original = old_card.locator('.discovery-card-open')
+        page.locator('#calendar-refresh').click()
+        expect(original).to_have_attribute('href', 'https://v.qq.com/fixture-2')
+        expect(original).to_have_attribute('target', '_blank')
+        expect(original).not_to_have_attribute('data-media-profile-link', '')
+        expect(old_card.locator('.discovery-watchlist-action')).to_have_attribute('aria-pressed', 'true')
+
     def test_card_resource_switch_uses_shared_dialog_and_keeps_calendar_context(self):
         self._assert_card_resource_switch_context(keyboard=False)
 

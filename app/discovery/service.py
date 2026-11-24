@@ -640,10 +640,10 @@ class DiscoveryService:
         return {"items": [dict(row) for row in rows], "total": count_media_watchlist(), "has_more": has_more,
                 "next": {"before_number": rows[-1]["id"], "limit": limit} if has_more else None}
 
-    def lookup_tmdb_mapping(
-        self, provider: str, external_id: str, media_type: str, title: str, year: str = ""
+    def map_to_tmdb(
+        self, provider: str, external_id: str, media_type: str, title: str, year: str = "", *, confirmed_tmdb_id: str = "",
     ) -> dict[str, Any]:
-        """只读返回已确认映射或 TMDB 候选；绝不写入映射表。"""
+        """优先复用已确认的身份；仅在用户选择候选时提交核验后的映射。"""
         if provider == "tmdb":
             return {"tmdb_id": external_id, "confirmed": True, "candidates": []}
         if media_type not in {"movie", "tv"}:
@@ -655,6 +655,17 @@ class DiscoveryService:
                 "confirmed": True,
                 "candidates": [],
             }
+        if confirmed_tmdb_id:
+            verified = self.verify_tmdb_mapping_candidate(confirmed_tmdb_id, media_type)
+            result = self._save_verified_mapping(
+                provider, external_id, media_type, verified, dict(existing) if existing is not None else None,
+            )
+            if result is not None:
+                return result
+            winner = discovery_repo.get_media_external_id(provider, external_id, media_type)
+            if winner is None or not winner["confirmed"]:
+                raise ValueError("来源映射已变化，请刷新后重试")
+            return {"tmdb_id": winner["tmdb_id"], "confirmed": True, "candidates": []}
         with self._network_operation(), self._scraper_operation() as scraper:
             candidates = scraper.search_candidates(title, year, media_type)
         serialized = [self._candidate_dict(candidate) for candidate in candidates]
@@ -663,24 +674,6 @@ class DiscoveryService:
             "confirmed": False,
             "candidates": serialized,
         }
-
-    def confirm_tmdb_mapping(
-        self, provider: str, external_id: str, media_type: str, tmdb_id: str
-    ) -> dict[str, Any]:
-        """核验显式 TMDB 身份后持久化 confirmed 映射。"""
-        if provider == "tmdb":
-            if external_id != tmdb_id:
-                raise ValueError("TMDB 来源身份不一致")
-            return {"tmdb_id": tmdb_id, "confirmed": True, "candidates": []}
-        verified = self.verify_tmdb_mapping_candidate(tmdb_id, media_type)
-        requested_id = verified["tmdb_id"]
-        discovery_repo.upsert_media_external_id(
-            provider, external_id, media_type, requested_id,
-            verified["title"],
-            verified["year"],
-            1.0, True,
-        )
-        return {"tmdb_id": requested_id, "confirmed": True, "candidates": []}
 
     def _tmdb_mapping_source(self, provider: str, external_id: str, media_type: str) -> dict[str, Any] | None:
         card = self.get_detail(provider, media_type, external_id)
@@ -734,6 +727,12 @@ class DiscoveryService:
             return None
         if check_cancelled is not None:
             check_cancelled()
+        return self._save_verified_mapping(provider, external_id, media_type, verified, expected_mapping)
+
+    @staticmethod
+    def _save_verified_mapping(
+        provider: str, external_id: str, media_type: str, verified: dict[str, str], expected_mapping: dict | None,
+    ) -> dict[str, Any] | None:
         requested_id = verified["tmdb_id"]
         if not discovery_repo.confirm_media_external_id_if_unchanged(
             provider,
@@ -768,28 +767,6 @@ class DiscoveryService:
             "media_type": media_type,
         }
 
-    def map_to_tmdb(self, provider: str, external_id: str, media_type: str,
-                    title: str, year: str = "", *, confirmed_tmdb_id: str = "",
-                    confirmed_title: str = "", confirmed_year: str = "") -> dict[str, Any]:
-        """兼容入口：复用既有确认；仅新显式 tmdb_id 会核验后写入。"""
-        del confirmed_title, confirmed_year
-        if provider == "tmdb":
-            return {"tmdb_id": external_id, "confirmed": True, "candidates": []}
-        if media_type not in {"movie", "tv"}:
-            raise ValueError("媒体类型无效")
-        existing = discovery_repo.get_media_external_id(provider, external_id, media_type)
-        if existing and bool(existing["confirmed"]):
-            return {
-                "tmdb_id": str(existing["tmdb_id"] or ""),
-                "confirmed": True,
-                "candidates": [],
-            }
-        if confirmed_tmdb_id:
-            return self.confirm_tmdb_mapping(
-                provider, external_id, media_type, confirmed_tmdb_id
-            )
-        return self.lookup_tmdb_mapping(provider, external_id, media_type, title, year)
-
     async def map_to_tmdb_async(
         self,
         provider: str,
@@ -799,8 +776,6 @@ class DiscoveryService:
         year: str = "",
         *,
         confirmed_tmdb_id: str = "",
-        confirmed_title: str = "",
-        confirmed_year: str = "",
     ) -> dict[str, Any]:
         """在探索专用的有界 executor 中执行同步 TMDB 映射。"""
         callback = partial(
@@ -811,8 +786,6 @@ class DiscoveryService:
             title,
             year,
             confirmed_tmdb_id=confirmed_tmdb_id,
-            confirmed_title=confirmed_title,
-            confirmed_year=confirmed_year,
         )
         loop = asyncio.get_running_loop()
         future = self._submit_mapping(callback)

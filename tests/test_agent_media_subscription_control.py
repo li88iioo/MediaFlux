@@ -1,6 +1,7 @@
 """媒体追更订阅的安全摘要、自然语言路由与确认写入回归。"""
 
 from __future__ import annotations
+from tests.support import seed_external_mapping
 from typing import Any
 
 import json
@@ -222,7 +223,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         tmdb_id = "99120"
         changed_tmdb_id = tmdb_id if revoke_confirmed else "99121"
         args = {"provider": "douban", "external_id": external_id, "media_type": "movie"}
-        discovery_repo.upsert_media_external_id(
+        seed_external_mapping(
             "douban", external_id, "movie", tmdb_id, confirmed=True
         )
         before_count = media_subscriptions_repo.count_media_subscriptions()

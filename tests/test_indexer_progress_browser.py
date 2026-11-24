@@ -4,6 +4,7 @@ import base64
 import json
 import shutil
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -43,6 +44,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         cls.dialog = PROFILE_DIALOG.read_text(encoding="utf-8")
         cls.styles = STYLES.read_text(encoding="utf-8")
 
+    @contextmanager
     def open_profile(self, *, json_payload=None, search_content_type=None, resource_focus=False):
         html = f"""<!doctype html>
         <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -64,22 +66,21 @@ class IndexerProgressBrowserTests(unittest.TestCase):
             <div id="discovery-live"></div>
             {self.dialog}
         </div></body></html>"""
-        context = self.browser.new_context(viewport={"width": 1100, "height": 850})
-        self.addCleanup(context.close)
-        page = context.new_page()
-        page_errors = []
-        page.on("pageerror", lambda error: page_errors.append(str(error)))
-        page.route(
-            "http://mediaflux.test/**",
-            lambda route: route.fulfill(
-                status=200,
-                headers={"Content-Type": "text/html; charset=utf-8"},
-                body=html,
-            ),
-        )
-        page.goto("http://mediaflux.test/discovery", wait_until="domcontentloaded")
-        page.evaluate(
-            """fixtures => {
+        with self.browser.new_context(viewport={"width": 1100, "height": 850}) as context:
+            page = context.new_page()
+            page_errors = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            page.route(
+                "http://mediaflux.test/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=html,
+                ),
+            )
+            page.goto("http://mediaflux.test/discovery", wait_until="domcontentloaded")
+            page.evaluate(
+                """fixtures => {
                 window.__resourceSearchRequests = [];
                 window.__streamControllers = [];
                 window.__abortedSearches = [];
@@ -143,22 +144,45 @@ class IndexerProgressBrowserTests(unittest.TestCase):
                 };
                 window.__finishStream = index => window.__streamControllers[index].close();
             }""",
-            {"jsonPayload": json_payload, "searchContentType": search_content_type},
-        )
-        page.add_script_tag(content=self.script)
-        page.locator("#profileLink").click()
-        page.wait_for_function("window.__resourceSearchRequests.length === 1")
-        self.assertEqual(page_errors, [])
-        request = page.evaluate("window.__resourceSearchRequests[0]")
-        self.assertEqual(request["url"], "/api/indexers/search")
-        self.assertEqual(request["method"], "POST")
-        self.assertEqual(request["headers"]["Accept"], "text/event-stream")
-        self.assertEqual(json.loads(request["body"])["title"], "测试作品 123")
-        return page
+                {"jsonPayload": json_payload, "searchContentType": search_content_type},
+            )
+            page.add_script_tag(content=self.script)
+            page.locator("#profileLink").click()
+            page.wait_for_function("window.__resourceSearchRequests.length === 1")
+            self.assertEqual(page_errors, [])
+            request = page.evaluate("window.__resourceSearchRequests[0]")
+            self.assertEqual(request["url"], "/api/indexers/search")
+            self.assertEqual(request["method"], "POST")
+            self.assertEqual(request["headers"]["Accept"], "text/event-stream")
+            self.assertEqual(json.loads(request["body"])["title"], "测试作品 123")
+            yield page
 
     @staticmethod
     def progress_payload(items, site_statuses, *, complete=False):
         return {"items": items, "site_statuses": site_statuses, "complete": complete}
+
+    def test_missing_result_after_reload_points_to_search_instead_of_download_reconciliation(self):
+        from playwright.sync_api import expect
+
+        page = self.enterContext(self.open_profile(json_payload=self.progress_payload(
+            [{"result_id": "old", "site_id": "nyaa", "title": "旧结果", "download_state": "ready",
+              "download_kinds": ["magnet"]}], [], complete=True,
+        )))
+        page.evaluate("""() => {
+            const fetchFixture = window.fetch;
+            window.fetch = (url, options) => url === '/api/indexers/download'
+                ? Promise.resolve(new Response(JSON.stringify({code: 'result_not_found', error: '资源结果不存在'}), {
+                    status: 404, headers: {'Content-Type': 'application/json'}
+                }))
+                : fetchFixture(url, options);
+        }""")
+        row = page.locator('[data-resource-result-id="old"]')
+        action = row.locator('[data-resource-submit-target="qb"]')
+        row.locator(".discovery-resource-select").check()
+        action.click()
+        expect(row.locator(".discovery-resource-item-status")).to_contain_text("重新检索")
+        expect(row.locator(".discovery-resource-select")).not_to_be_checked()
+        expect(action).to_be_disabled()
 
     def push_event(self, page, index, event, payload, *, split_utf8=False):
         frame = f"event:{event}\r\ndata:{json.dumps(payload, ensure_ascii=False)}\r\n\r\n".encode("utf-8")
@@ -173,7 +197,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         page.evaluate("args => window.__pushChunks(args.index, args.chunks)", {"index": index, "chunks": encoded})
 
     def test_progress_updates_in_place_and_diagnostics_stay_quiet(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         first_items = [
             {"result_id": "r1", "site_id": "alpha", "site_name": "Alpha", "title": "首批结果一", "published_at": "2024-01-01T00:00:00Z", "source_url": "https://alpha.test/1"},
             {"result_id": "r2", "site_id": "alpha", "site_name": "Alpha", "title": "首批结果二", "published_at": "2023-01-01T00:00:00Z", "source_url": "https://alpha.test/2"},
@@ -248,7 +272,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").count(), 3)
 
     def test_resource_focus_is_not_stolen_when_background_search_finishes(self):
-        page = self.open_profile(resource_focus=True)
+        page = self.enterContext(self.open_profile(resource_focus=True))
         page.wait_for_timeout(60)
         first = {"result_id": "focused", "site_id": "alpha", "title": "Demo", "download_state": "ready", "download_kinds": ["magnet"]}
         self.push_event(page, 0, "progress", self.progress_payload([first], [{"site_id": "alpha", "status": "success"}]))
@@ -263,7 +287,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertTrue(checkbox.is_checked())
 
     def test_late_correct_match_sorts_before_noise_without_losing_selection_or_focus(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         self.assertEqual(page.locator("[data-resource-sort]").input_value(), "relevance_desc")
         statuses = [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]
         noise = [{"result_id": f"noise-{i}", "site_id": "alpha", "title": f"无关作品{i}",
@@ -291,7 +315,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").count(), 11)
 
     def test_resort_transfers_selection_only_to_the_same_resource_new_reference(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         statuses = [{"site_id": "alpha", "status": "success"}]
         first = {"result_id": "old", "resource_key": "hash-a", "site_id": "alpha", "title": "相同标题", "download_state": "ready"}
         self.push_event(page, 0, "complete", self.progress_payload([first], statuses, complete=True))
@@ -316,7 +340,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertIn("已选 0 条", page.locator("[data-resource-batch-summary]").inner_text())
 
     def test_source_order_uses_server_snapshot_order_instead_of_arrival_or_score(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         page.locator("[data-resource-sort]").select_option("source_order")
         page.wait_for_function("window.__resourceSearchRequests.length === 2")
         statuses = [{"site_id": "alpha", "status": "success"}]
@@ -329,7 +353,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").evaluate_all("rows => rows.map(row => row.dataset.resourceResultId)"), ["later", "early"])
 
     def test_completion_count_includes_retained_earlier_candidates(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         statuses = [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]
         self.push_event(page, 0, "progress", self.progress_payload([
             {"result_id": "early", "site_id": "alpha", "title": "先返回的候选"},
@@ -345,7 +369,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertIn("本轮 2 条结果", text_content)
 
     def test_candidate_cap_is_information_not_failure_or_hidden_load_more(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         payload = self.progress_payload([
             {"result_id": "r1", "site_id": "alpha", "title": "Demo"},
         ], [{"site_id": "alpha", "site_name": "Alpha", "status": "success", "message": "达到候选上限，可细化条件"}], complete=True)
@@ -363,7 +387,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").count(), 1)
 
     def test_source_diagnostic_focus_survives_progress_and_completion(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         items = [{"result_id": "r1", "site_id": "alpha", "title": "资源"}]
         statuses = [
             {"site_id": "alpha", "site_name": "Alpha", "status": "success"},
@@ -378,7 +402,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertTrue(page.locator("[data-resource-site-retry='beta']").is_visible())
 
     def test_close_cancels_old_search_and_stale_snapshot_cannot_cross_detail(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         self.push_event(page, 0, "progress", self.progress_payload([
             {"result_id": "stale", "site_id": "alpha", "site_name": "Alpha", "title": "旧作品迟到结果"}
         ], [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]))
@@ -395,7 +419,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").evaluate_all("rows => rows.map(row => row.dataset.resourceResultId)"), ["fresh"])
 
     def test_disconnect_keeps_delivered_results_and_never_reports_complete(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         self.push_event(page, 0, "progress", self.progress_payload([
             {"result_id": "kept", "site_id": "alpha", "site_name": "Alpha", "title": "已到达结果"}
         ], [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]))
@@ -411,7 +435,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertNotIn("搜索完成", progress.inner_text())
 
     def test_empty_progress_snapshot_keeps_skeleton_until_delayed_first_results(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         self.push_event(page, 0, "progress", self.progress_payload([], [
             {"site_id": "alpha", "site_name": "Alpha", "status": "searching"},
         ]))
@@ -433,7 +457,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").count(), 1)
 
     def test_progress_chip_keeps_filter_positions_and_row_focus_stable(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         first = [{"result_id": "stable", "site_id": "alpha", "site_name": "Alpha", "title": "稳定首批结果"}]
         self.push_event(page, 0, "progress", self.progress_payload(first, [
             {"site_id": "alpha", "site_name": "Alpha", "status": "success"},
@@ -484,7 +508,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertIn("已找到 2 条", text_content)
 
     def test_same_context_empty_partial_refresh_preserves_selected_old_result(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         initial = [{"result_id": "old", "site_id": "alpha", "site_name": "Alpha", "title": "旧结果"}]
         self.push_event(page, 0, "progress", self.progress_payload(initial, [
             {"site_id": "alpha", "site_name": "Alpha", "status": "success"},
@@ -524,7 +548,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertNotIn("本轮 1 条结果", text_content)
 
     def test_sse_terminal_error_is_not_a_site_snapshot_and_keeps_results(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         self.push_event(page, 0, "progress", self.progress_payload([
             {"result_id": "kept", "site_id": "alpha", "site_name": "Alpha", "title": "已到达结果"},
         ], [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]))
@@ -561,7 +585,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
             "items": [{"result_id": "must-not-appear", "site_id": "alpha", "site_name": "Alpha", "title": "不能被当 JSON"}],
             "site_statuses": [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}],
         }
-        page = self.open_profile(json_payload=payload, search_content_type="text/plain; charset=utf-8")
+        page = self.enterContext(self.open_profile(json_payload=payload, search_content_type="text/plain; charset=utf-8"))
         page.locator(".discovery-resource-state.is-error").wait_for()
         self.assertEqual(page.locator("[data-resource-result-id='must-not-appear']").count(), 0)
 
@@ -598,8 +622,8 @@ class IndexerProgressBrowserTests(unittest.TestCase):
             ),
         )
         for statuses, expected_text, expected_class in cases:
-            with self.subTest(expected_text=expected_text):
-                page = self.open_profile(json_payload={"items": [], "site_statuses": statuses})
+            payload = {"items": [], "site_statuses": statuses}
+            with self.subTest(expected_text=expected_text), self.open_profile(json_payload=payload) as page:
                 page.wait_for_function(
                     "text => [...document.querySelectorAll('.discovery-resource-site-status[aria-live=\"polite\"]')].some(el => el.innerText.includes(text))",
                     arg=expected_text,
@@ -609,9 +633,9 @@ class IndexerProgressBrowserTests(unittest.TestCase):
                 self.assertTrue(summary.evaluate("(el, className) => el.classList.contains(className)", expected_class))
 
     def test_manual_site_label_fallback_uses_current_product_name(self):
-        page = self.open_profile(json_payload={
+        page = self.enterContext(self.open_profile(json_payload={
             "items": [], "site_statuses": [{"site_id": "btbtla", "status": "empty"}],
-        })
+        }))
         chip = page.locator("[data-resource-site-filter='btbtla']")
         chip.wait_for()
         self.assertEqual(chip.inner_text(), "综合 0")
@@ -660,7 +684,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual({site["site_id"] for site in payload["site_statuses"]}, expected)
         for site_id in AGENT_ONLY_INDEXER_SITE_IDS:
             adapters[site_id].search.assert_not_called()
-        page = self.open_profile(json_payload=payload)
+        page = self.enterContext(self.open_profile(json_payload=payload))
         page.locator("[data-resource-site-filter='btbtla']").wait_for()
         self.assertEqual(set(page.locator("[data-resource-site-filter]").evaluate_all(
             "els => els.map(el => el.dataset.resourceSiteFilter).filter(Boolean)"
@@ -688,7 +712,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
                   'code': 'timeout', 'message': '请求超时'}], 'retryable': True} if site_id == 'btbtla' else {})}
             for site_id, site_name in site_names.items()
         ]
-        page = self.open_profile(json_payload={'items': items, 'site_statuses': statuses})
+        page = self.enterContext(self.open_profile(json_payload={'items': items, 'site_statuses': statuses}))
         for site_id, site_name in site_names.items():
             row = page.locator(f"[data-resource-result-id='{site_id}-result']")
             row.wait_for()
@@ -708,7 +732,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertFalse(page.locator("[data-resource-result-id='btbtla-result']").is_visible())
 
     def test_btbtla_pagination_appends_without_losing_selection_or_site_filter(self):
-        page = self.open_profile()
+        page = self.enterContext(self.open_profile())
         btbtla_first = {
             'result_id': 'btbtla-page-1', 'site_id': 'btbtla', 'site_name': '综合',
             'title': '较新资源', 'download_state': 'ready',
@@ -766,7 +790,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
             "items": [{"result_id": "json-result", "site_id": "alpha", "site_name": "Alpha", "title": "JSON 兼容结果"}],
             "site_statuses": [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}],
         }
-        page = self.open_profile(json_payload=payload)
+        page = self.enterContext(self.open_profile(json_payload=payload))
         page.locator("[data-resource-result-id='json-result']").wait_for()
         summary = page.locator(".discovery-resource-site-status[aria-live='polite']")
         self.assertIn("搜索完成", summary.inner_text())

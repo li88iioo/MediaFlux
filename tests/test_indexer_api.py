@@ -1228,6 +1228,31 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(expired.status_code, 410)
         self.assertEqual(invalid.status_code, 400)
 
+    def test_pre_reload_result_is_missing_and_never_reaches_download_dispatch(self):
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+
+        headers = self.authenticate()
+        previous = FakeIndexerService()
+        previous_store = IndexerResultStore()
+        old_id = previous_store.put(previous.result_store.item)
+        fresh = indexer_service.IndexerService(
+            registry=IndexerRegistry({"nyaa": previous.adapter}),
+            result_store=IndexerResultStore(),
+            enabled_site_ids=(),
+        )
+        with (
+            patch("app.routes.indexers_api.get_indexer_service", return_value=fresh),
+            patch.object(indexer_download, "create_request") as create,
+        ):
+            result = self.client.post(
+                "/api/indexers/download", json={"result_id": old_id, "target": "qb"}, headers=headers,
+            )
+        self.assertEqual(result.status_code, 404, result.text)
+        self.assertEqual(result.json()["code"], "result_not_found")
+        self.assertEqual(previous.adapter.resolve_calls, [])
+        create.assert_not_called()
+
     def test_batch_download_returns_ordered_partial_summary(self):
         headers = self.authenticate()
         service = FakeIndexerService()

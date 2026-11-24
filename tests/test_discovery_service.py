@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.support import seed_external_mapping
 import asyncio
 import tempfile
 import threading
@@ -335,11 +336,11 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.addCleanup(service.shutdown)
         page = service.list_items("douban", "movie_hot", "movie")
         self.assertEqual(page.items[0].tmdb_id, "")
-        discovery_repo.upsert_media_external_id("douban", "1", "movie", "550", confirmed=False)
-        discovery_repo.upsert_media_external_id("douban", "1", "tv", "999", confirmed=True)
+        seed_external_mapping("douban", "1", "movie", "550", confirmed=False)
+        seed_external_mapping("douban", "1", "tv", "999", confirmed=True)
         self.assertEqual(service.list_items("douban", "movie_hot", "movie").items[0].tmdb_id, "")
         for identity in ("550", "551"):
-            discovery_repo.upsert_media_external_id("douban", "1", "movie", identity, confirmed=True)
+            seed_external_mapping("douban", "1", "movie", identity, confirmed=True)
             page = service.list_items("douban", "movie_hot", "movie")
             self.assertTrue(page.cached)
             self.assertEqual((page.items[0].external_id, page.items[0].tmdb_id), ("1", identity))
@@ -896,7 +897,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         )
         self.addCleanup(service.shutdown)
 
-        result = service.lookup_tmdb_mapping(
+        result = service.map_to_tmdb(
             "douban", "temporary-close-success", "movie", "Movie"
         )
         self.assertEqual(result["candidates"], [])
@@ -907,7 +908,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         failing.close.side_effect = RuntimeError("cleanup failed")
         service._scraper_factory = lambda: failing
         with self.assertRaisesRegex(RuntimeError, "business failed"):
-            service.lookup_tmdb_mapping(
+            service.map_to_tmdb(
                 "douban", "temporary-close-failure", "movie", "Movie"
             )
         failing.close.assert_called_once_with()
@@ -947,14 +948,14 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertTrue(thread_names[0].startswith("discovery-refresh"))
 
     def test_confirmed_mapping_is_reused_without_search(self):
-        discovery_repo.upsert_media_external_id("douban", "7", "movie", "550", "Movie", "1999", 1.0, True)
+        seed_external_mapping("douban", "7", "movie", "550", "Movie", "1999", 1.0, True)
         scraper = SimpleNamespace(search_candidates=lambda *args, **kwargs: self.fail("search should not run"))
         service = DiscoveryService(registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper)
         result = service.map_to_tmdb("douban", "7", "movie", "Movie", "1999")
         self.assertEqual((result["tmdb_id"], result["confirmed"]), ("550", True))
 
     def test_legacy_unconfirmed_mapping_does_not_hide_new_candidates(self):
-        discovery_repo.upsert_media_external_id(
+        seed_external_mapping(
             "douban", "legacy-tentative", "movie", "550", "旧自动候选",
             "1999", 0.96, False,
         )
@@ -968,7 +969,7 @@ class DiscoveryServiceTests(unittest.TestCase):
             registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper
         )
 
-        result = service.lookup_tmdb_mapping(
+        result = service.map_to_tmdb(
             "douban", "legacy-tentative", "movie", "Movie", "1999"
         )
 
@@ -977,7 +978,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["tmdb_id"], "551")
 
     def test_explicit_confirmation_does_not_overwrite_existing_confirmed_mapping(self):
-        discovery_repo.upsert_media_external_id(
+        seed_external_mapping(
             "douban", "confirmed-7", "movie", "550", "Existing Movie",
             "1999", 1.0, True,
         )
@@ -991,7 +992,7 @@ class DiscoveryServiceTests(unittest.TestCase):
 
         result = service.map_to_tmdb(
             "douban", "confirmed-7", "movie", "Movie", "1999",
-            confirmed_tmdb_id="551", confirmed_title="Other", confirmed_year="2000",
+            confirmed_tmdb_id="551",
         )
 
         stored = discovery_repo.get_media_external_id("douban", "confirmed-7", "movie")
@@ -1003,7 +1004,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         )
 
     def test_explicit_confirmation_corrects_existing_unconfirmed_mapping(self):
-        discovery_repo.upsert_media_external_id(
+        seed_external_mapping(
             "douban", "7", "movie", "550", "Wrong Movie", "1998", 0.96, False,
         )
         scraper = SimpleNamespace(
@@ -1017,7 +1018,7 @@ class DiscoveryServiceTests(unittest.TestCase):
 
         result = service.map_to_tmdb(
             "douban", "7", "movie", "Movie", "1999",
-            confirmed_tmdb_id="551", confirmed_title="Correct Movie", confirmed_year="2000",
+            confirmed_tmdb_id="551",
         )
 
         stored = discovery_repo.get_media_external_id("douban", "7", "movie")
@@ -1027,6 +1028,23 @@ class DiscoveryServiceTests(unittest.TestCase):
             (stored["tmdb_id"], stored["title"], stored["year"], stored["confirmed"]),
             ("551", "Correct Movie", "2000", 1),
         )
+
+    def test_mapping_returns_winner_when_other_client_confirms_during_verification(self):
+        key = ("douban", "concurrent-mapping", "movie")
+        def verify(tmdb_id, media_type):
+            self.assertTrue(discovery_repo.confirm_media_external_id_if_unchanged(
+                *key, "550", "First", "1999", None,
+            ))
+            return SimpleNamespace(need_confirm=False, tmdb_id=tmdb_id, media_type=media_type,
+                                   title="Later", year="2026")
+
+        service = DiscoveryService(registry=self.registry, cache=self.cache,
+                                   scraper_factory=lambda: SimpleNamespace(match_from_tmdb=verify))
+        result = service.map_to_tmdb(*key, "Movie", confirmed_tmdb_id="551")
+        self.assertEqual(result["tmdb_id"], "550")
+        saved = discovery_repo.get_media_external_id(*key)
+        assert saved is not None
+        self.assertEqual((saved["tmdb_id"], saved["title"]), ("550", "First"))
 
     def test_mapping_candidate_lookup_never_persists_without_confirmation(self):
         high = SimpleNamespace(tmdb_id="550", title="Fight Club", year="1999", score=0.96, media_type="movie")

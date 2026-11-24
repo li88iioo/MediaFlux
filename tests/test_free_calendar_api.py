@@ -170,6 +170,14 @@ class FreeCalendarAPITests(_BaseClientTests):
         self.assertEqual(response.status_code, 200)
         updated = self.client.get("/api/discovery/calendar").json()["days"][0]["items"][0]
         self.assertTrue(updated["watchlist"]["in_watchlist"])
+        self.assertEqual(updated["detail_url"], "/discovery?detail_provider=douban&detail_type=tv&detail_id=1234")
+        with patch.dict("os.environ", {"DISCOVERY_DOUBAN_ENABLED": "0"}):
+            self.assertEqual(self.client.get("/api/discovery/detail/douban/tv/1234").status_code, 400)
+            hidden = self.client.get("/api/discovery/calendar").json()["days"][0]["items"][0]
+            self.assertEqual(hidden["detail_url"], "")
+            self.assertEqual(hidden["watchlist"], updated["watchlist"])
+            [saved] = self.client.get("/api/subscriptions/watchlist").json()["items"]
+            self.assertEqual((saved["provider"], saved["external_id"]), ("douban", "1234"))
         self.assertEqual(self.client.delete("/api/discovery/watchlist/douban/tv/1234", headers=headers).status_code, 200)
         self.assertFalse(self.client.get("/api/discovery/calendar").json()["days"][0]["items"][0]["watchlist"]["in_watchlist"])
 

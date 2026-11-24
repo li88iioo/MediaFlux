@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.support import seed_external_mapping
 import json
 import sqlite3
 import tempfile
@@ -189,13 +190,17 @@ class DiscoveryDatabaseTests(unittest.TestCase):
                 self.assertTrue(discovery_repository.delete_media_watchlist("bangumi", "42", "tv"))
                 self.assertFalse(discovery_repository.delete_media_watchlist("bangumi", "42", "tv"))
 
-                discovery_repository.upsert_media_external_id("douban", "7", "movie", "550", "Movie", "1999", 0.95, False)
-                discovery_repository.upsert_media_external_id("douban", "7", "movie", "551", "Wrong", "2000", 0.99, False)
+                seed_external_mapping("douban", "7", "movie", "551", "旧候选", "2000", 0.99, False)
                 row = discovery_repository.get_media_external_id("douban", "7", "movie")
                 assert row is not None
                 self.assertEqual(row["tmdb_id"], "551")
-                discovery_repository.upsert_media_external_id("douban", "7", "movie", "550", "Confirmed", "1999", 1.0, True)
-                discovery_repository.upsert_media_external_id("douban", "7", "movie", "999", "Auto", "2020", 1.0, False)
+                snapshot = dict(row)
+                self.assertTrue(discovery_repository.confirm_media_external_id_if_unchanged(
+                    "douban", "7", "movie", "550", "Confirmed", "1999", snapshot,
+                ))
+                self.assertFalse(discovery_repository.confirm_media_external_id_if_unchanged(
+                    "douban", "7", "movie", "999", "Stale", "2020", snapshot,
+                ))
                 row = discovery_repository.get_media_external_id("douban", "7", "movie")
                 assert row is not None
                 self.assertEqual((row["tmdb_id"], row["confirmed"]), ("550", 1))

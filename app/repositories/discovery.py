@@ -148,33 +148,6 @@ def list_media_external_ids(
     return result
 
 
-def upsert_media_external_id(
-    provider: str,
-    external_id: str,
-    media_type: str,
-    tmdb_id: str,
-    title: str = "",
-    year: str = "",
-    confidence: float = 0,
-    confirmed: bool = False,
-) -> None:
-    with db.get_conn() as conn:
-        conn.execute(
-            "INSERT INTO media_external_ids(provider,external_id,media_type,tmdb_id,title,year,confidence,confirmed,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) DO UPDATE SET "
-            "tmdb_id=excluded.tmdb_id,title=excluded.title,year=excluded.year,"
-            "confidence=excluded.confidence,confirmed=excluded.confirmed,"
-            "version=media_external_ids.version+1,updated_at=excluded.updated_at "
-            "WHERE media_external_ids.confirmed=0 OR excluded.confirmed=1",
-            (
-                provider, external_id, media_type, tmdb_id,
-                (title or ""), (year or ""),
-                max(0.0, min(float(confidence or 0), 1.0)),
-                1 if confirmed else 0, db.now(),
-            ),
-        )
-
-
 def confirm_media_external_id_if_unchanged(
     provider: str,
     external_id: str,

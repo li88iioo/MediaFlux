@@ -2516,7 +2516,8 @@
             ...asArray(item?.succeeded),
         ]);
         const base = {...item, submitted_targets: [...submittedTargets]};
-        if (item.code === 'result_expired' || item.error === '资源结果已过期') {
+        if (['result_expired', 'result_not_found'].includes(item.code)
+            || ['资源结果已过期', '资源结果不存在'].includes(item.error)) {
             return {...base, status: 'expired'};
         }
         if (item.duplicate) return {...base, status: 'duplicate'};
@@ -2778,7 +2779,7 @@
                 const payload = error.payload || {};
                 const responseReceived = Boolean(
                     payload.status || payload.duplicate || payload.request_id
-                    || payload.succeeded || payload.failed || payload.code === 'result_expired'
+                    || payload.succeeded || payload.failed
                 );
                 const item = resourceSubmissionState({
                     ...payload,

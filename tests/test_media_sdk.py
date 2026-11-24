@@ -79,12 +79,12 @@ def test_media_resolve_is_not_gated_by_the_discovery_page_switch(monkeypatch, en
     # 用户决定（2026-11-16）：媒体探索开关只管 Web 页面，Agent 查询影视资料不受影响。
     monkeypatch.setenv("DISCOVERY_ENABLED", "1" if enabled else "0")
     service = Mock()
-    service.lookup_tmdb_mapping.return_value = {"tmdb_id": "90101", "confirmed": True, "candidates": []}
+    service.map_to_tmdb.return_value = {"tmdb_id": "90101", "confirmed": True, "candidates": []}
     with patch("app.discovery.service.get_discovery_service", return_value=service) as factory:
         result = sdk.media.resolve("douban", "101", "movie", "示例影片", "2026")
     assert result == {"tmdb_id": "90101", "confirmed": True, "candidates": []}
     factory.assert_called_once_with()
-    service.lookup_tmdb_mapping.assert_called_once_with("douban", "101", "movie", "示例影片", "2026")
+    service.map_to_tmdb.assert_called_once_with("douban", "101", "movie", "示例影片", "2026")
 
 
 def test_watchlist_cursor_preserves_all_provider_identities():

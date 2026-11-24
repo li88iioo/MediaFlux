@@ -32,6 +32,19 @@ def agent_llm_enabled(monkeypatch):
     monkeypatch.setenv("AGENT_LLM_ENABLED", "1")
 
 
+def seed_external_mapping(provider, external_id, media_type, tmdb_id, title="", year="", confidence=0, confirmed=False):
+    """构造历史候选或并发写入的已确认身份，供发现与订阅夹具使用。"""
+    from app import database as db
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO media_external_ids(provider,external_id,media_type,tmdb_id,title,year,confidence,confirmed,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) DO UPDATE SET "
+            "tmdb_id=excluded.tmdb_id,title=excluded.title,year=excluded.year,confidence=excluded.confidence,"
+            "confirmed=excluded.confirmed,updated_at=excluded.updated_at,version=media_external_ids.version+1",
+            (provider, external_id, media_type, tmdb_id, title, year, confidence, confirmed, db.now()),
+        )
+
+
 def authenticated_session(**extra: Any) -> dict[str, Any]:
     """按当前配置签发正式 Web 会话，允许夹具附带 CSRF 等状态。"""
     from app import config

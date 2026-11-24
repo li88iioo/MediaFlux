@@ -1,5 +1,6 @@
 """原推荐行为迁至原生 catalog；复用公共收集器，不再调用 Agent 动作。"""
 from __future__ import annotations
+from tests.support import seed_external_mapping
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -53,7 +54,6 @@ def _recommend_fixture(service, inventory=None):
 class NativeRecommendationTests(unittest.TestCase):
 
     def test_confirmed_douban_mapping_reaches_real_catalog_library_exclusion(self):
-        from app.repositories import discovery as discovery_repo
         from app.discovery.registry import ProviderRegistry
         from app.discovery.service import DiscoveryService
         from tests.support import isolated_test_database
@@ -65,7 +65,7 @@ class NativeRecommendationTests(unittest.TestCase):
             service = DiscoveryService(registry=ProviderRegistry({'douban': provider}))
             self.addCleanup(service.shutdown)
             for i, confirmed in ((1, True), (2, True), (3, False)):
-                discovery_repo.upsert_media_external_id('douban', str(2000 + i), 'movie', str(3000 + i), confirmed=confirmed)
+                seed_external_mapping('douban', str(2000 + i), 'movie', str(3000 + i), confirmed=confirmed)
             inventory = MediaIdentityInventory(candidates=[MediaIdentityCandidate(name='库内作品', tmdb_id='3002')], total=1)
             with _recommend_fixture(service, inventory):
                 result = sdk.media.catalog('douban', 'recommend', 'movie', limit=1, exclude_library=True)

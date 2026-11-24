@@ -1,6 +1,7 @@
 """Media Agent 第 5 批长尾业务安全闭环回归。"""
 
 from __future__ import annotations
+from tests.support import seed_external_mapping
 from app.modules import rss_delivery
 
 from typing import cast
@@ -365,12 +366,12 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
     def test_discovery_mapping_cas_preserves_concurrently_confirmed_mapping(self) -> None:
         service = self._mapping_service()
         card = MediaCard(provider="douban", external_id="race-existing", media_type="movie", title="原始来源", year="2025")
-        discovery_repo.upsert_media_external_id("douban", "race-existing", "movie", "100", "旧候选", "2025", 0.8, False)
+        seed_external_mapping("douban", "race-existing", "movie", "100", "旧候选", "2025", 0.8, False)
         with patch.object(service, "get_detail", return_value=card):
             prepared = service.prepare_tmdb_mapping("douban", "race-existing", "movie", "300")
             assert prepared is not None
             with patch("app.database.now", return_value=prepared["mapping"]["updated_at"]):
-                discovery_repo.upsert_media_external_id("douban", "race-existing", "movie", "200", "并发确认候选", "2026", 1.0, True)
+                seed_external_mapping("douban", "race-existing", "movie", "200", "并发确认候选", "2026", 1.0, True)
                 saved = service.confirm_tmdb_mapping_if_unchanged(
                     "douban", "race-existing", "movie", "300", prepared["mapping"],
                     expected_source=prepared["source"], expected_target=prepared["target"],
@@ -387,7 +388,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
 
         def concurrent_confirmation(tmdb_id, media_type):
             verified = verify(tmdb_id, media_type)
-            discovery_repo.upsert_media_external_id("douban", "race-agent", "movie", "404", "并发确认", "2026", 1.0, True)
+            seed_external_mapping("douban", "race-agent", "movie", "404", "并发确认", "2026", 1.0, True)
             return verified
 
         async def exercise():

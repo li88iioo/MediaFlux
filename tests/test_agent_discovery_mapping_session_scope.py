@@ -1,6 +1,7 @@
 """真实映射身份沿原生 SDK 和持久确认账本流转，不再依赖候选序号上下文。"""
 from __future__ import annotations
 
+from tests.support import seed_external_mapping
 from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
@@ -254,7 +255,7 @@ def test_reverified_target_must_equal_the_frozen_id_type_and_detail(backend, fie
 def test_mapping_cas_preserves_concurrent_changes_even_with_the_same_timestamp(backend, change):
     async def exercise():
         if change != "insert":
-            discovery_repo.upsert_media_external_id("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
+            seed_external_mapping("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
         store = SQLiteKernelStore()
         context = await context_for(store, owner=OWNER)
         plan = await prepare(executor(store), context)
@@ -264,9 +265,9 @@ def test_mapping_cas_preserves_concurrent_changes_even_with_the_same_timestamp(b
                 with db.get_conn() as conn:
                     conn.execute("DELETE FROM media_external_ids WHERE provider='douban' AND external_id='101'")
             else:
-                discovery_repo.upsert_media_external_id("douban", "101", "movie", "200", "并发确认", "2026", 1.0, True)
+                seed_external_mapping("douban", "101", "movie", "200", "并发确认", "2026", 1.0, True)
                 if change == "aba":
-                    discovery_repo.upsert_media_external_id("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
+                    seed_external_mapping("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
             current = discovery_repo.get_media_external_id("douban", "101", "movie")
             expected = dict(current) if current is not None else None
             with pytest.raises(ToolPipelineError) as error:
@@ -357,7 +358,7 @@ def test_invalid_identity_never_publishes_a_confirmation(backend, arguments):
 
 
 def test_existing_identical_confirmation_does_not_write_or_publish_a_plan(backend):
-    discovery_repo.upsert_media_external_id("douban", "101", "movie", "90101", "已确认", "2026", 1.0, True)
+    seed_external_mapping("douban", "101", "movie", "90101", "已确认", "2026", 1.0, True)
     before = stored_mapping()
 
     async def exercise():
