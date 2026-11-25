@@ -211,6 +211,45 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(self.config_posts, [])
         self.assertEqual(config.get("AGENT_LLM_API_KEY"), "stored-test-key")
 
+    def test_model_picker_tracks_provider_without_losing_manual_model_draft(self):
+        from playwright.sync_api import expect
+
+        self._write(AGENT_LLM_API_URL="https://first.example.invalid/v1", AGENT_LLM_MODEL="manual-model")
+        page = self._open("/settings#agent")
+        picker = page.locator("#agentModelPickerModal")
+        options = picker.get_by_role("option")
+        suggestions = page.locator("#agentLlmModelOptions option")
+        with patch("app.routes.tools_api.fetch_ai_models", side_effect=[["first-only"], ["second-only"]]) as fetch:
+            page.locator("#fetchAgentModelsBtn").click()
+            expect(options).to_have_text(["first-only"])
+            page.keyboard.press("Escape")
+            model = page.locator("#agentLlmModel")
+            model.fill("my-draft")
+            page.locator("#openAgentModelPickerBtn").click()
+            expect(options).to_have_text(["first-only"])
+            page.keyboard.press("Escape")
+
+            page.locator('[data-key="AGENT_LLM_API_URL"]').fill("https://second.example.invalid/v1")
+            page.locator("#openAgentModelPickerBtn").click()
+            expect(picker).to_be_visible()
+            self.assertEqual(options.all_text_contents(), ["my-draft"])
+            self.assertEqual(suggestions.count(), 0)
+            page.keyboard.press("Escape")
+            page.locator("#fetchAgentModelsBtn").click()
+            expect(options).to_have_text(["second-only"])
+            expect(suggestions).to_have_attribute("value", "second-only")
+            options.click()
+            expect(model).to_have_value("second-only")
+            self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(self.config_posts, [])
+        panel = page.locator('[data-settings-panel="agent"]')
+        panel.locator("[data-save-settings]").click()
+        expect(panel.locator("[data-settings-state]")).to_contain_text("当前分区已保存")
+        self.assertEqual(len(self.config_posts), 1)
+        page.reload()
+        expect(model).to_have_value("second-only")
+        expect(panel.locator('[data-key="AGENT_LLM_API_URL"]')).to_have_value("https://second.example.invalid/v1")
+
     def test_downloader_url_save_rejects_an_invalid_draft_and_accepts_its_correction(self):
         from playwright.sync_api import expect
 

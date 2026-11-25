@@ -237,16 +237,16 @@
     const agentModelSearchInput=document.getElementById('agentModelSearchInput');
     const agentModelCountBadge=document.getElementById('agentModelCountBadge');
     const agentModelInput=document.getElementById('agentLlmModel');
-    let cachedAgentModels=[];
+    const agentModelOptions=agentModelInput.list;
     const agentProtocolLabels={responses:'Responses API',chat_completions:'Chat Completions',anthropic_messages:'Anthropic Messages'};
 
     function renderAgentModelPickerList(filterText=''){
         if(!agentModelPickerList)return;
-        const currentModel=(agentModelInput?.value||'').trim();
+        const currentModel=agentModelInput.value.trim();
         const search=filterText.trim().toLowerCase();
-        let models=cachedAgentModels;
+        const models=Array.from(agentModelOptions.options,option=>option.value);
         if(!models.length && currentModel){
-            models=[currentModel];
+            models.push(currentModel);
         }
         const filtered=search ? models.filter(m=>m.toLowerCase().includes(search)) : models;
         if(agentModelCountBadge){
@@ -266,11 +266,9 @@
             item.setAttribute('aria-selected',isSelected?'true':'false');
             item.innerHTML=`<span class="agent-model-name">${escapeHtml(modelName)}</span><span class="agent-model-picker-item-icon"><i data-lucide="${isSelected?'check':'chevron-right'}"></i></span>`;
             item.addEventListener('click',()=>{
-                if(agentModelInput){
-                    agentModelInput.value=modelName;
-                    agentModelInput.dispatchEvent(new Event('input',{bubbles:true}));
-                    agentModelInput.dispatchEvent(new Event('change',{bubbles:true}));
-                }
+                agentModelInput.value=modelName;
+                agentModelInput.dispatchEvent(new Event('input',{bubbles:true}));
+                agentModelInput.dispatchEvent(new Event('change',{bubbles:true}));
                 agentModelPickerModal.close();
                 if(window.showToast) window.showToast(`已选择模型: ${modelName}`, 'info', 2000);
             });
@@ -279,11 +277,12 @@
         window.renderLucideIcons?.(agentModelPickerList);
     }
 
-    openAgentModelPickerButton?.addEventListener('click',event=>{
+    function openAgentModelPicker(trigger){
         if(agentModelSearchInput) agentModelSearchInput.value='';
         renderAgentModelPickerList('');
-        agentModelPickerModal.open(event.currentTarget,{initialFocus:agentModelSearchInput});
-    });
+        agentModelPickerModal.open(trigger,{initialFocus:agentModelSearchInput});
+    }
+    openAgentModelPickerButton?.addEventListener('click',event=>openAgentModelPicker(event.currentTarget));
 
     agentModelSearchInput?.addEventListener('input', (e)=>{
         renderAgentModelPickerList(e.target.value);
@@ -327,9 +326,14 @@
         renderAgentModelCapabilities(null);
         setAgentModelState('配置已变化，请重新获取或测试','idle');
     });
-    bindDraftInvalidation([
-        ...form.querySelectorAll('[data-settings-panel="agent"] [data-key^="AGENT_LLM_"]'),
-    ],agentModelRequestGate);
+    bindDraftInvalidation([...form.querySelectorAll('[data-settings-panel="agent"] [data-key^="AGENT_LLM_"]')],{
+        invalidate(event){
+            if(['AGENT_LLM_API_URL','AGENT_LLM_API_KEY','AGENT_LLM_PROTOCOL'].includes(event.currentTarget.dataset.key)){
+                agentModelOptions.replaceChildren();
+            }
+            agentModelRequestGate.invalidate();
+        },
+    });
     fetchAgentModelsButton?.addEventListener('click',async event=>{
         const {base_url,api_key,clear_api_key,protocol}=getAgentModelDraft();
         if(!base_url){setAgentModelState('请先填写 API Base URL','error');form.querySelector('[data-key="AGENT_LLM_API_URL"]').focus();return;}
@@ -341,15 +345,12 @@
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'模型列表读取失败');
             if(!agentModelRequestGate.isCurrent(ticket))return;
-            cachedAgentModels=Array.isArray(data.models)?data.models:[];
-            const list=document.getElementById('agentLlmModelOptions');
-            if(list) list.replaceChildren(...cachedAgentModels.map(name=>{const option=document.createElement('option');option.value=name;return option;}));
-            setAgentModelState(`已读取 ${cachedAgentModels.length} 个模型${data.protocol?' · '+(agentProtocolLabels[data.protocol]||data.protocol):''}`,'success');
-            if(cachedAgentModels.length>0){
-                if(window.showToast) window.showToast(`已获取 ${cachedAgentModels.length} 个可用模型，请点选`, 'success', 2500);
-                if(agentModelSearchInput) agentModelSearchInput.value='';
-                renderAgentModelPickerList('');
-                agentModelPickerModal.open(agentModelActiveButton,{initialFocus:agentModelSearchInput});
+            const models=Array.isArray(data.models)?data.models:[];
+            agentModelOptions.replaceChildren(...models.map(name=>new Option(name,name)));
+            setAgentModelState(`已读取 ${models.length} 个模型${data.protocol?' · '+(agentProtocolLabels[data.protocol]||data.protocol):''}`,'success');
+            if(models.length>0){
+                if(window.showToast) window.showToast(`已获取 ${models.length} 个可用模型，请点选`, 'success', 2500);
+                openAgentModelPicker(agentModelActiveButton);
             }
         }catch(error){if(agentModelRequestGate.isCurrent(ticket)&&!isAbortError(error))setAgentModelState(error.message||'模型列表读取失败','error');}
         finally{if(agentModelRequestGate.finish(ticket)){setAgentModelActionsBusy(agentModelActiveButton,false);agentModelActiveButton=null;}}

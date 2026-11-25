@@ -756,6 +756,10 @@ def _reply_context(message: Any) -> dict[str, Any]:
     }}
 
 
+class _QueryAdmissionError(RuntimeError):
+    """可直接向发起人展示的 Telegram 查询受理失败原因。"""
+
+
 def _execute_query(
     bot: Any,
     telebot_module: Any,
@@ -766,36 +770,43 @@ def _execute_query(
     text: str,
     torrent: tuple[str, dict[str, Any]] | None = None,
 ) -> TurnView:
-    owner, session_id, thread_id = _session_for_source(chat_id, user_id, source)
-    if torrent is not None:
-        stored_session, file = torrent
-        if stored_session != session_id:
-            raise SelectionInvalidError("会话路由已变更，请重新发送种子。")
-        reference = {"artifact_id": file["id"], "name": file["name"], "size": file["size"]}
-        text += (
-            "\n\n可用 mf.cloud.resolve_offline(artifact_id=...) 读取当前会话的种子文件清单。\n"
-            + json.dumps(reference, ensure_ascii=False)
-        )
-    if not agent_rate_limiter.allow(
-        f"{owner}:telegram-kernel-query",
-        limit=_QUERY_LIMIT_PER_MINUTE,
-        window_seconds=60,
-    ):
-        raise RuntimeError("请求过于频繁，请稍后重试。")
-    event_key = hashlib.sha256(
-        f"{owner}\0{getattr(source, 'message_id', '')}\0{text}".encode()
-    ).hexdigest()
-    if not agent_rate_limiter.allow(
-        f"telegram-kernel-message:{event_key}",
-        limit=1,
-        window_seconds=300,
-    ):
-        raise RuntimeError("该消息已经处理，请勿重复发送。")
+    try:
+        owner, session_id, thread_id = _session_for_source(chat_id, user_id, source)
+        if torrent is not None:
+            stored_session, file = torrent
+            if stored_session != session_id:
+                raise SelectionInvalidError("会话路由已变更，请重新发送种子。")
+            reference = {"artifact_id": file["id"], "name": file["name"], "size": file["size"]}
+            text += (
+                "\n\n可用 mf.cloud.resolve_offline(artifact_id=...) 读取当前会话的种子文件清单。\n"
+                + json.dumps(reference, ensure_ascii=False)
+            )
+        if not agent_rate_limiter.allow(
+            f"{owner}:telegram-kernel-query",
+            limit=_QUERY_LIMIT_PER_MINUTE,
+            window_seconds=60,
+        ):
+            raise _QueryAdmissionError("请求过于频繁，请稍后重试。")
+        event_key = hashlib.sha256(
+            f"{owner}\0{getattr(source, 'message_id', '')}\0{text}".encode()
+        ).hexdigest()
+        if not agent_rate_limiter.allow(
+            f"telegram-kernel-message:{event_key}",
+            limit=1,
+            window_seconds=300,
+        ):
+            raise _QueryAdmissionError("该消息已经处理，请勿重复发送。")
 
-    from app.bot.agent_candidates import reply_selection_ref
+        from app.bot.agent_candidates import reply_selection_ref
 
-    runtime = get_agent_kernel_runtime()
-    candidate_context = asyncio.run(reply_selection_ref(runtime, owner=owner, session_id=session_id, message=source))
+        runtime = get_agent_kernel_runtime()
+        candidate_context = asyncio.run(reply_selection_ref(runtime, owner=owner, session_id=session_id, message=source))
+    except (_QueryAdmissionError, SelectionInvalidError):
+        raise
+    except Exception as exc:
+        logger.warning("Telegram Agent 查询受理失败 type=%s", type(exc).__name__)
+        raise _QueryAdmissionError("Agent 暂时无法接收该请求，请稍后重试。") from exc
+
     progress = TelegramProgress(
         bot,
         telebot_module,
@@ -823,38 +834,29 @@ def _execute_query(
                 cancellation=AGENT_CANCELLATION.get(),
             )
         ))
-        if view.approval is not None:
-            body = _render_approval_turn(view)
-            progress.finish_many(
-                split_telegram_html(body, limit=_MAX_MESSAGE),
-                reply_markup=_approval_markup(
-                    telebot_module,
-                    view.approval,
-                    owner=owner,
-                    session_id=session_id,
-                    message_thread_id=thread_id,
-                ),
+        body = _render_approval_turn(view) if view.approval else _render_turn(view)
+        chunks = list(filter(None, split_telegram_html(body, limit=_MAX_MESSAGE))) or ["Agent 未返回可显示的回答，请重试。"]
+        markup = None
+        candidates = dict(view.candidate_view or {})
+        if view.approval:
+            markup = _approval_markup(
+                telebot_module, view.approval, owner=owner, session_id=session_id, message_thread_id=thread_id,
             )
-        else:
-            chunks = split_telegram_html(_render_turn(view), limit=_MAX_MESSAGE) or ["Agent 未返回可显示的回答，请重试。"]
-            markup = None
-            candidates = dict(view.candidate_view or {})
-            if view.status in {"success", "partial"} and candidates.get("items") and (
-                candidates.get("recommended_positions") or candidates.get("explicit_selection") is True
-            ):
-                from app.bot.agent_candidates import render, start_draft
+        elif view.status in {"success", "partial"} and candidates.get("items") and (
+            candidates.get("recommended_positions") or candidates.get("explicit_selection") is True
+        ):
+            from app.bot.agent_candidates import render, start_draft
 
+            try:
                 draft = asyncio.run(start_draft(runtime, owner=owner, session_id=session_id, view=candidates))
-                body, markup = render(
-                    telebot_module,
-                    candidates,
-                    draft,
-                    owner=owner,
-                    session_id=session_id,
-                    message_thread_id=thread_id,
+                card, markup = render(
+                    telebot_module, candidates, draft, owner=owner, session_id=session_id, message_thread_id=thread_id,
                 )
-                chunks = [*chunks, body]
-            progress.finish_many(chunks, reply_markup=markup)
+            except Exception as exc:  # 候选卡独立于已完成的查询，正文仍须送达。
+                logger.warning("Telegram Agent 候选卡不可用 type=%s", type(exc).__name__)
+                card = "候选按钮暂不可用，请重新搜索后选择。"
+            chunks.append(card)
+        progress.finish_many(chunks, reply_markup=markup)
         return view
     except Exception:
         with suppress(Exception):
@@ -899,13 +901,10 @@ def handle_agent_message(
                     first_user_message=text,
                 ))
 
-    except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
-        if isinstance(exc, SelectionInvalidError) or (
-            isinstance(exc, RuntimeError) and ("频繁" in str(exc) or "重复" in str(exc))
-        ):
-            bot.reply_to(message, str(exc), **_thread_kwargs(message))
-        else:
-            logger.warning("Telegram Agent 请求失败 type=%s", type(exc).__name__)
+    except (_QueryAdmissionError, SelectionInvalidError) as exc:
+        bot.reply_to(message, str(exc), **_thread_kwargs(message))
+    except Exception as exc:  # 已开始的查询由进度消息收尾。
+        logger.warning("Telegram Agent 请求失败 type=%s", type(exc).__name__)
     return True
 
 

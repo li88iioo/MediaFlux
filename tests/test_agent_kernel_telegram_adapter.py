@@ -15,7 +15,7 @@ from app.agent.kernel.state_types import SessionBusyError
 from app.bot import agent_adapter as adapter
 from app.bot import agent_candidates
 from app.bot.telegram_markdown import telegram_html_text_length
-from tests.support import FakeTelegramBot, fake_telebot_types
+from tests.support import FakeTelegramBot, fake_telebot_types, isolated_test_database
 
 
 class Button:
@@ -326,23 +326,24 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
                 text, _ = agent_candidates.render(TELEBOT, {**view, "coverage_notice": coverage_notice}, draft)
                 self.assertEqual(text, baseline)
 
-    def _query_candidate_response(self, answer, candidates, *, status="success"):
+    def _query_candidate_response(self, answer, candidates, *, status="success", draft_error=None, approval=None):
         transport = FakeTelegramTransport(TurnView(
             session_id="tg_session", turn_id="turn-candidate-answer", request_id="candidate-answer",
-            status=status, answer=answer, error_message="索引站查询失败", candidate_view=candidates,
+            status=status, answer=answer, error_message="索引站查询失败", candidate_view=candidates, approval=approval,
         ))
         runtime = types.SimpleNamespace(telegram=transport, store=FakeStore())
         bot = FakeBot()
         access = self._patch_access()
         draft = {"handle": "ref_" + "x" * 24, "positions": candidates.get("recommended_positions", []),
                  "target": "guangya", "expanded": False, "phase": "select"}
-        with (access[0], access[1], access[2],
+        with (isolated_test_database(), access[0], access[1], access[2],
               patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime),
-              patch("app.bot.agent_candidates.start_draft", new=AsyncMock(return_value=draft)) as start):
+              patch("app.bot.agent_candidates.start_draft", new=AsyncMock(return_value=draft, side_effect=draft_error)) as start):
             self.assertTrue(adapter.handle_agent_message(
                 bot, TELEBOT, Message("仙逆完美世界有更新吗？4k的排除1080")))
         messages = [(text, kwargs) for text, _, _, kwargs in bot.edits]
         messages += [(text, kwargs) for _, text, kwargs in bot.sent]
+        messages += bot.replies
         return messages, start
 
     def test_no_recommendation_keeps_query_answer_without_download_keyboard(self):
@@ -375,6 +376,44 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertTrue(any("未找到匹配资源" in text for text, _ in messages))
         self.assertFalse(any(kwargs.get("reply_markup") for _, kwargs in messages))
         start.assert_not_called()
+
+    def test_candidate_draft_failure_preserves_completed_answer(self):
+        answer = "已核对媒体库，尚缺两集。"
+        candidates = {"items": [{"position": 1}], "recommended_positions": [1]}
+        for error in (adapter.SelectionInvalidError(), OSError("private storage detail")):
+            with self.subTest(error=type(error).__name__):
+                messages, start = self._query_candidate_response(answer, candidates, draft_error=error)
+                start.assert_awaited_once()
+                output = "\n".join(text for text, _ in messages)
+                self.assertEqual(output.count(answer), 1)
+                self.assertEqual(output.count("重新搜索"), 1)
+                self.assertNotIn("Agent 暂时无法完成", output)
+                self.assertNotIn("private storage detail", output)
+                self.assertFalse(any(kwargs.get("reply_markup") for _, kwargs in messages))
+
+    def test_empty_rendered_answer_or_no_chunks_gets_readable_receipt(self):
+        fallback = "Agent 未返回可显示的回答，请重试。"
+        for answer in ("", " \x00 "):
+            messages, _ = self._query_candidate_response(answer, {})
+            self.assertEqual([text for text, _ in messages].count(fallback), 1)
+        with patch.object(adapter, "split_telegram_html", return_value=()):
+            messages, _ = self._query_candidate_response("正文", {})
+        self.assertEqual([text for text, _ in messages].count(fallback), 1)
+
+    def test_multipart_approval_only_last_message_has_plan_buttons(self):
+        approval = ApprovalView(
+            plan_id="plan_1234567890abcdef", tool_name="resources.download", effect="WRITE",
+            preview={"data": {"receiving_folders": ["📂" * 240] * 3,
+                             "resources": [{"title": "🎞" * 180}] * 5, "effects": ["📦" * 180] * 4}},
+            result={}, expires_at="", confirmation={"action": "预览资源"},
+        )
+        messages, _ = self._query_candidate_response("", {}, status="approval_required", approval=approval)
+        parts = [(text, kwargs.get("reply_markup")) for text, kwargs in messages if text != "思考中…"]
+        self.assertGreater(len(parts), 1)
+        self.assertIn("等待确认", parts[0][0])
+        self.assertTrue(all(markup is None for _, markup in parts[:-1]))
+        self.assertIn("确认后才会执行", parts[-1][0])
+        self.assertIn("agk:c:" + approval.plan_id, [b.callback_data for b in parts[-1][1].buttons])
 
     def test_recommendation_is_appended_after_the_complete_answer(self):
         answer = "结论：完美世界有4K资源。\n" + "查询依据与版本说明。" * 700 + "\n完整回答结束。"
@@ -418,6 +457,25 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         with patch.object(adapter, "is_agent_enabled", return_value=False):
             self.assertFalse(adapter.handle_agent_message(bot, TELEBOT, Message()))
         self.assertEqual(bot.replies, [])
+
+    def test_query_admission_failure_replies_once_in_original_topic(self):
+        message = Message()
+        message.message_thread_id = 41
+        for dependency in ("app.modules.telegram_topic_routing.topic_mode_enabled",
+                           "app.bot.agent_adapter.get_agent_kernel_runtime"):
+            with self.subTest(dependency=dependency):
+                bot = FakeBot()
+                access, enabled, rate = self._patch_access()
+                with (isolated_test_database(), access, enabled, rate,
+                      patch(dependency, side_effect=RuntimeError("private storage detail")) as refused):
+                    self.assertTrue(adapter.handle_agent_message(bot, TELEBOT, message))
+                refused.assert_called_once()
+                self.assertEqual(len(bot.replies), 1)
+                text, kwargs = bot.replies[0]
+                self.assertEqual(kwargs["message_thread_id"], 41)
+                self.assertIn("重试", text)
+                self.assertNotIn("private", text)
+                self.assertEqual((bot.edits, bot.sent), ([], []))
 
     def test_stream_display_toggle_keeps_progress_and_final_reply(self):
         for enabled in (True, False):

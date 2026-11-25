@@ -667,6 +667,71 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
 
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_web_skip_supersedes_first_action_card_at_essential_level(self, sender, editor):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.modules.organize_confirmations import publish_confirmation_event
+        from app.routes import logs_api
+
+        app = FastAPI()
+        app.include_router(logs_api.router)
+        editor.return_value = TelegramSendResult(ok=True, message_id=91)
+        with (
+            patch.object(logs_api, "require_api_login"), TestClient(app) as client,
+            self._agent_switches(notification_level="essential"),
+        ):
+            for phase, final_status in (
+                ("queued", "suppressed"), ("sending", "sent"),
+                ("retry_wait", "suppressed"), ("outcome_unknown", "outcome_unknown"),
+            ):
+                with self.subTest(phase=phase):
+                    token = f"essential-skip-{phase}"
+                    organize_confirmations_repo.create_organize_confirmation(
+                        token=token, fingerprint=token, chat_id="100", source_name="来源", directory_path="/剧集",
+                        payload={"allow_skip_terminal": True, "files": [{"file_id": token}]},
+                        expires_at="2099-01-01 00:00:00",
+                    )
+                    key = notification_thread_event_key(
+                        f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+                    )
+
+                    def skip():
+                        response = client.post("/api/logs/organize/confirmations/skip", json={"confirmation_ids": [token]})
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(response.json()["skipped"], 1)
+
+                    def send(*args, **kwargs):
+                        if phase == "sending":
+                            skip()  # 消息已发出，Telegram 的消息 ID 尚未回到 outbox。
+                        if phase == "retry_wait":
+                            return TelegramSendResult(False, status_code=429, retry_after_seconds=60)
+                        if phase == "outcome_unknown":
+                            return TelegramSendResult(False, error="ReadTimeout")
+                        return TelegramSendResult(ok=True, message_id=91)
+
+                    sender.reset_mock()
+                    editor.reset_mock()
+                    sender.side_effect = send
+                    action = NotificationEvent("待确认", actions=(NotificationAction("跳过", f"orgc:{token}:skip"),))
+                    self.assertTrue(publish_confirmation_event(action, token=token, chat_id="100", deliver_now=phase != "queued"))
+                    if phase != "sending":
+                        skip()
+                    drain_telegram_notifications(event_key=key)
+                    row = get_notification(key)
+                    handoff = organize_confirmations_repo.get_organize_confirmation_delivery(token)
+                    assert row is not None and handoff is not None
+                    self.assertEqual((handoff["status"], row["status"], row["revision"]), ("sent", final_status, 2))
+                    self.assertEqual(deserialize_notification_event(row["event_json"]).actions, ())
+                    self.assertEqual(sender.call_count, int(phase != "queued"))
+                    self.assertEqual(editor.call_count, int(phase == "sending"))
+                    if phase == "sending":
+                        self.assertEqual(editor.call_args.kwargs["message_id"], 91)
+                        self.assertEqual(editor.call_args.args[0].actions, ())
+                    if phase == "outcome_unknown":
+                        self.assertEqual(row["delivered_revision"], 0)
+
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
     def test_newer_thread_revision_survives_prior_unknown_edit(
         self, sender, editor,
     ) -> None:

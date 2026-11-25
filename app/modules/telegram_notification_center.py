@@ -900,25 +900,20 @@ def _publish(
     existing = get_notification(key) if thread else None
     if update_existing_only and (not existing or not expected_revision):
         return NotificationPublishResult(False, status="invalid", event_key=key)
-    continuation = bool(
-        existing
-        and int(existing.get("message_id") or 0) > 0
-        and int(existing.get("delivered_revision") or 0) > 0
+    allowed = agent_interaction or agent_continuation or allows_notification(
+        normalized_importance, topic_enabled=topic_enabled,
     )
-    allowed = True
-    if not agent_interaction and not agent_continuation:
-        allowed = allows_notification(
-            normalized_importance, topic_enabled=topic_enabled,
-        )
-        if not allowed:
-            from app.modules.telegram_notification_policy import notifications_enabled
+    if not allowed and existing:
+        from app.modules.telegram_notification_policy import notifications_enabled
 
-            # 已经展示给用户的线程需要完成终态更新，避免 essential 等级下
-            # 候选按钮、错误或“等待后处理”永久停留。
-            allowed = (thread and continuation and notifications_enabled())
-        # 事实恢复沿原序列化、route 与 revision CAS 落盘，不等同于允许发送。
-        if not allowed and not update_existing_only:
-            return NotificationPublishResult(False, status="disabled")
+        # 首卡尚未取得回执也要替换旧内容。投递时按真实 message_id 决定
+        # 是否编辑已展示的卡；未展示的低等级结果仍按策略抑制。
+        allowed = notifications_enabled() and (
+            (topic_enabled and existing["status"] in {"pending", "retry_wait", "sending", "outcome_unknown"})
+            or (int(existing.get("message_id") or 0) > 0 and int(existing.get("delivered_revision") or 0) > 0)
+        )
+    if not allowed and not update_existing_only:
+        return NotificationPublishResult(False, status="disabled")
     try:
         if event.actions:
             valid_actions = _normalized_actions(event.actions)
