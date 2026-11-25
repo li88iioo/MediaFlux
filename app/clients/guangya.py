@@ -724,6 +724,37 @@ def _read_page_has_more(
     return bool(count) if page_size is None else count >= page_size
 
 
+@dataclass
+class _ListingProgress:
+    """一次完整清单读取的总数、唯一条目数及下一页游标。"""
+
+    label: str
+    error: type[RuntimeError] = RuntimeError
+    total: int | None = None
+    seen: int = 0
+    cursor: str = ""
+
+    def advance(self, response, *, count: int, seen: int, page_size: int, use_cursor: bool = False) -> bool:
+        data = response.get("data", response) if isinstance(response, dict) else {}
+        total = data.get("total") if isinstance(data, dict) else None
+        if type(total) is int and total >= 0:
+            if self.total is not None and total != self.total:
+                raise self.error(f"{self.label}分页总数发生变化，列表不完整")
+            self.total = total
+        more = _read_page_has_more(response, count=count, seen=seen, page_size=page_size, known_total=self.total)
+        if self.seen == seen and (count or more):
+            raise self.error(f"{self.label}分页未推进，列表不完整")
+        if not more and self.total is not None and seen != self.total:
+            raise self.error(f"{self.label}分页条目数与总数不一致，列表不完整")
+        if more and use_cursor:
+            next_cursor = str(data.get("cursor") or "") if isinstance(data, dict) else ""
+            if self.cursor and (not next_cursor or self.cursor == next_cursor):
+                raise self.error(f"{self.label}游标未推进，列表不完整")
+            self.cursor = next_cursor
+        self.seen = seen
+        return more
+
+
 def _validate_write_response(response, *, operation: str) -> None:
     """识别光鸭在 HTTP 200 中返回的业务失败。
 
@@ -2408,6 +2439,7 @@ class GuangYaClient:
         page = 0
         yielded = 0
         seen_ids: set[str] = set()
+        progress = _ListingProgress("光鸭回收站")
         while True:
             response = self._call_read(
                 "list_recycle",
@@ -2420,7 +2452,6 @@ class GuangYaClient:
             if metrics is not None:
                 metrics.record_page()
             items = self._extract_list(response)
-            new_count = 0
             for raw_item in items:
                 item = _to_file(raw_item)
                 if item.file_id and item.file_id in seen_ids:
@@ -2432,12 +2463,8 @@ class GuangYaClient:
                 if item.file_id:
                     seen_ids.add(item.file_id)
                 yielded += 1
-                new_count += 1
                 yield item
-            has_more = _read_page_has_more(response, count=len(items), seen=yielded, page_size=safe_page_size)
-            if new_count == 0 and (items or has_more):
-                raise RuntimeError("光鸭回收站分页未推进，已停止读取")
-            if not has_more:
+            if not progress.advance(response, count=len(items), seen=yielded, page_size=safe_page_size):
                 return
             page += 1
 
@@ -2610,46 +2637,32 @@ class GuangYaClient:
         access_token = self._extract_share_token(token_resp)
         if not access_token:
             raise RuntimeError(self._extract_message(token_resp) or "分享链接无效或提取码错误")
-        files: list[dict] = []
-        seen: set[str] = set()
-        cursor = ""
-        has_more = False
+        files: dict[str, dict] = {}
+        progress = _ListingProgress("光鸭分享文件")
         for page in range(1, max_pages + 1):
             response = Raw._public_post(
                 "https://api.guangyapan.com/nd.bizuserres.s/v1/get_share_page_files_list",
-                {"accessToken": access_token, "parentId": "", "cursor": cursor,
+                {"accessToken": access_token, "parentId": "", "cursor": progress.cursor,
                  "pageSize": page_size, "orderBy": 0, "sortType": 0},
-            ) if cursor else Raw.share_files_list(
+            ) if progress.cursor else Raw.share_files_list(
                 access_token, page=page, page_size=page_size,
             )
             raw_files = self._extract_list(response)
-            new_count = 0
             for raw in raw_files:
                 item = self._to_share_file(raw)
                 if not item["id"]:
                     raise RuntimeError("光鸭分享文件缺少标识，无法建立完整快照")
-                if item["id"] not in seen:
-                    seen.add(item["id"])
-                    files.append(item)
-                    new_count += 1
-            has_more = _read_page_has_more(response, count=len(raw_files), seen=len(files), page_size=page_size)
-            if new_count == 0 and (raw_files or has_more):
-                raise RuntimeError("光鸭分享文件分页未推进，列表不完整")
-            if not has_more:
+                files.setdefault(item["id"], item)
+            if not progress.advance(response, count=len(raw_files), seen=len(files), page_size=page_size, use_cursor=True):
                 break
-            payload = response.get("data") if isinstance(response, dict) else None
-            next_cursor = str(payload.get("cursor") or "") if isinstance(payload, dict) else ""
-            if cursor and (not next_cursor or next_cursor == cursor):
-                raise RuntimeError("光鸭分享文件游标未推进，列表不完整")
-            cursor = next_cursor
         else:
             raise RuntimeError("光鸭分享文件达到安全分页上限，未返回不完整快照")
         return ({
             "share_id": share_id,
             "code_required": bool(code),
-            "files": files,
+            "files": list(files.values()),
             "count": len(files),
-            "has_more": has_more,
+            "has_more": False,
         }, access_token)
 
     def restore_share(self, access_token: str, file_ids: list[str],
@@ -2782,8 +2795,8 @@ class GuangYaClient:
         safe_limit = max(1, min((max_items or 2_000), 10_000))
         page_size = 100
         page = 0
-        result: list[dict] = []
-        seen: set[str] = set()
+        result: dict[str, dict] = {}
+        progress = _ListingProgress("光鸭分享")
         while True:
             response = self._call_read(
                 "list_user_shares",
@@ -2796,10 +2809,7 @@ class GuangYaClient:
             if metrics is not None:
                 metrics.record_page()
             items = self._extract_list(response)
-            new_count = 0
             for item in items:
-                if not isinstance(item, dict):
-                    continue
                 share_id = str(
                     item.get("id")
                     or item.get("shareId")
@@ -2815,20 +2825,13 @@ class GuangYaClient:
                         default=str,
                     ).encode("utf-8")
                 ).hexdigest()
-                if identity in seen:
-                    continue
-                if len(result) >= safe_limit:
+                result.setdefault(identity, dict(item))
+                if len(result) > safe_limit:
                     raise RuntimeError(
                         f"光鸭分享数量超过安全上限 {safe_limit}，已停止读取"
                     )
-                seen.add(identity)
-                result.append(dict(item))
-                new_count += 1
-            has_more = _read_page_has_more(response, count=len(items), seen=len(result), page_size=page_size)
-            if new_count == 0 and (items or has_more):
-                raise RuntimeError("光鸭分享分页未推进，已停止读取")
-            if not has_more:
-                return result
+            if not progress.advance(response, count=len(items), seen=len(result), page_size=page_size):
+                return list(result.values())
             page += 1
 
     def create_user_share(
@@ -2990,20 +2993,19 @@ class GuangYaClient:
             return {**receipt, "ok": False, "status": "outcome_unknown",
                     "error": "光鸭分享操作结果未知，请先查询分享列表，勿重复提交"}
         if revoke:
-            remaining = {item["share_id"] for item in expected}
+            selected = {item["share_id"] for item in expected}
             for attempt in range(20):
                 try:
                     current = self.user_share_snapshot()
                     if current["credential_generation"] != snapshot["credential_generation"]:
                         break
-                    remaining &= {item["share_id"] for item in current["items"]}
+                    receipt["verified"] = selected.isdisjoint(item["share_id"] for item in current["items"])
                 except Exception:
                     break  # 撤销已受理，回读失败仍须保留原受理回执。
-                if not remaining:
+                if receipt["verified"]:
                     break
                 if attempt < 19:
                     sleep(0.5)
-            receipt["verified"] = not remaining
         receipt["verification_pending"] = not receipt["verified"]
         return {**receipt, "ok": True, "status": "completed" if receipt["verified"] else "accepted"}
 
@@ -3227,12 +3229,12 @@ class GuangYaClient:
         tasks: list[dict] = []
         seen_ids: set[str] = set()
         seen_pages: set[tuple[str, ...]] = set()
-        cursor = ""
+        progress = _ListingProgress("光鸭离线任务", IncompleteOfflineTaskListError)
         for page in range(max_pages):
             res = self._call_read(
                 "list_offline_tasks",
                 # 新接口忽略 page，需要沿服务端 cursor 翻页；没有 cursor 的旧响应保留页码协议。
-                lambda page=page, cursor=cursor: self.raw.request(
+                lambda page=page, cursor=progress.cursor: self.raw.request(
                     "https://api.guangyapan.com/nd.bizcloudcollection.s/v1/list_task",
                     method="POST",
                     json={"cursor": cursor, "pageSize": page_size, "status": status_filter},
@@ -3243,7 +3245,6 @@ class GuangYaClient:
             )
             items = self._extract_list(res)
             page_keys: list[str] = []
-            new_count = 0
             for position, item in enumerate(items):
                 normalized = self._to_offline_task(item)
                 identity = str(normalized.get("id") or "").strip()
@@ -3255,21 +3256,12 @@ class GuangYaClient:
                     continue
                 seen_ids.add(key)
                 tasks.append(normalized)
-                new_count += 1
             signature = tuple(page_keys)
-            has_more = _read_page_has_more(res, count=len(items), seen=len(tasks), page_size=page_size)
-            if (not items and has_more) or (items and (signature in seen_pages or new_count == 0)):
-                raise IncompleteOfflineTaskListError(
-                    "光鸭离线任务分页未推进，列表不完整"
-                )
+            if signature and signature in seen_pages:
+                raise IncompleteOfflineTaskListError("光鸭离线任务分页未推进，列表不完整")
             seen_pages.add(signature)
-            if not has_more:
+            if not progress.advance(res, count=len(items), seen=len(tasks), page_size=page_size, use_cursor=True):
                 break
-            payload = res.get("data") if isinstance(res, dict) else None
-            next_cursor = str(payload.get("cursor") or "") if isinstance(payload, dict) else ""
-            if cursor and (not next_cursor or next_cursor == cursor):
-                raise IncompleteOfflineTaskListError("光鸭离线任务游标未推进，列表不完整")
-            cursor = next_cursor
         else:
             raise IncompleteOfflineTaskListError(
                 "光鸭离线任务达到安全分页上限，列表不完整"

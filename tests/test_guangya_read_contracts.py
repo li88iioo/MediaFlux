@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import cast
+from typing import Any, cast
 import unittest
 from copy import deepcopy
 from unittest import mock
@@ -68,19 +68,31 @@ class GuangYaReadContractTests(unittest.TestCase):
                 self.assertEqual(GuangYaClient._extract_list({"data": {key: [item]}}), [item])
 
     def test_short_pages_with_remaining_total_are_not_truncated(self):
-        for method, sdk in (("list_dir", "fs_files"), ("list_recycle", "fs_recycle_files"), ("list_user_shares", "share_user_list")):
+        for method, sdk in (
+            ("list_dir", "fs_files"), ("list_recycle", "fs_recycle_files"),
+            ("list_user_shares", "share_user_list"), ("list_offline_tasks", "cloud_task_list"),
+        ):
             client = ReadClient(None)
-            records = [
-                {"fileId": "1", "fileName": "one", "shareId": "share-1"},
-                {"fileId": "2", "fileName": "two", "shareId": "share-2"},
+            pages: list[dict[str, Any]] = [
+                {"data": {"list": [{"fileId": n, "fileName": n, "shareId": n, "taskId": n}]}}
+                for n in ("a", "b", "c")
             ]
-            getattr(client.raw, sdk).side_effect = [
-                {"msg": "success", "data": {"total": 2, "list": [row]}}
-                for row in records
-            ]
+            pages[0]["data"]["total"] = 3
+            getattr(client.raw, sdk).side_effect = pages
             with self.subTest(method=method):
-                self.assertEqual(len(getattr(client, method)()), 2)
-                self.assertEqual(getattr(client.raw, sdk).call_count, 2)
+                self.assertEqual(len(getattr(client, method)()), 3)
+                self.assertEqual(getattr(client.raw, sdk).call_count, 3)
+
+    def test_offline_task_list_rejects_a_contradictory_total_or_premature_end(self):
+        for metadata in ({"total": 2}, {"hasMore": False}):
+            with self.subTest(metadata=metadata):
+                client = ReadClient(None)
+                client.raw.cloud_task_list.side_effect = [
+                    {"data": {"total": 3, "list": [{"taskId": "a"}]}},
+                    {"data": {**metadata, "list": [{"taskId": "b"}]}},
+                ]
+                with self.assertRaises(IncompleteOfflineTaskListError):
+                    client.list_offline_tasks()
 
     def test_directory_page_size_tracks_the_read_budget(self):
         for limit, size in ((None, 1000), (0, 2), (1, 2), (17, 18), (999, 1000), (100000, 1000)):
@@ -512,19 +524,20 @@ class GuangYaReadContractTests(unittest.TestCase):
         raw.share_access_token.return_value = {"data": {"accessToken": "private-token"}}
         raw.share_files_list.return_value = {"msg": "success", "data": {
             "list": [{"fileId": f"f{i}", "fileName": str(i)} for i in range(200)],
-            "total": 201, "cursor": "next",
+            "total": 202, "cursor": "next",
         }}
-        raw._public_post.return_value = {"msg": "success", "data": {
-            "list": [{"fileId": "f200", "fileName": "last"}], "total": 201,
-        }}
+        raw._public_post.side_effect = [
+            {"data": {"list": [{"fileId": "f200", "fileName": "middle"}], "cursor": "last"}},
+            {"data": {"list": [{"fileId": "f201", "fileName": "last"}]}},
+        ]
         with mock.patch("app.clients.guangya._load_raw", return_value=raw):
             result = ReadClient(None).inspect_share("https://www.guangyapan.com/s/public_test")
-            self.assertEqual(result["count"], 201)
-            self.assertEqual(result["files"][-1]["id"], "f200")
+            self.assertEqual(result["count"], 202)
+            self.assertEqual(result["files"][-1]["id"], "f201")
             self.assertEqual(result["access_token"], "private-token")
             self.assertFalse(result["has_more"])
             raw.share_access_token.assert_called_once()
-            self.assertEqual(raw._public_post.call_args.args[1]["cursor"], "next")
+            self.assertEqual([call.args[1]["cursor"] for call in raw._public_post.call_args_list], ["next", "last"])
             with self.assertRaisesRegex(RuntimeError, "分页上限"):
                 ReadClient(None).inspect_share("https://www.guangyapan.com/s/public_test", max_pages=1)
 

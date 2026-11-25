@@ -633,6 +633,30 @@ class GuangYaShareServiceTests(unittest.TestCase):
             self.assertEqual(created["status"], "completed")
             self.assertTrue(sdk.cloud.revoke_share(["10001"])["verified"])
 
+    def test_batch_revoke_requires_one_snapshot_without_any_selected_share(self):
+        for converges, expected_status, expected_reads in (
+            (False, "accepted", 20), (True, "completed", 3),
+        ):
+            with self.subTest(converges=converges):
+                client = _ShareClient()
+                first = client.shares[0]
+                second = {**first, "id": "20002", "shareId": "share-2"}
+                selected = ["10001", "20002"]
+                snapshots = [[first, second], [first, second], [first], [second]]
+                snapshots += [[]] if converges else [[second]] * 18
+                with (
+                    mock.patch("app.clients.guangya.GuangYaClient", return_value=client),
+                    mock.patch("app.clients.guangya.sleep"),
+                    mock.patch.object(client, "list_user_shares", side_effect=snapshots) as read,
+                    mock.patch.object(client, "delete_user_shares", return_value=True) as delete,
+                ):
+                    receipt = sdk.cloud.revoke_share(selected)
+                delete.assert_called_once_with(selected)
+                self.assertEqual(receipt["status"], expected_status)
+                self.assertEqual(receipt["verified"], converges)
+                self.assertEqual(receipt["verification_pending"], not converges)
+                self.assertEqual(read.call_count - 2, expected_reads)
+
     def test_create_share_does_not_expose_untrusted_provider_url_or_code(self):
         client = _ShareClient()
         client.create_response = {"code": 200, "data": {

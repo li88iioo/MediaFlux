@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app import database as db
-from app.clients.guangya import GuangYaFile
+from app.clients.guangya import GuangYaFile, GuangYaReadRejected
 from app.config import web_credentials
 from app.main import create_app
 from app.modules.directory_scrape_errors import DirectoryScrapePublicError
@@ -21,21 +21,21 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
     def setUp(self):
         # TestClient不启动应用lifespan，审计写入必须显式使用已初始化的隔离库。
         self.enterContext(isolated_test_database("guangya-direct-delete.db"))
-        self.provider = Mock()
-        self.provider.logged_in = True
+        self.provider = Mock(logged_in=True, credential_generation=1)
+        self.enterContext(patch("app.routes.guangya_api.read_guangya_credential_generation", return_value=1))
         self.provider.list_dir.return_value = [
             GuangYaFile(
-                "video", "Supergirl.2026.mkv", False, 1024, "etag-video", "root",
+                "video", " Supergirl.2026.mkv ", False, 1024, "etag-video", "root",
                 created_at=1_700_000_000, updated_at=1_700_000_100,
                 mime_type="video/x-matroska", extension="mkv",
             ),
             GuangYaFile("subtitle", "Supergirl.zh.srt", False, 128, "etag-subtitle", "root"),
-            GuangYaFile("junk", "广告.txt", False, 64, "etag-junk", "root", updated_at=77),
+            GuangYaFile("junk", " 广告.txt ", False, 64, "etag-junk", "root", updated_at=77),
             GuangYaFile("folder", "Season 1", True, 0, "etag-folder", "root", updated_at=88),
         ]
         infos = {
             "junk": GuangYaFile(
-                "junk", "广告.txt", False, 64, "etag-junk", "root", updated_at=77
+                "junk", " 广告.txt ", False, 64, "etag-junk", "root", updated_at=77
             ),
             "folder": GuangYaFile(
                 "folder", "Season 1", True, 0, "etag-folder", "root", updated_at=88
@@ -101,7 +101,7 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
     def _delete_payload(file_id: str, *, is_dir: bool = False) -> dict:
         return {
             "file_id": file_id,
-            "expected_name": "Season 1" if is_dir else "广告.txt",
+            "expected_name": "Season 1" if is_dir else " 广告.txt ",
             "expected_parent_id": "root",
             "expected_is_dir": is_dir,
             "expected_etag": "etag-folder" if is_dir else "etag-junk",
@@ -116,17 +116,17 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
 
         self.assertEqual(response.status_code, 200)
         rows = {item["name"]: item for item in response.json()}
-        self.assertTrue(rows["Supergirl.2026.mkv"]["is_video"])
+        self.assertTrue(rows[" Supergirl.2026.mkv "]["is_video"])
         self.assertFalse(rows["Supergirl.zh.srt"]["is_video"])
-        self.assertFalse(rows["广告.txt"]["is_video"])
+        self.assertFalse(rows[" 广告.txt "]["is_video"])
         self.assertFalse(rows["Season 1"]["is_video"])
-        self.assertEqual(rows["Supergirl.2026.mkv"]["etag"], "etag-video")
-        self.assertEqual(rows["Supergirl.2026.mkv"]["parent_id"], "root")
-        self.assertEqual(rows["Supergirl.2026.mkv"]["created_at"], 1_700_000_000)
-        self.assertEqual(rows["Supergirl.2026.mkv"]["updated_at"], 1_700_000_100)
-        self.assertEqual(rows["Supergirl.2026.mkv"]["mime_type"], "video/x-matroska")
-        self.assertEqual(rows["Supergirl.2026.mkv"]["extension"], "mkv")
-        self.assertEqual(rows["广告.txt"]["extension"], "txt")
+        self.assertEqual(rows[" Supergirl.2026.mkv "]["etag"], "etag-video")
+        self.assertEqual(rows[" Supergirl.2026.mkv "]["parent_id"], "root")
+        self.assertEqual(rows[" Supergirl.2026.mkv "]["created_at"], 1_700_000_000)
+        self.assertEqual(rows[" Supergirl.2026.mkv "]["updated_at"], 1_700_000_100)
+        self.assertEqual(rows[" Supergirl.2026.mkv "]["mime_type"], "video/x-matroska")
+        self.assertEqual(rows[" Supergirl.2026.mkv "]["extension"], "mkv")
+        self.assertEqual(rows[" 广告.txt "]["extension"], "txt")
 
     def test_directory_listing_hides_provider_error_from_response_and_logs(self):
         secret = "opaque-directory-provider-secret"
@@ -170,8 +170,14 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
                 self.assertEqual(response.status_code, 202)
                 self.assertEqual(response.json()["task_id"], f"delete-{file_id}")
                 args = self.manager.start_operation.call_args
-                self.assertEqual(args.args[:2], ("删除光鸭目录项", "Season 1" if is_dir else "广告.txt"))
-                self.assertEqual(args.kwargs["dedupe_key"], f"guangya-direct-delete:{file_id}")
+                self.assertEqual(args.args[:2], ("删除光鸭目录项", "Season 1" if is_dir else " 广告.txt "))
+                repeated = self.client.post(
+                    "/api/guangya/delete-item", json=self._delete_payload(file_id, is_dir=is_dir), headers=self.headers,
+                )
+                self.assertEqual(repeated.status_code, 202)
+                first_key = args.kwargs["dedupe_key"]
+                self.assertTrue(first_key)
+                self.assertEqual(first_key, self.manager.start_operation.call_args.kwargs["dedupe_key"])
 
                 result = self._scheduled_callback()()
                 self.assertTrue(result["ok"])
@@ -240,6 +246,8 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
         scenarios = (
             ("logged_out", {"logged_in": False}, "重新登录"),
             ("missing", {"file_info": None}, "已不存在"),
+            ("removed", {"failure": GuangYaReadRejected("file_info", code="149")}, "已不存在"),
+            ("relogin", {"credential_generation": 2}, "登录已变化"),
             (
                 "renamed",
                 {"file_info": GuangYaFile("junk", "新名称.txt", False, 64, "etag-junk", "root", updated_at=77)},
@@ -249,12 +257,15 @@ class GuangYaDirectDeleteApiTests(InitializedWebTestCase):
         for name, state, expected in scenarios:
             with self.subTest(name=name):
                 self.provider.logged_in = bool(state.get("logged_in", True))
-                if "file_info" in state:
+                self.provider.credential_generation = state.get("credential_generation", 1)
+                if "failure" in state:
+                    self.provider.file_info.side_effect = state["failure"]
+                elif "file_info" in state:
                     self.provider.file_info.side_effect = None
                     self.provider.file_info.return_value = state["file_info"]
                 else:
                     self.provider.file_info.side_effect = lambda key: {
-                        "junk": GuangYaFile("junk", "广告.txt", False, 64, "etag-junk", "root", updated_at=77)
+                        "junk": GuangYaFile("junk", " 广告.txt ", False, 64, "etag-junk", "root", updated_at=77)
                     }.get(key)
                 self.manager.start_operation.reset_mock()
                 self.manager.start_operation.return_value = {

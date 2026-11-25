@@ -2050,13 +2050,16 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
     return verified, None
 
 
-def _browser_file_info(client: GuangYaClient, file_id: str) -> GuangYaFile | None:
+def require_browser_item(client: GuangYaClient, file_id: str, label: str) -> GuangYaFile:
     try:
-        return client.file_info(file_id)
+        item = client.file_info(file_id)
     except GuangYaReadRejected as exc:
-        if exc.operation == "file_info" and exc.code == "149":
-            return None
-        raise
+        if exc.operation != "file_info" or exc.code != "149":
+            raise
+        item = None
+    if item is None or item.file_id != file_id:
+        raise DirectoryScrapeGoneError(f"{label}已不存在，请刷新目录")
+    return item
 
 
 def _validate_browser_target(client: GuangYaClient, target_dir_id: str, source_dir_id: str) -> None:
@@ -2068,9 +2071,7 @@ def _validate_browser_target(client: GuangYaClient, target_dir_id: str, source_d
             raise DirectoryScrapeConflictError("无法确认目标目录的父链，请刷新目录")
         if current_id == source_dir_id:
             raise DirectoryScrapeConflictError("不能把目录复制或移动到自身或其子目录")
-        folder = _browser_file_info(client, current_id)
-        if folder is None or folder.file_id != current_id:
-            raise DirectoryScrapeGoneError("目标目录或其父目录已不存在，请刷新目录")
+        folder = require_browser_item(client, current_id, "目标目录或其父目录")
         if not folder.is_dir:
             raise DirectoryScrapeConflictError("所选目标或其父级不是目录，请重新选择")
         if not source_dir_id:
@@ -2090,17 +2091,12 @@ def execute_browser_file_change(
     expected_name: str,
 ) -> dict[str, Any]:
     """持有统一 Writer 时复核浏览器选中的 ID，并执行和核验单步写入。"""
-    if not client.logged_in:
-        raise DirectoryScrapeStateError("光鸭未登录，请重新登录后再试")
-
     source = None
     source_dir_id = ""
     if operation == "mkdir":
         item: dict[str, Any] = {"op": "create_directory", "parent_id": target_dir_id, "name": name}
     else:
-        source = _browser_file_info(client, file_id)
-        if source is None or source.file_id != file_id:
-            raise DirectoryScrapeGoneError("源项目已不存在，请刷新目录")
+        source = require_browser_item(client, file_id, "源项目")
         if source.name != expected_name:
             raise DirectoryScrapeConflictError("源项目名称已变化，请刷新后重新选择")
         if source.parent_id != expected_parent_id:

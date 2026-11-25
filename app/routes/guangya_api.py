@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
@@ -18,7 +19,6 @@ from app.clients.guangya import (
 from app.logger import get_logger
 from app.modules.directory_scrape_errors import (
     DirectoryScrapeConflictError,
-    DirectoryScrapeGoneError,
     DirectoryScrapePublicError,
     DirectoryScrapeStateError,
     public_error_message,
@@ -200,7 +200,7 @@ def _browser_video_extensions() -> set[str]:
 
 
 def _browser_item(file: GuangYaFile, video_exts: set[str]) -> dict:
-    name_ext = file.name.rsplit(".", 1)[-1].lower() if not file.is_dir and "." in file.name else ""
+    name_ext = file.name.rstrip().rsplit(".", 1)[-1].lower() if not file.is_dir and "." in file.name else ""
     return {
         "file_id": file.file_id, "name": file.name, "is_dir": file.is_dir,
         "is_video": bool(name_ext) and name_ext in video_exts,
@@ -256,6 +256,29 @@ def list_dirs(request: Request, parent_id: str = "0"):
         close_guangya_client(c)
 
 
+def _start_browser_write(
+    label: str, reference: str, identity: tuple, run: Callable[[GuangYaClient], dict],
+) -> dict:
+    from app.modules.organize_tasks import get_organize_manager
+
+    generation = read_guangya_credential_generation()
+
+    def execute() -> dict:
+        client = GuangYaClient()
+        try:
+            if client.credential_generation != generation:
+                raise DirectoryScrapeStateError("光鸭登录已变化，请刷新目录后重试")
+            if not client.logged_in:
+                raise DirectoryScrapeStateError("光鸭未登录，请重新登录后再试")
+            return run(client)
+        finally:
+            close_guangya_client(client)
+
+    return get_organize_manager().start_operation(
+        label, reference, execute, dedupe_key=f"guangya-browser:{json.dumps((generation, *identity))}",
+    )
+
+
 @router.post("/delete-item")
 def delete_item(request: Request, data: dict | None = Body(default=None)):
     """把已确认的目录项删除提交到统一光鸭 Writer。"""
@@ -268,7 +291,7 @@ def delete_item(request: Request, data: dict | None = Body(default=None)):
     if file_id == "0":
         return JSONResponse({"error": "不能删除光鸭根目录"}, status_code=400)
 
-    expected_name = str(payload.get("expected_name") or "").strip()
+    expected_name = str(payload.get("expected_name") or "")
     expected_parent_id = str(payload.get("expected_parent_id") or "").strip()
     expected_etag = str(payload.get("expected_etag") or "").strip()
     expected_is_dir = payload.get("expected_is_dir")
@@ -279,71 +302,59 @@ def delete_item(request: Request, data: dict | None = Body(default=None)):
     except (TypeError, ValueError):
         return JSONResponse({"error": "删除项目版本无效"}, status_code=400)
 
-    def execute_delete() -> dict:
-        from app.modules.download_staging_cleanup import (
-            assert_guangya_download_delete_allowed,
-        )
+    def execute_delete(client: GuangYaClient) -> dict:
+        from app.modules.download_staging_cleanup import assert_guangya_download_delete_allowed
+        from app.modules.guangya_fs_change import require_browser_item
         from app.modules.organize_delete_audit import (
             DeleteCandidate,
             execute_recycle_bin_delete,
             record_blocked_delete,
         )
 
-        client = GuangYaClient()
+        item = require_browser_item(client, file_id, "项目")
+        if expected_name and item.name != expected_name:
+            raise DirectoryScrapeConflictError("项目名称已变化，请刷新后重新确认")
+        if expected_parent_id and item.parent_id != expected_parent_id:
+            raise DirectoryScrapeConflictError("项目所在目录已变化，请刷新后重新确认")
+        if expected_is_dir is not None and item.is_dir is not expected_is_dir:
+            raise DirectoryScrapeConflictError("项目类型已变化，请刷新后重新确认")
+        if expected_etag and (item.etag or "") != expected_etag:
+            raise DirectoryScrapeConflictError("项目版本已变化，请刷新后重新确认")
+        if expected_updated_at and (item.updated_at or 0) != expected_updated_at:
+            raise DirectoryScrapeConflictError("项目更新时间已变化，请刷新后重新确认")
+        candidate = DeleteCandidate(
+            file_id=file_id,
+            name=item.name,
+            parent_id=item.parent_id,
+            size=max(0, (item.size or 0)),
+            gcid=(item.etag or ""),
+        )
         try:
-            if not client.logged_in:
-                raise DirectoryScrapeStateError("光鸭未登录，请重新登录后再试")
-            item = client.file_info(file_id)
-            if item is None:
-                raise DirectoryScrapeGoneError("项目已不存在，请刷新目录")
-            if expected_name and item.name != expected_name:
-                raise DirectoryScrapeConflictError("项目名称已变化，请刷新后重新确认")
-            if expected_parent_id and item.parent_id != expected_parent_id:
-                raise DirectoryScrapeConflictError("项目所在目录已变化，请刷新后重新确认")
-            if expected_is_dir is not None and item.is_dir is not expected_is_dir:
-                raise DirectoryScrapeConflictError("项目类型已变化，请刷新后重新确认")
-            if expected_etag and (item.etag or "") != expected_etag:
-                raise DirectoryScrapeConflictError("项目版本已变化，请刷新后重新确认")
-            if expected_updated_at and (item.updated_at or 0) != expected_updated_at:
-                raise DirectoryScrapeConflictError("项目更新时间已变化，请刷新后重新确认")
-            candidate = DeleteCandidate(
-                file_id=file_id,
-                name=item.name,
-                parent_id=item.parent_id,
-                size=max(0, (item.size or 0)),
-                gcid=(item.etag or ""),
+            assert_guangya_download_delete_allowed(client, item)
+        except DirectoryScrapeConflictError as exc:
+            record_blocked_delete(
+                trigger="web_direct_delete", reason=public_error_message(exc), candidate=candidate,
             )
-            try:
-                assert_guangya_download_delete_allowed(client, item)
-            except DirectoryScrapeConflictError as exc:
-                record_blocked_delete(
-                    trigger="web_direct_delete", reason=public_error_message(exc), candidate=candidate,
-                )
-                raise
-            audit = execute_recycle_bin_delete(
-                client,
-                trigger="web_direct_delete",
-                reason="用户已在 Web 目录浏览中确认移入回收站",
-                candidate=candidate,
-                safe_failure_message="光鸭删除项目失败，请稍后重试",
-            )
-            return {
-                "ok": True,
-                "file_id": file_id,
-                "is_dir": item.is_dir,
-                "audit_id": int(audit.get("audit_id") or 0),
-                "stats": {"deleted": 1},
-            }
-        finally:
-            close_guangya_client(client)
+            raise
+        audit = execute_recycle_bin_delete(
+            client,
+            trigger="web_direct_delete",
+            reason="用户已在 Web 目录浏览中确认移入回收站",
+            candidate=candidate,
+            safe_failure_message="光鸭删除项目失败，请稍后重试",
+        )
+        return {
+            "ok": True,
+            "file_id": file_id,
+            "is_dir": item.is_dir,
+            "audit_id": int(audit.get("audit_id") or 0),
+            "stats": {"deleted": 1},
+        }
 
-    from app.modules.organize_tasks import get_organize_manager
-
-    result = get_organize_manager().start_operation(
-        "删除光鸭目录项",
-        expected_name or file_id,
+    result = _start_browser_write(
+        "删除光鸭目录项", expected_name or file_id,
+        ("delete", file_id, expected_parent_id, expected_name, expected_is_dir, expected_etag, expected_updated_at),
         execute_delete,
-        dedupe_key=f"guangya-direct-delete:{file_id}",
     )
     if not result.get("ok"):
         return JSONResponse(
@@ -362,7 +373,6 @@ def file_change(request: Request, data: dict | None = None):
         execute_browser_file_change,
         validate_fs_change_name,
     )
-    from app.modules.organize_tasks import get_organize_manager
 
     payload = data or {}
     operation = payload.get("operation")
@@ -395,27 +405,15 @@ def file_change(request: Request, data: dict | None = None):
             return JSONResponse({"error": "缺少源项目的父目录或名称，请刷新后重试"}, status_code=400)
         expected_parent_id = expected_parent_id.strip()
 
-    generation = read_guangya_credential_generation()
+    def execute(client: GuangYaClient) -> dict:
+        return execute_browser_file_change(
+            client, operation, target_dir_id=target_dir_id, name=name,
+            file_id=file_id, expected_parent_id=expected_parent_id, expected_name=expected_name,
+        )
 
-    def execute() -> dict:
-        client = GuangYaClient()
-        try:
-            if client.credential_generation != generation:
-                raise DirectoryScrapeStateError("光鸭登录已变化，请刷新目录后重试")
-            return execute_browser_file_change(
-                client, operation, target_dir_id=target_dir_id, name=name,
-                file_id=file_id, expected_parent_id=expected_parent_id, expected_name=expected_name,
-            )
-        finally:
-            close_guangya_client(client)
-
-    identity = json.dumps([
-        generation, operation, target_dir_id, file_id, expected_parent_id, expected_name, name,
-    ])
-    result = get_organize_manager().start_operation(
-        labels[operation], name or expected_name, execute,
-        dedupe_key=f"guangya-browser-file-change:{identity}",
-    )
+    result = _start_browser_write(labels[operation], name or expected_name, (
+        operation, target_dir_id, file_id, expected_parent_id, expected_name, name,
+    ), execute)
     return JSONResponse(result, status_code=202 if result.get("ok") else 409)
 
 

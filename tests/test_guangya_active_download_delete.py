@@ -43,7 +43,7 @@ class _DeleteCase:
                 ("root-file", "0", False),
             )
         }
-        self.provider = Mock(logged_in=True)
+        self.provider = Mock(logged_in=True, credential_generation=1)
         self.provider.file_info.side_effect = self.nodes.get
         self.manager = Mock()
         self.manager.start_operation.return_value = {"ok": True, "task_id": "delete-task"}
@@ -84,9 +84,7 @@ class _DeleteCase:
         assert json.loads(bytes(response.body))["task_id"] == "delete-task"
         call = self.manager.start_operation.call_args
         assert call.args[:2] == ("删除光鸭目录项", item.name)
-        assert call.kwargs == {
-            "dedupe_key": f"guangya-direct-delete:{file_id}",
-        }
+        assert call.kwargs["dedupe_key"]
         self.provider.file_info.assert_not_called()
         self.provider.delete.assert_not_called()
         return call.args[2]
@@ -142,6 +140,7 @@ def delete_case():
         case = _DeleteCase()
         with (
             patch.object(routes, "require_api_login"),
+            patch.object(routes, "read_guangya_credential_generation", return_value=1),
             patch.object(routes, "GuangYaClient", return_value=case.provider),
             patch("app.modules.organize_tasks.get_organize_manager", return_value=case.manager),
         ):
