@@ -55,6 +55,21 @@ def test_connection_uses_configured_snapshot_and_returns_complete_safe_identity(
     assert all(value not in serialized for value in ("jellyfin.internal", "jellyfin-secret-token", "must-not-leak"))
 
 
+@pytest.mark.parametrize("slot,product", [("jellyfin", "Jellyfin Server"), ("emby", "Emby")])
+def test_bridge_service_name_does_not_hide_the_reported_product(connection_backend, slot, product):
+    selected, payloads, calls = connection_backend
+    index = next(i for i, profile in enumerate(selected) if profile.server_type == slot)
+    selected[index] = replace(selected[index], url=f"http://{slot}:8096", enabled=True)
+    payloads[slot]["ProductName"] = product
+    payloads[slot]["ServerName"] = f"{slot}:8096"
+
+    result = sdk.library.connection(slot)
+    node = result["data"]["nodes"][0]
+    assert [url for url, _ in calls] == [f"http://{slot}:8096/System/Info"]
+    assert node["online"] and node["server_name"] is None
+    assert (result["status"], node["product"], node["product_name"]) == ("healthy", slot, product)
+
+
 @pytest.mark.parametrize("url,credential", [
     ("", "x"), ("file:///tmp/media", "x"), ("https://user:pass@emby.internal", "x"),
     ("https://emby.internal/base?next=/admin", "x"), ("https://emby.internal/base#fragment", "x"),

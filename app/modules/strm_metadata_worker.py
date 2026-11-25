@@ -139,13 +139,16 @@ class STRMMetadataWorker:
                             self._consumer_active = True
                         if recovered:
                             logger.warning("已恢复中断的 STRM 元数据任务 count=%s", recovered)
-                    if self._process_one():
+                    try:
+                        worked = self._process_one()
+                    finally:
+                        # 已落盘路径可以独立交接，即使后台下载的前置条件暂不可用。
+                        self._flush_media_refresh(force=False)
+                    if worked:
                         self._stop_event.wait(max(0, min(
                             get_int("STRM_METADATA_REQUEST_INTERVAL_MS", 0), 10000,
                         )) / 1000.0)
                         continue
-                    # 空闲刷新沿用配置节流，读取失败与处理失败共用轮询退避。
-                    self._flush_media_refresh(force=False)
                 except Exception:
                     logger.exception("STRM 元数据后台轮询异常")
                 self._wake_event.wait(timeout=5.0)
@@ -289,7 +292,6 @@ class STRMMetadataWorker:
                     self._consecutive_failures = 0
                     self._last_error_type = ""
                     self._completed_session += 1
-                self._flush_media_refresh(force=False)
             return True
         except _STRMStopped:
             strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
@@ -405,9 +407,7 @@ class STRMMetadataWorker:
             if self._last_refresh_at is None
             else max(0.0, now_mono - self._last_refresh_at)
         )
-        if self._refresh_retry_pending and not force and elapsed < interval:
-            return
-        if not force and len(entries) < batch_size and elapsed < interval:
+        if not force and elapsed < interval and (self._refresh_retry_pending or len(entries) < batch_size):
             return
         self._last_refresh_at = now_mono
         from app.modules.media_refresh_coordinator import (

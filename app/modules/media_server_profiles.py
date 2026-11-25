@@ -179,6 +179,7 @@ def capture_media_refresh_intents(*, allow_emby: bool = True) -> dict[str, Media
 
 
 _SLOT_LABELS = {"jellyfin": "Jellyfin 12", "emby": "Emby / Jellyfin 10.x"}
+_PUBLIC_PRODUCTS = frozenset({"jellyfin", "jellyfin server", "emby", "emby server"})
 _VERSION_RE = re.compile(r"^(?P<major>0|[1-9]\d{0,2})(?:\.\d{1,4}){0,3}$")
 _CONNECTION_LIMIT = threading.BoundedSemaphore(2)
 _FAILURES = {
@@ -205,9 +206,11 @@ def _valid_endpoint(profile: MediaServerProfile) -> bool:
         return False
 
 
-def _identity(value, profile, *, limit):
+def _identity(value, profile, *, limit, public_labels=()):
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
     text = " ".join("".join(" " if unicodedata.category(c).startswith("C") else c for c in text).split())
+    if text.casefold() in public_labels:
+        return text
     parsed = urlsplit(profile.url)
     forbidden = (profile.url, parsed.netloc, parsed.hostname, profile.credential)
     if (not text or "://" in text or text.startswith(("/", "\\")) or contains_sensitive_credential(text)
@@ -219,19 +222,17 @@ def _identity(value, profile, *, limit):
 def _compatibility(slot, product, major):
     if product == "unknown":
         return "review", "product_unrecognized"
-    if slot == "jellyfin":
-        if product == "emby" or major is not None and major <= 10:
-            return "wrong_slot", "use_legacy_slot"
-        if major is None:
-            return "review", "version_unrecognized"
-        return ("compatible", "jellyfin12_slot_compatible") if major >= 12 else ("review", "jellyfin_major_not_classified")
     if product == "emby":
-        return "compatible", "emby_legacy_slot_compatible"
+        return ("compatible", "emby_legacy_slot_compatible") if slot == "emby" else ("wrong_slot", "use_legacy_slot")
     if major is None:
         return "review", "version_unrecognized"
+    if major >= 12:
+        return ("compatible", "jellyfin12_slot_compatible") if slot == "jellyfin" else ("wrong_slot", "use_jellyfin12_slot")
+    if slot == "jellyfin" and major <= 10:
+        return "wrong_slot", "use_legacy_slot"
     if major == 10:
         return "compatible", "jellyfin10_legacy_slot_compatible"
-    return ("wrong_slot", "use_jellyfin12_slot") if major >= 12 else ("review", "jellyfin_major_not_classified")
+    return "review", "jellyfin_major_not_classified"
 
 
 def _connection_node(slot, profile=None):
@@ -281,7 +282,7 @@ def _probe_connection(profile: MediaServerProfile) -> dict[str, Any]:
         status, info = system_info_response(response.status_code, response.json)
         if info is not None:
             products = [name for key in ("ProductName", "Product")
-                        if (name := _identity(info.get(key), profile, limit=40))]
+                        if (name := _identity(info.get(key), profile, limit=40, public_labels=_PUBLIC_PRODUCTS))]
             hints = " ".join(products).casefold()
             product = "jellyfin" if "jellyfin" in hints else "emby" if "emby" in hints else "unknown"
             version = _identity(info.get("Version") or info.get("ServerVersion"), profile, limit=64)

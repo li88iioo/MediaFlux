@@ -1701,7 +1701,6 @@ class MediaServerClient:
                     "[%s] 媒体库 %s 超过精准枚举上限，改为定位物理根目录",
                     self.display_name, library_id,
                 )
-                oversized_item_listings.add(library_id)
                 try:
                     root_rows = self._library_root_items_with_paths(
                         library_id,
@@ -1709,27 +1708,19 @@ class MediaServerClient:
                             location for _target, location in library_targets_for_id
                         )),
                     )
-                except Exception:
+                except MediaLibraryEnumerationTooLarge:
                     root_rows = []
+                except Exception as exc:
+                    logger.warning("[%s] 读取媒体库 %s 物理根失败: %s", self.display_name, library_id, exc)
+                    failed_item_listings.add(library_id)
+                    continue
+                oversized_item_listings.add(library_id)
+                preferred_items = {}
                 root_items = {
                     self._media_path_key(item.get("Path")): item
                     for item in root_rows
                     if self._media_path_key(item.get("Path"))
                 }
-                for target, library_location in library_targets_for_id:
-                    root_item = root_items.get(self._media_path_key(library_location))
-                    root_id = str(
-                        root_item.get("Id") if isinstance(root_item, dict) else ""
-                    ).strip()
-                    if root_id:
-                        folder_targets[root_id] = {
-                            "library_id": library_id,
-                            "path": library_location,
-                        }
-                    else:
-                        library_targets.add(library_id)
-                    target_ids[target] = root_id or library_id
-                continue
             except Exception as exc:
                 logger.warning(
                     "[%s] 读取媒体库 %s 条目失败: %s",
@@ -1737,32 +1728,32 @@ class MediaServerClient:
                 )
                 failed_item_listings.add(library_id)
                 continue
+            else:
+                root_items = {}
+                for item in items:
+                    if str(item.get("Type") or "").strip().casefold() != "folder":
+                        continue
+                    item_path = self._normalize_media_path(item.get("Path"))
+                    item_id = str(item.get("Id") or "").strip()
+                    if item_path and item_id:
+                        root_items[self._media_path_key(item_path)] = item
 
-            root_items: dict[str, dict[str, Any]] = {}
-            for item in items:
-                if str(item.get("Type") or "").strip().casefold() != "folder":
-                    continue
-                item_path = self._normalize_media_path(item.get("Path"))
-                item_id = str(item.get("Id") or "").strip()
-                if item_path and item_id:
-                    root_items[self._media_path_key(item_path)] = item
-
-            # 映射命中时以映射的本地前缀为根；未配置任何映射时本机与媒体服务器同路径
-            # 空间，以媒体库目录为根；配置了映射却未命中的路径只在服务端可见，不判断删除。
-            presence = {
-                target: next((
-                    state for state in (
-                        self._local_presence(raw, local_root_for_source.get(raw) or (
-                            "" if self.path_mappings else location
-                        ))
-                        for raw in sources_for_target.get(target, [target])
-                    ) if state[0] != "unknown"
-                ), ("unknown", 0))
-                for target, location in library_targets_for_id
-            }
-            preferred_items = self._resolve_refresh_items(
-                items, (target for target, _location in library_targets_for_id), presence,
-            )
+                # 映射命中时以映射的本地前缀为根；未配置任何映射时本机与媒体服务器同路径
+                # 空间，以媒体库目录为根；配置了映射却未命中的路径只在服务端可见，不判断删除。
+                presence = {
+                    target: next((
+                        state for state in (
+                            self._local_presence(raw, local_root_for_source.get(raw) or (
+                                "" if self.path_mappings else location
+                            ))
+                            for raw in sources_for_target.get(target, [target])
+                        ) if state[0] != "unknown"
+                    ), ("unknown", 0))
+                    for target, location in library_targets_for_id
+                }
+                preferred_items = self._resolve_refresh_items(
+                    items, (target for target, _location in library_targets_for_id), presence,
+                )
             for target, library_location in library_targets_for_id:
                 matched_item = preferred_items.get(target)
                 item_id = str(

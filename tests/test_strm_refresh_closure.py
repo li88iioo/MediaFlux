@@ -321,6 +321,52 @@ def test_actual_client_partial_results_are_saved_on_original_run(tmp_path):
         assert claim_due_media_refreshes(owner="restart", force=True) == []
 
 
+def test_large_library_folder_read_failure_ends_refresh_without_scanning_other_roots(tmp_path):
+    from tests.test_deep_audit_media_chain import MediaEndpoint, Response, drain_refresh
+
+    root = tmp_path / strm.STRM_SUBDIR
+    endpoint = MediaEndpoint(root, series={"audit-library": root, "strm-root": root})
+    folder_available = False
+
+    def upstream_get(url, **kwargs):
+        if url.endswith("/Library/VirtualFolders"):
+            return Response([{"ItemId": "audit-library", "Name": "影视",
+                              "Locations": [str(root), "/archive"], "CollectionType": "movies"}])
+        assert url.endswith("/Items")
+        if kwargs["params"]["IncludeItemTypes"] == "Folder":
+            if not folder_available:
+                raise TimeoutError("读取媒体库目录超时")
+            return Response({"TotalRecordCount": 1, "Items": [
+                {"Id": "strm-root", "Type": "Folder", "Path": str(root)},
+            ]})
+        return Response({"TotalRecordCount": 100_001, "Items": [
+            {"Id": "another-movie", "Type": "Movie", "Path": "/archive/Other.strm"},
+        ]})
+
+    with isolated_test_database(), _providers("jellyfin", "emby"), patch.object(endpoint, "get", side_effect=upstream_get):
+        _run(tmp_path)
+        db.init_db()
+        drain_refresh(endpoint)
+        first = db.get_last_task_run("strm_sync")
+        assert first is not None and first["status"] == "success"
+        assert (root / "Film" / "Movie.strm").is_file()
+        assert (json.loads(first["result"])["media_refresh"], endpoint.provider_posts) == (
+            {"Jellyfin": "failed", "Emby": "failed"}, [],
+        )
+
+        folder_available = True
+        db.init_db()
+        assert claim_due_media_refreshes(owner="restart", force=True) == []
+        _run(tmp_path, tree=_tree(etag="changed"))
+        drain_refresh(endpoint)
+        latest = db.get_last_task_run("strm_sync")
+        assert latest is not None and latest["id"] != first["id"]
+        assert json.loads(latest["result"])["media_refresh"] == {"Jellyfin": "success", "Emby": "success"}
+        assert sorted(endpoint.provider_posts) == [
+            ("emby", "/Items/strm-root/Refresh"), ("jellyfin", "/Items/strm-root/Refresh"),
+        ]
+
+
 @pytest.mark.parametrize("remaining", [("jellyfin",), ()])
 def test_provider_disabled_before_failed_enqueue_recovery_reaches_terminal(tmp_path, remaining):
     enqueue = refresh.enqueue_media_refresh

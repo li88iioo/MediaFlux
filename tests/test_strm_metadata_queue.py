@@ -932,6 +932,36 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             self.worker.wake()
             self._assert_download_and_handoff()
 
+    def test_restart_hands_off_installed_video_while_metadata_client_is_unavailable(self):
+        from app.clients.guangya import GuangYaFile
+        from app.modules import strm
+        from app.repositories.media_refresh_queue import claim_due_media_refreshes
+
+        video = GuangYaFile("video", "Movie.mkv", False, 100, "v1", "parent")
+        cloud = _TreeClient({"parent": [video, self.remote]})
+        media_root = self.root / strm.STRM_SUBDIR
+        policy = strm_repo.StrmRefreshPolicy(media_root=str(media_root)).with_current_targets()
+        stats = strm.sync_strm(
+            "parent", "http://play.invalid", str(self.root), client=cast(GuangYaClient, cloud),
+            metadata_exts={"nfo"}, refresh_policy=policy,
+        )
+        pointer = media_root / "Movie.strm"
+        self.assertEqual((stats["generated"], stats["metadata_queued"]), (1, 1))
+        self.assertTrue(pointer.is_file())
+        self.assertEqual([entry["path"] for entry in strm_repo.list_strm_refresh_entries()], [str(pointer)])
+        db.init_db()
+
+        with patch.object(self.worker, "_runtime_client", side_effect=OSError("凭据文件暂不可读")):
+            self.worker.start()
+            self.assertTrue(self.backoff.wait(2))
+            job = strm_repo.list_strm_metadata_queue()[0]
+            self.assertEqual((job["status"], job["attempts"]), ("queued", 0))
+            self.download.assert_not_called()
+            self.assertEqual((strm_repo.count_strm_refresh_paths(), media_refresh_queue_status()["paths"]), (0, 1))
+            self.assertTrue(self.worker.stop(timeout=3))
+        groups = claim_due_media_refreshes(owner="media-worker", force=True)
+        self.assertEqual([(group["provider"], group["paths"]) for group in groups], [("jellyfin", [str(pointer)])])
+
     def test_startup_recovery_retries_before_claiming_or_flushing(self):
         restored = Event()
         recover = strm_repo.recover_stale_strm_metadata_jobs
