@@ -48,7 +48,7 @@ COPY app /app/app
 COPY --from=static-builder /out/ /app/app/static/
 COPY mediaflux.py /app/
 COPY packaging/scripts/docker-entrypoint.sh /usr/local/bin/mediaflux-entrypoint
-COPY packaging/scripts/generate_build_info.py /tmp/generate_build_info.py
+COPY packaging/scripts/generate_build_info.py /app/packaging/scripts/generate_build_info.py
 
 # 版本信息仅影响元数据层，不能让每次提交都重装系统包和 Python 依赖。
 ARG VERSION_REF=v0.0.0-dev
@@ -61,14 +61,14 @@ RUN case "${TARGETARCH:-amd64}" in \
       arm64) MEDIAFLUX_ARCH=aarch64 ;; \
       *) echo "unsupported Docker architecture: $TARGETARCH" >&2; exit 2 ;; \
     esac \
-    && python /tmp/generate_build_info.py \
+    && python /app/packaging/scripts/generate_build_info.py \
       --ref "$VERSION_REF" --commit "$GIT_SHA" \
       --platform linux --arch "$MEDIAFLUX_ARCH" --package docker \
       --output /app/app/_build_info.json \
     && chown -R root:root /app/app /app/mediaflux.py \
     && chmod -R a-w /app/app /app/mediaflux.py \
     && chmod 0444 /app/app/_build_info.json \
-    && rm -f /tmp/generate_build_info.py
+    && rm -f /app/packaging/scripts/generate_build_info.py
 
 RUN mkdir -p /app/db/cache /app/db/logs /data/strm \
     && chown -R mediaflux:mediaflux /app/db /data/strm \

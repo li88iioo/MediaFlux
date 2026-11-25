@@ -7,17 +7,16 @@ import json
 import os
 import re
 import tempfile
+import sys
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-PRERELEASE_IDENTIFIER = r"(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-SEMVER_RE = re.compile(
-    rf"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    rf"(?:-({PRERELEASE_IDENTIFIER}(?:\.{PRERELEASE_IDENTIFIER})*))?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-)
+# 此脚本也支持从仓库之外直接执行。
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from app.semver import version_order
+
 DOCKER_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
 @dataclass(frozen=True)
@@ -31,15 +30,11 @@ def normalize_version(ref: str, *, release: bool = True) -> str:
     if not value:
         if release: raise ValueError('正式构建必须提供版本 tag')
         return '0.0.0-dev'
-    match=SEMVER_RE.fullmatch(value)
-    if not match: raise ValueError(f'非法 SemVer tag：{ref}')
+    version_order(value)
     return value.removeprefix('v')
 
 def is_prerelease(version: str) -> bool:
-    normalized = normalize_version(version)
-    match = SEMVER_RE.fullmatch(normalized)
-    assert match is not None
-    return match.group(4) is not None
+    return not version_order(version).stable
 
 
 def docker_version_tag(version: str) -> str:
@@ -52,39 +47,9 @@ def docker_version_tag(version: str) -> str:
 
 def compare_versions(left: str, right: str) -> int:
     """按 SemVer precedence 比较两个版本，忽略 build metadata。"""
-    left_version = normalize_version(left)
-    right_version = normalize_version(right)
-    left_match = SEMVER_RE.fullmatch(left_version)
-    right_match = SEMVER_RE.fullmatch(right_version)
-    assert left_match is not None and right_match is not None
+    first, second = version_order(left), version_order(right)
+    return (first > second) - (first < second)
 
-    left_core = tuple(int(left_match.group(index)) for index in range(1, 4))
-    right_core = tuple(int(right_match.group(index)) for index in range(1, 4))
-    if left_core != right_core:
-        return 1 if left_core > right_core else -1
-
-    left_pre = left_match.group(4)
-    right_pre = right_match.group(4)
-    if left_pre is None or right_pre is None:
-        if left_pre == right_pre:
-            return 0
-        return 1 if left_pre is None else -1
-
-    left_parts = left_pre.split('.')
-    right_parts = right_pre.split('.')
-    for left_part, right_part in zip(left_parts, right_parts):
-        if left_part == right_part:
-            continue
-        left_numeric = left_part.isdigit()
-        right_numeric = right_part.isdigit()
-        if left_numeric and right_numeric:
-            return 1 if int(left_part) > int(right_part) else -1
-        if left_numeric != right_numeric:
-            return -1 if left_numeric else 1
-        return 1 if left_part > right_part else -1
-    if len(left_parts) == len(right_parts):
-        return 0
-    return 1 if len(left_parts) > len(right_parts) else -1
 
 def artifact_name(version: str, platform: str, arch: str, package: str) -> str:
     arch={'amd64':'x86_64','arm64':'aarch64'}.get(arch,arch)

@@ -48,7 +48,7 @@ class UpdateCheckTests(unittest.TestCase):
             },
         ]
         result = check_for_updates(
-            build=build(), machine="AMD64", opener=lambda *_a, **_k: FakeResponse(payload)
+            build=build(), opener=lambda *_a, **_k: FakeResponse(payload)
         )
         self.assertTrue(result.update_available)
         self.assertEqual(result.latest_version, "1.2.4")
@@ -66,6 +66,23 @@ class UpdateCheckTests(unittest.TestCase):
         )
         self.assertEqual(stable.latest_version, "1.9.9")
         self.assertEqual(preview.latest_version, "2.0.0-beta.1")
+
+    def test_update_channels_follow_release_tag_precedence(self) -> None:
+        payload = [
+            {"tag_name": "v3.0.0-01", "prerelease": True},
+            {"tag_name": "v2.0.0-RC.1", "prerelease": False},
+            {"tag_name": "v2.0.0-rc.1", "prerelease": False},
+            {"tag_name": "v1.9.9+build-test", "prerelease": False},
+        ]
+        for previews, expected in ((False, "1.9.9+build-test"), (True, "2.0.0-rc.1")):
+            with self.subTest(previews=previews):
+                result = check_for_updates(
+                    build=build("2.0.0-RC.1"), include_prerelease=previews,
+                    opener=lambda *_a, **_k: FakeResponse(payload),
+                )
+                self.assertEqual(result.latest_version, expected)
+                self.assertEqual(result.prerelease, previews)
+                self.assertEqual(result.update_available, previews)
 
     def test_stable_release_sorts_after_same_core_prerelease(self) -> None:
         payload = [
