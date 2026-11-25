@@ -615,6 +615,10 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         self.assertTrue(repeated.json()["review_required"])
         backend.assert_called_once()
 
+        [history] = client.get("/api/downloads/logs", params={"source": "guangya"}).json()["items"]
+        self.assertEqual((history["request_id"], history["status"]), (request_id, "manual_review"))
+        self.assertIn("长时间无法匹配", history["error"])
+        self.assertEqual(history["backend_task_id"], "")
         retry = client.post(f"/api/downloads/issues/{request_id}/resubmit", json={"target": "guangya"})
         self.assertEqual(retry.status_code, 200, retry.text)
         successor_id = retry.json()["request_id"]

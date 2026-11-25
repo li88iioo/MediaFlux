@@ -270,6 +270,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                 logs = download_requests_repo.list_download_logs()
                 self.assertEqual(len(logs), 1)
                 self.assertEqual((logs[0]["status"], logs[0]["error"]), ("failed", expected_error))
+                self.assertTrue(logs[0]["completed_at"])
                 self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
                 self.assertEqual(row["notification_delivery_status"], "sent")
                 self.assertEqual(build_download_lifecycle_event(row).footer, expected_error)
@@ -395,7 +396,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         )
         subscription_id = self._bind_admission(request_id)
         download_requests_repo.add_download_log(source="guangya", request_id=request_id)
-        download_requests_repo.add_download_log(source="qb", request_id=request_id)
+        download_requests_repo.add_download_log(source="qb", request_id=request_id, error="原 qB 回执说明")
         tasks = [
             GuangYaClient._to_offline_task({
                 "taskId": f"gy-{index}", "status": state, "errCode": code, "errMsg": message,
@@ -425,7 +426,8 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         logs = {log["source"]: log for log in download_requests_repo.list_download_logs()}
         self.assertEqual((logs["guangya"]["status"], logs["guangya"]["error"]),
                          ("manual_review", expected_error))
-        self.assertEqual((logs["qb"]["status"], logs["qb"]["error"]), ("downloading", ""))
+        self.assertEqual((logs["qb"]["status"], logs["qb"]["error"], logs["qb"]["completed_at"]),
+                         ("downloading", "原 qB 回执说明", None))
         self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
         self.assertEqual(len(media_subscriptions_repo.list_active_media_download_admissions(subscription_id)), 1)
         self.organize.assert_not_called()
@@ -438,7 +440,10 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                     targets="both" if qb_status else "guangya", qb_status=qb_status,
                     local_import_status="completed", gy_task_ids=task_ids, error=old_error,
                 )
-                download_requests_repo.add_download_log(source="guangya", request_id=request_id, error=old_error)
+                previous = download_requests_repo.add_download_log(
+                    source="guangya", request_id=request_id, status="failed", error="前一次提交失败",
+                )
+                latest = download_requests_repo.add_download_log(source="guangya", request_id=request_id, error=old_error)
                 tasks = self._gy_batch(2)
                 tasks[0].update(error_code="112", error="已完成任务的旧错误")
                 self.tracker._update_request(
@@ -450,7 +455,10 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                 self.assertEqual((row["status"], row["gy_status"], row["qb_status"]),
                                  ("completed", "completed", qb_status))
                 self.assertEqual(row["error"], expected_error)
-                self.assertEqual(download_requests_repo.list_download_logs()[0]["error"], "")
+                logs = {log["id"]: log for log in download_requests_repo.list_download_logs()}
+                self.assertEqual((logs[latest]["status"], logs[latest]["error"]), ("success", ""))
+                self.assertTrue(logs[latest]["completed_at"])
+                self.assertEqual((logs[previous]["status"], logs[previous]["error"]), ("failed", "前一次提交失败"))
                 self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
 
     def test_guangya_batch_without_id_list_cannot_collapse_to_one_terminal_task(self) -> None:

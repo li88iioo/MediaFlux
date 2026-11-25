@@ -6234,51 +6234,30 @@ class SecurityTests(InitializedWebTestCase):
     def test_download_tracker_marks_qb_error_state_failed(self):
         self.enterContext(isolated_test_database())
         tracker = DownloadTracker()
-        row = {
-            "id": 41,
-            "title": "Broken",
-            "status": "submitted",
-            "qb_status": "submitted",
-            "gy_status": "",
-            "qb_task_id": "hash-1",
-            "gy_task_id": "",
-            "source_value": "magnet:?xt=urn:btih:hash-1",
-            "organize_started": 0,
-            "chat_id": "chat",
-        }
-        task = SimpleNamespace(
-            hash="hash-1", name="Broken", progress=0.2, state="error"
+        task = SimpleNamespace(hash="hash-1", name="Broken", progress=0.2, state="error")
+        request_id, _ = download_requests_repo.create_download_request(
+            "broken-qb", "magnet", title=task.name, chat_id="chat",
         )
-        # 检查真实日志结果，不绑定私有函数是否显式传入默认参数。
+        download_requests_repo.update_download_request(
+            request_id, status="submitted", qb_status="submitted", qb_task_id=task.hash,
+        )
         download_requests_repo.add_download_log(
-            source="qb", title="Broken", request_id=41, error="qB 原有错误"
+            source="qb", title=task.name, request_id=request_id, error="qB 原有错误",
         )
-        with (
-            patch(
-                "app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}
-            ) as update,
-            patch("app.repositories.download_requests.update_download_request"),
-            patch(
-                "app.repositories.download_requests.claim_download_request_notification",
-                return_value={"token": "notice-41", "attempts": 0},
-            ),
-            patch(
-                "app.repositories.download_requests.finalize_download_request_notification",
-                return_value=True,
-            ),
-            patch(
-                "app.modules.download_tracker.DownloadTracker._publish_lifecycle"
-            ) as notify,
-        ):
-            tracker._update_request(row, [task], [])
-        self.assertEqual(update.call_args.kwargs["qb_status"], "failed")
-        self.assertEqual(update.call_args.kwargs["status"], "failed")
+        snapshot = download_requests_repo.get_download_request(request_id)
+        assert snapshot is not None
+        with patch.object(DownloadTracker, "_publish_lifecycle", return_value=True) as notify:
+            tracker._update_request(snapshot, [task], [])
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["qb_status"], row["status"], row["notification_delivery_status"]),
+                         ("failed", "failed", "sent"))
         log, = download_requests_repo.list_download_logs(source="qb")
         self.assertEqual((log["request_id"], log["status"], log["progress"], log["backend_task_id"]),
-                         (41, "failed", 0.2, "hash-1"))
+                         (request_id, "failed", 0.2, task.hash))
         self.assertEqual(log["error"], "qB 原有错误")
         self.assertTrue(log["completed_at"])
-        notify.assert_called_once()
+        notify.assert_called_once_with(request_id)
 
     def test_download_tracker_starts_organize_after_guangya_completion(self):
         tracker = DownloadTracker()

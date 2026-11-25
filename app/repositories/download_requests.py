@@ -82,21 +82,6 @@ def add_download_log(source: str, title: str = "", path: str = "",
         return cur.lastrowid
 
 
-def update_download_log(log_id: int, **fields) -> None:
-    allowed = {"status", "backend_task_id", "progress", "error", "completed_at", "path", "title"}
-    sets, values = [], []
-    for key, value in fields.items():
-        if key in allowed:
-            sets.append(f"{key}=?")
-            values.append(value)
-    if not sets:
-        return
-    sets.append("updated_at=?")
-    values.extend([db.now(), log_id])
-    with db.get_conn() as conn:
-        conn.execute(f"UPDATE download_log SET {', '.join(sets)} WHERE id=?", values)
-
-
 def _download_log_filters(source: str | None = None, status: str | None = None,
                           keyword: str = "") -> tuple[str, list]:
     sql = " WHERE 1=1"

@@ -154,10 +154,14 @@ class QbRemovalTrackingTests(unittest.TestCase):
             get_download_request_result_9 = download_requests_repo.get_download_request(request_id)
             assert get_download_request_result_9 is not None
             self.assertEqual(get_download_request_result_9["qb_status"], "downloading")
+            self.assertEqual(download_requests_repo.list_download_logs()[0]["status"], "downloading")
             tracker._update_request(download_requests_repo.get_download_request(request_id), [], [], qb_available=True)
         row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row["status"], row["qb_status"]), ("manual_review", "manual_review"))
+        [log] = download_requests_repo.list_download_logs()
+        self.assertEqual((log["status"], log["error"]), ("manual_review", row["error"]))
+        self.assertEqual((log["backend_task_id"], log["progress"]), ("a" * 40, 0.1))
         with patch("app.modules.telegram_download_lifecycle.get_notification_thread_event", return_value=None):
             event = build_download_lifecycle_event(row, probe_progress={})
         organize_status = dict(event.fields)["自动整理"]

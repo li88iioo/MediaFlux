@@ -330,9 +330,10 @@ class DownloadTracker:
             return _DEFAULT_MISSING_GRACE_SECONDS
 
     @classmethod
-    def _missing_expired(cls, value: object) -> bool:
-        raw = str(value or "").strip()
+    def _record_missing_and_check_expiry(cls, row, field: str, updates: dict[str, Any]) -> bool:
+        raw = str(row_value(row, field, "") or "").strip()
         if not raw:
+            updates[field] = db.now()
             return False
         try:
             started = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
@@ -348,27 +349,29 @@ class DownloadTracker:
         gy_tasks = gy_tasks if isinstance(gy_tasks, _GYTaskIndex) else _GYTaskIndex(gy_tasks)
         request_id = int(row["id"])
         updates: dict[str, Any] = {}
-        backend_logs: list[tuple[str, str, float, str]] = []
         qb_status = str(row["qb_status"] or "")
         gy_status = str(row["gy_status"] or "")
 
         matched_qb_task = None
         matched_gy_tasks = []
+        qb_progress = gy_progress = None
+        gy_log_task_id = None
+        qb_error = None
         gy_error = ""
         local_import_pending = str(
             row_value(row, "local_import_status", "") or ""
         ) in {"", "pending"}
         tracking_completed_qb = qb_status == "completed" and local_import_pending
-        if qb_status in {"submitted", "downloading", "outcome_unknown"} or tracking_completed_qb:
+        if qb_available and (qb_status in {"submitted", "downloading", "outcome_unknown"} or tracking_completed_qb):
             from app.modules.download_dispatcher import torrent_identity
 
             identity = str(row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
-            if qb_available and identity and not row_value(row, "qb_task_id", ""):
+            if identity and not row_value(row, "qb_task_id", ""):
                 updates["qb_task_id"] = identity
-            task = qb_tasks.by_hash.get(identity) if qb_available and identity else None
+            task = qb_tasks.by_hash.get(identity) if identity else None
             matched_qb_task = task
             if task:
-                progress = max(0.0, min(float(task.progress or 0), 1.0))
+                qb_progress = max(0.0, min(float(task.progress or 0), 1.0))
                 state = (task.state or "").strip().lower()
                 updates["qb_task_id"] = task.hash
                 updates["qb_task_missing_since"] = None
@@ -378,27 +381,20 @@ class DownloadTracker:
                     else:
                         updates["qb_status"] = (
                             "completed"
-                            if is_qb_torrent_complete(state, progress)
+                            if is_qb_torrent_complete(state, qb_progress)
                             else "downloading"
                         )
-                    backend_logs.append(("qb", updates["qb_status"], progress, task.hash))
-            elif (
-                not tracking_completed_qb
-                and qb_available
-                and identity
-            ):
-                missing_since = row_value(row, "qb_task_missing_since", "")
-                if not missing_since:
-                    updates["qb_task_missing_since"] = db.now()
-                elif self._missing_expired(missing_since):
+            elif not tracking_completed_qb:
+                if not identity:
+                    qb_error = (
+                        "qB 未返回可跟踪任务标识，且无法从原始资源恢复身份；"
+                        "请在下载器中核对，勿直接重复提交"
+                    )
+                elif self._record_missing_and_check_expiry(row, "qb_task_missing_since", updates):
+                    qb_error = "qB 后端任务长时间未找到，请核对下载器后人工处理"
+                if qb_error:
                     updates["qb_status"] = "manual_review"
-                    updates["error"] = "qB 后端任务长时间未找到，请核对下载器后人工处理"
-            elif not tracking_completed_qb and qb_available:
-                updates["qb_status"] = "manual_review"
-                updates["error"] = (
-                    "qB 未返回可跟踪任务标识，且无法从原始资源恢复身份；"
-                    "请在下载器中核对，勿直接重复提交"
-                )
+                    updates["error"] = qb_error
 
         if gy_available and gy_status in {"submitted", "downloading", "outcome_unknown"}:
             task_ids = self._parse_gy_task_ids(row)
@@ -409,7 +405,8 @@ class DownloadTracker:
                 progress_values = [
                     max(0.0, min(float(task.get("progress") or 0), 1.0)) for task in matched
                 ]
-                progress = sum(progress_values) / expected_batches if expected_batches else 0.0
+                gy_progress = sum(progress_values) / expected_batches if matched else None
+                gy_log_task_id = task_ids[0] if task_ids else None
                 if expected_batches > len(task_ids):
                     updates["gy_status"] = "manual_review"
                     gy_error = (
@@ -417,13 +414,10 @@ class DownloadTracker:
                         "请核对云端任务，勿直接重复提交"
                     )
                 elif len(matched) < expected_batches:
-                    missing_since = row_value(row, "gy_task_missing_since", "")
-                    if not missing_since:
-                        updates["gy_task_missing_since"] = db.now()
-                    elif self._missing_expired(missing_since):
+                    if self._record_missing_and_check_expiry(row, "gy_task_missing_since", updates):
                         updates["gy_status"] = "manual_review"
                         gy_error = "光鸭后端任务长时间未找到，请核对云端任务后人工处理"
-                    else:
+                    elif row_value(row, "gy_task_missing_since", ""):
                         updates["gy_status"] = "downloading"
                 else:
                     matched_gy_tasks = matched
@@ -437,15 +431,11 @@ class DownloadTracker:
                     else:
                         updates["gy_status"] = "failed" if states == {"failed"} else "manual_review"
                         gy_error = "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
-                backend_logs.append((
-                    "guangya", updates.get("gy_status", gy_status), progress,
-                    task_ids[0] if task_ids else str(row_value(row, "gy_task_id", "") or ""),
-                ))
             else:
                 task = self._match_gy(row, gy_tasks)
                 if task:
                     matched_gy_tasks = [task]
-                    progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
+                    gy_progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
                     updates["gy_status"] = self._gy_task_state(task)
                     if updates["gy_status"] == "failed":
                         gy_error = "光鸭下载失败，请人工核验"
@@ -458,29 +448,18 @@ class DownloadTracker:
                         if int(row_value(row, "gy_isolated", 0) or 0):
                             updates["gy_task_ids"] = json.dumps([matched_task_id], ensure_ascii=False)
                             updates["gy_batch_count"] = 1
-                    backend_logs.append((
-                        "guangya", updates["gy_status"], progress,
-                        str(task.get("id") or row_value(row, "gy_task_id", "") or ""),
-                    ))
                 elif gy_status == "outcome_unknown":
                     updates["gy_status"] = "manual_review"
                     gy_error = (
                         "光鸭提交结果未知且无法匹配云端任务；"
                         "请人工核对后再决定是否重试"
                     )
-                else:
-                    # 提交时没有拿到任务 ID，且云端任务列表中也匹配不到
-                    # （可能已快速完成并从列表消失）。与批量路径对称：先记
-                    # 缺失时间，宽限期后升级人工核验，禁止永远停在 submitted。
-                    missing_since = row_value(row, "gy_task_missing_since", "")
-                    if not missing_since:
-                        updates["gy_task_missing_since"] = db.now()
-                    elif self._missing_expired(missing_since):
-                        updates["gy_status"] = "manual_review"
-                        gy_error = (
-                            "光鸭云端任务长时间无法匹配，可能已完成或提交失败；"
-                            "请核对云端文件后人工处理"
-                        )
+                elif self._record_missing_and_check_expiry(row, "gy_task_missing_since", updates):
+                    updates["gy_status"] = "manual_review"
+                    gy_error = (
+                        "光鸭云端任务长时间无法匹配，可能已完成或提交失败；"
+                        "请核对云端文件后人工处理"
+                    )
             errors = dict.fromkeys(
                 str(task.get("error") or "").strip()
                 for task in matched_gy_tasks
@@ -559,10 +538,15 @@ class DownloadTracker:
         row = persisted
         effective_qb = str(row["qb_status"] or "")
         effective_gy = str(row["gy_status"] or "")
-        for source, status, progress, task_id in backend_logs:
+        if "qb_status" in updates:
             self._update_backend_log(
-                request_id, source, status, progress, task_id,
-                error=gy_error if source == "guangya" else None,
+                request_id, "qb", effective_qb, qb_progress,
+                row_value(row, "qb_task_id", "") or None, error=qb_error,
+            )
+        if "gy_status" in updates or gy_progress is not None:
+            self._update_backend_log(
+                request_id, "guangya", effective_gy, gy_progress,
+                gy_log_task_id or row_value(row, "gy_task_id", "") or None, error=gy_error,
             )
 
         if effective_qb == "completed" and matched_qb_task is not None:
@@ -1239,18 +1223,20 @@ class DownloadTracker:
 
     @staticmethod
     def _update_backend_log(request_id: int, source: str, status: str,
-                            progress: float, task_id: str, *, error: str | None = None) -> None:
+                            progress: float | None, task_id: str | None, *, error: str | None = None) -> None:
+        now = db.now()
         with db.get_conn() as conn:
-            row = conn.execute(
-                "SELECT id FROM download_log WHERE request_id=? AND source=? ORDER BY id DESC LIMIT 1",
-                (request_id, source),
-            ).fetchone()
-        if row:
-            download_requests_repo.update_download_log(
-                int(row["id"]), status="success" if status == "completed" else status,
-                progress=progress, backend_task_id=task_id,
-                completed_at=db.now() if status in {"completed", "failed"} else None,
-                **({"error": error} if error is not None else {}),
+            conn.execute(
+                "UPDATE download_log SET status=?,progress=COALESCE(?,progress),"
+                "backend_task_id=COALESCE(?,backend_task_id),error=COALESCE(?,error),"
+                "completed_at=?,updated_at=? WHERE id=("
+                "SELECT log.id FROM download_log AS log JOIN download_requests AS req ON req.id=log.request_id "
+                "WHERE log.request_id=? AND log.source=? "
+                "AND CASE log.source WHEN 'qb' THEN req.qb_status WHEN 'guangya' THEN req.gy_status END=? "
+                "ORDER BY log.id DESC LIMIT 1) "
+                "AND COALESCE(status,'') NOT IN ('failed','cancelled','success','completed','manual_review','resubmitted')",
+                ("success" if status == "completed" else status, progress, task_id, error,
+                 now if status in {"completed", "failed"} else None, now, request_id, source, status),
             )
 
     @staticmethod

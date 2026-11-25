@@ -304,26 +304,53 @@ class DownloadBatchActionApiTests(LoggedInDownloadsApiCase):
         qb.assert_not_called()
 
     def test_web_delete_closes_bound_download_before_qb_call(self):
+        from app.clients.qbittorrent import TorrentTask
+        from app.modules.download_tracker import DownloadTracker
+
         headers = self._headers()
         torrent_hash = "7" * 40
         with isolated_test_database():
-            request_id, _ = download_requests_repo.create_download_request("web-delete", "magnet", title="Web delete")
-            download_requests_repo.update_download_request(request_id, status="downloading", qb_status="downloading", qb_task_id=torrent_hash)
+            with patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True}), patch(
+                "app.modules.download_dispatcher._submit_qb", return_value={"ok": True, "task_id": torrent_hash},
+            ) as submit:
+                response = self.client.post("/api/downloads/direct/submit", headers=headers, data={
+                    "target": "qb", "url": f"magnet:?xt=urn:btih:{torrent_hash}",
+                })
+            self.assertEqual(response.json()["status"], "submitted", response.text)
+            request_id = response.json()["request_id"]
+            submit.assert_called_once()
             client = Mock()
 
             def delete(hashes, *, delete_files):
                 self.assertEqual(hashes, torrent_hash)
                 self.assertFalse(delete_files)
-                get_download_request_result = download_requests_repo.get_download_request(request_id)
-                assert get_download_request_result is not None
-                self.assertEqual(get_download_request_result["qb_status"], "cancelled")
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual(row["qb_status"], "cancelled")
                 return True
 
+            def persist_then_delete(snapshot, **fields):
+                persisted = download_requests_repo.apply_download_tracker_update(snapshot, **fields)
+                assert persisted is not None
+                self.assertEqual(persisted["qb_status"], "downloading")
+                removed = self.client.post("/api/downloads/qb/delete", headers=headers, json={"hashes": [torrent_hash]})
+                self.assertEqual(removed.status_code, 200, removed.text)
+                return persisted
+
+            tracker = DownloadTracker()
+            task = Mock(spec=TorrentTask, hash=torrent_hash, state="downloading", progress=0.4)
+            task.name = "Web delete"
             client.delete_torrents.side_effect = delete
-            with patch("app.routes.downloads_api._qb", return_value=client):
-                response = self.client.post("/api/downloads/qb/delete", headers=headers, json={"hashes": [torrent_hash]})
-            self.assertEqual(response.status_code, 200)
+            with (
+                patch("app.routes.downloads_api._qb", return_value=client),
+                patch("app.modules.download_tracker.apply_download_tracker_update", side_effect=persist_then_delete),
+                patch.object(tracker, "_notify_completion"),
+            ):
+                tracker._update_request(download_requests_repo.get_download_request(request_id), [task], [])
+            client.delete_torrents.assert_called_once_with(torrent_hash, delete_files=False)
             self.assertEqual(download_requests_repo.list_active_download_requests(), [])
+            history = self.client.get("/api/downloads/logs", params={"source": "qb"}).json()["items"]
+            self.assertEqual([(item["request_id"], item["status"]) for item in history], [(request_id, "cancelled")])
 
     def test_web_delete_timeout_reports_unknown_not_success(self):
         headers = self._headers()
@@ -663,6 +690,45 @@ class DirectDownloadApiTests(LoggedInDownloadsApiCase):
                 self.assertEqual(repeated.json()["request_id"], first.json()["request_id"])
                 qb.assert_called_once()
                 gy.assert_called_once()
+
+    def test_clearing_retry_log_preserves_previous_failed_attempt(self):
+        from app.modules.download_tracker import DownloadTracker
+
+        headers = self._headers()
+        with (
+            patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}),
+            patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1),
+            patch("app.modules.download_dispatcher._submit_qb", return_value={"ok": True}) as qb,
+            patch("app.modules.download_dispatcher._submit_guangya", side_effect=[
+                {"ok": False, "error": "首次解析失败"}, {"ok": True, "task_id": "cloud-retry"},
+            ]) as cloud,
+        ):
+            first = self.client.post(
+                "/api/downloads/direct/submit", headers=headers, data={"target": "both"},
+                files={"file": ("fixture.torrent", _torrent_bytes(), "application/x-bittorrent")},
+            )
+            self.assertEqual(first.json()["status"], "partial")
+            rid = first.json()["request_id"]
+            retry = self.client.post(f"/api/downloads/issues/{rid}/resubmit", headers=headers, json={"target": "guangya"})
+            self.assertEqual(retry.status_code, 200, retry.text)
+            self.assertEqual(retry.json()["request_id"], rid)
+        qb.assert_called_once()
+        self.assertEqual(cloud.call_count, 2)
+        params = {"source": "guangya"}
+        current, original = self.client.get("/api/downloads/logs", params=params).json()["items"]
+        self.assertEqual((current["status"], original["status"]), ("submitted", "failed"))
+        cleared = self.client.post("/api/downloads/logs/batch/clear", headers=headers, json={"log_ids": [current["id"]]})
+        self.assertEqual(cleared.json()["deleted"], 1)
+
+        DownloadTracker()._update_request(
+            download_requests_repo.get_download_request(rid), [], [{"id": "cloud-retry", "status": 1, "progress": 0.6}],
+            qb_available=False,
+        )
+        row = download_requests_repo.get_download_request(rid)
+        assert row is not None
+        self.assertEqual(row["gy_status"], "downloading")
+        [remaining] = self.client.get("/api/downloads/logs", params=params).json()["items"]
+        self.assertEqual(remaining, original)
 
     def test_uploaded_streams_are_closed_after_success_or_rejection(self):
         from starlette.datastructures import UploadFile
