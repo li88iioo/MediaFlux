@@ -20,7 +20,7 @@ from typing import Any
 from app.clients.guangya import (
     GuangYaClient,
     GuangYaFile,
-    GuangYaReadRejected,
+    file_info_or_none,
     GuangYaWriteRejected,
     guangya_provider_task_state,
     verify_guangya_write,
@@ -2051,12 +2051,7 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
 
 
 def require_browser_item(client: GuangYaClient, file_id: str, label: str) -> GuangYaFile:
-    try:
-        item = client.file_info(file_id)
-    except GuangYaReadRejected as exc:
-        if exc.operation != "file_info" or exc.code != "149":
-            raise
-        item = None
+    item = file_info_or_none(client.file_info, file_id)
     if item is None or item.file_id != file_id:
         raise DirectoryScrapeGoneError(f"{label}已不存在，请刷新目录")
     return item

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import httpx
 
-from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaWriteRejected
+from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaReadRejected, GuangYaWriteRejected
 from app.modules.guangya_gcid import GCIDImportItemResult, GuangyaGCIDImporter
 
 _API = "https://api.guangyapan.com/userres/v1/"
@@ -93,6 +93,29 @@ class GuangyaGCIDImporterTests(TestCase):
             (_STATUS, {"taskId": "task-1"}),
         ])
         self.assertFalse(drive.replies)
+
+    def test_import_rechecks_a_replaced_directory_only_after_a_confirmed_absence(self):
+        drive = _Drive()
+        importer = GuangyaGCIDImporter(cast(GuangYaClient, drive))
+        drive.files["old"] = GuangYaFile("old", "Season 1", True, parent_id="target")
+        drive.landed(file_id="ep1", parent_id="old")
+        path = "Season 1/样本.mkv"
+        self.assertEqual(self._import_with(importer, path=path), GCIDImportItemResult(True, "ep1"))
+        del drive.files["old"]
+        drive.files["new"] = GuangYaFile("new", "Season 1", True, parent_id="target")
+        drive.landed(file_id="ep2", parent_id="new")
+        lookup = drive.file_info
+        for code, expected in (("101", GCIDImportItemResult(False, error_code="provider_rejected")),
+                               ("149", GCIDImportItemResult(True, "ep2"))):
+            def read(file_id):
+                if file_id == "old":
+                    raise GuangYaReadRejected("file_info", code=code)
+                return lookup(file_id)
+
+            with self.subTest(code=code), patch.object(drive, "file_info", side_effect=read):
+                self.assertEqual(self._import_with(importer, path=path), expected)
+        self.assertFalse(drive.created)
+        self.assertTrue(all(operation == "list_dir" for operation, _ in drive.calls))
 
     def test_flash_probe_uses_full_resource_fields_and_result_task_id(self):
         drive = _Drive()

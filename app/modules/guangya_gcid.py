@@ -14,6 +14,7 @@ from app.clients.guangya import (
     _read_success_acknowledged,
     _validate_read_response,
     _validate_write_response,
+    file_info_or_none,
 )
 
 from .gcid_manifest import ManifestValidationError, _normalize_gcid, _normalize_path, _normalize_size
@@ -125,7 +126,7 @@ class GuangyaGCIDImporter:
         try:
             with self._lock:
                 if target_dir_id != "0":
-                    target = self.client.file_info(target_dir_id)
+                    target = file_info_or_none(self.client.file_info, target_dir_id)
                     if target is None or target.file_id != target_dir_id or not target.is_dir:
                         raise _ImportFailure("invalid_target")
                 parent_id = target_dir_id
@@ -155,7 +156,7 @@ class GuangyaGCIDImporter:
         key = (parent_id, name)
         cached_id = self._directory_ids.get(key)
         if cached_id:
-            current = self.client.file_info(cached_id)
+            current = file_info_or_none(self.client.file_info, cached_id)
             if current and current.file_id == cached_id and current.is_dir and (current.parent_id, current.name) == key:
                 return cached_id
             self._directory_ids.pop(key)

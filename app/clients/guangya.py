@@ -893,6 +893,16 @@ def normalize_provider_md5(value: str) -> str | None:
     return digest.hex() if len(digest) == 16 else None
 
 
+def file_info_or_none(read: Callable[[str], GuangYaFile | None], file_id: str) -> GuangYaFile | None:
+    """仅把文件详情接口明确返回的 149 当作缺失，其余读取失败交给调用方。"""
+    try:
+        return read(file_id)
+    except GuangYaReadRejected as exc:
+        if exc.operation != "file_info" or exc.code != "149":
+            raise
+        return None
+
+
 def file_extension(item: GuangYaFile) -> str:
     """优先使用云端声明的扩展名，缺失时从文件名推断。"""
     declared = (item.extension or "").strip().lower().lstrip(".")

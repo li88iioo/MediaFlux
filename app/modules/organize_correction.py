@@ -20,6 +20,7 @@ from app.clients.guangya import (
     GuangYaClient,
     GuangYaFile,
     GuangYaReadRejected,
+    file_info_or_none,
     close_guangya_client,
 )
 from app.logger import get_logger
@@ -896,14 +897,8 @@ class OrganizeCorrectionService:
                                 or current.name != name or not any(entry.file_id == result for entry in self.client.list_dir(parent_id))):
                             raise RuntimeError("已恢复目录的身份或位置已变化，禁止接管同名目录")
                 else:
-                    try:
-                        info = self.client.file_info(directory_id)
-                    except GuangYaReadRejected as exc:
-                        # 只在完整成功清理凭据、父目录可读且原 ID 已不在父列表时，
-                        # 允许按凭据重建。149 绝不用于判空、放行删除或跳过父级校验。
-                        if exc.code != "149":
-                            raise
-                        info = None
+                    # 此处已核对成功的清理凭据及父目录内容。
+                    info = file_info_or_none(self.client.file_info, directory_id)
                     if info is not None and (info.name != name or info.parent_id != str(audit['parent_id'])):
                         raise RuntimeError("原目录已被外部移动或改名，禁止猜测重建")
                     if any(entry.name == name for entry in children):
