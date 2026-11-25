@@ -143,9 +143,11 @@ window.fetch=async(input,options={})=>{
   const taskId=url.searchParams.get('task_id');
   window.__apiCalls.push({path:url.pathname,method,body,taskId,page:url.searchParams.get('page'),confirmationId:url.searchParams.get('confirmation_id')});
   const config=window.__testConfig;
+  if(url.pathname==='/api/logs/overview'&&config.overviewError)return jsonResponse({error:config.overviewError},503);
   if(url.pathname==='/api/logs/overview')return jsonResponse({timeline:{success:0,failed:0,skipped:0,reverted:0}});
   if(url.pathname==='/api/logs/organize/timeline'){
     const page=Number(url.searchParams.get('page'))||1;
+    if(config.timelineError)return jsonResponse({error:config.timelineError},503);
     const items=config.rowsByPage?.[page]||config.rows||[];
     const response=jsonResponse({items,page,pages:config.rowsByPage?Object.keys(config.rowsByPage).length:1,total:config.rowsByPage?Object.values(config.rowsByPage).flat().length:items.length});
     if(config.holdTimeline)return new Promise(resolve=>window.__pendingTimelines.push(()=>resolve(response)));
@@ -318,6 +320,57 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.page.wait_for_function("() => window.__apiCalls.some(call => call.path === '/api/logs/organize/batch' && call.method === 'POST')")
         self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.includes('批次完成')")
         return self.page.locator('#organizeBatchState')
+
+    def test_overview_failure_survives_later_timeline_success_until_retry(self):
+        refresh = self.page.locator("#refreshLogsBtn")
+        state = self.page.locator("#lastRefresh")
+        self.page.evaluate("Object.assign(window.__testConfig, {overviewError:'概览暂时不可用', holdTimeline:true})")
+        refresh.click()
+        self.page.wait_for_function("document.querySelector('#lastRefresh').textContent.includes('概览暂时不可用') && window.__pendingTimelines.length")
+        self.page.evaluate("window.__pendingTimelines.shift()()")
+        self.page.wait_for_function("!document.querySelector('#refreshLogsBtn').disabled")
+        self.assertIn("概览暂时不可用", state.inner_text())
+        self.assertEqual(self.page.locator(".organize-row-select").count(), len(ROWS))
+
+        self.page.evaluate("Object.assign(window.__testConfig, {overviewError:'', holdTimeline:false, timelineError:'明细暂时不可用'})")
+        refresh.click()
+        self.page.wait_for_function("document.querySelector('#lastRefresh').textContent.includes('明细暂时不可用')")
+        self.page.wait_for_function("!document.querySelector('#refreshLogsBtn').disabled")
+        self.assertNotIn("概览暂时不可用", state.inner_text())
+        self.assertEqual(self.page.locator(".organize-row-select").count(), len(ROWS))
+
+        self.page.evaluate("Object.assign(window.__testConfig, {timelineError:'', rows:[]})")
+        refresh.click()
+        self.page.wait_for_function("document.querySelector('#organizePageInfo').textContent === '共 0 条'")
+        self.assertIn("暂无整理日志", self.page.locator("#organizeList").inner_text())
+        self.assertIn("更新于", state.inner_text())
+        self.assertNotIn("暂时不可用", state.inner_text())
+        self.assertNotIn("暂时不可用", state.get_attribute("title") or "")
+
+    def test_next_page_after_failed_read_retries_from_visible_logs(self):
+        rows = [{**ROWS[0], "id": i, "record_key": f"guangya:{i}"} for i in range(1, 42)]
+        self.page.evaluate("pages => window.__testConfig.rowsByPage = pages",
+                           {1: rows[:20], 2: rows[20:40], 3: rows[40:]})
+        self.page.locator(".logs-search-btn").click()
+        page_info = self.page.locator("#organizePageInfo")
+        self.page.wait_for_function("document.querySelector('#organizePageInfo').textContent.includes('第 1 / 3 页')")
+        selection = self.page.locator('.organize-row-select[data-key="guangya:1"]')
+        selection.check()
+        self.page.evaluate("window.__testConfig.timelineError = '时间线暂时不可用'")
+        next_page = self.page.locator("#organizeNext")
+        next_page.click()
+        self.page.wait_for_function("document.querySelector('#lastRefresh').textContent.includes('时间线暂时不可用')")
+        self.assertEqual(page_info.inner_text(), "共 41 条 · 第 1 / 3 页")
+        self.assertTrue(selection.is_checked())
+
+        self.page.evaluate("delete window.__testConfig.timelineError")
+        next_page.click()
+        self.page.wait_for_function("document.querySelector('#lastRefresh').textContent.startsWith('更新于')")
+        self.assertEqual(page_info.inner_text(), "共 41 条 · 第 2 / 3 页")
+        self.assertEqual(self.page.locator(".organize-row-select").first.get_attribute("data-key"), "guangya:21")
+        self.assertEqual(self.page.locator(".organize-row-select:checked").count(), 0)
+        pages = [call["page"] for call in self.calls() if call["path"] == "/api/logs/organize/timeline"]
+        self.assertEqual(pages[-3:], ["1", "2", "2"])
 
     def test_recycled_status_is_consistent_in_filter_list_and_detail(self):
         self.page.evaluate("""async () => {

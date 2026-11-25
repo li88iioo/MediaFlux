@@ -1,7 +1,7 @@
-let loadingOrg = false;
 let organizeRequestSerial = 0;
 let overviewRequestSerial = 0;
-let organizePage = 1;
+let organizePage = 1; // 最近请求的页，供刷新重试。
+let displayedOrganizePage = 1;
 const ORGANIZE_LOG_PAGE_SIZE = 20;
 let runtimeSource = null, runtimePaused = false, runtimeLines = [], runtimeOffset = 0, runtimeStreamId = '', runtimeCheckpoint = '', runtimeGeneration = 0;
 let runtimeRequestSerial = 0, runtimeReconnectTimer = null, runtimeClearPending = false;
@@ -50,14 +50,25 @@ function switchTab(tab) {
 }
 
 async function refreshActive() {
-    if (activeTab !== 'organize') return;
     const button=document.getElementById('refreshLogsBtn');
-    if(button?.getAttribute('aria-busy')==='true')return;
-    if(button){button.disabled=true;button.setAttribute('aria-busy','true');button.classList.add('is-refreshing');}
+    if (activeTab !== 'organize' || button.disabled) return;
+    button.disabled=true;
+    button.setAttribute('aria-busy','true');
+    button.classList.add('is-refreshing');
     try { await Promise.all([loadOverview(), loadOrganize()]); }
     finally {
-        if(button){button.disabled=false;button.setAttribute('aria-busy','false');button.classList.remove('is-refreshing');}
+        button.disabled=false;
+        button.setAttribute('aria-busy','false');
+        button.classList.remove('is-refreshing');
     }
+}
+
+const logRefreshStatus={overview:'',timeline:''};
+function setLogRefreshStatus(source,message) {
+    logRefreshStatus[source]=message;
+    const refresh=document.getElementById('lastRefresh');
+    refresh.textContent=Object.values(logRefreshStatus).filter(Boolean).join(' · ') || '—';
+    refresh.title=logRefreshStatus.overview;
 }
 
 function loadOverview() {
@@ -74,12 +85,11 @@ function loadOverview() {
             orgSkipped:Number(overview.skipped)||0,
             orgReverted:Number(overview.reverted)||0,
         });
+        setLogRefreshStatus('overview','');
         return true;
     }).catch(error=>{
         if(requestSerial!==overviewRequestSerial)return false;
-        const refresh=document.getElementById('lastRefresh');
-        refresh.textContent=`概览刷新失败 · ${error.message||'读取失败'} · 已保留上次结果`;
-        refresh.title=error.message||'概览读取失败';
+        setLogRefreshStatus('overview',`概览刷新失败 · ${error.message||'读取失败'}`);
         return false;
     });
 }
@@ -101,7 +111,6 @@ function currentOrganizeFilters() {
 
 function loadOrganize(page=organizePage,preserveSelection=false) {
     const requestSerial = ++organizeRequestSerial;
-    loadingOrg = true;
     organizePage=Math.max(1,Number(page)||1);
     const {origin,status,q} = currentOrganizeFilters();
     const params = [`page=${organizePage}`,`page_size=${ORGANIZE_LOG_PAGE_SIZE}`,`origin=${encodeURIComponent(origin)}`];
@@ -113,12 +122,12 @@ function loadOrganize(page=organizePage,preserveSelection=false) {
         if(requestSerial!==organizeRequestSerial)return;
         const rows=data.items||[];const pages=Number(data.pages)||0;const total=Number(data.total)||0;
         organizePage=Number(data.page)||organizePage;
-        document.getElementById('organizePageInfo').textContent=total?`共 ${total} 条 · 第 ${organizePage} / ${pages} 页`:'共 0 条';
-        document.getElementById('organizePrev').disabled=organizePage<=1;
-        document.getElementById('organizeNext').disabled=!pages||organizePage>=pages;
+        displayedOrganizePage=organizePage;
+        document.getElementById('organizePageInfo').textContent=total?`共 ${total} 条 · 第 ${displayedOrganizePage} / ${pages} 页`:'共 0 条';
+        document.getElementById('organizePrev').disabled=displayedOrganizePage<=1;
+        document.getElementById('organizeNext').disabled=!pages||displayedOrganizePage>=pages;
         const body = document.getElementById('organizeList');
         const releaseHeight=lockElementHeight(body.closest('.table-wrap'));
-        if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="table-empty">暂无整理日志</td></tr>'; organizeRows=[];selectedOrganizeLogs.clear();updateOrganizeBatchState();revealOrganizePagination();releaseHeight();return; }
         organizeRows=rows;
         if(preserveSelection){
             const keys=new Set(selectedOrganizeLogs.keys());
@@ -148,7 +157,7 @@ function loadOrganize(page=organizePage,preserveSelection=false) {
                 <td class="text-muted">${_esc(r.updated_at||r.created_at||'-')}</td>
                 <td>${action}</td>
             </tr>`;
-        }).join('');
+        }).join('') || '<tr><td colspan="7" class="table-empty">暂无整理日志</td></tr>';
         body.querySelectorAll('.organize-row-select').forEach(input=>{
             input.checked=selectedOrganizeLogs.has(input.dataset.key);
             input.addEventListener('change',()=>toggleOrganizeSelection(input.dataset.key,input.checked));
@@ -156,22 +165,21 @@ function loadOrganize(page=organizePage,preserveSelection=false) {
         body.querySelectorAll('.detail-btn').forEach(btn=>{
             btn.addEventListener('click', ()=>openOrganizeDetail(parseInt(btn.dataset.id,10),btn));
         });
-        document.getElementById('organizeSelectAll').checked=false;updateOrganizeBatchState();
-        document.getElementById('lastRefresh').textContent = '更新于 '+new Date().toLocaleTimeString();
+        updateOrganizeBatchState();
+        setLogRefreshStatus('timeline','更新于 '+new Date().toLocaleTimeString());
         revealOrganizePagination();
         releaseHeight();
     }).catch(error=>{
         if(requestSerial!==organizeRequestSerial)return;
         const hasRows=organizeRows.length>0;
-        document.getElementById('lastRefresh').textContent=`刷新失败 · ${error.message||'读取失败'}${hasRows?' · 已保留上次结果':''}`;
+        setLogRefreshStatus('timeline',`明细刷新失败 · ${error.message||'读取失败'}${hasRows?' · 已保留上次结果':''}`);
         if(!hasRows)document.getElementById('organizeList').innerHTML='<tr><td colspan="7" class="table-empty">读取失败，请稍后重试</td></tr>';
-    })
-      .finally(()=>{if(requestSerial===organizeRequestSerial)loadingOrg=false;});
+    });
 }
 
 function toggleOrganizeSelection(recordKey,checked){const row=organizeRows.find(item=>item.record_key===recordKey&&item.actions?.batch);if(!row)return;if(checked&&selectedOrganizeLogs.size>=50&&!selectedOrganizeLogs.has(recordKey)){_setOrganizeBatchState('单次最多选择 50 条日志','error');return;}if(checked)selectedOrganizeLogs.set(recordKey,row);else selectedOrganizeLogs.delete(recordKey);updateOrganizeBatchState();}
-document.getElementById('organizePrev').addEventListener('click',()=>loadOrganize(organizePage-1));
-document.getElementById('organizeNext').addEventListener('click',()=>loadOrganize(organizePage+1));
+document.getElementById('organizePrev').addEventListener('click',()=>loadOrganize(displayedOrganizePage-1));
+document.getElementById('organizeNext').addEventListener('click',()=>loadOrganize(displayedOrganizePage+1));
 function updateOrganizeBatchState(){
     const count=selectedOrganizeLogs.size;
     const selectable=organizeRows.filter(row=>row.actions?.batch);
