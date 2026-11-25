@@ -48,8 +48,14 @@ def companion_target_name(
     return f"{target_base}{suffix}" if suffix else companion_name
 
 
+def media_extension(name: str) -> str:
+    """按原始文件名识别扩展名，允许末尾空白，保留快照中的原名。"""
+    text = (name or "").rstrip()
+    return text.rsplit(".", 1)[-1].lower() if "." in text else ""
+
+
 def media_role(name: str) -> str:
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    ext = media_extension(name)
     if ext in SUBTITLE_EXTS:
         return "subtitle"
     if ext == "nfo":

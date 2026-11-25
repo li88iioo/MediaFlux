@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Sequence
 
 from app.logger import get_logger
+from app.modules.organize_postprocess import media_extension
 from app.modules.organize_scan import filter_source_entries, record_protected_staging
 
 logger = get_logger("app.modules.organize")
@@ -179,11 +180,6 @@ class GroupEnumeration:
 
     def __bool__(self) -> bool:
         return bool(self.tasks)
-
-
-def _video_extension(name: str) -> str:
-    text = (name or "")
-    return text.rsplit(".", 1)[-1].lower() if "." in text else ""
 
 
 _EXPLICIT_EPISODE_TOKEN_RE = re.compile(
@@ -373,7 +369,7 @@ def enumerate_group_tasks(
         item
         for item in entries
         if not getattr(item, "is_dir", False)
-        and _video_extension(getattr(item, "name", "")) in exts
+        and media_extension(getattr(item, "name", "")) in exts
     ]
     root_units = _root_media_units(root_videos, nsfw_enabled=nsfw_enabled)
     if root_videos and (root_units is None or len(root_units) <= 1):
@@ -606,6 +602,7 @@ def build_group_result(
         key: stats[key]
         for key in (
             "empty_dirs_cleaned",
+            "promo_files_recycled",
             "empty_dir_cleanup_candidates",
             "empty_dir_cleanup_protected",
             "empty_dir_cleanup_not_empty",

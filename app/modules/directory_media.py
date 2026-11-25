@@ -16,7 +16,7 @@ from app.modules.directory_scrape_errors import (
     DirectoryScrapeStateError,
 )
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot
-from app.modules.organize_postprocess import media_role, normalized_stem
+from app.modules.organize_postprocess import media_extension, media_role, normalized_stem
 from app.modules.scraper import TMDBScraper, strip_staging_directory_prefix
 from app.modules.special_media import (
     is_sample_media_path,
@@ -187,7 +187,7 @@ class DirectoryMediaInspector:
                         child_season if child_season is not None else inherited_season,
                     )
                     continue
-                ext = item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
+                ext = media_extension(item.name)
                 if ext in video_exts:
                     if is_sample_media_path(f"{relative_dir}/{item.name}") or (
                         0 < item.size < rules.small_file_mb * 1024 * 1024
@@ -416,8 +416,8 @@ class DirectoryMediaInspector:
         if source is None or source.is_dir:
             raise DirectoryScrapeRequestError("所选视频文件不存在或已被移动")
 
-        ext = source.name.rsplit(".", 1)[-1].lower() if "." in source.name else ""
-        if ext not in self.organizer.video_exts(rules):
+        video_exts = self.organizer.video_exts(rules)
+        if media_extension(source.name) not in video_exts:
             raise DirectoryScrapeRequestError("所选文件不是当前整理规则支持的视频")
         if rules.small_file_mb and (
             0 < source.size < rules.small_file_mb * 1024 * 1024
@@ -444,24 +444,23 @@ class DirectoryMediaInspector:
         )
         videos = [self._snapshot(resolved_source, "video", "", parsed)]
         metadata_exts = self.organizer.metadata_exts(rules)
+        video_owners = {source_id: resolved_source}
         subtitle_candidates: list[GuangYaFile] = []
         for item in self.client.list_dir(parent_id):
             if item.is_dir:
                 continue
-            item_ext = item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
-            if item_ext not in metadata_exts:
-                continue
-            resolved = self._enrich_identity(item)
-            if media_role(resolved.name) == "subtitle":
-                subtitle_candidates.append(resolved)
+            ext = media_extension(item.name)
+            if ext in video_exts:
+                video_owners.setdefault(item.file_id, item)
+            elif ext in metadata_exts:
+                resolved = self._enrich_identity(item)
+                if media_role(resolved.name) == "subtitle":
+                    subtitle_candidates.append(resolved)
 
-        subtitle_result = plan_subtitle_companions(
-            [resolved_source],
-            subtitle_candidates,
-        )
+        subtitle_result = plan_subtitle_companions(list(video_owners.values()), subtitle_candidates)
         companions = [
             self._snapshot(item.file, "subtitle", "", {})
-            for item in subtitle_result.plans
+            for item in subtitle_result.plans if item.video_file_id == source_id
         ]
         companions.sort(key=lambda item: (item.name.casefold(), item.file_id))
         media_type = (

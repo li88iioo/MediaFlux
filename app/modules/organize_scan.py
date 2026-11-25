@@ -1,6 +1,7 @@
 """统一整理的只读目录扫描阶段。"""
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Callable
 from app.clients.guangya import GuangYaFile
 from app.logger import get_logger
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+from app.modules.organize_postprocess import media_extension
 from app.modules.special_media import (
     is_special_media_name,
     is_special_path,
@@ -26,6 +28,23 @@ logger = get_logger("app.modules.organize")
 DEFAULT_TRAVERSAL_MAX_DEPTH = 64
 DEFAULT_TRAVERSAL_MAX_DIRS = 50_000
 DEFAULT_TRAVERSAL_MAX_ENTRIES = 250_000
+
+
+_DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_PROMO_DOMAIN = rf"(?=[A-Za-z0-9.-]{{1,253}}】)(?:{_DOMAIN_LABEL}\.)+[A-Za-z]{{2,63}}"
+_RELEASE_PROMO_FILENAME = re.compile(
+    rf"(?P<marker>【更多(?:无水印)?高品质资源请访问 *{_PROMO_DOMAIN}】)"
+    r"(?P=marker)?\.(?i:doc|mkv|mp4)"
+)
+
+
+def is_release_promo_file(item: GuangYaFile) -> bool:
+    """仅匹配小体积、全名由一至两个相同发布站推广标记组成的文件。"""
+    return (
+        item.is_dir is False
+        and type(item.size) is int and 0 < item.size <= 1024 * 1024
+        and _RELEASE_PROMO_FILENAME.fullmatch(item.name) is not None
+    )
 
 
 def filter_source_entries(
@@ -367,14 +386,14 @@ class OrganizerScanner:
             files = list(current_by_id.values())
             accumulator.source_entries[dir_id] = tuple(files)
 
+        # 显式选集沿用冻结时的识别和伴随规划；普通分组仍按清理规则筛选。
+        if rules.clean_empty and context.source_member_ids is None and context.source_snapshots is None:
+            files = [item for item in files if not is_release_promo_file(item)]
         accumulator.video_files_by_path[rel] = [
             item
             for item in files
             if not item.is_dir
-            and (
-                item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
-            )
-            in accumulator.video_exts
+            and media_extension(item.name) in accumulator.video_exts
             and (
                 not selected_file_ids
                 or str(getattr(item, "file_id", "") or "") in selected_file_ids
@@ -384,10 +403,7 @@ class OrganizerScanner:
             item
             for item in files
             if not item.is_dir
-            and (
-                item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
-            )
-            in accumulator.metadata_exts
+            and media_extension(item.name) in accumulator.metadata_exts
         ]
         if metadata_here:
             accumulator.companion_files[rel] = metadata_here
@@ -434,8 +450,7 @@ class OrganizerScanner:
                         )
                     )
                 continue
-            ext = item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
-            if ext not in accumulator.video_exts:
+            if media_extension(item.name) not in accumulator.video_exts:
                 continue
             if (
                 selected_file_ids

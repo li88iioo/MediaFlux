@@ -38,7 +38,7 @@ class SubtitleIdentity:
 
     @classmethod
     def parse(cls, filename: str) -> "SubtitleIdentity":
-        raw = (filename or "").strip()
+        raw = (filename or "").rstrip()
         if "." in raw:
             stem, extension = raw.rsplit(".", 1)
         else:

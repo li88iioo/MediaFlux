@@ -19,7 +19,7 @@ _COUNTER_FIELDS = (
     "total", "matched", "moved", "renamed", "metadata_moved",
     "skipped", "need_confirm", "failed", "conflict",
     "subtitle_moved", "subtitle_skipped",
-    "empty_dirs_cleaned", "replacement_cleanup_failed", "audit_failures",
+    "empty_dirs_cleaned", "promo_files_recycled", "replacement_cleanup_failed", "audit_failures",
     "duplicate_recycled", "duplicate_cleanup_failed",
 )
 

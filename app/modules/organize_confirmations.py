@@ -2784,6 +2784,7 @@ def _cleanup_confirmed_source(payload: dict, organizer: Organizer, rules: Organi
             cleaned = int(stats.get("empty_dirs_cleaned", 0) or 0)
             _cleanup_manual_source_root(
                 organizer, directory_id, "", replace(rules, clean_empty=True), stats, trigger_type="manual",
+                release_source_id=source_id if rules.clean_empty else "",
             )
             if int(stats.get("empty_dirs_cleaned", 0) or 0) == cleaned:
                 break  # 非空、受保护或清理失败时，不再向上尝试。

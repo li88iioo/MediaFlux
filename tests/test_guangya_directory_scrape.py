@@ -3399,6 +3399,13 @@ class SingleFileScrapeScopeTests(IsolatedDatabaseTestCase):
             self.service.preview("owner", inspection_id, "1726", "movie")
 
     def test_file_execute_never_moves_other_video_or_junk(self):
+        # 另一个版本的完整文件名恰好也是所选视频的合法字幕语言尾缀。
+        for item in (
+            _file("english-cut", "Supergirl.2026.en.mp4", "source"),
+            _file("english-sub", "Supergirl.2026.en.srt", "source", size=1024),
+        ):
+            self.client.tree["source"].append(item)
+            self.client.infos[item.file_id] = item
         inspection_id = self._inspect_file()
         preview_id = self.service.preview(
             "owner",
@@ -3412,7 +3419,10 @@ class SingleFileScrapeScopeTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["stats"]["moved"], 1)
         self.assertNotEqual(self.client.infos["supergirl"].parent_id, "source")
         self.assertNotEqual(self.client.infos["supergirl-sub"].parent_id, "source")
+        self.assertEqual(self.client.infos["english-sub"].parent_id, "source")
+        self.assertEqual(self.client.infos["english-sub"].name, "Supergirl.2026.en.srt")
         for file_id in (
+            "english-cut",
             "other",
             "other-sub",
             "supergirl-nfo",
@@ -3423,6 +3433,64 @@ class SingleFileScrapeScopeTests(IsolatedDatabaseTestCase):
         ):
             expected_parent = "extras" if file_id == "extra-video" else "source"
             self.assertEqual(self.client.infos[file_id].parent_id, expected_parent)
+
+    def test_same_stem_video_added_after_preview_leaves_ambiguous_subtitle_at_source(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError, DirectoryScrapeGoneError
+
+        preview = self.service.preview("owner", self._inspect_file(), "1726", "movie")
+        other = _file("second-cut", "Supergirl.2026.mp4", "source")
+        self.client.tree["source"].append(other)
+        self.client.infos[other.file_id] = other
+        before = self.client.infos.copy()
+
+        with self.assertRaises(DirectoryScrapeConflictError):
+            self.service.execute_preview("owner", preview["preview_id"])
+        self.assertEqual(self.client.infos, before)
+
+        fresh = self.service.preview("owner", self._inspect_file(), "1726", "movie")
+        self.assertEqual(fresh["companion_plans"], [])
+        result = self.service.execute_preview("owner", fresh["preview_id"])
+        self.assertEqual((result["stats"]["moved"], result["stats"]["subtitle_moved"]), (1, 0))
+        self.assertNotEqual(self.client.infos["supergirl"].parent_id, "source")
+        for file_id in ("supergirl-sub", "second-cut"):
+            self.assertEqual(self.client.infos[file_id], before[file_id])
+        with self.assertRaises(DirectoryScrapeGoneError):
+            self.service.execute_preview("owner", fresh["preview_id"])
+
+    def test_spaced_file_names_use_the_name_extension_and_keep_exact_source_names(self):
+        from dataclasses import replace
+        from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
+
+        names = {
+            "supergirl": " Supergirl.2026.MKV ",
+            "supergirl-sub": " Supergirl.2026.zh.SRT ",
+            "other": " Supergirl.2026.en.MP4 ",
+            "other-sub": " Supergirl.2026.en.SRT ",
+            "advert": " Note.TXT ",
+        }
+        for index, item in enumerate(self.client.tree["source"]):
+            if item.file_id in names:
+                declared = "mkv" if item.file_id == "advert" else "txt"
+                updated = replace(item, name=names[item.file_id], extension=declared)
+                self.client.tree["source"][index] = updated
+                self.client.infos[item.file_id] = updated
+
+        with self.assertRaises(DirectoryScrapeRequestError):
+            self.service.inspect_file("owner", "advert")
+        preview = self.service.preview("owner", self._inspect_file(), "1726", "movie")
+        self.assertEqual([row["original_name"] for row in preview["plans"]], [names["supergirl"]])
+        self.assertEqual([row["original_name"] for row in preview["companion_plans"]], [names["supergirl-sub"]])
+        result = self.service.execute_preview("owner", preview["preview_id"])
+        self.assertEqual((result["stats"]["moved"], result["stats"]["subtitle_moved"]), (1, 1))
+        video = self.client.infos["supergirl"]
+        subtitle = self.client.infos["supergirl-sub"]
+        self.assertNotEqual(video.parent_id, "source")
+        self.assertTrue(video.name.lower().endswith(".mkv"), video.name)
+        self.assertEqual(subtitle.parent_id, video.parent_id)
+        self.assertTrue(subtitle.name.endswith(".zh.srt"), subtitle.name)
+        for file_id in ("other", "other-sub", "advert"):
+            item = self.client.infos[file_id]
+            self.assertEqual((item.parent_id, item.name), ("source", names[file_id]))
 
     def test_file_execute_excludes_companions_added_after_preview_validation(self):
         inspection_id = self._inspect_file()
@@ -5072,6 +5140,93 @@ if __name__ == "__main__":
 
 
 class OrganizeScanSampleTests(unittest.TestCase):
+    def test_release_promo_requires_complete_identical_markers_and_bounded_size(self):
+        from app.modules.organize_scan import is_release_promo_file
+
+        short = "【更多高品质资源请访问 www.Butailing.com】"
+        full = "【更多无水印高品质资源请访问 cdn.release-example.org】"
+        one_mib = 1024 * 1024
+        for name, size, expected in (
+            (short + ".doc", 1, True),
+            (full + ".mkv", one_mib, True),
+            (full + full + ".MP4", one_mib, True),
+            (full + ".mp4", 0, False),
+            (full + ".mp4", -1, False),
+            (full + ".mkv", one_mib + 1, False),
+            ("Film.S01E01." + full + ".mkv", 1, False),
+            (full + ".1080p.mkv", 1, False),
+            (full + short + ".doc", 1, False),
+            (full + full.replace(".org", ".net") + ".mp4", 1, False),
+            (short * 3 + ".mp4", 1, False),
+            (short + ".nfo", 1, False),
+            (short + ".mp4.bak", 1, False),
+            (short.replace("www.Butailing.com", "www..com") + ".mkv", 1, False),
+            (short.replace("www.Butailing.com", ("a" * 63 + ".") * 4 + "org") + ".mkv", 1, False),
+            (short.replace("www.Butailing.com", "www.example.org/path") + ".mkv", 1, False),
+        ):
+            with self.subTest(name=name, size=size):
+                self.assertEqual(is_release_promo_file(_file("f", name, "source", size=size)), expected)
+        self.assertFalse(is_release_promo_file(replace(_dir("d", short + ".doc"), size=1)))
+
+    def test_clean_empty_filters_only_promo_candidates_and_keeps_source_evidence(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+        from app.modules.organize import Organizer
+        from app.modules.organize_models import OrganizeContext
+        from app.modules.organize_scan import OrganizerScanner, ScanRestriction
+
+        marker = "【更多无水印高品质资源请访问 www.Butailing.com】"
+        video = _file("movie", "Film." + marker + ".mkv", "source", size=512)
+        advert = _file("advert", marker + ".mp4", "source", size=512)
+        document = _file("doc", marker * 2 + ".doc", "source", size=1)
+        note = _file("note", "Film.nfo", "source", size=1)
+        sibling = _file("other", "Other.mkv", "source", size=512)
+        members = [video, advert, document, note, sibling]
+        client = _TreeClient({"source": members}, {"source": _dir("source", "Downloads")})
+        scanner = OrganizerScanner(client, traversal_limits=(64, 100, 1000), append_reason=Organizer._append_reason)
+        ordinary = OrganizeContext(source_dir_id="source", source_name="Downloads")
+
+        def scan(context, *, clean_empty=True, restriction=None):
+            return scanner.scan(
+                context, OrganizeRules(small_file_mb=0, clean_empty=clean_empty), Organizer._initial_stats(),
+                video_exts={"mkv", "mp4"}, metadata_exts={"doc", "nfo"}, restriction=restriction,
+            )
+
+        for enabled, videos, companions in (
+            (True, [video, sibling], [note]),
+            (False, [video, advert, sibling], [document, note]),
+        ):
+            with self.subTest(clean_empty=enabled):
+                result = scan(ordinary, clean_empty=enabled)
+                self.assertEqual([row.file for row in result.scanned_videos], videos)
+                self.assertEqual(result.video_files_by_path[""], videos)
+                self.assertEqual(result.companion_files[""], companions)
+
+        snapshots = {item.file_id: replace(item) for item in (video, advert, document, note)}
+        frozen = replace(ordinary, source_member_ids=frozenset(snapshots), source_snapshots=snapshots)
+        restricted = ScanRestriction("source", files_only=True, file_ids=frozenset({"movie", "advert"}))
+        group = scan(ordinary, restriction=restricted)
+        self.assertEqual([row.file for row in group.scanned_videos], [video])
+        self.assertEqual(group.video_files_by_path[""], [video])
+        self.assertEqual(group.companion_files[""], [note])
+        for label, context, restriction in (
+            ("members", replace(frozen, source_snapshots=None), None),
+            ("snapshots", replace(frozen, source_member_ids=None), restricted),
+            ("empty snapshots", replace(ordinary, source_snapshots={}), restricted),
+            ("both", frozen, restricted),
+        ):
+            with self.subTest(frozen_by=label):
+                result = scan(context, restriction=restriction)
+                self.assertEqual([row.file for row in result.scanned_videos], [video, advert])
+                self.assertEqual(result.video_files_by_path[""], [video, advert])
+                self.assertEqual(result.companion_files[""], [document, note])
+                if context.source_snapshots is not None:
+                    raw = members if context.source_member_ids is None else list(snapshots.values())
+                    self.assertEqual(list(result.source_entries["source"]), raw)
+        self.assertEqual(client.list_dir("source"), [video, advert, document, note, sibling])
+        client.tree["source"] = [video, replace(advert, etag="changed"), document, note, sibling]
+        with self.assertRaises(DirectoryScrapeConflictError):
+            scan(frozen, restriction=restricted)
+
     def test_sample_names_and_sample_directories_do_not_pass_size_threshold(self):
         from app.modules.organize_models import OrganizeContext
         from app.modules.organize_scan import OrganizerScanner
@@ -5124,7 +5279,7 @@ class OrganizeScanSampleTests(unittest.TestCase):
 
         result = scanner.scan(
             context,
-            cast(OrganizeRules, SimpleNamespace(small_file_mb=300)),
+            OrganizeRules(small_file_mb=300),
             stats,
             video_exts={"mkv"},
             metadata_exts=set(),
@@ -5162,7 +5317,7 @@ class OrganizeScanSampleTests(unittest.TestCase):
 
         result = scanner.scan(
             OrganizeContext(source_dir_id="source", source_name="Downloads"),
-            cast(OrganizeRules, SimpleNamespace(small_file_mb=300)),
+            OrganizeRules(small_file_mb=300),
             stats,
             video_exts={"mkv"},
             metadata_exts=set(),

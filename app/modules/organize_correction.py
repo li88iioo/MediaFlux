@@ -796,10 +796,10 @@ class OrganizeCorrectionService:
             raise DirectoryScrapeConflictError("文件位置已变化，当前日志快照已过期；请查看同一文件的其它整理记录，或在当前云盘目录重新识别。")
         if item.current_name and remote.name != item.current_name:
             raise DirectoryScrapeConflictError("文件名已变化，当前日志快照已过期；请查看同一文件的其它整理记录，或在当前云盘目录重新识别。")
-        if item.size and remote.size and item.size != remote.size:
-            raise DirectoryScrapeConflictError("文件大小已变化，当前日志快照已过期，请在当前云盘目录重新识别。")
-        if item.etag and remote.etag and item.etag != remote.etag:
-            raise DirectoryScrapeConflictError("文件校验值已变化，当前日志快照已过期，请在当前云盘目录重新识别。")
+        if item.size and item.size != remote.size:
+            raise DirectoryScrapeConflictError("文件大小与日志快照不一致，请刷新云盘详情并核对后重试。")
+        if item.etag and item.etag != remote.etag:
+            raise DirectoryScrapeConflictError("文件校验值与日志快照不一致，请刷新云盘详情并核对后重试。")
         return remote
 
     def _verify_items(self, items: list[CorrectionItem]) -> None:
@@ -807,10 +807,10 @@ class OrganizeCorrectionService:
             self._verify_item(item)
 
 
-    def _preflight_delete_items(self, items: list[CorrectionItem]) -> list[GuangYaFile]:
-        remotes = [self._verify_item(item) for item in items]
+    def _preflight_delete_items(self, items: list[CorrectionItem]) -> None:
+        self._verify_items(items)
         directory_cache: dict[str, list[GuangYaFile]] = {}
-        for item, remote in zip(items, remotes):
+        for item in items:
             parent_id = item.current_parent_id
             if parent_id not in directory_cache:
                 directory_cache[parent_id] = self.client.list_dir(parent_id)
@@ -826,9 +826,6 @@ class OrganizeCorrectionService:
             ]
             if len(matches) != 1 or matches[0].file_id != item.file_id:
                 raise RuntimeError(f"GCID/size 歧义，禁止删除: {item.current_name}")
-            if remote.etag != item.etag or (remote.size or 0) != (item.size or 0):
-                raise RuntimeError(f"GCID/size 与日志快照不一致: {item.current_name}")
-        return remotes
 
     def _directory_targets(self, directory_ids: list[str], *, recreate: bool = True
                            ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:

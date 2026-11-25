@@ -647,6 +647,7 @@ class ManualSourceRootCleanupTests(unittest.TestCase):
             [("temporary", 0, "", 0)],
             protected_source_ids={"0", "archive"},
             cancel_check=None,
+            release_source_id="",
         )
         self.assertEqual(stats["source_dir_cleaned"], 1)
         self.assertEqual(stats["empty_dirs_cleaned"], 1)

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, overload
 
 from app import database as db
 from app.repositories import media_probe as media_probe_repo
+from app.repositories.organize_history import has_archived_video_from
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get, get_int
 from app.database import add_organize_log, add_organize_log_items
@@ -151,6 +152,7 @@ from app.modules.organize_scan import (
     ScanRestriction,
     TraversalBudget,
     TraversalLimitExceeded,
+    is_release_promo_file,
     validate_source_snapshot,
 )
 from app.modules.recognition.resolver import (
@@ -2501,10 +2503,10 @@ class Organizer:
             "reasons": ["目录仍含未移动媒体，已跳过空目录复核"],
         }
 
-    def _duplicate_cleanup_dirs(
+    def _source_ancestor_dirs(
         self, parent_ids: list[str], source_dir_id: str,
     ) -> list[tuple[str, int, str, int]]:
-        """先核实已回收视频的整条原父链；仅返回来源根以内的精确祖先。"""
+        """核实原父链，仅返回来源根以内的精确祖先。"""
         directories: dict[str, tuple[str, int, str, int]] = {}
         for parent_id in dict.fromkeys(parent_ids):
             current = parent_id
@@ -2512,11 +2514,11 @@ class Organizer:
             seen: set[str] = set()
             while current != source_dir_id:
                 if not current or current == "0" or current in seen or len(seen) >= 64:
-                    raise RuntimeError("已回收视频的原父链不在扫描来源内，已保留空目录")
+                    raise RuntimeError("原父链不在扫描来源内，已保留目录")
                 seen.add(current)
                 info = self.client.file_info(current)
                 if info is None or info.is_dir is not True or info.file_id != current:
-                    raise RuntimeError("已回收视频的原父目录无法核验，已保留空目录")
+                    raise RuntimeError("原父目录无法核验，已保留目录")
                 chain.append(info)
                 current = str(info.parent_id or "").strip()
             for index, info in enumerate(chain):
@@ -2581,11 +2583,11 @@ class Organizer:
                 on_stage(GROUP_STAGE_CLEANUP)
             # 明确回收独立于普通清空开关；关闭时只清理这些原父链，来源根仍保护。
             cleanup_dirs = list(scanned_dirs) if rules.clean_empty else []
-            cleanup_protected = protected_sources | {source_dir_id}
+            cleanup_protected = protected_sources | {source_dir_id, rules.target_dir_id or "0"}
             cleanup_report: dict[str, Any]
             try:
                 if duplicate_cleanup:
-                    cleanup_dirs.extend(self._duplicate_cleanup_dirs(
+                    cleanup_dirs.extend(self._source_ancestor_dirs(
                         stats["duplicate_cleanup_parent_ids"], source_dir_id,
                     ))
                 cleanup_report = self._known_nonempty_cleanup_report(
@@ -2594,6 +2596,10 @@ class Organizer:
                     cleanup_dirs,
                     protected_source_ids=cleanup_protected,
                     cancel_check=context.cancelled,
+                    release_source_id=(
+                        source_dir_id if rules.clean_empty and context.source_member_ids is None
+                        and context.source_snapshots is None else ""
+                    ),
                 )
             except Exception as exc:
                 # 文件回收已确认；目录只读失败不能丢掉成功事实或重跑文件删除。
@@ -2603,6 +2609,7 @@ class Organizer:
                 }
             stats["empty_dirs_cleaned"] = int(cleanup_report.get("cleaned", 0) or 0)
             for report_key, stats_key in (
+                ("promo_files_recycled", "promo_files_recycled"),
                 ("candidates", "empty_dir_cleanup_candidates"),
                 ("protected", "empty_dir_cleanup_protected"),
                 ("not_empty", "empty_dir_cleanup_not_empty"),
@@ -7506,6 +7513,34 @@ class Organizer:
             }
         return report["cleaned"]
 
+    def _verify_release_cleanup(
+        self, directory_id: str, source_id: str, protected: set[str], promo: GuangYaFile | None = None,
+    ) -> None:
+        """在回收请求发出前复核云盘位置、配置边界和待回收文件的版本。"""
+        from app.modules.download_staging_cleanup import source_inside_protected_staging
+        from app.modules.organize_sources import normalize_organize_sources
+        from app.repositories import download_requests as download_requests_repo
+
+        try:
+            configured, error = normalize_organize_sources(get("GY_ORGANIZE_SOURCE_DIRS", ""))
+            active = set(download_requests_repo.list_protected_guangya_staging_ids())
+            archive = get("GY_ORGANIZE_TARGET_DIR", "0")
+            if archive and archive != "0":
+                active.add(archive)
+            forbidden = protected | {entry["id"] for entry in configured} | active
+            chain = self._source_ancestor_dirs([directory_id], source_id)
+            if (error or directory_id in forbidden or any(row[0] in forbidden for row in chain)
+                    or source_inside_protected_staging(self.client, source_id, active)):
+                raise RuntimeError("来源目录归属变化或配置异常，已停止回收")
+            if promo is not None:
+                live = validate_source_snapshot(promo, self.client.file_info(promo.file_id), role="推广文件")
+                if not promo.etag and promo.updated_at != live.updated_at:
+                    raise DirectoryScrapeConflictError("推广文件版本已变化，已保留")
+        except Exception as exc:
+            # 审计应记为 blocked，实际回收请求尚未发出。
+            setattr(exc, "provider_write_not_started", True)
+            raise
+
     def _clean_empty_dirs_report(
         self,
         scanned_dirs: list[tuple],
@@ -7514,9 +7549,11 @@ class Organizer:
         cancel_check: Callable[[], bool] | None = None,
         expected_locations: dict[str, tuple[str, str]] | None = None,
         trigger: str = "empty_dir_cleanup",
+        release_source_id: str = "",
     ) -> dict:
         """安全清理空目录，并返回不泄露目录标识的结构化保留原因。"""
         cleaned = 0
+        promo_files_recycled: int = 0
         delete_failures = 0
         protected_count: int = 0
         not_empty: int = 0
@@ -7532,7 +7569,7 @@ class Organizer:
                 self.client, "supports_atomic_empty_directory_delete", None
             )
         capability_available = callable(delete_empty) and explicit_capability is True
-        unique_dirs: dict[str, tuple[str, int, str, int]] = {}
+        unique_dirs: dict[str, int] = {}
         for item in scanned_dirs:
             if len(item) < 2:
                 continue
@@ -7543,14 +7580,7 @@ class Organizer:
                 depth = max(0, int(item[1] or 0))
             except (TypeError, ValueError):
                 depth = 0
-            etag = str(item[2] or "") if len(item) > 2 else ""
-            try:
-                updated_at = max(0, int(item[3] or 0)) if len(item) > 3 else 0
-            except (TypeError, ValueError):
-                updated_at = 0
-            previous = unique_dirs.get(dir_id)
-            if previous is None or depth > previous[1]:
-                unique_dirs[dir_id] = (dir_id, depth, etag, updated_at)
+            unique_dirs[dir_id] = max(depth, unique_dirs.get(dir_id, 0))
         candidates = len(unique_dirs)
         if not capability_available:
             if unique_dirs:
@@ -7576,13 +7606,8 @@ class Organizer:
         staging_ids = download_requests_repo.list_protected_guangya_staging_ids() if unique_dirs else set()
         parent_infos: dict[str, GuangYaFile] = {}
         failure_reasons: dict[str, int] = {}
-        for item in sorted(unique_dirs.values(), key=lambda row: row[1], reverse=True):
-            dir_id, _depth = item[:2]
-            expected_etag = (item[2] or "") if len(item) > 2 else ""
-            try:
-                expected_updated_at = max(0, (item[3] or 0)) if len(item) > 3 else 0
-            except (TypeError, ValueError):
-                expected_updated_at = 0
+
+        for dir_id in sorted(unique_dirs, key=unique_dirs.__getitem__, reverse=True):
             if dir_id in protected:
                 protected_count += 1
                 continue
@@ -7590,25 +7615,53 @@ class Organizer:
                 stopped = True
                 break
             try:
-                if self.client.list_dir(dir_id):
+                files = self.client.list_dir(dir_id)
+                if files and not (
+                    release_source_id and release_source_id != "0" and self._before_plan_write is None
+                    and all(is_release_promo_file(f) and f.file_id and f.parent_id == dir_id
+                            and (f.etag or f.updated_at) for f in files)
+                    and has_archived_video_from(dir_id, release_source_id)
+                ):
                     not_empty += 1
                     continue
                 # 移动/改名会更新目录版本；删除前必须刷新快照，不能继续使用
                 # 扫描阶段的旧 etag/updated_at，否则空目录会被安全校验保留。
                 current = self.client.file_info(dir_id)
-                if current is None or not bool(getattr(current, "is_dir", False)):
+                if current is None or not current.is_dir or current.file_id != dir_id:
                     unavailable += 1
                     continue
-                if expected_locations is not None and (
-                    current.file_id != dir_id
-                    or expected_locations[dir_id] != (current.parent_id, current.name)
-                ):
+                if expected_locations is not None and expected_locations[dir_id] != (current.parent_id, current.name):
                     unavailable += 1
                     continue
                 parent_infos[dir_id] = current
                 if source_inside_protected_staging(self.client, dir_id, staging_ids, info_cache=parent_infos):
                     protected_count += 1
                     continue
+                if files:
+                    for promo in files:
+                        if cancel_check is not None and cancel_check():
+                            raise OrganizeOperationCancelled("任务已停止，已保留剩余推广文件")
+
+                        def recycle_promo(promo: GuangYaFile = promo):
+                            self._verify_release_cleanup(dir_id, release_source_id, protected, promo)
+                            if cancel_check is not None and cancel_check():
+                                raise OrganizeOperationCancelled("任务已停止，已保留剩余推广文件")
+                            return self.client.delete([promo.file_id])
+
+                        execute_recycle_bin_delete(
+                            self.client, trigger="organize_release_promo_cleanup",
+                            reason="原目录已有视频入库，仅剩发布站推广文件",
+                            candidate=DeleteCandidate(promo.file_id, promo.name, dir_id, promo.size, promo.etag),
+                            delete_operation=recycle_promo,
+                        )
+                        promo_files_recycled += 1
+                    if self.client.list_dir(dir_id):
+                        not_empty += 1
+                        continue
+                    current = self.client.file_info(dir_id)
+                    if current is None or not current.is_dir or current.file_id != dir_id:
+                        unavailable += 1
+                        continue
                 expected_etag = str(getattr(current, "etag", "") or "")
                 try:
                     expected_updated_at = max(
@@ -7620,6 +7673,8 @@ class Organizer:
                     raise RuntimeError("目录版本信息缺失，已保留")
 
                 def delete_operation():
+                    if files:
+                        self._verify_release_cleanup(dir_id, release_source_id, protected)
                     # 审计落盘期间也可能收到停止；真正发请求前仍须检查。
                     if cancel_check is not None and cancel_check():
                         raise OrganizeOperationCancelled("任务已停止，已保留剩余空目录")
@@ -7687,6 +7742,8 @@ class Organizer:
         }
         if stopped:
             report["stopped"] = 1
+        if promo_files_recycled:
+            report["promo_files_recycled"] = promo_files_recycled
         return report
 
     def _cleanup_created_dirs(

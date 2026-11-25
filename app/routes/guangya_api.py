@@ -23,6 +23,7 @@ from app.modules.directory_scrape_errors import (
     DirectoryScrapeStateError,
     public_error_message,
 )
+from app.modules.organize_postprocess import media_extension
 from app.modules.scheduler import get_scheduler
 from app.web import api_error, require_api_login
 
@@ -200,7 +201,7 @@ def _browser_video_extensions() -> set[str]:
 
 
 def _browser_item(file: GuangYaFile, video_exts: set[str]) -> dict:
-    name_ext = file.name.rstrip().rsplit(".", 1)[-1].lower() if not file.is_dir and "." in file.name else ""
+    name_ext = "" if file.is_dir else media_extension(file.name)
     return {
         "file_id": file.file_id, "name": file.name, "is_dir": file.is_dir,
         "is_video": bool(name_ext) and name_ext in video_exts,

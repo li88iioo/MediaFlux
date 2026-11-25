@@ -245,12 +245,33 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
                           ("source", "Synthetic source", "incoming", "success")])
 
     def test_cleaned_source_is_recreated_for_return_with_companions(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+
         self.cloud.add("subtitle", "leaf", "Original.S01E01.zh.srt")
         self._add_item("subtitle", "subtitle")
         self._reorganize()
         self.assertEqual(self.cloud.deleted, ["leaf", "source"])
+        # 成员详情暂缺已记录的内容证据时，整组必须留在归档位置。
+        archived = {key: replace(value) for key, value in self.cloud.nodes.items()}
+        version = self.service.detail(self.log_id)["version"]
+        for field in ("size", "etag"):
+            with self.subTest(field=field):
+                file_info = self.cloud.file_info
+
+                def incomplete(file_id):
+                    remote = file_info(file_id)
+                    if remote is not None and file_id == "subtitle":
+                        return replace(remote, size=0) if field == "size" else replace(remote, etag="")
+                    return remote
+
+                with patch.object(self.cloud, "file_info", side_effect=incomplete):
+                    with self.assertRaisesRegex(DirectoryScrapeConflictError, "文件大小|文件校验值"):
+                        self.service.return_to_source(self.log_id, "incomplete-detail", version)
+                self.assertEqual(self.cloud.nodes, archived)
+                detail = self.service.detail(self.log_id)
+                self.assertEqual((detail["status"], detail["version"]), ("success", version))
         result = self.service.return_to_source(
-            self.log_id, "return-cleaned", self.service.detail(self.log_id)["version"],
+            self.log_id, "return-cleaned", version,
         )
         self.assertTrue(result['success'])
         parent = self.cloud.file_info(self.cloud.nodes['video'].parent_id)
@@ -1045,6 +1066,28 @@ class OrganizeCleanupCancellationTests(IsolatedDatabaseTestCase):
         )
         self.addCleanup(organizer.close)
         return cloud, organizer, rules
+
+    def test_move_creates_the_archive_receipt_and_recycles_release_promos_in_the_same_run(self):
+        cloud, organizer, rules = self._fixture()
+        marker = "【更多无水印高品质资源请访问 www.Butailing.com】" * 2
+        promos = {"ad-doc": "DOC", "ad-mkv": "MKV", "ad-mp4": "MP4"}
+        for file_id, ext in promos.items():
+            cloud.add(file_id, "leaf", f"{marker}.{ext}")
+
+        def recycle_files(file_ids):
+            for file_id in file_ids:
+                self.assertIn(file_id, promos)
+                self.assertEqual(cloud.nodes.pop(file_id).parent_id, "leaf")
+                cloud._touch("leaf")
+            return True
+
+        with patch.object(cloud, "delete", side_effect=recycle_files):
+            _, stats = organizer.organize("source", rules, dry_run=False, post_actions=False)
+        self.assertEqual((stats["moved"], stats["need_confirm"], stats["failed"]), (1, 0, 0))
+        self.assertEqual(stats["promo_files_recycled"], 3)
+        self.assertNotIn("leaf", cloud.nodes)
+        self.assertIn("source", cloud.nodes)
+        self.assertNotEqual(cloud.nodes["video"].parent_id, "leaf")
 
     def test_cleanup_cancel_boundaries_preserve_remaining_dirs_and_retry(self):
         for grouping in (True, False):

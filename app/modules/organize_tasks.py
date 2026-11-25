@@ -296,6 +296,7 @@ def _cleanup_manual_source_root(
     *,
     trigger_type: str,
     cancel_check: Callable[[], bool] | None = None,
+    release_source_id: str = "",
 ) -> None:
     """安全清理手动选择的临时空源根，永久配置根和归档根永不删除。"""
     stats.setdefault("source_dir_cleaned", 0)
@@ -378,6 +379,7 @@ def _cleanup_manual_source_root(
         [(source_id, 0, "", 0)],
         protected_source_ids=protected,
         cancel_check=cancel_check,
+        release_source_id=release_source_id,
     )
     if not isinstance(report, dict):
         return
@@ -388,6 +390,7 @@ def _cleanup_manual_source_root(
     failures = int(report.get("delete_failures", 0) or 0)
     unsupported = int(report.get("unsupported", 0) or 0)
     for report_key, stats_key in (
+        ("promo_files_recycled", "promo_files_recycled"),
         ("protected", "source_dir_cleanup_protected"),
         ("not_empty", "source_dir_cleanup_not_empty"),
         ("unavailable", "source_dir_cleanup_unavailable"),
@@ -1889,6 +1892,8 @@ class OrganizeTaskManager:
                             source_rule,
                             stats,
                             trigger_type=trigger_type,
+                            cancel_check=self._cancel_event.is_set,
+                            release_source_id=source["id"],
                         )
                     terminal = (
                         "stopped" if self._cancel_event.is_set()

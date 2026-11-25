@@ -22,6 +22,19 @@ _BUSINESS_LOG_FIELDS = (
 _FINISH_FIELDS = {"status", "operation_type", "current_parent_id", "current_name", "error"}
 
 
+def has_archived_video_from(directory_id: str, source_id: str) -> bool:
+    """以实际归档成功记录证明来源，人工确认的执行记录以原父目录为扫描根。"""
+    with db.get_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM organize_log WHERE source='guangya' AND status='success' "
+            "AND operation_type IN ('organize','reorganize') AND legacy_incomplete=0 "
+            "AND original_parent_id=? AND source_dir_id IN (?,?) AND file_id<>'' AND new_path<>'' "
+            "AND target_parent_id<>'' AND current_parent_id=target_parent_id "
+            "AND current_parent_id<>original_parent_id LIMIT 1",
+            (directory_id, source_id, directory_id),
+        ).fetchone() is not None
+
+
 def has_unresolved_delete_audits(
     file_ids: list[str], *, parent_ids: Iterable[str] = (), conn: sqlite3.Connection | None = None,
 ) -> bool:

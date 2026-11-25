@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
 from app.agent.errors import AgentToolError
+from app.clients.guangya import GuangYaFile
 from app.modules.organize import Organizer, OrganizeRules
 from app.modules.organize_service import (
     OrganizeServiceError,
@@ -231,12 +233,8 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             return []
 
         client.list_dir.side_effect = list_dir
-        client.file_info.return_value = SimpleNamespace(
-            is_dir=True,
-            name="Empty",
-            parent_id="parent",
-            etag="empty-v2",
-            updated_at=201,
+        client.file_info.return_value = GuangYaFile(
+            "ordinary-empty", "Empty", True, parent_id="parent", etag="empty-v2", updated_at=201,
         )
         organizer = Organizer(client=client)
         with patch("app.modules.organize.execute_recycle_bin_delete") as delete:
@@ -254,23 +252,16 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         )
 
     def test_normal_organize_cleanup_refreshes_current_directory_version(self):
-        child = SimpleNamespace(
-            is_dir=True,
-            file_id="ordinary-empty",
-            name="Empty",
-            etag="empty-v7",
-            updated_at=700,
+        child = GuangYaFile(
+            "ordinary-empty", "Empty", True, parent_id="source", etag="empty-v7", updated_at=700,
         )
         client = Mock()
         client.supports_guarded_empty_directory_delete = True
         client.supports_atomic_empty_directory_delete = True
-        client.file_info.return_value = SimpleNamespace(
-            is_dir=True,
-            name="Empty",
-            parent_id="source",
-            etag="empty-v8",
-            updated_at=701,
-        )
+        client.file_info.side_effect = {
+            "source": GuangYaFile("source", "Source", True),
+            child.file_id: replace(child, etag="empty-v8", updated_at=701),
+        }.get
         client.list_dir.side_effect = lambda dir_id: (
             [child] if dir_id == "source" else []
         )
@@ -301,23 +292,16 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             etag="nested-v1",
             updated_at=100,
         )
-        ordinary = SimpleNamespace(
-            is_dir=True,
-            file_id="ordinary-empty",
-            name="Empty",
-            etag="empty-v1",
-            updated_at=200,
+        ordinary = GuangYaFile(
+            "ordinary-empty", "Empty", True, parent_id="parent-source", etag="empty-v1", updated_at=200,
         )
         client = Mock()
         client.supports_guarded_empty_directory_delete = True
         client.supports_atomic_empty_directory_delete = True
-        client.file_info.return_value = SimpleNamespace(
-            is_dir=True,
-            name="Empty",
-            parent_id="parent-source",
-            etag="empty-v2",
-            updated_at=201,
-        )
+        client.file_info.side_effect = {
+            "parent-source": GuangYaFile("parent-source", "Parent", True),
+            ordinary.file_id: replace(ordinary, etag="empty-v2", updated_at=201),
+        }.get
 
         def list_dir(dir_id):
             if dir_id == "parent-source":
@@ -351,19 +335,24 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
     def test_clean_empty_missing_version_is_reported_and_not_deleted(self):
         client = Mock()
         client.supports_guarded_empty_directory_delete = True
-        client.list_dir.side_effect = [
-            [SimpleNamespace(is_dir=True, file_id="empty", etag="", updated_at=0)],
-            [],
-            [],
-        ]
-        client.file_info.return_value = SimpleNamespace(
-            is_dir=True, name="Empty", parent_id="source", etag="", updated_at=0
-        )
-        report = Organizer(client=client).clean_empty_dirs("source", with_report=True)
-        self.assertEqual(
-            report, {"cleaned": 0, "delete_failures": 1, "scan_failures": 0}
-        )
-        client.delete_empty_directory.assert_not_called()
+        directory = GuangYaFile("empty", "Empty", True, parent_id="source")
+        client.list_dir.side_effect = {"source": [directory], "empty": []}.__getitem__
+        for details, failures, unavailable in (
+            (directory, 1, 0),
+            (replace(directory, file_id="other", etag="other-v1"), 0, 1),
+        ):
+            with self.subTest(file_id=details.file_id):
+                client.file_info.return_value = details
+                report = Organizer(client=client).clean_empty_dirs(
+                    "source", with_report=True, with_diagnostics=True,
+                )
+                self.assertEqual(report["cleaned"], 0)
+                self.assertEqual(report["scan_failures"], 0)
+                self.assertEqual(report["delete_failures"], failures)
+                self.assertEqual(report["unavailable"], unavailable)
+                if failures:
+                    self.assertIn("目录版本信息缺失", "；".join(report["reasons"]))
+                client.delete_empty_directory.assert_not_called()
 
     def test_preview_is_dry_run_with_real_source_identity(self):
         sources = [{"id": "secret-source-id", "name": "Secret Source"}]
