@@ -6,6 +6,7 @@ import stat
 import tempfile
 import unittest
 import zipfile
+from contextlib import chdir
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +27,19 @@ class SupportBundleTests(unittest.TestCase):
             strm_dir=root / "strm-data",
             trash_dir=root / "trash",
         )
+
+    def test_default_output_uses_writable_cwd_or_instance_support_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._paths(Path(temporary))
+            paths.program_dir.mkdir()
+            with chdir(paths.program_dir), patch(
+                "app.modules.support_bundle.run_diagnostics", return_value=DiagnosticReport(())
+            ):
+                for writable, expected in ((False, paths.data_dir / "support"), (True, paths.program_dir)):
+                    with self.subTest(writable=writable), patch("os.access", return_value=writable):
+                        destination = create_support_bundle(paths)
+                        self.assertEqual(destination.parent, expected.resolve())
+                        self.assertTrue(zipfile.is_zipfile(destination))
 
     def test_bundle_rejects_authoritative_runtime_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

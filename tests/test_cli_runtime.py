@@ -12,7 +12,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -428,6 +428,21 @@ sys.addaudithook(audit)
             self.assertEqual(request.call_args.args[0], url + "healthz")
             browser.assert_called_once_with(url, new=2)
             self.assertEqual(output.getvalue().splitlines(), ["MediaFlux is healthy", url])
+
+    def test_status_and_open_reject_invalid_endpoint_before_access(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.dict(os.environ, {"MEDIAFLUX_CONFIG_DIR": root, "WEB_PORT": "invalid"}, clear=True),
+            patch("urllib.request.OpenerDirector.open", return_value=_Response(b'{"status":"ok"}')) as request,
+            patch("app.cli.webbrowser.open", return_value=True) as browser,
+        ):
+            for command in ("status", "open"):
+                for options in ([], ["--port", "0"], ["--port", "65536"]):
+                    with self.subTest(command=command, options=options), redirect_stderr(io.StringIO()) as error:
+                        self.assertEqual(main([command, *options]), 2)
+                        self.assertIn("WEB_PORT", error.getvalue())
+            request.assert_not_called()
+            browser.assert_not_called()
 
     def test_status_uses_source_config_port_or_container_internal_port(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -164,12 +164,9 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
 def _local_service_url(host: str | None, port: int | None) -> str:
     from app.runtime_paths import get_runtime_paths
 
-    try:
-        host, port, error = _resolve_doctor_endpoint(get_runtime_paths(), host, port)
-        if error:
-            host, port = "127.0.0.1", DEFAULT_WEB_PORT
-    except (OSError, ValueError):
-        host, port = "127.0.0.1", DEFAULT_WEB_PORT
+    host, port, error = _resolve_service_endpoint(get_runtime_paths(), host, port)
+    if error:
+        raise ValueError(error.message)
     host = host.strip("[]")
     host = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
     authority = f"[{host}]" if ":" in host else host
@@ -195,7 +192,7 @@ def _open_web(url: str) -> int:
     return 0 if opened else 1
 
 
-def _resolve_doctor_endpoint(
+def _resolve_service_endpoint(
     paths: RuntimePaths,
     host: str | None,
     port: int | None,
@@ -205,76 +202,37 @@ def _resolve_doctor_endpoint(
 
     resolved_host = host if host is not None else os.environ.get("WEB_HOST") or None
     resolved_port = port
-    if resolved_port is None and _is_official_container():
-        # docker exec 不经过入口脚本，仍使用镜像约定的内部端口。
-        resolved_port = DEFAULT_WEB_PORT
-    raw_environment_port = os.environ.get("WEB_PORT") if resolved_port is None else None
-    if raw_environment_port:
-        try:
-            resolved_port = int(raw_environment_port)
-        except ValueError:
-            return (
-                resolved_host or "0.0.0.0",
-                DEFAULT_WEB_PORT,
-                DiagnosticCheck(
-                    "runtime_config",
-                    "error",
-                    "当前执行身份无法解析 WEB_PORT 环境变量。",
-                    "将 WEB_PORT 设置为 1 到 65535 的整数。",
-                ),
-            )
-
-    values: dict[str, str] = {}
-    if (resolved_host is None or resolved_port is None) and paths.env_file.exists():
-        try:
+    port_source = "WEB_PORT 环境变量"
+    try:
+        if resolved_port is None:
+            # docker exec 不经过入口脚本，仍使用镜像约定的内部端口。
+            if _is_official_container():
+                resolved_port = DEFAULT_WEB_PORT
+            elif environment_port := os.environ.get("WEB_PORT"):
+                resolved_port = int(environment_port)
+        values: dict[str, str] = {}
+        if (resolved_host is None or resolved_port is None) and paths.env_file.exists():
             from app.env_file import read_env_text
 
             values = read_env_text(paths.env_file.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError) as exc:
-            return (
-                resolved_host or "0.0.0.0",
-                resolved_port or DEFAULT_WEB_PORT,
-                DiagnosticCheck(
-                    "runtime_config",
-                    "error",
-                    f"当前执行身份无法读取运行配置：{getattr(exc, 'strerror', None) or exc}。",
-                    "检查已有 user.env 的读取权限和格式。",
-                ),
-            )
-
-    if resolved_host is None:
-        resolved_host = values.get("WEB_HOST") or "0.0.0.0"
-    if resolved_port is None:
-        raw_file_port = values.get("WEB_PORT")
-        if raw_file_port:
-            try:
-                resolved_port = int(raw_file_port)
-            except ValueError:
-                return (
-                    resolved_host,
-                    DEFAULT_WEB_PORT,
-                    DiagnosticCheck(
-                        "runtime_config",
-                        "error",
-                        "当前执行身份无法解析 user.env 中的 WEB_PORT。",
-                        "将 WEB_PORT 设置为 1 到 65535 的整数。",
-                    ),
-                )
-        else:
-            resolved_port = DEFAULT_WEB_PORT
-
-    if not 1 <= resolved_port <= 65535:
-        return (
-            resolved_host,
-            DEFAULT_WEB_PORT,
-            DiagnosticCheck(
-                "runtime_config",
-                "error",
-                "当前执行身份解析到无效的 WEB_PORT。",
-                "将 WEB_PORT 设置为 1 到 65535 的整数。",
-            ),
+        if resolved_host is None:
+            resolved_host = values.get("WEB_HOST") or "0.0.0.0"
+        if resolved_port is None:
+            port_source = "user.env 中的 WEB_PORT"
+            resolved_port = int(values.get("WEB_PORT") or DEFAULT_WEB_PORT)
+        if 1 <= resolved_port <= 65535:
+            return resolved_host, resolved_port, None
+        message = "当前执行身份解析到无效的 WEB_PORT。"
+    except (OSError, UnicodeError) as exc:
+        return resolved_host or "0.0.0.0", resolved_port or DEFAULT_WEB_PORT, DiagnosticCheck(
+            "runtime_config", "error", f"当前执行身份无法读取运行配置：{getattr(exc, 'strerror', None) or exc}。",
+            "检查已有 user.env 的读取权限和格式。",
         )
-    return resolved_host, resolved_port, None
+    except ValueError:
+        message = f"当前执行身份无法解析 {port_source}。"
+    return resolved_host or "0.0.0.0", DEFAULT_WEB_PORT, DiagnosticCheck(
+        "runtime_config", "error", message, "将 WEB_PORT 设置为 1 到 65535 的整数。",
+    )
 
 
 def _emit_doctor_checks(as_json: bool, checks: list[dict[str, str]]) -> int:
@@ -317,7 +275,7 @@ def _doctor(
         )
         return _emit_doctor_checks(as_json, [check.as_dict()])
 
-    effective_host, effective_port, runtime_config_check = _resolve_doctor_endpoint(paths, host, port)
+    effective_host, effective_port, runtime_config_check = _resolve_service_endpoint(paths, host, port)
 
     # RuntimePaths 和端口均确定后才导入诊断模块。
     from app.modules.runtime_diagnostics import DiagnosticReport, run_diagnostics
@@ -364,7 +322,7 @@ def _support_bundle(output: Path | None, log_lines: int) -> int:
 
     try:
         paths = get_runtime_paths()
-        host, port, runtime_config_check = _resolve_doctor_endpoint(paths, None, None)
+        host, port, runtime_config_check = _resolve_service_endpoint(paths, None, None)
         destination = create_support_bundle(
             paths,
             output=output,
@@ -466,10 +424,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, RuntimeLayoutError) as exc:
             print(f"MediaFlux runtime layout: {exc}", file=sys.stderr)
             return 2
-    if args.command == "status":
-        return _status(_local_service_url(args.host, args.port), args.ready)
-    if args.command == "open":
-        return _open_web(_local_service_url(args.host, args.port))
+    if args.command in ("status", "open"):
+        try:
+            url = _local_service_url(args.host, args.port)
+        except (OSError, ValueError) as exc:
+            print(f"MediaFlux {args.command}: {exc}", file=sys.stderr)
+            return 2
+        return _open_web(url) if args.command == "open" else _status(url, args.ready)
     if args.command == "doctor":
         return _doctor(
             args.json,

@@ -193,6 +193,8 @@ python mediaflux.py doctor --source /path/to/downloads --target /path/to/media
 python mediaflux.py support-bundle
 ```
 
+支持包默认写入当前目录。当前目录不可写时，写入实例数据目录下的 `support/`。命令会输出 ZIP 的绝对路径，也可用 `--output` 指定文件。
+
 ### 源码备份与恢复
 
 从源码目录执行下列命令。使用默认目录的实例可直接执行启动与备份命令。使用自定义目录时，将以下绝对路径改为实际值，把同一组环境变量交给启动服务的进程和每个运维终端。下例沿用仅指定 `start --data-dir /path/to/mediaflux-data` 时的目录布局。已有实例若单独指定了配置、缓存、日志或 STRM 目录，保留各自的实际路径。

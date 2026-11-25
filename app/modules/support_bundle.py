@@ -261,11 +261,6 @@ def _redacted_config(paths: RuntimePaths) -> tuple[dict[str, str], str]:
     return redact_config(values), ""
 
 
-def _default_output() -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    return Path.cwd() / f"mediaflux-support-{stamp}.zip"
-
-
 def _validate_destination(destination: Path) -> None:
     try:
         metadata = destination.lstat()
@@ -431,8 +426,11 @@ def create_support_bundle(
     log_lines: int = 300,
 ) -> Path:
     """创建支持包；不包含数据库、token 或原始 user.env。"""
-    destination_input = Path(output) if output is not None else _default_output()
-    destination = _absolute_path_without_links(destination_input.expanduser())
+    if output is None:
+        directory = Path.cwd() if os.access(".", os.W_OK | os.X_OK) else paths.data_dir / "support"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        output = directory / f"mediaflux-support-{stamp}.zip"
+    destination = _absolute_path_without_links(Path(output).expanduser())
     protected = protected_runtime_output_target(paths, destination)
     if protected is not None:
         raise SupportBundleError(
