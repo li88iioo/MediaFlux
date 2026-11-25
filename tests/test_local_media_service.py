@@ -1205,17 +1205,24 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             (source_root / "Movie.2026.mkv").write_bytes(b"main-video")
             (source_root / "Movie.2026.sample.mkv").write_bytes(b"sample-video")
             source_id = self._source(source_root, target_root, "movie")
-            service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(
+            service = LocalMediaService(scraper=cast(TMDBScraper, SharedPositionFakeScraper(MatchResult(
                 tmdb_id="1", title="Movie", year="2026",
                 media_type="movie", confidence=1.0,
             ))))
+            self.addCleanup(service.close)
             inspection = service.inspect_source("admin", source_id, source_root)
             with patch(
                 "app.modules.local_media_service.OrganizeRules.from_config",
-                return_value=OrganizeRules(region_split=False, year_split=False),
+                return_value=OrganizeRules(region_split=False, year_split=False, emby_refresh=False),
             ):
                 preview = service.preview("admin", inspection["inspection_id"])
 
+            self.assertEqual(inspection["suggested_query"], "Movie")
+            self.assertEqual(inspection["primary_video_name"], "Movie.2026.mkv")
+            self.assertEqual(inspection["video_count"], 2)
+            self.assertFalse(inspection["single_video"])
+            self.assertEqual({item["name"] for item in inspection["files"]},
+                             {"Movie.2026.mkv", "Movie.2026.sample.mkv"})
             self.assertEqual(preview["status"], "planned")
             self.assertEqual(len(preview["plans"]), 1)
             self.assertEqual(preview["plans"][0]["source_path"], "Movie.2026.mkv")
@@ -1228,6 +1235,13 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                     "reason_code": "sample-review",
                 }],
             )
+            task_id = service.create_manual_task("admin", inspection["inspection_id"],
+                                                 preview_digest=preview["preview_digest"])
+            result = service.execute_task("admin", task_id)
+            self.assertEqual(_require_task(task_id).status, "completed")
+            self.assertEqual(result["moved"], [preview["plans"][0]["target_path"]])
+            self.assertEqual(Path(result["moved"][0]).read_bytes(), b"main-video")
+            self.assertEqual((source_root / "Movie.2026.sample.mkv").read_bytes(), b"sample-video")
 
     def test_rules_snapshot_keeps_manual_execution_consistent_with_preview(self):
         from app.modules.organize import OrganizeRules

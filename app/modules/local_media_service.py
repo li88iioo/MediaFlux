@@ -30,9 +30,9 @@ from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
 from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
 from app.modules.local_media_candidates import move_candidate_to_trash
 from app.modules.local_media_cleanup import (
-    cleanup_candidates_from_snapshots,
+    classify_cleanup_items,
     delete_cleanup_items,
-    probable_sample_video_paths,
+    split_media_videos,
 )
 from app.modules.local_media_models import (
     LOCAL_MEDIA_CATEGORIES,
@@ -468,7 +468,8 @@ class LocalMediaService:
             and item.role != "other"
             and not adapter.is_temporary(item.path)
         ]
-        videos = [item for item in visible_snapshots if item.role == "video"]
+        videos, sample_paths = split_media_videos(visible_snapshots)
+        video_count = len(videos) + len(sample_paths)
         if not videos:
             raise LocalMediaServiceError("选择路径中没有可整理的视频")
         primary_video = videos[0] if len(videos) == 1 else None
@@ -568,8 +569,8 @@ class LocalMediaService:
             "selected_name": selected.name,
             "selected_kind": "file" if selected.is_file() else "directory",
             "file_count": len(visible_snapshots),
-            "video_count": len(videos),
-            "single_video": primary_video is not None,
+            "video_count": video_count,
+            "single_video": video_count == 1,
             "primary_video_name": primary_video.path.name if primary_video else "",
             "suggested_query": suggested_query,
             "media_type": detected_media_type,
@@ -1240,19 +1241,11 @@ class LocalMediaService:
             )
         effective_rules_snapshot = self._serialize_rules_snapshot(rules)
 
-        cleanup_candidates = cleanup_candidates_from_snapshots(current)
-        cleanup_paths = {item.snapshot.path for item in cleanup_candidates}
-        retained_sample_paths = probable_sample_video_paths(current)
-        videos = [
-            item for item in current
-            if item.role == "video"
-            and item.path not in cleanup_paths
-            and item.path not in retained_sample_paths
-        ]
+        cleanup_candidates, retained = classify_cleanup_items(current)
+        videos, retained_sample_paths = split_media_videos(retained)
         companions = [
-            item for item in current
+            item for item in retained
             if item.role in {"subtitle", "metadata", "image"}
-            and item.path not in cleanup_paths
         ]
         if not videos:
             raise LocalMediaServiceError("选择路径中没有可整理的视频")

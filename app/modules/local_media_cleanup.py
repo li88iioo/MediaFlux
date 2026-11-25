@@ -64,8 +64,6 @@ def is_probable_sample_video(
 
 def classify_cleanup_items(
     snapshots: Iterable[LocalFileSnapshot],
-    *,
-    sample_max_bytes: int = 300 * 1024 * 1024,
 ) -> tuple[list[CleanupCandidate], list[LocalFileSnapshot]]:
     """返回（确定垃圾、保留文件），未知文件永远进入保留列表。"""
     cleanup: list[CleanupCandidate] = []
@@ -293,36 +291,17 @@ def delete_cleanup_items(
             os.close(root_fd)
 
 
-def cleanup_candidates_from_snapshots(
+def split_media_videos(
     snapshots: Iterable[LocalFileSnapshot],
-) -> list[CleanupCandidate]:
-    """复用既有扫描快照，只选择可确定删除的非媒体垃圾。"""
-    items = list(snapshots)
-    cleanup, _ = classify_cleanup_items(items)
-    return cleanup
-
-
-def probable_sample_video_paths(
-    snapshots: Iterable[LocalFileSnapshot],
-    *,
-    sample_max_bytes: int = 300 * 1024 * 1024,
-) -> set[Path]:
-    """返回需保留但不自动归档的 sample/proof 视频路径。"""
-    items = list(snapshots)
-    primary_count = sum(
-        1 for item in items
-        if item.role == "video" and not is_sample_media_path(item.path)
-    )
-    if primary_count <= 0:
-        return set()
-    return {
-        item.path
-        for item in items
-        if item.role == "video"
-        and is_probable_sample_video(
-            item.path, item.size, sample_max_bytes=sample_max_bytes
-        )
+) -> tuple[list[LocalFileSnapshot], set[Path]]:
+    """区分参与识别的视频和随正片保留的样片；仅有样片时保留原选择。"""
+    videos = [item for item in snapshots if item.role == "video"]
+    if not any(not is_sample_media_path(item.path) for item in videos):
+        return videos, set()
+    samples = {
+        item.path for item in videos if is_probable_sample_video(item.path, item.size)
     }
+    return [item for item in videos if item.path not in samples], samples
 
 
 def discover_cleanup_candidates(
@@ -377,4 +356,5 @@ def discover_cleanup_candidates(
             snapshots.append(adapter.snapshot(path))
         except Exception:
             continue
-    return cleanup_candidates_from_snapshots(snapshots)
+    cleanup, _ = classify_cleanup_items(snapshots)
+    return cleanup
