@@ -65,7 +65,7 @@ def _capability_status() -> dict:
         from guangyaclient import GuangyaClient as _SDKProbe  # noqa: F401
     except ImportError:
         sdk_available = False
-    strm_error = get_scheduler().validate_config(auto_only=False)
+    strm_error = get_scheduler().validate_config()
     return {
         "sdk_available": sdk_available,
         "proxy_enabled": sdk_available,

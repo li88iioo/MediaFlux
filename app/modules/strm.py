@@ -3730,38 +3730,29 @@ def _process_claimed_strm_failures(
                 continue
             resolved = located.get((str(row["source_id"]), str(row["file_id"])))
             action = str(row["action"] or "")
-            filter_error = ""
+            defer_reason = ""
             if action == "metadata" and not runtime["metadata_enabled"]:
-                filter_error = "STRM 伴随同步已暂停，保留待重试"
+                defer_reason = "STRM 伴随同步已暂停，保留待重试"
             elif resolved is not None:
                 file = resolved[0]
                 extension = file.name.rsplit(".", 1)[-1].lower() if "." in file.name else ""
                 if action == "generate" and extension not in video_exts:
-                    filter_error = "STRM 视频类型已被本轮配置排除，保留待重试"
-                elif action == "generate" and threshold_bytes and 0 < file.size < threshold_bytes:
-                    filter_error = "STRM 视频大小低于本轮最小阈值，保留待重试"
+                    defer_reason = "STRM 视频类型已被本轮配置排除，保留待重试"
+                elif action == "generate" and 0 < file.size < threshold_bytes:
+                    defer_reason = "STRM 视频大小低于本轮最小阈值，保留待重试"
                 elif action == "metadata" and extension not in metadata_exts:
-                    filter_error = "STRM 伴随文件类型已被本轮配置排除，保留待重试"
-            if filter_error:
-                if not db.release_strm_failure_retry(failure_id, error=filter_error, expected_status="retrying"):
+                    defer_reason = "STRM 伴随文件类型已被本轮配置排除，保留待重试"
+            elif lookup.scan_incomplete or lookup.stopped:
+                defer_reason = (
+                    "STRM 重试扫描已停止，尚未确认云端对象状态"
+                    if lookup.stopped else "STRM 重试扫描不完整，尚未确认云端对象状态"
+                )
+            if defer_reason:
+                if not db.release_strm_failure_retry(failure_id, error=defer_reason, expected_status="retrying"):
                     raise RuntimeError("STRM deferred 状态已变化，拒绝覆盖")
                 result["deferred"] += 1
                 continue
             if resolved is None:
-                if lookup.scan_incomplete or lookup.stopped:
-                    deferred_error = (
-                        "STRM 重试扫描已停止，尚未确认云端对象状态"
-                        if lookup.stopped
-                        else "STRM 重试扫描不完整，尚未确认云端对象状态"
-                    )
-                    if not db.release_strm_failure_retry(
-                        failure_id,
-                        error=deferred_error,
-                        expected_status="retrying",
-                    ):
-                        raise RuntimeError("STRM deferred 状态已变化，拒绝覆盖")
-                    result["deferred"] += 1
-                    continue
                 stale_error = "stale: 云端对象已不存在或已移出已配置 STRM 来源"
                 if not db.mark_strm_failure_stale(
                     failure_id, error=stale_error, expected_status="retrying"
@@ -3784,32 +3775,40 @@ def _process_claimed_strm_failures(
                 refresh_paths = [str(target)]
                 if action == "generate":
                     source_key = source["source_key"]
+                    file_ids = {file.file_id}
+                    valid_ids: set[str] = set()
                     existing_by_id, existing_by_path = _build_index_maps(
                         strm_repo.list_strm_installation_rows(source_key, file.file_id, _index_path_aliases(target, strm_root)),
                         strm_root,
                     )
-                    current_before_install = existing_by_id.get(file.file_id)
                     if _video_candidate_wins(
                         file, rel_dir, target, strm_root, existing_by_path,
                         lookup_file=client.file_info,
                         video_exts=video_exts, threshold_bytes=threshold_bytes,
                     ):
-                        cleaned, _installed_fingerprint = _install_video_candidate(
+                        _install_video_candidate(
                             file, rel_dir, target, base_url, strm_root, source_key,
                             existing_by_id, existing_by_path,
                         )
-                        if cleaned and current_before_install:
-                            previous = _safe_indexed_path(_row_field(current_before_install, "strm_path", ""), strm_root)
-                            if previous is not None:
-                                refresh_paths.append(str(previous))
+                        valid_ids = file_ids
                     else:
+                        current = existing_by_id.get(file.file_id)
                         cleanup = _remove_indexed_rows(
-                            source_key, [current_before_install] if current_before_install else [],
+                            source_key, [current] if current else [],
                             strm_root, refresh_policy=refresh_policy,
                         )
                         if cleanup["errors"]:
                             raise cleanup["errors"][0][1]
                         refresh_paths = cleanup["removed_paths"]
+                    recovery: dict[str, Any] = {"cleaned": 0}
+                    if not recover_pending_paths(
+                        source_key, strm_root, recovery, valid_ids=valid_ids, only_file_ids=file_ids,
+                        should_stop=should_stop, on_refresh_paths=refresh_policy,
+                    ):
+                        if recovery.get("stop_stage") == "recovery-cleanup":
+                            raise _STRMStopped("旧 STRM 路径交接已取消，保留待重试")
+                        detail = next(iter(recovery.get("error_samples", ())), "旧 STRM 路径交接未完成")
+                        raise RuntimeError(detail)
                 elif action == "metadata":
                     metadata_job = _metadata_queue_payload(
                         file, rel_dir, strm_root, source_id=source["id"],
@@ -3823,7 +3822,6 @@ def _process_claimed_strm_failures(
                         installed = commit_strm_metadata_job(
                             metadata_job, prepared_job, strm_root, should_stop=should_stop,
                         )
-                        cleaned = installed["cleaned"]
                         metadata_job["installed_path"] = installed["path"]
                     finally:
                         prepared = prepared_job.get("prepared")

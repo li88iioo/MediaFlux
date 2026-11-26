@@ -1199,7 +1199,7 @@ class GuangYaTokenApiTests(InitializedWebTestCase):
         return payload
 
     def test_capabilities_api_exposes_runtime_readiness(self):
-        scheduler = type("Scheduler", (), {"validate_config": lambda self, auto_only=False: "STRM 未配置"})()
+        scheduler = type("Scheduler", (), {"validate_config": lambda self: "STRM 未配置"})()
         with patch("app.routes.guangya_api.get_scheduler", return_value=scheduler):
             response = self.client.get("/api/guangya/capabilities")
 

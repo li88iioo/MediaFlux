@@ -10,12 +10,11 @@ import threading
 from datetime import datetime
 from typing import Callable
 
-from croniter import croniter
-
 from app.config import get, get_bool
 from app.defaults import DEFAULT_SCHEDULE_CRON
 from app.logger import get_logger, log_throttled
 from app.modules.organize import OrganizeRules
+from app.modules.schedule_cron import INVALID_CRON, next_cron_run
 from app.modules.organize_sources import normalize_organize_sources
 
 logger = get_logger(__name__)
@@ -88,18 +87,6 @@ class OrganizeScheduler:
             self._config_error = ""
         self._wake_event.set()
 
-    @staticmethod
-    def validate_cron(expr: str) -> bool:
-        """只接受标准 5 段 cron（分 时 日 月 周）。"""
-        text = (expr or "").strip()
-        if len(text.split()) != 5:
-            return False
-        try:
-            croniter(text, datetime.now()).get_next(datetime)
-            return True
-        except (KeyError, TypeError, ValueError):
-            return False
-
     def status(self) -> dict:
         """返回启用状态、下次运行和最近一次 Cron 结果。"""
         self._refresh_active_result()
@@ -112,7 +99,7 @@ class OrganizeScheduler:
         return {
             "enabled": enabled,
             "cron": cron_expr,
-            "cron_valid": self.validate_cron(cron_expr),
+            "cron_valid": next_cron_run(cron_expr) is not None,
             "config_error": error,
             "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "",
             "last_result": last_result,
@@ -142,7 +129,9 @@ class OrganizeScheduler:
         cron_expr = self._cron_expr()
         sources = self._configured_sources()
         target_dir_id = (self._get_value("GY_ORGANIZE_TARGET_DIR", "0") or "0").strip()
-        error = self._validate_config(cron_expr, sources, target_dir_id)
+        now = self._now()
+        next_run = next_cron_run(cron_expr, now)
+        error = self._validate_config(next_run, sources, target_dir_id)
         if error:
             with self._state_lock:
                 self._loaded_cron = cron_expr
@@ -150,15 +139,14 @@ class OrganizeScheduler:
                 self._config_error = error
             return
 
-        now = self._now()
         with self._state_lock:
             self._config_error = ""
             if self._next_run is None or self._loaded_cron != cron_expr:
-                self._next_run = croniter(cron_expr, now).get_next(datetime)
+                self._next_run = next_run
                 self._loaded_cron = cron_expr
             due = bool(self._next_run and now >= self._next_run)
             if due:
-                self._next_run = croniter(cron_expr, now).get_next(datetime)
+                self._next_run = next_run
         if due:
             self._start_due_task(sources, target_dir_id)
 
@@ -235,15 +223,14 @@ class OrganizeScheduler:
             )
         return sources
 
-    @classmethod
+    @staticmethod
     def _validate_config(
-        cls,
-        cron_expr: str,
+        next_run: datetime | None,
         sources: list[dict[str, str]],
         target_dir_id: str,
     ) -> str:
-        if not cls.validate_cron(cron_expr):
-            return "cron 表达式无效，需使用 5 段格式：分 时 日 月 周"
+        if next_run is None:
+            return INVALID_CRON
         if not sources:
             return "未配置网盘整理源目录"
         if not target_dir_id or target_dir_id == "0":

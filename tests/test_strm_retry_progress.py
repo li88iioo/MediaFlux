@@ -16,7 +16,7 @@ from app import database as db
 from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm as strm_module
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 from tests.support import PagedDirectoryTestMixin
 
 
@@ -1079,7 +1079,11 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
     def test_overlapping_source_retry_restores_each_failed_namespace(self):
         for reverse in (False, True):
             for retry_all in (False, True):
-                with self.subTest(reverse=reverse, retry_all=retry_all), tempfile.TemporaryDirectory() as root:
+                with (
+                    self.subTest(reverse=reverse, retry_all=retry_all),
+                    isolated_test_database(),
+                    tempfile.TemporaryDirectory() as root,
+                ):
                     sources = strm_module.plan_strm_sources([
                         {"id": "outer", "name": "Outer"}, {"id": "inner", "name": "Inner"},
                     ])

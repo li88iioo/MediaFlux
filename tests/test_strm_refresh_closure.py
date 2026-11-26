@@ -820,7 +820,8 @@ def test_real_scheduler_entry_retires_last_source_without_config_short_circuit(t
         stack.enter_context(patch.object(config, "_cache", {
             "GY_STRM_SOURCE_DIRS": "[]", "STRM_ROOT": str(tmp_path),
             "GY_STRM_BASE_URL": "", "STRM_SCHEDULE_ENABLED": "1" if entry == "start-cron" else "0",
-            "STRM_SCHEDULE_CRON": "* * * * *", "JELLYFIN_ENABLED": "0", "EMBY_ENABLED": "0",
+            "STRM_SCHEDULE_CRON": "* * * * *" if entry == "start-cron" else "",
+            "JELLYFIN_ENABLED": "0", "EMBY_ENABLED": "0",
         }))
         scheduler = STRMScheduler()
         for name in ("_notify_success", "_notify_details", "_notify_failure",
@@ -831,7 +832,7 @@ def test_real_scheduler_entry_retires_last_source_without_config_short_circuit(t
                                ("organize_probe_worker", "get_organize_probe_worker")):
             stack.enter_context(patch(f"app.modules.{module}.{getter}", return_value=Mock()))
         assert scheduler._source_dirs() == []
-        assert scheduler.validate_config(auto_only=entry == "start-cron") == ""
+        assert scheduler.validate_config() == ""
         try:
             if entry == "start-cron":
                 # scheduler 使用本机无时区时间；显式转换以保持同一时间契约。

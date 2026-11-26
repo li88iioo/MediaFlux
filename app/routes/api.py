@@ -38,6 +38,7 @@ from app.indexers.config import (
     normalize_persisted_indexer_site_ids,
 )
 from app.logger import get_logger
+from app.modules.schedule_cron import next_cron_run
 from app.modules.policy_config import POLICY_BY_KEY, policy_int
 from app.modules.telegram_notification_policy import DEFAULT_NOTIFICATION_LEVEL, NOTIFICATION_LEVELS
 from app.modules.feature_config import (
@@ -700,7 +701,7 @@ def _validate_nsfw_organize_updates(data: dict[str, Any]) -> dict[str, str]:
                 values.append(domain)
         normalized["GY_ORGANIZE_NSFW_STRIP_DOMAINS"] = ",".join(values[:100])
     if "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS" in data:
-        raw_timeout = str(data["GY_ORGANIZE_NSFW_TIMEOUT_SECONDS"] or "").strip()
+        raw_timeout = str(data["GY_ORGANIZE_NSFW_TIMEOUT_SECONDS"]).strip()
         try:
             timeout = int(raw_timeout or (config.get("GY_ORGANIZE_NSFW_TIMEOUT_SECONDS", "8") or "8"))
         except (TypeError, ValueError) as exc:
@@ -1363,34 +1364,22 @@ def save_config(request: Request, data: Any = Body(default=None)):
                     )
             else:
                 media_workflow_updates["GY_STRM_BASE_URL"] = ""
-        cron_validators = {
-            "STRM_SCHEDULE_CRON": ("app.modules.scheduler", "STRMScheduler"),
-            "GY_ORGANIZE_SCHEDULE_CRON": ("app.modules.organize_scheduler", "OrganizeScheduler"),
-        }
-        for key, (module_name, class_name) in cron_validators.items():
-            if key not in data:
-                continue
-            # 提交的空值也必须拒绝：存为空串不会回退默认，计划会静默失效。
-            import importlib
-
-            validator = getattr(importlib.import_module(module_name), class_name)
-            if not validator.validate_cron(str(data[key] or "").strip()):
+        for key in ("STRM_SCHEDULE_CRON", "GY_ORGANIZE_SCHEDULE_CRON"):
+            if key in data and next_cron_run(str(data[key] or "").strip()) is None:
                 return api_error(f"{key} 必须是有效的 5 段 cron 表达式", 400)
         integer_limits = {
             "STRM_SKIP_THRESHOLD_MB": (0, None),
             "GY_ORGANIZE_SMALL_FILE_MB": (0, None),
             "AGENT_LIBRARY_PATROL_INTERVAL_HOURS": (1, 168),
             "AGENT_LIBRARY_PATROL_MAX_SERIES": (1, 100),
-            "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS": (2, 30),
         }
         for key, (minimum, maximum) in integer_limits.items():
-            if key not in data:
-                continue
-            if str(data[key] or "").strip() == "":
+            raw = str(data.get(key, "")).strip()
+            if not raw:
                 continue
             try:
-                number = int(str(data[key]).strip())
-            except (TypeError, ValueError):
+                number = int(raw)
+            except ValueError:
                 return api_error(f"{key} 必须是整数", 400)
             if number < minimum or (maximum is not None and number > maximum):
                 scope = f"{minimum} 到 {maximum}" if maximum is not None else f"不小于 {minimum}"

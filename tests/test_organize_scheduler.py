@@ -98,13 +98,12 @@ class OrganizeSchedulerTests(unittest.TestCase):
         assert (OrganizeScheduler) is not None, "缺少 app.modules.organize_scheduler"
         return OrganizeScheduler
 
-    def test_validate_cron_accepts_standard_five_fields(self):
-        scheduler_class = self.require_scheduler()
-        self.assertTrue(scheduler_class.validate_cron("*/15 1-5 * * 1-5"))
+    def test_next_run_uses_standard_five_fields(self):
+        from app.modules.schedule_cron import next_cron_run
 
-    def test_validate_cron_rejects_six_fields(self):
-        scheduler_class = self.require_scheduler()
-        self.assertFalse(scheduler_class.validate_cron("0 */15 1-5 * * 1-5"))
+        base = datetime(2026, 11, 23, 2, 8)
+        self.assertEqual(next_cron_run("*/15 1-5 * * 1-5", base), base.replace(minute=15))
+        self.assertIsNone(next_cron_run("0 */15 1-5 * * 1-5", base))
 
     def test_disabled_schedule_clears_next_run_without_starting_task(self):
         self.require_scheduler()

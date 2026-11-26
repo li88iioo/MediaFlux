@@ -21,8 +21,6 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Iterable, Optional, TypedDict
 
-from croniter import croniter
-
 from app import config, database as db
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import strm as strm_repo
@@ -31,6 +29,7 @@ from app.repositories import strm_request_ownership as strm_request_ownership_re
 from app.config import get, get_bool, get_int
 from app.defaults import DEFAULT_SCHEDULE_CRON, DEFAULT_STRM_SKIP_THRESHOLD_MB
 from app.logger import get_logger, log_throttled
+from app.modules.schedule_cron import INVALID_CRON, next_cron_run
 from app.modules.media_refresh import plan_refresh_targets
 from app.modules.organize_probe_notifications import (
     merge_notification_scopes,
@@ -1214,8 +1213,10 @@ class STRMScheduler:
         """返回调度器状态和最近运行记录。"""
         enabled = get_bool("STRM_SCHEDULE_ENABLED", False)
         cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
-        error = self.validate_config(auto_only=False)
-        next_run = self._calculate_next(cron_expr) if enabled and not error else None
+        error = self.validate_config()
+        next_run = next_cron_run(cron_expr)
+        if enabled and next_run is None and not error:
+            error = INVALID_CRON
         last = db.get_last_task_run(TASK_NAME)
         with self._state_lock:
             running = self._running
@@ -1257,7 +1258,7 @@ class STRMScheduler:
             "cron": cron_expr,
             "sources": self._source_dirs(),
             "metadata_enabled": get_bool("STRM_METADATA_ENABLED", False),
-            "cron_valid": self.validate_cron(cron_expr),
+            "cron_valid": next_run is not None,
             "config_error": error,
             "running": running,
             "current_run_id": current_run_id,
@@ -1270,7 +1271,7 @@ class STRMScheduler:
             "source_runtime": source_runtime,
             "metadata_queue": metadata_queue,
             "organize_probe_queue": organize_probe_queue,
-            "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "",
+            "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if enabled and not error and next_run else "",
             "last_run": self.run_record(last),
         }
 
@@ -1295,21 +1296,8 @@ class STRMScheduler:
                 )
 
     @staticmethod
-    def validate_cron(expr: str) -> bool:
-        """仅接受标准 5 段 cron。"""
-        if len((expr or "").split()) != 5:
-            return False
-        try:
-            croniter(expr, datetime.now()).get_next(datetime)
-            return True
-        except (ValueError, KeyError):
-            return False
-
-    @staticmethod
-    def validate_config(auto_only: bool = False) -> str:
+    def validate_config() -> str:
         """验证运行所需配置，返回错误文字或空字符串。"""
-        if auto_only and not get_bool("STRM_SCHEDULE_ENABLED", False):
-            return "定时任务未启用"
         sources = STRMScheduler._source_dirs()
         root = get("STRM_ROOT", "").strip()
         base_url = get("GY_STRM_BASE_URL", "").strip()
@@ -1324,9 +1312,6 @@ class STRMScheduler:
             validate_strm_extensions(STRMScheduler._video_exts(), STRMScheduler._metadata_exts())
         except ValueError as exc:
             return str(exc)
-        cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
-        if not STRMScheduler.validate_cron(cron_expr):
-            return "cron 表达式无效，需使用 5 段格式：分 时 日 月 周"
         return ""
 
     @staticmethod
@@ -1471,23 +1456,24 @@ class STRMScheduler:
                 self._next_run = None
                 self._loaded_cron = ""
             return
-        error = self.validate_config(auto_only=True)
+        cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
+        now = datetime.now()
+        next_run = next_cron_run(cron_expr, now)
+        error = self.validate_config() if next_run else INVALID_CRON
         if error:
             log_throttled(
                 logger, logging.WARNING, f"strm-schedule-config:{error}",
                 "STRM 定时任务配置无效: %s", error,
             )
             return
-        cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
-        now = datetime.now()
         with self._state_lock:
             if self._next_run is None or self._loaded_cron != cron_expr:
-                self._next_run = self._calculate_next(cron_expr, now)
+                self._next_run = next_run
                 self._loaded_cron = cron_expr
-                logger.info(f"STRM 下次定时扫描: {self._next_run:%Y-%m-%d %H:%M:%S}")
+                logger.info("STRM 下次定时扫描: %s", next_run)
             due = self._next_run is not None and now >= self._next_run
             if due:
-                self._next_run = self._calculate_next(cron_expr, now)
+                self._next_run = next_run
         if due:
             result = self.trigger("cron")
             if not result.get("ok"):
@@ -1901,7 +1887,7 @@ class STRMScheduler:
                 "notification_scopes": notification_scopes(options),
                 "download_request_owners": options.get("download_request_owners") or [],
             })
-            error = self.validate_config(auto_only=False)
+            error = self.validate_config()
             if error:
                 raise ValueError(error)
             configured_sources = self._source_dirs()
@@ -2319,10 +2305,6 @@ class STRMScheduler:
                 get_strm_metadata_worker().wake()
             except Exception:
                 logger.exception("唤醒 STRM 元数据后台下载器失败")
-
-    @staticmethod
-    def _calculate_next(expr: str, base: Optional[datetime] = None) -> datetime:
-        return croniter(expr, base or datetime.now()).get_next(datetime)
 
     @staticmethod
     def _source_dirs() -> list[dict[str, str]]:
@@ -2889,7 +2871,7 @@ def _capture_strm_run(source_ids: list[str] | None) -> dict:
     selection_error = bool(selected and (source_error or any(identity not in by_id for identity in selected)))
     chosen = [by_id[identity] for identity in selected if identity in by_id] if selected else sources
     scheduler = get_scheduler()
-    validation_error = scheduler.validate_config(auto_only=False) or ""
+    validation_error = scheduler.validate_config() or ""
     running = scheduler.status().get("running") is True
     payload: dict[str, Any] = {key: config.get(key, "") for key in _STRM_CONFIRMATION_KEYS}
     payload.update(selected_source_ids=selected, selection_error=selection_error,

@@ -9,6 +9,8 @@ from app import config
 from app.defaults import DEFAULT_SCHEDULE_CRON
 from app import database as db
 from app.logger import get_logger
+from app.modules.feature_config import normalize_boolean
+from app.modules.schedule_cron import INVALID_CRON, next_cron_run
 from app.modules.scheduler import STRMScheduler, get_scheduler
 from app.modules.strm import retry_all_strm_failures, retry_strm_failures
 from app.web import api_error, api_response, config_write_api_error, require_api_login
@@ -204,16 +206,18 @@ def schedule_status(request: Request):
 def update_schedule(request: Request, data: dict = Body(...)):
     require_api_login(request)
     cron_expr = str(data.get("cron", DEFAULT_SCHEDULE_CRON)).strip()
-    if not STRMScheduler.validate_cron(cron_expr):
-        return api_error("cron 表达式无效，需使用 5 段格式：分 时 日 月 周", 400)
-    updates = {
-        "STRM_SCHEDULE_ENABLED": "1" if data.get("enabled") else "0",
-        "STRM_SCHEDULE_CRON": cron_expr,
-    }
-    if "notify_enabled" in data:
-        updates["STRM_NOTIFY_ENABLED"] = "1" if data["notify_enabled"] else "0"
+    if next_cron_run(cron_expr) is None:
+        return api_error(INVALID_CRON, 400)
     try:
+        updates = {
+            "STRM_SCHEDULE_ENABLED": normalize_boolean("enabled", data.get("enabled") or False),
+            "STRM_SCHEDULE_CRON": cron_expr,
+        }
+        if "notify_enabled" in data:
+            updates["STRM_NOTIFY_ENABLED"] = normalize_boolean("notify_enabled", data["notify_enabled"] or False)
         config.set_and_save(updates)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
     except (config.AtomicPublishError, OSError) as exc:
         return config_write_api_error(
             exc,
@@ -228,17 +232,15 @@ def update_schedule(request: Request, data: dict = Body(...)):
 def validate_schedule(request: Request, data: dict = Body(...)):
     require_api_login(request)
     expr = str(data.get("cron", "")).strip()
-    valid = STRMScheduler.validate_cron(expr)
-    next_run = ""
-    if valid:
-        next_run = STRMScheduler._calculate_next(expr).strftime("%Y-%m-%d %H:%M:%S")
-    return api_response({"valid": valid, "next_run": next_run})
+    next_run = next_cron_run(expr)
+    return api_response({"valid": next_run is not None,
+                         "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else ""})
 
 
 @router.post("/run/fast")
 def run_fast_now(request: Request):
     require_api_login(request)
-    config_error = get_scheduler().validate_config(auto_only=False)
+    config_error = get_scheduler().validate_config()
     if config_error:
         return api_error(config_error, 400)
     result = get_scheduler().trigger("manual", sync_mode="fast")
@@ -248,7 +250,7 @@ def run_fast_now(request: Request):
 @router.post("/run/full")
 def run_full_now(request: Request):
     require_api_login(request)
-    config_error = get_scheduler().validate_config(auto_only=False)
+    config_error = get_scheduler().validate_config()
     if config_error:
         return api_error(config_error, 400)
     result = get_scheduler().trigger("manual", sync_mode="full", force_full=True)

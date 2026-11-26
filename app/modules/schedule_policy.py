@@ -11,8 +11,8 @@ from typing import Any
 from app import config
 from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_SCHEDULE_CRON
 from app.logger import get_logger
-from app.modules.organize_scheduler import OrganizeScheduler, get_organize_scheduler
-from app.modules.scheduler import STRMScheduler
+from app.modules.organize_scheduler import get_organize_scheduler
+from app.modules.schedule_cron import INVALID_CRON, next_cron_run
 
 logger = get_logger(__name__)
 _TARGETS: dict[str, dict[str, tuple[str, Any]]] = {
@@ -61,9 +61,8 @@ def normalize_changes(kind: str, arguments: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(value, str):
                 raise ValueError("cron 必须是字符串")
             value = " ".join(value.strip().split())
-            scheduler = OrganizeScheduler if kind == "organize" else STRMScheduler
-            if len(value) > 128 or not scheduler.validate_cron(value):
-                raise ValueError("cron 表达式无效，需使用 5 段格式：分 时 日 月 周")
+            if len(value) > 128 or next_cron_run(value) is None:
+                raise ValueError(INVALID_CRON)
         else:
             minimum, maximum = _BOUNDS[name]
             if type(value) is not int:
@@ -125,7 +124,7 @@ def summarize_policy(kind: str) -> dict:
         "managed_fields": _public_fields(kind, managed),
     }
     if kind == "organize":
-        data.update(configured=True, cron_valid=OrganizeScheduler.validate_cron(policy["cron"]), next_run=None)
+        data.update(configured=True, cron_valid=next_cron_run(policy["cron"]) is not None, next_run=None)
         try:
             runtime = get_organize_scheduler().status()
             data.update(configured=not bool(runtime.get("config_error")), cron_valid=bool(runtime.get("cron_valid")))

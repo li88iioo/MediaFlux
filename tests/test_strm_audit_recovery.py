@@ -85,6 +85,94 @@ def test_retry_stop_never_installs_remaining_located_files(tmp_path, mode, stop_
         assert len(list(tmp_path.rglob("*.strm"))) == 3
 
 
+def test_moved_video_retry_defers_cancelled_handoff_and_keeps_other_receipts(tmp_path):
+    with isolated_test_database(), patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
+        client, runtime = seed(tmp_path, 2)
+        selected, unselected = client.tree["s"]
+        source_key = "guangya:s"
+
+        def install_indexed(file, directory):
+            path = strm.generate_strm(file, directory, runtime["base_url"], str(tmp_path))
+            strm_repo.upsert_strm_index(
+                source_key, file.file_id, file.etag, file.size, file.name,
+                str(path), strm._content_fingerprint(path),
+            )
+            return path
+
+        selected_old = install_indexed(selected, "Old")
+        unselected_old = install_indexed(unselected, "Old")
+        unselected_current = install_indexed(unselected, "Keep")
+        unselected_payload = unselected_old.read_bytes()
+        ids = {row["file_id"]: row["id"] for row in db.list_strm_failures(status="open")}
+        stop = threading.Event()
+        install = strm._install_video_candidate
+
+        def stop_after_install(*args, **kwargs):
+            result = install(*args, **kwargs)
+            stop.set()
+            return result
+
+        def retry_selected():
+            return strm.retry_strm_failures(
+                [ids[selected.file_id]], "agent", client=cast(GuangYaClient, client),
+                runtime_config=runtime, should_stop=stop.is_set,
+            )
+
+        with patch.object(strm, "_install_video_candidate", side_effect=stop_after_install):
+            cancelled = retry_selected()
+        assert cancelled["stopped"] and cancelled["stop_stage"] == "retry", cancelled
+        assert (cancelled["resolved"], cancelled["failed"], cancelled["deferred"]) == (0, 0, 1)
+        selected_current = tmp_path / strm.STRM_SUBDIR / "Movie0.strm"
+        assert selected_current.is_file() and not selected_old.exists()
+        assert {row["file_id"] for row in db.list_strm_failures(status="open")} == set(ids)
+        assert {row["file_id"] for row in strm_repo.list_strm_path_cleanup(source_key)} == set(ids)
+        assert strm_repo.list_strm_refresh_entries() == []
+
+        stop.clear()
+        assert retry_selected()["resolved"] == 1
+        assert [row["file_id"] for row in db.list_strm_failures(status="open")] == [unselected.file_id]
+        assert [row["strm_path"] for row in strm_repo.list_strm_path_cleanup(source_key)] == [str(unselected_old)]
+        assert unselected_old.read_bytes() == unselected_current.read_bytes() == unselected_payload
+        assert {entry["path"] for entry in strm_repo.list_strm_refresh_entries()} == {
+            str(selected_old), str(selected_current),
+        }
+
+
+def test_moved_video_retry_waits_for_registered_old_output_root(tmp_path):
+    with isolated_test_database(), patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
+        previous_root = tmp_path / "previous"
+        current_root = tmp_path / "current"
+        offline_root = tmp_path / "temporarily-unmounted"
+        client, runtime = seed(current_root, 1)
+        [file] = client.tree["s"]
+        sources = runtime["sources"]
+        source_key = sources[0]["source_key"]
+        db.reconcile_configured_strm_sources(sources, str(previous_root))
+        old = strm.generate_strm(file, "", runtime["base_url"], str(previous_root))
+        strm_repo.upsert_strm_index(
+            source_key, file.file_id, file.etag, file.size, file.name,
+            str(old), strm._content_fingerprint(old),
+        )
+        db.reconcile_configured_strm_sources(sources, str(current_root))
+        assert str(previous_root) in db.get_strm_source_output_roots(file.parent_id)
+        previous_root.rename(offline_root)
+
+        first = retry("selected", client, runtime)
+        assert (first["resolved"], first["failed"]) == (0, 1), first
+        [failure] = db.list_strm_failures(status="open")
+        assert "旧输出根无法访问" in failure["error"]
+        assert [row["strm_path"] for row in strm_repo.list_strm_path_cleanup(source_key)] == [str(old)]
+        target = current_root / strm.STRM_SUBDIR / "Movie0.strm"
+        assert target.read_bytes() == (offline_root / old.relative_to(previous_root)).read_bytes()
+        assert strm_repo.list_strm_refresh_entries() == []
+
+        offline_root.rename(previous_root)
+        assert retry("selected", client, runtime)["resolved"] == 1
+        assert not old.exists()
+        assert strm_repo.list_strm_path_cleanup(source_key) == []
+        assert {entry["path"] for entry in strm_repo.list_strm_refresh_entries()} == {str(old), str(target)}
+
+
 def test_retry_committed_video_persists_refresh_before_ack_and_replays(tmp_path):
     from app.modules.strm_metadata_worker import STRMMetadataWorker
     with isolated_test_database(), patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):

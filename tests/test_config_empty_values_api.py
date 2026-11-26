@@ -55,6 +55,55 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
 
     _write_raw = staticmethod(write_raw)
 
+    def test_invalid_stored_cron_blocks_only_scheduled_strm_runs(self):
+        from app.modules.scheduler import get_scheduler
+
+        self._write_raw(GY_STRM_SOURCE_DIRS='[{"id":"source","name":"整理"}]',
+                        STRM_ROOT="/library", GY_STRM_BASE_URL="http://example.invalid",
+                        STRM_SCHEDULE_CRON="")
+        scheduler = get_scheduler()
+        with patch.object(scheduler, "trigger", return_value={"ok": True}) as trigger:
+            for enabled in ("0", "1"):
+                self._write_raw(STRM_SCHEDULE_ENABLED=enabled)
+                with self.subTest(enabled=enabled):
+                    status = self.client.get("/api/strm/schedule").json()
+                    self.assertFalse(status["cron_valid"])
+                    self.assertFalse(status["next_run"])
+                    self.assertEqual(bool(status["config_error"]), enabled == "1")
+                    scheduler._tick()
+                    trigger.assert_not_called()
+                    for mode in ("fast", "full"):
+                        response = self.client.post(f"/api/strm/run/{mode}", headers=self.headers)
+                        self.assertEqual(response.status_code, 202, response.text)
+                        self.assertEqual(trigger.call_args.kwargs["sync_mode"], mode)
+                        trigger.reset_mock()
+
+    def test_strm_schedule_saves_boolean_text_and_rejects_invalid_edits_atomically(self):
+        self._write_raw(STRM_SCHEDULE_ENABLED="1", STRM_NOTIFY_ENABLED="1")
+        path = "/api/strm/schedule"
+        response = self.client.put(path, json={"enabled": "0", "notify_enabled": "false"}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["status"]["enabled"])
+        self.assertFalse(config.get_bool("STRM_NOTIFY_ENABLED"))
+        before = config.ENV_FILE.read_bytes()
+        invalid = self.client.put(path, json={"enabled": True, "notify_enabled": "perhaps"}, headers=self.headers)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
+    def test_numeric_zero_is_validated_against_each_field_minimum(self):
+        self._write_raw(STRM_SKIP_THRESHOLD_MB="10")
+        before = config.ENV_FILE.read_bytes()
+        for key in ("AGENT_LIBRARY_PATROL_INTERVAL_HOURS", "AGENT_LIBRARY_PATROL_MAX_SERIES",
+                    "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS"):
+            with self.subTest(key=key):
+                response = self.client.post("/api/config", json={key: 0, "STRM_SKIP_THRESHOLD_MB": 0},
+                                            headers=self.headers)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(config.ENV_FILE.read_bytes(), before)
+        response = self.client.post("/api/config", json={"STRM_SKIP_THRESHOLD_MB": 0}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(config.get("STRM_SKIP_THRESHOLD_MB"), "0")
+
     def _config(self) -> dict:
         response = self.client.get("/api/config")
         self.assertEqual(response.status_code, 200)

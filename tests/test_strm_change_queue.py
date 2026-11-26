@@ -469,6 +469,8 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
             with db.get_conn() as conn:
                 conn.execute("UPDATE strm_change_queue SET next_attempt_at='2000-01-01 00:00:00'")
             claimed = strm_repo.claim_strm_change_targets(owner="worker-a")
+            # 后台 ACK 重验不是新的文件版本，不能补发重试预算。
+            strm_repo.enqueue_strm_change_targets([{**_change(file_id="f1"), "_revalidation": True}])
             state = strm_repo.fail_strm_change_target(
                 claimed[0]["id"],
                 expected_owner=claimed[0]["lease_owner"],
@@ -521,6 +523,36 @@ class StrmChangeReplayTests(unittest.TestCase):
             "socket.create_connection", "socket.getaddrinfo",
         ):
             self.enterContext(patch(target, side_effect=AssertionError("network forbidden")))
+
+    def test_last_failure_cannot_retire_a_replacement_that_was_never_attempted(self):
+        name: str = "A - S01E01.mkv"
+        rel_dir: str = "剧集/作品 A/Season 01"
+        original = {**_change(name=name, rel_dir=rel_dir), "etag": "old", "size": 1, "parent_id": "parent"}
+        latest = {**original, "etag": "new", "size": 2}
+        strm_repo.enqueue_strm_change_targets([original])
+        scheduler = STRMScheduler()
+        with patch.object(scheduler, "_schedule_persisted_change_queue"):
+            for attempt in range(5):
+                claimed = scheduler._claim_change_targets("organize")
+                self.assertEqual(claimed[0]["attempts"], attempt)
+                if attempt == 4:
+                    strm_repo.enqueue_strm_change_targets([latest], not_before_seconds=120)
+                scheduler._settle_change_targets(claimed, "failed", error="old version timed out")
+                if attempt < 4:
+                    strm_repo.reschedule_strm_change_targets([original], not_before_seconds=0)
+
+        row = dict(strm_repo.list_strm_change_queue()[0])
+        self.assertEqual((row["state"], row["attempts"]), ("queued", 0))
+        self.assertEqual(strm_repo.count_due_strm_change_targets(), 0)
+        strm_repo.reschedule_strm_change_targets([latest], not_before_seconds=0)
+        retry = STRMScheduler()._claim_change_targets("organize")[0]
+        self.assertEqual(retry["changes"], [latest])
+        remote = GuangYaFile("f1", name, False, 2, "new", "parent")
+        stats = sync_strm_incremental("source", retry["changes"], "http://play.invalid", str(self.root),
+                                     client=cast(GuangYaClient, _IncrementalClient({"f1": remote})))
+        self.assertEqual(stats["failed"], 0)
+        target = self.root / STRM_SUBDIR / rel_dir / Path(name).with_suffix(".strm")
+        self.assertEqual(target.read_text(), build_play_url("http://play.invalid", "f1", "new", 2, name))
 
     def test_replay_keeps_latest_file_and_fences_old_lease(self):
         original = {**_change(), "etag": "old", "size": 1, "parent_id": "parent"}

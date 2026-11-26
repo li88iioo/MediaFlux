@@ -139,12 +139,13 @@ def recover_pending_paths(
     only_file_ids: set[str] | None = None,
     should_stop: Callable[[], bool] | None = None,
     on_refresh_paths: Callable[[list[str]], object] | None = None,
-) -> None:
+) -> bool:
     """索引迁移与历史副本统一消费旧路径凭据，绝不删除仍被索引引用的路径。
 
     valid_ids 是本轮确认仍有效的 ID；精准增量必须同时给 only_file_ids，
     避免把未核查的其他 ID 当成远端删除。当前新文件存在且指纹正确才删旧
     副本；已确认远端删除的 ID 可以直接使用原索引指纹清理。
+    本范围内的凭据均已确认或本来为空时返回 True。
     """
     from app.modules import strm
 
@@ -153,12 +154,14 @@ def recover_pending_paths(
     current = None
     reported_paths = set(stats.get("changed_strm_paths") or [])
     after_id = 0
-    while not _stopped(stats, should_stop):
+    pending_receipts = 0
+    while True:
         batch = strm_repo.list_strm_path_cleanup(
             source_key, after_id=after_id, only_file_ids=only_file_ids,
         )
-        if not batch:
-            return
+        pending_receipts += len(batch)
+        if _stopped(stats, should_stop) or not batch:
+            return pending_receipts == 0
         after_id = int(batch[-1]["id"])
         if roots is None:
             roots = _cleanup_roots(source_key, strm_root)
@@ -235,10 +238,11 @@ def recover_pending_paths(
                     if changed_targets and sink:
                         sink(list(changed_targets))
                     strm_repo.delete_strm_path_cleanup(completed)
+                    pending_receipts -= len(completed)
                 except Exception as exc:
                     _blocked(stats, source_key, f"旧路径刷新或凭据确认失败（{type(exc).__name__}），保留清理凭据")
                     stats.update(stopped=True, stop_stage="refresh-persist")
-                    return
+                    return False
 
 
 def _pointer(path: Path) -> bytes:

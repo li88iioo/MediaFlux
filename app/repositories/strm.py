@@ -1247,18 +1247,11 @@ def enqueue_strm_change_targets(
             else:
                 target_id = int(row["id"])
                 if str(row["state"]) in {"running", "dirty"}:
-                    if next_attempt_at is None:
-                        conn.execute(
-                            "UPDATE strm_change_queue SET state='dirty',dirty=1,"
-                            "pending_changes_json=?,updated_at=? WHERE id=?",
-                            (payload, stamp, int(row["id"])),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE strm_change_queue SET state='dirty',dirty=1,"
-                            "pending_changes_json=?,updated_at=?,next_attempt_at=? WHERE id=?",
-                            (payload, stamp, next_attempt_at, int(row["id"])),
-                        )
+                    conn.execute(
+                        "UPDATE strm_change_queue SET state='dirty',dirty=1,pending_changes_json=?,"
+                        "updated_at=?,next_attempt_at=COALESCE(?,next_attempt_at) WHERE id=?",
+                        (payload, stamp, next_attempt_at, target_id),
+                    )
                 else:
                     resolved_next_attempt = (
                         str(row["next_attempt_at"] or stamp)
@@ -1440,30 +1433,30 @@ def fail_strm_change_target(
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT attempts,pending_changes_json,inflight_changes_json "
+            "SELECT attempts,pending_changes_json,inflight_changes_json,next_attempt_at "
             "FROM strm_change_queue WHERE id=? AND state IN ('running','dirty') "
             "AND lease_owner=? AND lease_generation=?",
             (target_id, (expected_owner or ""), expected_lease_generation),
         ).fetchone()
         if row is None:
             return "stale"
-        attempts = int(row["attempts"] or 0) + 1
-        pending = _replay_strm_changes(row)
+        # 租约只能消耗已领取变化的尝试次数。领取后到达的新批次沿用自己的静默窗口。
+        new_batch = any(not item.get("_revalidation") for item in _load_changes(row["pending_changes_json"]))
+        attempts = 0 if new_batch else int(row["attempts"] or 0) + 1
         exhausted = attempts >= max(1, (max_attempts or 1))
         state = "failed" if exhausted else "queued"
         delay = 0 if exhausted else max(1, (backoff_seconds or 1)) * min(attempts, 6)
-        cur = conn.execute(
+        next_attempt = row["next_attempt_at"] if new_batch else _future_stamp(delay)
+        conn.execute(
             "UPDATE strm_change_queue SET state=?,dirty=0,attempts=?,last_error=?,"
             "pending_changes_json=?,inflight_changes_json='[]',lease_owner='',lease_until=0,"
-            "updated_at=?,next_attempt_at=? WHERE id=? AND state IN ('running','dirty') "
-            "AND lease_owner=? AND lease_generation=?",
+            "updated_at=?,next_attempt_at=? WHERE id=?",
             (
-                state, attempts, (error or "")[:300],
-                json.dumps(pending, ensure_ascii=False), stamp, _future_stamp(delay),
-                target_id, (expected_owner or ""), expected_lease_generation,
+                state, attempts, "" if new_batch else (error or "")[:300],
+                json.dumps(_replay_strm_changes(row), ensure_ascii=False), stamp, next_attempt, target_id,
             ),
         )
-        return state if cur.rowcount == 1 else "stale"
+        return state
 
 
 def release_strm_change_targets(claimed: Iterable[object] | None, *, reason: str = "") -> int:
