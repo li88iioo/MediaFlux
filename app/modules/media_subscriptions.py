@@ -876,13 +876,12 @@ class MediaSubscriptionService:
         cancel_event: threading.Event | None = None,
         identity_batch: MediaIdentityBatch | None = None,
     ) -> dict[str, Any]:
-        if media_subscriptions_repo.get_media_subscription(subscription_id) is None:
-            raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
         run_id = media_subscriptions_repo.claim_media_subscription_check_run(subscription_id, trigger)
+        row = media_subscriptions_repo.get_media_subscription(subscription_id)
+        if row is None:
+            raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
         if run_id is None:
             raise MediaSubscriptionError("该媒体订阅正在检查或已暂停", status_code=409, code="busy")
-        row = media_subscriptions_repo.get_media_subscription(subscription_id)
-        assert row is not None
         interval = int(row["check_interval_minutes"] or MEDIA_SUBSCRIPTION_DEFAULTS["check_interval_minutes"])
         revision = int(row["revision"] or 1)
         run_token = _ACTIVE_CHECK_RUN_ID.set(run_id)

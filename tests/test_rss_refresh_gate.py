@@ -6,6 +6,7 @@ import re
 import socket
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
@@ -1005,6 +1006,93 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         self.assertTrue(refresh.json()["busy"])
         self.assertEqual(auto.status_code, 409)
         self.assertTrue(auto.json()["busy"])
+
+    def test_web_pause_after_pending_snapshot_preserves_entry_for_next_auto_round(self):
+        sid = rss_repo.add_rss_subscription(
+            "Pause auto round", "https://feed.invalid/rss",
+            exclude_keywords="合集", action="download", download_method="qb",
+        )
+        task_hash = "e" * 40
+        entry_id = rss_repo.add_rss_entry_with_media(
+            sid, "作品 合集", "paused-round:1",
+            payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{task_hash}"}),
+        )["id"]
+        assert isinstance(entry_id, int)
+        subscription_path = f"/api/rss/subscriptions/{sid}"
+        auto_path = f"{subscription_path}/auto"
+        loaded, resume_round = threading.Event(), threading.Event()
+        list_entries = rss_repo.list_rss_entries
+
+        def hold_after_pending_snapshot(*args, **kwargs):
+            page = list_entries(*args, **kwargs)
+            loaded.set()
+            if not resume_round.wait(5):
+                raise AssertionError("暂停配置未在自动轮次继续前保存")
+            return page
+
+        with (
+            patch.dict("os.environ", {"QB_URL": "http://downloader.invalid"}),
+            patch.object(MikanParser, "parse", return_value=[]),
+            patch("app.modules.download_tracker.get_download_tracker"),
+            patch("app.modules.download_dispatcher._submit_qb",
+                  return_value={"ok": True, "task_id": task_hash}) as submit_qb,
+            TestClient(create_app(start_background=False)) as client,
+        ):
+            login = client.post("/login", data={
+                "username": "admin",
+                "password": "123456",
+                "csrf_token": self._csrf(client.get("/login").text),
+            }, follow_redirects=False)
+            self.assertEqual(login.status_code, 302)
+            headers = {"X-CSRF-Token": self._csrf(client.get("/settings").text)}
+            with (
+                patch.object(rss_repo, "list_rss_entries", side_effect=hold_after_pending_snapshot),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                worker = TestClient(client.app, cookies=client.cookies)
+                try:
+                    pending = executor.submit(worker.post, auto_path, headers=headers)
+                    try:
+                        self.assertTrue(loaded.wait(5), "自动轮次未读到 pending 快照")
+                        paused = client.put(subscription_path, json={"enabled": False}, headers=headers)
+                        self.assertEqual(paused.status_code, 200, paused.text)
+                    finally:
+                        resume_round.set()
+                    stopped = pending.result(timeout=5)
+                finally:
+                    worker.close()
+
+            row = assert_present(rss_repo.get_rss_entry(entry_id))
+            with db.get_conn() as conn:
+                skip = conn.execute(
+                    "SELECT skip_reason FROM rss_entry_media WHERE rss_entry_id=?", (entry_id,)
+                ).fetchone()
+            self.assertEqual(
+                (row["status"], row["processed"], row["download_request_id"], skip["skip_reason"] if skip else None),
+                ("pending", 0, None, None),
+                f"暂停后的自动轮次回执为 HTTP {stopped.status_code} {stopped.text}",
+            )
+            self.assertEqual(stopped.status_code, 400, stopped.text)
+            self.assertTrue(stopped.json()["conflict"], stopped.text)
+            submit_qb.assert_not_called()
+
+            resumed = client.put(
+                subscription_path, json={"enabled": True, "exclude_keywords": ""}, headers=headers,
+            )
+            self.assertEqual(resumed.status_code, 200, resumed.text)
+            completed = client.post(auto_path, headers=headers)
+            self.assertEqual(completed.status_code, 200, completed.text)
+            self.assertEqual(completed.json()["result"]["downloaded"], 1, completed.text)
+            submit_qb.assert_called_once()
+
+        with db.get_conn() as conn:
+            receipts = conn.execute(
+                "SELECT e.status,e.processed,r.status AS request_status,r.qb_status "
+                "FROM download_requests r LEFT JOIN rss_entries e ON e.download_request_id=r.id AND e.id=? "
+                "WHERE r.origin=?",
+                (entry_id, f"rss:{sid}"),
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in receipts], [("downloaded", 1, "submitted", "submitted")])
 
     def test_web_refresh_exception_is_sanitized(self):
         secret = "https://secret.invalid/rss?passkey=RSS_SECRET"

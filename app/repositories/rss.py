@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -554,11 +554,10 @@ def purge_processed_rss_entries(retention_days: int = 7) -> int:
         cur = conn.execute(
             "DELETE FROM rss_entries WHERE id IN (SELECT e.id FROM rss_entries e "
             + _RSS_REQUEST_JOIN +
-            "WHERE COALESCE(e.processed,0)=1 AND e.processed_at IS NOT NULL "
-            "AND datetime(e.processed_at) < datetime('now', ?) "
+            "WHERE COALESCE(e.processed,0)=1 AND datetime(e.processed_at) < datetime(?, ?) "
             "AND (e.status='skipped' OR NOT COALESCE("
             + _rss_delivery_failed_sql() + " OR " + _rss_delivery_review_sql() + ",0)))",
-            (f"-{days} days",),
+            (db.now(), f"-{days} days"),
         )
         return (cur.rowcount or 0)
 
@@ -956,45 +955,26 @@ def record_rss_entry_failure(
         )
 
 
-def skip_pending_rss_entries(entry_ids: Iterable[int], reason: str) -> int:
-    """按当前过滤规则原子收束历史 pending 条目，并保留可解释原因。"""
-    normalized = list(dict.fromkeys(
-        entry_id for entry_id in entry_ids if entry_id > 0
-    ))
-    if not normalized:
+def skip_pending_rss_entries(conn: sqlite3.Connection, entry_ids: Collection[int]) -> int:
+    """在调用方校验订阅版本的写事务中标记本批命中关键词的条目。"""
+    if not entry_ids:
         return 0
-    message = (reason or "命中排除关键词").strip()[:160]
-    updated = 0
     stamp = db.now()
-    with db.get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        for offset in range(0, len(normalized), 500):
-            batch = normalized[offset:offset + 500]
-            placeholders = ",".join("?" for _ in batch)
-            rows = conn.execute(
-                f"SELECT id FROM rss_entries WHERE id IN ({placeholders}) "
-                "AND status='pending' AND COALESCE(processed,0)=0",
-                batch,
-            ).fetchall()
-            eligible = [int(row["id"]) for row in rows]
-            if not eligible:
-                continue
-            eligible_placeholders = ",".join("?" for _ in eligible)
-            cur = conn.execute(
-                f"UPDATE rss_entries SET status='skipped',processed=1,processed_at=?,"
-                "failure_code='',failure_retryable=0,failed_at=NULL "
-                f"WHERE id IN ({eligible_placeholders}) AND status='pending' "
-                "AND COALESCE(processed,0)=0",
-                (stamp, *eligible),
-            )
-            updated += (cur.rowcount or 0)
-            conn.executemany(
-                "INSERT INTO rss_entry_media(rss_entry_id,skip_reason,created_at,updated_at) "
-                "VALUES(?,?,?,?) ON CONFLICT(rss_entry_id) DO UPDATE SET "
-                "skip_reason=excluded.skip_reason,updated_at=excluded.updated_at",
-                [(entry_id, message, stamp, stamp) for entry_id in eligible],
-            )
-    return updated
+    placeholders = ",".join("?" for _ in entry_ids)
+    rows = conn.execute(
+        "UPDATE rss_entries SET status='skipped',processed=1,processed_at=?,"
+        "failure_code='',failure_retryable=0,failed_at=NULL "
+        f"WHERE id IN ({placeholders}) AND status='pending' "
+        "AND COALESCE(processed,0)=0 RETURNING id",
+        (stamp, *entry_ids),
+    ).fetchall()
+    conn.executemany(
+        "INSERT INTO rss_entry_media(rss_entry_id,skip_reason,created_at,updated_at) "
+        "VALUES(?,?,?,?) ON CONFLICT(rss_entry_id) DO UPDATE SET "
+        "skip_reason=excluded.skip_reason,updated_at=excluded.updated_at",
+        [(row["id"], "命中当前订阅排除关键词", stamp, stamp) for row in rows],
+    )
+    return len(rows)
 
 
 def _rss_processed_update_condition(processed: bool) -> str:

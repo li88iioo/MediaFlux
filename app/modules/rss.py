@@ -14,6 +14,7 @@ import json
 import re
 import secrets
 import socket
+import sqlite3
 import threading
 import time
 import unicodedata
@@ -1395,52 +1396,32 @@ class RSSEngine:
         subscription = rss_repo.get_rss_subscription(sub_id)
         if subscription is None:
             return {"error": "订阅项不存在", "cancelled": True}
+        if not subscription["enabled"] or subscription["action"] != "download":
+            return {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True}
         revision = expected_revision or rss_subscription_refresh_revision(subscription)
-        # refresh 自己写 last_refreshed_at 会带动 updated_at。确认入口仍检查完整
-        # revision；持续提交栅栏比较配置内容，排除本轮统计写入造成的伪冲突。
+        # 刷新核对完整版本，后续提交只核对本轮冻结的下载相关配置。
         auto_revision = rss_subscription_refresh_revision({**dict(subscription), "updated_at": ""})
 
-        def auto_guard():
-            current = rss_repo.get_rss_subscription(sub_id)
-            return bool(
-                current is not None
-                and int(current["enabled"] or 0)
-                and str(current["action"] or "") == "download"
-                and secrets.compare_digest(
-                    rss_subscription_refresh_revision({**dict(current), "updated_at": ""}), auto_revision,
-                )
+        def auto_guard(connection: sqlite3.Connection | None = None) -> bool:
+            current = rss_repo.get_rss_subscription(sub_id, connection=connection)
+            return current is not None and secrets.compare_digest(
+                rss_subscription_refresh_revision({**dict(current), "updated_at": ""}), auto_revision,
             )
 
-        if not auto_guard():
-            return {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True}
         refreshed = self.refresh(sub_id, expected_revision=revision)
         if refreshed.get("error"):
             return refreshed
-        if not auto_guard():
-            return {"refresh": refreshed, "error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True}
-        page = rss_repo.list_rss_entries(
-            sub_id=sub_id, status="pending", order="received_desc",
-        )
-        rows, pending_total = page.items, page.total
-        subscription = rss_repo.get_rss_subscription(sub_id)
-        exclude = self._split_keywords(
-            str(subscription["exclude_keywords"] or "") if subscription else ""
-        )
-        excluded_ids = [
-            int(row["id"]) for row in rows
-            if exclude and self._excluded(
-                str(row["title"] or "") if "title" in row.keys() else "",
-                exclude,
-            )
-        ]
-        filtered = rss_repo.skip_pending_rss_entries(
-            excluded_ids, "命中当前订阅排除关键词"
-        )
-        excluded = set(excluded_ids)
-        pending_ids = [
-            int(row["id"]) for row in rows if int(row["id"]) not in excluded
-        ]
-        ids = pending_ids[:_RSS_AUTO_DOWNLOAD_MAX_ENTRIES]
+        page = rss_repo.list_rss_entries(sub_id=sub_id, status="pending", order="received_desc")
+        exclude = self._split_keywords(subscription["exclude_keywords"] or "")
+        excluded_ids = {row["id"] for row in page.items if exclude and self._excluded(row["title"], exclude)}
+        with db.get_conn() as conn:
+            # 标记过滤结果与暂停、修改订阅使用同一把 SQLite 写锁。
+            if excluded_ids:
+                conn.execute("BEGIN IMMEDIATE")
+            if not auto_guard(conn):
+                return {"refresh": refreshed, "error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True}
+            filtered = rss_repo.skip_pending_rss_entries(conn, excluded_ids)
+        ids = [row["id"] for row in page.items if row["id"] not in excluded_ids][:_RSS_AUTO_DOWNLOAD_MAX_ENTRIES]
         deadline = time.monotonic() + _RSS_AUTO_DOWNLOAD_DEADLINE_SECONDS
         result: dict[str, Any] = {
             "total": 0,
@@ -1496,7 +1477,7 @@ class RSSEngine:
             "review_required": bool(result.get("review_required"))
             or outcome_unknown_count > 0,
             "filtered": filtered,
-            "deferred": max(0, pending_total - len(excluded_ids) - processed),
+            "deferred": max(0, page.total - len(excluded_ids) - processed),
         }
 
     # ===== 工具 =====

@@ -351,6 +351,39 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
 
 
 class SubscriptionAPITests(IsolatedDatabaseTestCase):
+    def test_delete_after_check_claim_returns_not_found_and_preserves_cancelled_run(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        headers = self.login()
+        sid = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="471", tmdb_id="471", media_type="movie", title="Removed",
+        )
+        endpoint = f"/api/subscriptions/media/{sid}"
+        claimed, resume = threading.Event(), threading.Event()
+        claim = media_subscriptions_repo.claim_media_subscription_check_run
+
+        def wait_after_claim(*args):
+            run_id = claim(*args)
+            claimed.set()
+            self.assertTrue(resume.wait(5))
+            return run_id
+
+        checker = TestClient(self.client.app, cookies=self.client.cookies, raise_server_exceptions=False)
+        self.addCleanup(checker.close)
+        with patch.object(media_subscriptions_repo, "claim_media_subscription_check_run", side_effect=wait_after_claim):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                checking = pool.submit(checker.post, endpoint + "/check", headers=headers)
+                try:
+                    self.assertTrue(claimed.wait(5))
+                    self.assertEqual(self.client.delete(endpoint, headers=headers).status_code, 200)
+                finally:
+                    resume.set()
+                response = checking.result(timeout=5)
+        runs = self.client.get("/api/subscriptions/runs", params={"subscription_id": sid}).json()
+        self.assertEqual([run["status"] for run in runs], ["cancelled"])
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertIn("媒体订阅不存在", response.text)
+
     def test_pause_during_indexer_resolution_prevents_candidate_submission(self):
         from app.indexers.registry import IndexerRegistry
         from app.indexers.result_store import IndexerResultStore

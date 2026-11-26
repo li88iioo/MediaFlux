@@ -727,6 +727,34 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
             self.assertEqual(page.locator("#f_method").input_value(), "guangya", "历史继承订阅按原有效目标回显")
             page.close()
 
+    def test_watchlist_tracks_pause_and_resume_from_manage_subscription(self):
+        from app.repositories import discovery, media_subscriptions
+        from playwright.sync_api import expect
+
+        subscription_id = media_subscriptions.add_media_subscription(
+            provider="tmdb", external_id="728", tmdb_id="728", media_type="movie", title="收藏样片",
+        )
+        discovery.add_media_watchlist("tmdb", "728", "movie", title="收藏样片")
+        page = self._open("/rss#rss")
+        watchlist = page.locator("#subscriptionTabWatchlist")
+        badge = page.locator('#subscriptionWatchlist [data-external-id="728"] .subscription-status')
+        watchlist.click()
+        expect(badge).to_have_text("已订阅 · 待首次检查")
+
+        with patch("app.routes.subscriptions_api._wake_scheduler"):
+            for action, enabled, label in (("暂停媒体订阅", False, "已暂停"), ("启用媒体订阅", True, "待首次检查")):
+                page.get_by_role("button", name="管理订阅").click()
+                card = page.locator(f'[data-subscription-id="{subscription_id}"]')
+                with page.expect_response(lambda res: res.request.method == "PUT") as update:
+                    card.get_by_role("button", name=action).click()
+                self.assertTrue(update.value.ok)
+                stored = media_subscriptions.get_media_subscription(subscription_id)
+                assert stored is not None
+                self.assertEqual(bool(stored["enabled"]), enabled)
+                expect(card.locator(".subscription-status")).to_have_text(label)
+                watchlist.click()
+                expect(badge).to_have_text("已订阅 · " + label)
+
     def test_rss_save_without_qb_opens_configuration_dialog_and_keeps_draft(self):
         from app.repositories import rss as rss_repo
 

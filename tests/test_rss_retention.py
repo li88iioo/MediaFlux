@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import socket
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from app import database as db
@@ -106,3 +107,24 @@ class RSSRetentionTests(unittest.TestCase):
                 self.expire(eid)
                 self.assertEqual(rss_repo.purge_processed_rss_entries(), 1)
                 self.assertIsNone(rss_repo.get_rss_entry(eid))
+
+    def test_cleanup_uses_the_same_local_clock_as_the_processed_receipt(self):
+        utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        sid = rss_repo.add_rss_subscription("local time", "https://feed.invalid/rss")
+        for offset in (8, -8):
+            local = utc + timedelta(hours=offset)
+            processed = local - timedelta(days=7)
+            with self.subTest(offset=offset):
+                older, newer = [
+                    int(rss_repo.add_rss_entry_with_media(sid, name, f"{offset}-{name}")["id"])
+                    for name in ("older", "newer")
+                ]
+                for eid, age in ((older, -1), (newer, 1)):
+                    stamp = (processed + timedelta(hours=age)).isoformat(" ", timespec="seconds")
+                    with patch.object(db, "now", return_value=stamp):
+                        self.assertEqual(rss_repo.update_rss_entries_processed([eid], True), 1)
+                with patch.object(db, "now", return_value=local.isoformat(" ", timespec="seconds")):
+                    self.assertEqual(rss_repo.purge_processed_rss_entries(), 1)
+                    self.assertEqual(rss_repo.purge_processed_rss_entries(), 0)
+                self.assertIsNone(rss_repo.get_rss_entry(older))
+                self.assertIsNotNone(rss_repo.get_rss_entry(newer))

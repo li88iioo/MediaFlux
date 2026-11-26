@@ -9,7 +9,6 @@
         watchlist: [],
         runs: [],
         mediaRequestId: 0,
-        watchlistRequestId: 0,
         runsRequestId: 0,
         statsRequestId: 0,
         candidateRequestId: 0,
@@ -605,36 +604,34 @@
         state.watchlistController?.abort();
         const controller = new AbortController();
         state.watchlistController = controller;
-        const requestId = state.watchlistRequestId + 1;
-        state.watchlistRequestId = requestId;
         const frame = elements.watchlist.closest('.subscription-list-frame');
         frame?.setAttribute('aria-busy', 'true');
         buttonBusy(elements.watchlistRefresh, true, '刷新');
         const hadContent = elements.watchlist.childElementCount > 0;
-        let timer = null;
-        if (!hadContent || !preserve) timer = window.setTimeout(() => {
-            if (requestId === state.watchlistRequestId && !elements.watchlist.childElementCount) showSkeleton(elements.watchlist, 6, 'watchlist');
+        const timer = hadContent ? undefined : window.setTimeout(() => {
+            if (!controller.signal.aborted) showSkeleton(elements.watchlist, 6, 'watchlist');
         }, 320);
         try {
             const rows = await collectPages('/api/subscriptions/watchlist', controller.signal);
-            if (requestId !== state.watchlistRequestId) return;
+            if (controller.signal.aborted) return;
             await settleSkeleton(elements.watchlist);
-            if (requestId !== state.watchlistRequestId) return;
+            if (controller.signal.aborted) return;
             state.watchlist = rows;
             state.loaded.watchlist = true;
             const releaseHeight = preserve && hadContent ? lockElementHeight(elements.watchlist) : () => {};
             renderWatchlist(state.watchlist);
             releaseHeight();
         } catch (error) {
-            if (error.name === 'AbortError' || requestId !== state.watchlistRequestId) return;
+            if (controller.signal.aborted) return;
+            state.loaded.watchlist = false;
             if (!hadContent || !preserve) {
                 await settleSkeleton(elements.watchlist);
-                if (requestId !== state.watchlistRequestId) return;
+                if (controller.signal.aborted) return;
                 elements.watchlist.replaceChildren(errorState(error.message, () => loadWatchlist({preserve: false})));
             } else appAlert?.({type: 'error', title: '收藏清单读取失败', message: error.message});
         } finally {
-            if (timer) window.clearTimeout(timer);
-            if (requestId === state.watchlistRequestId) {
+            window.clearTimeout(timer);
+            if (!controller.signal.aborted) {
                 frame?.setAttribute('aria-busy', 'false');
                 buttonBusy(elements.watchlistRefresh, false);
                 state.watchlistController = null;
@@ -1011,6 +1008,11 @@
         return [...new Set(String(value || '').split(/[，,\s]+/).map((item) => item.trim().toLowerCase()).filter(Boolean))];
     }
 
+    function refreshSubscriptionViews() {
+        const needsWatchlist = state.loaded.watchlist || state.watchlistController || state.activeTab === 'watchlist';
+        return Promise.all([loadMedia(), loadStats(), needsWatchlist && loadWatchlist()]);
+    }
+
     async function saveMediaSubscription(event) {
         event.preventDefault();
         if (elements.mediaSave.disabled) return;
@@ -1067,7 +1069,7 @@
             const ownsEditor = isCurrent();
             if (ownsEditor) closeModal(elements.mediaModal);
             const closedVersion = state.mediaEditVersion;
-            await Promise.all([loadMedia({preserve: true}), loadStats(), loadWatchlist({preserve: true})]);
+            await refreshSubscriptionViews();
             if (!ownsEditor || closedVersion !== state.mediaEditVersion) return;
             appAlert?.({type: 'success', title: result.created ? '媒体订阅已创建' : '媒体订阅已更新', message: '系统将按检查周期核对媒体库，并避免重复下载。'});
         } catch (error) {
@@ -1092,7 +1094,7 @@
             const {result} = await apiJSON(`/api/subscriptions/media/${item.id}/check`, {method: 'POST'});
             const missing = Number(result.missing_count || 0);
             const candidates = Number(result.candidate_count || 0);
-            await Promise.all([loadMedia({preserve: true}), loadRuns({preserve: true}), loadStats()]);
+            await Promise.all([refreshSubscriptionViews(), loadRuns()]);
             appAlert?.({
                 type: result.status === 'error' ? 'error' : result.status === 'inconclusive' ? 'warning' : 'success',
                 title: '媒体巡检完成',
@@ -1109,7 +1111,7 @@
         buttonBusy(trigger, true, item.enabled ? '暂停中' : '启用中');
         try {
             await apiJSON(`/api/subscriptions/media/${item.id}`, {method: 'PUT', body: JSON.stringify({enabled: !item.enabled})});
-            await Promise.all([loadMedia({preserve: true}), loadStats()]);
+            await refreshSubscriptionViews();
         } catch (error) {
             appAlert?.({type: 'error', title: item.enabled ? '暂停失败' : '启用失败', message: error.message});
         } finally { buttonBusy(trigger, false); }
@@ -1120,7 +1122,7 @@
         if (!confirmed) return;
         try {
             await apiJSON(`/api/subscriptions/media/${item.id}`, {method: 'DELETE'});
-            await Promise.all([loadMedia({preserve: true}), loadWatchlist({preserve: true}), loadStats()]);
+            await refreshSubscriptionViews();
         } catch (error) { appAlert?.({type: 'error', title: '删除失败', message: error.message}); }
     }
 
@@ -1262,7 +1264,7 @@
             });
         } finally {
             const subscription = state.media.find((item) => Number(item.id) === subscriptionId);
-            const refreshes = [loadMedia({preserve: true}), loadStats()];
+            const refreshes = [refreshSubscriptionViews()];
             if (subscription && state.candidateSubscriptionId === subscriptionId) {
                 refreshes.push(apiJSON(`/api/subscriptions/media/${subscriptionId}/candidates`).then((rows) => {
                     if (state.candidateSubscriptionId === subscriptionId) renderCandidates(subscription, Array.isArray(rows) ? rows : []);
