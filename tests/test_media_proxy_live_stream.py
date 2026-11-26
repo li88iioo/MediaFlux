@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
@@ -16,6 +17,113 @@ from tests.support import isolated_test_database
 class LivePlaybackRecordTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
+
+    async def test_stalled_web_audio_retry_releases_first_hls_contract(self):
+        playlist = b"#EXTM3U\n#EXT-X-ENDLIST\n"
+        first = {
+            "PlaySessionId": "first-session",
+            "MediaSources": [{
+                "Id": "main-source",
+                "Path": "/playgy/fixture-file/v1/100/film.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "SupportsTranscoding": True,
+                "TranscodingUrl": "/Videos/film/master.m3u8?PlaySessionId=first-session&MediaSourceId=main-source",
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {"Type": "Audio", "Index": 1, "Codec": "eac3", "Language": "eng"},
+                    {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "eng"},
+                ],
+            }],
+        }
+        request_body = {
+            "MediaSourceId": "main-source",
+            "DeviceProfile": {"Name": "Jellyfin Web", "DirectPlayProfiles": [{
+                "Type": "Video", "Container": "mkv", "VideoCodec": "h264", "AudioCodec": "aac",
+            }]},
+        }
+        auth = {"X-Emby-Token": "fixture-user", "X-Emby-Client": "Jellyfin Web"}
+        for stall_after_headers in (False, True):
+            with self.subTest(stall_after_headers=stall_after_headers):
+                retry_started, retry_closed = asyncio.Event(), asyncio.Event()
+                playback_requests = []
+                playlist_requests = []
+
+                async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+                    try:
+                        request_head = (await reader.readuntil(b"\r\n\r\n")).decode("ascii")
+                        request_line, *header_lines = request_head.strip().split("\r\n")
+                        _, target, _ = request_line.split()
+                        headers = dict(line.lower().split(":", 1) for line in header_lines)
+                        if urlsplit(target).path.endswith("/PlaybackInfo"):
+                            request_bytes = await reader.readexactly(int(headers["content-length"]))
+                            playback_requests.append(json.loads(request_bytes))
+                            retry = len(playback_requests) > 1
+                            body, content_type = json.dumps(first).encode(), "application/json"
+                        else:
+                            playlist_requests.append(target)
+                            retry = False
+                            body, content_type = playlist, "application/vnd.apple.mpegurl"
+                        if not retry or stall_after_headers:
+                            writer.write((
+                                f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n"
+                                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+                            ).encode() + (body[:1] if retry else body))
+                            await writer.drain()
+                        if retry:
+                            retry_started.set()
+                            # 保持本机上游连接打开，直到反代主动释放。
+                            await reader.read()
+                            retry_closed.set()
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+
+                server = await asyncio.start_server(upstream, "127.0.0.1", 0)
+                async with server:
+                    port = server.sockets[0].getsockname()[1]
+                    instance_id = repository.add_media_proxy_instance(
+                        name="Local Jellyfin", server_type="jellyfin", upstream_url=f"http://127.0.0.1:{port}",
+                        api_key="fixture-api", listen_host="127.0.0.1", listen_port=18096 + int(stall_after_headers),
+                    )
+                    instance = repository.get_media_proxy_instance(instance_id)
+                    assert instance is not None
+                    with patch.object(media_proxy, "_WEB_AUDIO_RETRY_TIMEOUT_SECONDS", 0.2, create=True):
+                        app = media_proxy.create_proxy_app(dict(instance))
+                        async with (
+                            app.router.lifespan_context(app),
+                            httpx.AsyncClient(
+                                transport=httpx.ASGITransport(app=app), base_url="http://proxy.invalid", trust_env=False,
+                            ) as client,
+                        ):
+                            pending = asyncio.create_task(client.post(
+                                "/Items/film/PlaybackInfo", headers=auth, json=request_body,
+                            ))
+                            try:
+                                await asyncio.wait_for(retry_started.wait(), 2)
+                                try:
+                                    response = await asyncio.wait_for(asyncio.shield(pending), 1.5)
+                                except TimeoutError:
+                                    self.fail("直放优化停顿后，已取得的 HLS 播放信息仍未返回")
+                                self.assertEqual(response.status_code, 200)
+                                self.assertEqual(response.json()["PlaySessionId"], "first-session")
+                                source = response.json()["MediaSources"][0]
+                                self.assertEqual(source["Id"], "main-source")
+                                self.assertEqual(source["TranscodingUrl"], first["MediaSources"][0]["TranscodingUrl"])
+                                self.assertFalse(source["SupportsDirectPlay"])
+                                await asyncio.wait_for(retry_closed.wait(), 2)
+                                hls = await client.get(source["TranscodingUrl"], headers=auth)
+                                self.assertEqual((hls.status_code, hls.content), (200, playlist))
+                                self.assertEqual(playlist_requests, [source["TranscodingUrl"]])
+                            finally:
+                                if not pending.done():
+                                    pending.cancel()
+                                await asyncio.gather(pending, return_exceptions=True)
+                    self.assertEqual(playback_requests, [request_body, {**request_body, "AudioStreamIndex": 2}])
+                    records = repository.list_media_proxy_playback_records(instance_id=instance_id)["items"]
+                    receipt, = [record for record in records if record["route_class"] == "playback_info"]
+                    self.assertEqual((receipt["status_code"], receipt["failure_stage"]), (200, ""))
 
     async def test_live_response_head_cancel_and_upstream_error_keep_one_receipt(self):
         real_client = httpx.AsyncClient

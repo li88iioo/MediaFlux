@@ -79,17 +79,16 @@ public sealed class StrmPreProbeService(
             {
                 await Task.Delay(SettleDelay, token).ConfigureAwait(false);
                 while (library.IsScanRunning) await Task.Delay(SettleDelay, token).ConfigureAwait(false);
-                bool probed;
                 try
                 {
                     // 自身刷新也会触发 ItemUpdated，探测结束前保持占位，避免失败后循环入队。
-                    probed = StrmProbeMediaSourceManager.Enabled && await ProbeAsync(id, token).ConfigureAwait(false);
+                    if (!StrmProbeMediaSourceManager.Enabled || !await ProbeAsync(id, token).ConfigureAwait(false)) continue;
                 }
                 finally
                 {
                     _pending.TryRemove(id, out _);
                 }
-                if (probed) await Task.Delay(Gap, token).ConfigureAwait(false);
+                await Task.Delay(Gap, token).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -100,14 +99,14 @@ public sealed class StrmPreProbeService(
     /// <summary>与 Jellyfin 播放前的探测参数一致；返回是否实际发起了远程探测。</summary>
     public async Task<bool> ProbeAsync(Guid id, CancellationToken token)
     {
-        if (library.GetItemById(id) is not Video item || !StrmProbeLedger.IsStrm(item.Path)
-            || StrmProbeLedger.Fingerprint(item.Path) is not { } fingerprint)
-            return false;
-        if (ledger.Matches(id, fingerprint) && StrmProbeMediaSourceManager.HasVideoAndAudio(mediaSources.GetMediaStreams(id)))
-            return false;
-        var refreshedBefore = item.DateLastRefreshed;
         try
         {
+            if (library.GetItemById(id) is not Video item || !StrmProbeLedger.IsStrm(item.Path)
+                || StrmProbeLedger.Fingerprint(item.Path) is not { } fingerprint)
+                return false;
+            if (ledger.Matches(id, fingerprint) && StrmProbeMediaSourceManager.HasVideoAndAudio(mediaSources.GetMediaStreams(id)))
+                return false;
+            var refreshedBefore = item.DateLastRefreshed;
             await item.RefreshMetadata(
                 new MetadataRefreshOptions(new DirectoryService(fileSystem))
                 {
@@ -120,7 +119,7 @@ public sealed class StrmPreProbeService(
         }
         catch (Exception e) when (e is not OperationCanceledException || !token.IsCancellationRequested)
         {
-            // 提供方自身超时只结束当前条目；服务停机取消才终止整个 worker。
+            // 条目读取或提供方失败只结束本项；服务停机取消才终止整个 worker。
             logger.LogWarning(e, "STRM 起播加速：预探测失败 {Item}", id);
         }
         return true;

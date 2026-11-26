@@ -766,7 +766,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
                     target,
                     headers={
                         "If-Range": metadata.headers["etag"],
-                        "Range": "bytes=0-0",
+                        "Range": "BYTES=0-0",
                     },
                     follow_redirects=False,
                 )

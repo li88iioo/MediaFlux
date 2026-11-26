@@ -321,7 +321,8 @@ def test_actual_client_partial_results_are_saved_on_original_run(tmp_path):
         assert claim_due_media_refreshes(owner="restart", force=True) == []
 
 
-def test_large_library_folder_read_failure_ends_refresh_without_scanning_other_roots(tmp_path):
+@pytest.mark.parametrize("failure", ["timeout", "premature_end", "missing_count", "repeated_page"])
+def test_large_library_folder_read_failure_ends_refresh_without_scanning_other_roots(tmp_path, failure):
     from tests.test_deep_audit_media_chain import MediaEndpoint, Response, drain_refresh
 
     root = tmp_path / strm.STRM_SUBDIR
@@ -335,10 +336,21 @@ def test_large_library_folder_read_failure_ends_refresh_without_scanning_other_r
         assert url.endswith("/Items")
         if kwargs["params"]["IncludeItemTypes"] == "Folder":
             if not folder_available:
-                raise TimeoutError("读取媒体库目录超时")
-            return Response({"TotalRecordCount": 1, "Items": [
+                if failure == "timeout":
+                    raise TimeoutError("读取媒体库目录超时")
+                if failure == "missing_count":
+                    return Response({"Items": []})
+                if failure == "repeated_page":
+                    return Response({"TotalRecordCount": 2, "Items": [
+                        {"Id": "other", "Type": "Folder", "Path": "/archive"},
+                    ]})
+                return Response({"TotalRecordCount": 2, "Items": []})
+            folders = [
+                {"Id": "archived-root", "Type": "Folder", "Path": "/archive"},
                 {"Id": "strm-root", "Type": "Folder", "Path": str(root)},
-            ]})
+            ]
+            offset = kwargs["params"]["StartIndex"]
+            return Response({"TotalRecordCount": len(folders), "Items": folders[offset:offset + 1]})
         return Response({"TotalRecordCount": 100_001, "Items": [
             {"Id": "another-movie", "Type": "Movie", "Path": "/archive/Other.strm"},
         ]})

@@ -129,6 +129,7 @@ _PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT_SECONDS = 20.0
 PLAYGY_SIGNED_URL_TIMEOUT_SECONDS = 8.0
 _PROXY_WRITE_TIMEOUT_SECONDS = 30.0
 _PROXY_POOL_TIMEOUT_SECONDS = 5.0
+_WEB_AUDIO_RETRY_TIMEOUT_SECONDS = 2.0
 _SIGNED_MEDIA_MAX_REDIRECTS = 5
 _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY = 32
 _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS = 1.0
@@ -429,14 +430,15 @@ def classify_proxy_route(path: str, method: str = "GET") -> str:
     return "upstream"
 
 
+_SINGLE_BYTE_RANGE = re.compile(r"bytes=(?:([0-9]+)-([0-9]*)|-([0-9]+))", re.IGNORECASE | re.ASCII)
+
+
 def _range_diagnostic(value: str) -> str:
     """只记录 Range 形态，不记录可能含敏感偏移信息的原始值。"""
     text = (value or "").strip()
     if not text:
         return "none"
-    if re.fullmatch(r"bytes=(?:\d+-\d*|-\d+)", text, re.IGNORECASE):
-        return "single"
-    return "invalid"
+    return "single" if _SINGLE_BYTE_RANGE.fullmatch(text) else "invalid"
 
 
 def clear_signed_url_cache(instance_id: int | None = None) -> int:
@@ -2732,6 +2734,11 @@ def _decoded_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return result
 
 
+async def _read_playback_info(response: httpx.Response) -> tuple[bytes, dict[str, str], Any]:
+    raw = await _read_bounded_upstream_body(response, _playback_info_response_limit())
+    return raw, _decoded_response_headers(response.headers), json.loads(raw)
+
+
 def _without_mediaflux_session_cookie(value: str) -> str:
     """保留媒体服务器 Cookie，但绝不把 MediaFlux 登录会话转给上游。"""
     retained: list[str] = []
@@ -3914,23 +3921,15 @@ def _playback_info_query_string(
 def _parse_range(value: str, size: int) -> tuple[int, int] | None:
     if not value:
         return None
-    if not value.startswith("bytes=") or "," in value:
+    match = _SINGLE_BYTE_RANGE.fullmatch(value)
+    if not match:
         raise ValueError("仅支持单段 bytes Range")
-    start_text, separator, end_text = value[6:].partition("-")
-    if not separator:
-        raise ValueError("Range 格式无效")
-    if not start_text:
-        suffix = int(end_text)
-        if suffix <= 0:
-            raise ValueError("Range 后缀无效")
-        start = max(0, size - suffix)
-        end = size - 1
-    else:
-        start = int(start_text)
-        end = int(end_text) if end_text else size - 1
-    if start < 0 or start >= size or end < start:
+    first, last, suffix = match.groups()
+    start = max(0, size - int(suffix)) if suffix else int(first)
+    end = min(int(last), size - 1) if last else size - 1
+    if start > end:
         raise ValueError("Range 超出文件范围")
-    return start, min(end, size - 1)
+    return start, end
 
 
 def media_content_type(filename: str) -> str:
@@ -5537,11 +5536,7 @@ def create_proxy_app(
         if playback_match and 200 <= response.status_code < 300:
             request.state.proxy_source = "playback_info"
             try:
-                raw = await _read_bounded_upstream_body(
-                    response,
-                    _playback_info_response_limit(),
-                )
-                headers = _decoded_response_headers(response.headers)
+                raw, headers, payload = await _read_playback_info(response)
             except ProxyUpstreamBodyTooLarge:
                 request.state.proxy_failure_stage = "upstream_response_body"
                 logger.warning(
@@ -5549,10 +5544,10 @@ def create_proxy_app(
                     instance_id,
                 )
                 return JSONResponse({"error": "上游响应过大"}, status_code=502)
-            except httpx.DecodingError as exc:
+            except (ValueError, httpx.DecodingError) as exc:
                 request.state.proxy_failure_stage = "upstream_playback_info"
                 logger.warning(
-                    "媒体反代 PlaybackInfo 解码失败 instance=%s type=%s",
+                    "媒体反代 PlaybackInfo 解析失败 instance=%s type=%s",
                     instance_id,
                     type(exc).__name__,
                 )
@@ -5562,23 +5557,6 @@ def create_proxy_app(
                 )
             finally:
                 await response.aclose()
-            try:
-                payload = httpx.Response(
-                    status_code=200,
-                    content=raw,
-                    headers={"content-type": headers.get("content-type", "application/json")},
-                ).json()
-            except ValueError as exc:
-                request.state.proxy_failure_stage = "upstream_playback_info"
-                logger.warning(
-                    "媒体反代 PlaybackInfo JSON 无效 instance=%s type=%s",
-                    instance_id,
-                    type(exc).__name__,
-                )
-                return JSONResponse(
-                    {"error": "上游播放信息无效"},
-                    status_code=502,
-                )
             if (
                 request.method == "POST"
                 and playback_rewrite_mode == "web"
@@ -5609,41 +5587,17 @@ def create_proxy_app(
                     )
                     retry_response: httpx.Response | None = None
                     try:
-                        retry_response = await _send_pinned_request(client, retry_request, pinned, stream=True)
-                        if 200 <= retry_response.status_code < 300:
-                            retry_raw = await _read_bounded_upstream_body(
-                                retry_response,
-                                _playback_info_response_limit(),
-                            )
-                            retry_headers = _decoded_response_headers(
-                                retry_response.headers
-                            )
-                            retry_result = httpx.Response(
-                                status_code=200,
-                                content=retry_raw,
-                                headers={
-                                    "content-type": retry_headers.get(
-                                        "content-type", "application/json"
-                                    )
-                                },
-                            ).json()
-                            retry_source_id = str(
-                                _diagnostic_dict_value(
-                                    retry_payload, "MediaSourceId"
-                                )
-                                or ""
-                            )
-                            if _playback_source_gained_direct_play(
-                                payload, retry_result, retry_source_id
-                            ):
-                                raw = retry_raw
-                                headers = retry_headers
-                                payload = retry_result
-                                playback_request_payload = retry_payload
-                                request.state.proxy_action = (
-                                    "playback_web_audio_direct_retry"
-                                )
-                    except (ValueError, httpx.HTTPError):
+                        # 已有可播放的首次响应，限定音轨优化从发起到读完的等待时间。
+                        async with asyncio.timeout(_WEB_AUDIO_RETRY_TIMEOUT_SECONDS):
+                            retry_response = await _send_pinned_request(client, retry_request, pinned, stream=True)
+                            if 200 <= retry_response.status_code < 300:
+                                retry_raw, retry_headers, retry_result = await _read_playback_info(retry_response)
+                                retry_source_id = str(_diagnostic_dict_value(retry_payload, "MediaSourceId") or "")
+                                if _playback_source_gained_direct_play(payload, retry_result, retry_source_id):
+                                    raw, headers, payload = retry_raw, retry_headers, retry_result
+                                    playback_request_payload = retry_payload
+                                    request.state.proxy_action = "playback_web_audio_direct_retry"
+                    except (TimeoutError, ValueError, httpx.HTTPError):
                         # 自动优化失败时必须无损回到首次 HLS/转码合同。
                         pass
                     finally:

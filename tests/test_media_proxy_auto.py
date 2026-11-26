@@ -4952,7 +4952,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 headers={
                     "Accept": "video/*",
                     "If-Range": '"stale-etag"',
-                    "Range": "bytes=100-199",
+                    "Range": "Bytes=100-199",
                     "User-Agent": "Jellyfin-Android/2.6.3",
                 },
                 follow_redirects=False,

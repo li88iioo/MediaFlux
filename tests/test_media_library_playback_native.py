@@ -124,6 +124,45 @@ def test_history_and_resume_keep_user_scope_real_ids_and_full_facts(native, serv
     assert ("/Users" in [path for path, _ in calls]) is (not configured)
 
 
+def test_history_matches_a_configured_guid_to_jellyfin_activity_user(native):
+    add, _, responses, _ = native
+    configured = "A967EF72-8933-4E10-AAB3-A08236E060FF"
+    add(user=configured)
+    responses["/System/ActivityLog/Entries"] = {"Items": [
+        {"UserId": "a967ef7289334e10aab3a08236e060aa", "ItemId": "other", "Type": "VideoPlayback"},
+        {"UserId": "a967ef7289334e10aab3a08236e060ff", "ItemId": "mine", "Type": "VideoPlayback"},
+    ]}
+
+    def details(params):
+        assert params["UserId"] == configured
+        assert params["Ids"] == "mine"
+        return {"Items": [media("mine")]}
+
+    responses["/Items"] = details
+    result = sdk.library.history(server="jellyfin", limit=1)
+    assert result["scope"]["user_id"] == configured
+    assert [item["id"] for item in result["items"]] == ["mine"]
+
+
+def test_history_fills_limit_from_visible_items_when_recent_media_was_removed(native):
+    add, _, responses, calls = native
+    add()
+    responses["/System/ActivityLog/Entries"] = {"Items": [
+        {"UserId": "viewer", "ItemId": item_id, "Type": "VideoPlaybackStopped",
+         "Date": f"2026-09-03T10:{59 - i:02}:00Z"}
+        for i, item_id in enumerate([*(f"gone-{n}" for n in range(50)), "available"])
+    ]}
+    responses["/Items"] = lambda params: {
+        "Items": [media("available")] if "available" in params["Ids"].split(",") else []
+    }
+
+    result = sdk.library.history(server="jellyfin", limit=1)
+
+    assert result["status"] == "success"
+    assert [item["id"] for item in result["items"]] == ["available"]
+    assert all(len(params["Ids"].split(",")) <= 50 for path, params in calls if path == "/Items")
+
+
 @pytest.mark.parametrize("method", ["history", "resume"])
 def test_empty_playback_window_is_empty_with_unknown_collection_size(native, method):
     add, _, responses, calls = native

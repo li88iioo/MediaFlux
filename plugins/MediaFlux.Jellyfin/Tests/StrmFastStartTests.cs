@@ -369,6 +369,20 @@ public sealed class StrmFastStartTests
     }
 
     [Fact]
+    public async Task ItemLookupFailureLeavesTheWorkerAvailableForLaterAdditions()
+    {
+        using var p = new PreProbeHarness();
+        var missing = p.Add(p.H.Strm("lookup-failure.strm"));
+        var next = p.Add(p.H.Strm("next.strm"));
+        p.Library.Setup(l => l.GetItemById(missing.Id)).Throws(new IOException("library read failed"));
+
+        p.Raise("added", missing);
+        p.Raise("added", next);
+        Assert.Equal(next.Id, await p.NextRefresh());
+        Assert.False(p.H.Ledger.Contains(missing.Id));
+    }
+
+    [Fact]
     public async Task NewStrmIsPreProbedWithPlaybackProbeOptionsThenPlaysWithoutProbe()
     {
         using var p = new PreProbeHarness();

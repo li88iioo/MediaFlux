@@ -1296,136 +1296,72 @@ class MediaServerClient:
         except Exception:
             return ""
 
+    def _library_path_pages(self, library_id: str, *, folders_only: bool) -> Iterator[list[dict[str, Any]]]:
+        """按媒体库分页。只有完整读完索引，才能据此判定目标不存在。"""
+        cap = 20_000 if folders_only else _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH
+        item_types = "Folder" if folders_only else "Series,Season,Movie,Folder,BoxSet"
+        seen: set[str] = set()
+        expected_total: int | None = None
+        while len(seen) < cap:
+            limit = min(_MEDIA_ITEM_PAGE_SIZE, cap - len(seen))
+            data = self._request(
+                "/Items",
+                params={
+                    "ParentId": library_id,
+                    "Recursive": "true",
+                    "IncludeItemTypes": item_types,
+                    "Fields": "Path",
+                    "StartIndex": len(seen),
+                    "Limit": limit,
+                },
+            )
+            rows = data.get("Items") if isinstance(data, dict) else None
+            if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
+                raise RuntimeError("媒体库条目响应格式异常，已停止精准刷新")
+            if len(rows) > limit:
+                raise RuntimeError("媒体库条目分页超过请求上限，已停止精准刷新")
+            total = self._search_record_count(data)
+            # 已定位全部物理根时无需枚举余页；只有继续查找或报告缺失才需要核对完整性。
+            yield rows
+            if total is None:
+                raise RuntimeError("媒体库条目总数无效，已停止精准刷新")
+            if expected_total is not None and total != expected_total:
+                raise RuntimeError("媒体库条目分页总数发生变化，已停止精准刷新")
+            if not folders_only and total > cap:
+                break  # 库过大，改查物理根。
+            expected_total = total
+            ids = {str(item.get("Id") or "").strip() for item in rows}
+            if "" in ids:
+                raise RuntimeError("媒体库条目缺少 ID，已停止精准刷新")
+            if len(ids) != len(rows) or not seen.isdisjoint(ids):
+                raise RuntimeError("媒体库条目分页未前进，存在重复或缺失，已停止精准刷新")
+            seen.update(ids)
+            if len(seen) == total:
+                return
+            if len(seen) > total:
+                raise RuntimeError("媒体库条目分页总数不一致，已停止精准刷新")
+            if not rows or (not folders_only and len(rows) < limit):
+                raise RuntimeError("媒体库条目分页提前结束，已停止精准刷新")
+        raise MediaLibraryEnumerationTooLarge(f"媒体库条目超过精准刷新安全上限 {cap}")
+
     def _library_root_items_with_paths(
         self, library_id: str, *, locations: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
-        """分页查找虚拟媒体库对应的物理根 Folder。
-
-        Jellyfin 多路径媒体库不会把物理根作为直属子项返回，因此必须递归查询
-        Folder 后按虚拟库 Location 精确过滤；找到全部目标根后立即停止。
-        """
-        wanted = {
-            self._media_path_key(item) for item in locations
-            if self._media_path_key(item)
-        }
+        """多路径库的物理根需递归查找 Folder；找到全部指定根即可停止。"""
+        wanted = {key for item in locations if (key := self._media_path_key(item))}
         found: dict[str, dict[str, Any]] = {}
-        start_index = 0
-        page_size = 5000
-        cap = 20000
-        while start_index < cap:
-            data = self._request(
-                "/Items",
-                params={
-                    "ParentId": library_id,
-                    "Recursive": "true",
-                    "IncludeItemTypes": "Folder",
-                    "Fields": "Path",
-                    "StartIndex": start_index,
-                    "Limit": page_size,
-                },
-            )
-            if not isinstance(data, dict) or not isinstance(data.get("Items"), list):
-                raise RuntimeError("媒体库物理根响应格式异常")
-            rows = data["Items"]
-            if len(rows) > page_size or any(not isinstance(item, dict) for item in rows):
-                raise RuntimeError("媒体库物理根响应无效")
-            for item in rows:
-                item_id = str(item.get("Id") or "").strip()
+        for page in self._library_path_pages(library_id, folders_only=True):
+            for item in page:
                 key = self._media_path_key(item.get("Path"))
-                if not item_id or not key:
-                    continue
-                if not wanted or key in wanted:
+                if str(item.get("Id") or "").strip() and key and (not wanted or key in wanted):
                     found[key] = item
             if wanted and wanted.issubset(found):
-                return list(found.values())
-            try:
-                total = int(data.get("TotalRecordCount") or 0)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise RuntimeError("媒体库物理根总数无效") from exc
-            next_index = start_index + len(rows)
-            if not rows or next_index >= total:
-                return list(found.values())
-            start_index = next_index
-        raise MediaLibraryEnumerationTooLarge("媒体库 Folder 超过物理根定位安全上限")
+                break
+        return list(found.values())
 
     def _library_items_with_paths(self, library_id: str) -> list[dict[str, Any]]:
         """完整分页列出库内可定位 Item；无法证明完整时失败关闭。"""
-        collected: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        start_index = 0
-        expected_total: int | None = None
-        while start_index < _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH:
-            data = self._request(
-                "/Items",
-                params={
-                    "ParentId": library_id,
-                    "Recursive": "true",
-                    "IncludeItemTypes": "Series,Season,Movie,Folder,BoxSet",
-                    "Fields": "Path",
-                    "StartIndex": start_index,
-                    "Limit": _MEDIA_ITEM_PAGE_SIZE,
-                },
-            )
-            if not isinstance(data, dict) or not isinstance(data.get("Items"), list):
-                raise RuntimeError("媒体库条目响应格式异常，已停止精准刷新")
-            total_raw = data.get("TotalRecordCount")
-            if total_raw is None:
-                raise RuntimeError("媒体库条目总数无效，已停止精准刷新")
-            if isinstance(total_raw, bool):
-                raise RuntimeError("媒体库条目总数无效，已停止精准刷新")
-            try:
-                total = int(total_raw)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise RuntimeError("媒体库条目总数无效，已停止精准刷新") from exc
-            if total < 0:
-                raise RuntimeError("媒体库条目总数无效，已停止精准刷新")
-            if expected_total is None:
-                expected_total = total
-            elif total != expected_total:
-                raise RuntimeError("媒体库条目分页总数发生变化，已停止精准刷新")
-            if total > _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH:
-                raise MediaLibraryEnumerationTooLarge(
-                    f"媒体库条目超过精准刷新安全上限 "
-                    f"{_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
-                )
-
-            raw_items = data["Items"]
-            if len(raw_items) > _MEDIA_ITEM_PAGE_SIZE:
-                raise RuntimeError("媒体库条目分页超过请求上限，已停止精准刷新")
-            if any(not isinstance(item, dict) for item in raw_items):
-                raise RuntimeError("媒体库条目响应包含无效项目，已停止精准刷新")
-            page = list(raw_items)
-            new_items = 0
-            for item in page:
-                identity = str(item.get("Id") or "").strip()
-                if not identity:
-                    raise RuntimeError("媒体库条目缺少 ID，已停止精准刷新")
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                collected.append(item)
-                new_items += 1
-
-            next_index = start_index + len(page)
-            if next_index > total or len(collected) > total:
-                raise RuntimeError("媒体库条目分页总数不一致，已停止精准刷新")
-            if not page:
-                if start_index == total and len(collected) == total:
-                    return collected
-                raise RuntimeError("媒体库条目分页提前结束，已停止精准刷新")
-            if not new_items:
-                raise RuntimeError("媒体库条目分页未前进，已停止精准刷新")
-            start_index = next_index
-            if start_index == total:
-                if len(collected) != total:
-                    raise RuntimeError("媒体库条目分页存在重复或缺失，已停止精准刷新")
-                return collected
-            if len(page) < _MEDIA_ITEM_PAGE_SIZE:
-                raise RuntimeError("媒体库条目分页提前结束，已停止精准刷新")
-
-        raise MediaLibraryEnumerationTooLarge(
-            f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
-        )
+        return [item for page in self._library_path_pages(library_id, folders_only=False) for item in page]
 
     def _resolve_refresh_items(
         self, items: list[dict[str, Any]], targets: Iterable[str],

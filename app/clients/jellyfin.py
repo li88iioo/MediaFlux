@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from itertools import islice
 from typing import Any
 from urllib.parse import quote
 
@@ -302,11 +304,15 @@ class JellyfinClient(MediaServerClient):
         if not isinstance(data, dict) or not isinstance(data.get("Items"), list):
             raise ValueError("Jellyfin 活动日志响应格式无效")
 
+        # Jellyfin 活动日志以无连字符小写 GUID 输出用户 ID。
+        activity_user = user_id
+        if re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", user_id, re.I):
+            activity_user = user_id.replace("-", "").lower()
         activities = sorted(
             (
                 item for item in data["Items"]
                 if isinstance(item, dict)
-                and str(item.get("UserId") or "") == user_id
+                and str(item.get("UserId") or "") in (user_id, activity_user)
                 and str(item.get("Type") or "") in {
                     "VideoPlayback", "VideoPlaybackStopped",
                 }
@@ -318,41 +324,37 @@ class JellyfinClient(MediaServerClient):
         activity_dates: dict[str, str] = {}
         for activity in activities:
             item_id = str(activity.get("ItemId") or "")
-            if item_id in activity_dates:
-                continue
-            activity_dates[item_id] = str(activity.get("Date") or "")
-            if len(activity_dates) >= normalized_limit:
-                break
-        if not activity_dates:
-            return []
+            activity_dates.setdefault(item_id, str(activity.get("Date") or ""))
 
-        details = self._request(
-            "/Items",
-            params={
-                "UserId": user_id,
-                "Ids": ",".join(activity_dates),
-                "Fields": (
-                    "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
-                    "ProductionYear,Genres,UserData"
-                ),
-                "EnableUserData": "true",
-                "EnableTotalRecordCount": "false",
-            },
-        )
-        raw_items, _total = self._items_payload(details)
-        by_id = {
-            str(item.get("Id") or ""): item
-            for item in raw_items if isinstance(item, dict) and item.get("Id")
-        }
         items: list[MediaItem] = []
-        for item_id, played_at in activity_dates.items():
-            raw = by_id.get(item_id)
-            if raw is None:
-                continue
-            media = self._media_item(raw, played=True)
-            media.last_played = self._local_datetime(played_at) or media.last_played
-            items.append(media)
+        # 活动记录可能属于已移除的条目；按可见详情填满结果，每批最多查询 50 个 ID。
+        remaining = iter(activity_dates)
+        batch_size = normalized_limit
+        while batch := tuple(islice(remaining, batch_size)):
+            details = self._request(
+                "/Items",
+                params={
+                    "UserId": user_id,
+                    "Ids": ",".join(batch),
+                    "Fields": (
+                        "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
+                        "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
+                        "ProductionYear,Genres,UserData"
+                    ),
+                    "EnableUserData": "true",
+                    "EnableTotalRecordCount": "false",
+                },
+            )
+            raw_items, _total = self._items_payload(details)
+            by_id = {str(item.get("Id") or ""): item for item in raw_items}
+            for item_id in batch:
+                if item_id in by_id:
+                    media = self._media_item(by_id[item_id], played=True)
+                    media.last_played = self._local_datetime(activity_dates[item_id]) or media.last_played
+                    items.append(media)
+                    if len(items) == normalized_limit:
+                        return items
+            batch_size = 50
         return items
 
     def _recent_played_from_user_data(
