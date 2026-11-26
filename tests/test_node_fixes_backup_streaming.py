@@ -95,6 +95,24 @@ class BackupStreamingTests(unittest.TestCase):
                         tracemalloc.stop()
                     self.assertLess(peak, 8 * 1024 * 1024, 'whole-database memory allocation regressed')
 
+    def test_source_disappearing_before_open_does_not_replace_a_good_backup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            paths = self.make_database(Path(raw))
+            archive = create_backup(paths)
+            original = archive.read_bytes()
+            connect = sqlite3.connect
+
+            def open_after_removal(*args, **kwargs):
+                if paths.database_path.exists() and not paths.database_path.with_suffix('.moved').exists():
+                    paths.database_path.rename(paths.database_path.with_suffix('.moved'))
+                return connect(*args, **kwargs)
+
+            with patch.object(sqlite3, 'connect', side_effect=open_after_removal), self.assertRaises(BackupError):
+                create_backup(paths, output=archive)
+            self.assertFalse(paths.database_path.exists())
+            self.assertEqual(archive.read_bytes(), original)
+            verify_backup(archive)
+
     def test_archive_write_failure_preserves_existing_backup_and_cleans_temporary(self):
         with tempfile.TemporaryDirectory() as raw:
             paths = self.make_database(Path(raw))

@@ -225,10 +225,14 @@ class FirstRunTests(unittest.TestCase):
     def test_remote_first_run_binding_requires_explicit_opt_in(self):
         self._reload_runtime_modules()
 
+        self.assertEqual(self.first_run.resolve_bind_host("[::1]"), "::1")
+        with self.assertRaises(self.first_run.UnsafeFirstRunBindingError):
+            self.first_run.resolve_bind_host("[::]")
         with self.assertRaises(self.first_run.UnsafeFirstRunBindingError):
             self.first_run.resolve_bind_host("0.0.0.0")
 
         os.environ["MEDIAFLUX_ALLOW_REMOTE_SETUP"] = "1"
+        self.assertEqual(self.first_run.resolve_bind_host("[::]"), "::")
         self.assertEqual(self.first_run.resolve_bind_host("0.0.0.0"), "0.0.0.0")
 
     def test_official_container_defaults_fresh_setup_to_all_interfaces(self):

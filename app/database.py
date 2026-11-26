@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -162,6 +162,10 @@ def resolve_db_path() -> Path:
         if test_mode and configured_path == _PRODUCTION_DB_PATH:
             raise RuntimeError("测试模式禁止连接生产数据库")
         return configured_path
+
+
+def readonly_connection(path: Path, *, timeout: float = 5.0) -> closing[sqlite3.Connection]:
+    return closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout))
 
 
 def configure_database(path: Path, *, test_mode: bool = False) -> Path:

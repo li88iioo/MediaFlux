@@ -123,20 +123,17 @@ def _remote_setup_allowed() -> bool:
 
 def resolve_bind_host(requested: str | None, *, initialized_default: str = "0.0.0.0") -> str:
     """源码首启仅监听回环；官方容器默认开放一次性 Web 初始化。"""
-    if requested is None:
-        requested = os.getenv("WEB_HOST") or None
-    if needs_initialization():
-        if requested and not _is_loopback_host(requested) and not _remote_setup_allowed():
-            raise UnsafeFirstRunBindingError(
-                "首次初始化禁止监听非回环地址；请先在本机完成初始化，"
-                "或显式设置 MEDIAFLUX_ALLOW_REMOTE_SETUP=1"
-            )
-        if requested:
-            return requested
-        return initialized_default if _remote_setup_allowed() else "127.0.0.1"
-    if requested:
-        return requested
-    return config.get("WEB_HOST", initialized_default) or initialized_default
+    host = os.getenv("WEB_HOST") if requested is None else requested
+    if not needs_initialization():
+        host = host or config.get("WEB_HOST", initialized_default) or initialized_default
+    elif not host:
+        host = initialized_default if _remote_setup_allowed() else "127.0.0.1"
+    elif not _is_loopback_host(host) and not _remote_setup_allowed():
+        raise UnsafeFirstRunBindingError(
+            "首次初始化禁止监听非回环地址；请先在本机完成初始化，"
+            "或显式设置 MEDIAFLUX_ALLOW_REMOTE_SETUP=1"
+        )
+    return host[1:-1] if host.startswith("[") and host.endswith("]") and ":" in host else host
 
 
 def _contains_disallowed_separator(value: str) -> bool:

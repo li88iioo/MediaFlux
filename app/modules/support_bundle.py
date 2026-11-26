@@ -7,7 +7,6 @@ import secrets
 import stat
 import tempfile
 import zipfile
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -185,7 +184,6 @@ def _tail_redacted_log(path: Path, limit: int) -> str:
     directory_fd = -1
     file_fd = -1
     chunks: list[bytes] = []
-    start = 0
     try:
         directory_fd = _open_directory_fd(path.parent)
         path_metadata = os.stat(
@@ -208,9 +206,10 @@ def _tail_redacted_log(path: Path, limit: int) -> str:
         ):
             return "[应用日志读取期间发生变化，已跳过]\n"
 
-        start = max(0, opened_metadata.st_size - _MAX_LOG_BYTES)
-        os.lseek(file_fd, start, os.SEEK_SET)
-        remaining = min(opened_metadata.st_size, _MAX_LOG_BYTES)
+        # 多读窗口前一个字节，区分已完整落在窗口内的首行和被截断的行。
+        truncated = opened_metadata.st_size > _MAX_LOG_BYTES
+        remaining = min(opened_metadata.st_size, _MAX_LOG_BYTES + 1)
+        os.lseek(file_fd, opened_metadata.st_size - remaining, os.SEEK_SET)
         while remaining > 0:
             chunk = os.read(file_fd, min(remaining, 64 * 1024))
             if not chunk:
@@ -230,10 +229,8 @@ def _tail_redacted_log(path: Path, limit: int) -> str:
                     pass
 
     raw = b"".join(chunks)
-    truncated = start > 0
     if truncated:
-        separator = raw.find(b"\n")
-        raw = raw[separator + 1 :] if separator >= 0 else b""
+        raw = raw.partition(b"\n")[2]
     if b"\x00" in raw:
         return "[应用日志包含二进制内容，已跳过]\n"
     try:
@@ -241,14 +238,11 @@ def _tail_redacted_log(path: Path, limit: int) -> str:
     except UnicodeDecodeError:
         return "[应用日志不是有效 UTF-8，已跳过]\n"
 
-    lines: deque[str] = deque(maxlen=count)
-    for raw_line in decoded.splitlines():
-        if len(raw_line) > _MAX_LOG_LINE_CHARS:
-            lines.append("[超长日志行已跳过]")
-        else:
-            lines.append(redact_sensitive_text(raw_line))
     prefix = "[日志过长，已截取末尾内容]\n" if truncated else ""
-    return prefix + "\n".join(lines) + ("\n" if lines else "")
+    return prefix + "".join(
+        (redact_sensitive_text(line) if len(line) <= _MAX_LOG_LINE_CHARS else "[超长日志行已跳过]") + "\n"
+        for line in decoded.splitlines()[-count:]
+    )
 
 
 def _redacted_config(paths: RuntimePaths) -> tuple[dict[str, str], str]:

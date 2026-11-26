@@ -10,6 +10,8 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -139,30 +141,23 @@ class RuntimeLifecycleMessageTests(unittest.TestCase):
     """重复启动的提示语必须描述启动冲突，而不是恢复备份。"""
 
     def test_second_instance_reports_a_start_conflict(self):
-        from app.modules.backup import BackupError, runtime_lifecycle_guard
-        from app.runtime_paths import get_runtime_paths
+        from app.modules.backup import runtime_lifecycle_guard
+        from app.runtime_paths import RuntimePaths
 
         with TemporaryDirectory() as root:
-            base = get_runtime_paths()
-            paths = type(base)(**{
-                **{
-                    field: getattr(base, field)
-                    for field in base.__dataclass_fields__
-                },
-                "data_dir": Path(root),
-            })
-            # 守卫在同一进程内可重入，这里模拟另一个进程已持有租约。
-            with patch(
-                "app.modules.process_lock.CrossProcessLock.acquire",
-                return_value=False,
-            ):
-                with self.assertRaises(BackupError) as raised:
-                    with runtime_lifecycle_guard(paths):
-                        pass
-
-        message = str(raised.exception)
-        self.assertIn("已拒绝重复启动", message)
-        self.assertNotIn("恢复备份", message)
+            environment = {k: v for k, v in os.environ.items() if not k.startswith("MEDIAFLUX_")}
+            environment["MEDIAFLUX_DATA_DIR"] = root
+            paths = RuntimePaths.from_environment(environment)
+            with runtime_lifecycle_guard(paths):
+                result = subprocess.run(
+                    [sys.executable, "mediaflux.py", "start", "--data-dir", root],
+                    cwd=Path(__file__).resolve().parents[1], env=environment,
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("已拒绝重复启动", result.stderr)
+        self.assertNotIn("恢复备份", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_restore_guard_keeps_its_backup_wording(self):
         from app.modules.backup import BackupError, _exclusive_runtime_lifecycle_guard

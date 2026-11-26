@@ -82,7 +82,7 @@ def test_migration_backup_failure_cancels_startup_without_fence(secret):
             conn.execute('CREATE TABLE organize_log (id INTEGER PRIMARY KEY, source TEXT NOT NULL, original_path TEXT NOT NULL, new_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)')
             conn.commit()
         before_config = case.paths.env_file.read_bytes()
-        with patch.object(backup, '_create_backup_unlocked', side_effect=backup.BackupError('synthetic archive failure')):
+        with patch.object(backup, '_sqlite_backup_file', side_effect=backup.BackupError('synthetic archive failure')):
             with pytest.raises(RuntimeError, match='synthetic archive failure'):
                 with case._new_client():
                     pytest.fail('startup admitted without backup')

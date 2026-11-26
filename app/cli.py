@@ -11,13 +11,14 @@ import json
 import os
 import sys
 import webbrowser
+from http.client import HTTPException
 from pathlib import Path
 from typing import Sequence
 from urllib.request import ProxyHandler, build_opener
 
 
 from app.defaults import DEFAULT_WEB_PORT
-from app.runtime_paths import RuntimePaths, configure_runtime_paths, get_runtime_paths
+from app.runtime_paths import RuntimeLayoutError, RuntimePaths, configure_runtime_paths, get_runtime_paths
 from app.version import BuildInfo
 
 
@@ -174,13 +175,13 @@ def _local_service_url(host: str | None, port: int | None) -> str:
 
 
 def _status(url: str, ready: bool) -> int:
-    endpoint, expected = ("readyz", "ready") if ready else ("healthz", "ok")
+    endpoint, expected, timeout = ("readyz", "ready", 3) if ready else ("healthz", "ok", 1)
     try:
         opener = build_opener(ProxyHandler({}))
-        with opener.open(url + endpoint, timeout=3 if ready else 1) as response:
+        with opener.open(url + endpoint, timeout=timeout) as response:
             payload = json.load(response)
         healthy = isinstance(payload, dict) and payload.get("status") == expected
-    except (OSError, ValueError):
+    except (OSError, ValueError, HTTPException):
         healthy = False
     print("MediaFlux is healthy" if healthy else "MediaFlux health check failed")
     return 0 if healthy else 1
@@ -198,39 +199,38 @@ def _resolve_service_endpoint(
     port: int | None,
 ) -> tuple[str, int, DiagnosticCheck | None]:
     """只读解析运维命令使用的服务端点。"""
+    from app.env_file import read_env_text
     from app.modules.runtime_diagnostics import DiagnosticCheck
 
-    resolved_host = host if host is not None else os.environ.get("WEB_HOST") or None
-    resolved_port = port
+    host = host if host is not None else os.environ.get("WEB_HOST") or None
     port_source = "WEB_PORT 环境变量"
     try:
-        if resolved_port is None:
+        if port is None:
             # docker exec 不经过入口脚本，仍使用镜像约定的内部端口。
             if _is_official_container():
-                resolved_port = DEFAULT_WEB_PORT
+                port = DEFAULT_WEB_PORT
             elif environment_port := os.environ.get("WEB_PORT"):
-                resolved_port = int(environment_port)
+                port = int(environment_port)
         values: dict[str, str] = {}
-        if (resolved_host is None or resolved_port is None) and paths.env_file.exists():
-            from app.env_file import read_env_text
-
-            values = read_env_text(paths.env_file.read_text(encoding="utf-8"))
-        if resolved_host is None:
-            resolved_host = values.get("WEB_HOST") or "0.0.0.0"
-        if resolved_port is None:
+        try:
+            if (host is None or port is None) and paths.env_file.exists():
+                values = read_env_text(paths.env_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return host or "0.0.0.0", port or DEFAULT_WEB_PORT, DiagnosticCheck(
+                "runtime_config", "error", f"当前执行身份无法读取运行配置：{getattr(exc, 'strerror', None) or exc}。",
+                "检查已有 user.env 的读取权限和格式。",
+            )
+        if host is None:
+            host = values.get("WEB_HOST") or "0.0.0.0"
+        if port is None:
             port_source = "user.env 中的 WEB_PORT"
-            resolved_port = int(values.get("WEB_PORT") or DEFAULT_WEB_PORT)
-        if 1 <= resolved_port <= 65535:
-            return resolved_host, resolved_port, None
+            port = int(values.get("WEB_PORT") or DEFAULT_WEB_PORT)
+        if 1 <= port <= 65535:
+            return host, port, None
         message = "当前执行身份解析到无效的 WEB_PORT。"
-    except (OSError, UnicodeError) as exc:
-        return resolved_host or "0.0.0.0", resolved_port or DEFAULT_WEB_PORT, DiagnosticCheck(
-            "runtime_config", "error", f"当前执行身份无法读取运行配置：{getattr(exc, 'strerror', None) or exc}。",
-            "检查已有 user.env 的读取权限和格式。",
-        )
     except ValueError:
         message = f"当前执行身份无法解析 {port_source}。"
-    return resolved_host or "0.0.0.0", DEFAULT_WEB_PORT, DiagnosticCheck(
+    return host or "0.0.0.0", DEFAULT_WEB_PORT, DiagnosticCheck(
         "runtime_config", "error", message, "将 WEB_PORT 设置为 1 到 65535 的整数。",
     )
 
@@ -351,8 +351,7 @@ def _backup_command(args: argparse.Namespace) -> int:
     try:
         paths = get_runtime_paths()
         if args.backup_command == "create":
-            destination = create_backup(paths, output=args.output, reason=args.reason)
-            print(destination)
+            print(create_backup(paths, output=args.output, reason=args.reason))
             return 0
         if args.backup_command == "verify":
             manifest = verify_backup(args.archive)
@@ -371,7 +370,7 @@ def _backup_command(args: argparse.Namespace) -> int:
                 "Restart the service and run mediaflux doctor."
             )
             return 0
-    except (OSError, ValueError, BackupError) as exc:
+    except (OSError, ValueError, BackupError, RuntimeLayoutError) as exc:
         print(f"MediaFlux backup failed: {exc}", file=sys.stderr)
         return 2
     raise AssertionError(f"unsupported backup command: {args.backup_command}")
@@ -406,22 +405,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     """运行 MediaFlux CLI 并返回适合进程退出的状态码。"""
     args = build_parser().parse_args(argv)
     if args.command in {"start", "runtime-migrate"}:
-        from app.runtime_paths import RuntimeLayoutError
+        from app.modules.backup import BackupError
 
-        if args.command == "start":
-            try:
-                return _start(args.host, args.port, args.data_dir)
-            except RuntimeLayoutError as exc:
-                print(f"MediaFlux runtime layout: {exc}", file=sys.stderr)
-                return 2
         try:
+            if args.command == "start":
+                return _start(args.host, args.port, args.data_dir)
             _configure_start_paths(args.data_dir)
             from app.modules.runtime_layout import migrate_runtime_layout
 
             count = migrate_runtime_layout(get_runtime_paths())
             print(f"运行目录迁移完成：收纳 {count} 个旧锁；旧 PID 已清理，新实例 PID 将写入 runtime/。")
             return 0
-        except (OSError, RuntimeLayoutError) as exc:
+        except (BackupError, OSError, RuntimeLayoutError) as exc:
+            if args.command == "start" and isinstance(exc, OSError):
+                raise
             print(f"MediaFlux runtime layout: {exc}", file=sys.stderr)
             return 2
     if args.command in ("status", "open"):

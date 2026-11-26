@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from http.client import HTTPException
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.semver import VersionOrder, version_order
@@ -49,7 +49,7 @@ def _select_asset(release: dict[str, Any]) -> tuple[str, str]:
 
 
 def _read_response(response: Any) -> bytes:
-    declared = str(getattr(response, "headers", {}).get("Content-Length", "") or "")
+    declared = str(getattr(response, "headers", {}).get("Content-Length", ""))
     if declared.isdigit() and int(declared) > _MAX_RESPONSE_BYTES:
         raise UpdateCheckError("更新响应体过大")
     payload = response.read(_MAX_RESPONSE_BYTES + 1)
@@ -79,7 +79,7 @@ def check_for_updates(
     try:
         with opener(request, timeout=timeout) as response:
             payload = json.loads(_read_response(response).decode("utf-8"))
-    except (HTTPError, URLError, OSError, UnicodeError, ValueError) as exc:
+    except (HTTPException, OSError, ValueError) as exc:
         raise UpdateCheckError(f"无法检查更新：{type(exc).__name__}") from exc
     if not isinstance(payload, list):
         raise UpdateCheckError("更新服务返回了无效数据")

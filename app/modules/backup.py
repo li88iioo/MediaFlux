@@ -12,7 +12,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
-from contextlib import closing, contextmanager, suppress
+from contextlib import closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -83,22 +83,19 @@ def _sqlite_backup_file(
     source_connection: sqlite3.Connection | None = None,
 ) -> bool:
     """在线一致性快照留在私有临时目录，避免把整个库装入内存。"""
+    from app.database import readonly_connection
+
     if source_connection is None and not path.exists():
         return False
-    owns_source = source_connection is None
-    source = source_connection or sqlite3.connect(str(path), timeout=10)
-    target: sqlite3.Connection | None = None
     try:
-        target = sqlite3.connect(str(target_path))
-        source.backup(target)
-        target.commit()
+        source_context = (
+            readonly_connection(path.resolve(), timeout=10)
+            if source_connection is None else nullcontext(source_connection)
+        )
+        with source_context as source, closing(sqlite3.connect(target_path)) as target:
+            source.backup(target)
     except sqlite3.Error as exc:
         raise BackupError(f"SQLite 在线备份失败：{exc}") from exc
-    finally:
-        if target is not None:
-            target.close()
-        if owns_source:
-            source.close()
     return True
 
 
@@ -134,7 +131,7 @@ def _default_backup_path(paths: RuntimePaths, reason: str) -> Path:
     return paths.backup_dir / f"mediaflux-{stamp}-{safe_reason}-{uuid.uuid4().hex[:8]}.zip"
 
 
-def _create_backup_unlocked(
+def create_backup(
     paths: RuntimePaths,
     *,
     output: Path | None = None,
@@ -142,14 +139,19 @@ def _create_backup_unlocked(
     source_connection: sqlite3.Connection | None = None,
     include_settings: bool = True,
 ) -> Path:
-    """创建原子 ZIP；使用 SQLite backup API，避免 WAL 不一致。"""
-    destination = (Path(output) if output is not None else _default_backup_path(paths, reason)).expanduser().resolve()
-    protected = protected_runtime_output_target(paths, destination)
-    if protected is not None:
-        raise BackupError(f"备份输出不能覆盖 MediaFlux 运行文件：{protected.name}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="mediaflux-sqlite-backup-") as temporary:
+    """在配置与恢复锁内创建同一代快照，包括 SQLite 的 WAL 状态。"""
+    with (
+        config_snapshot_guard(paths),
+        _backup_operation_guard(paths),
+        tempfile.TemporaryDirectory(prefix="mediaflux-sqlite-backup-") as temporary,
+    ):
+        if _read_restore_journal(paths) is not None:
+            raise BackupError("上次恢复尚未结束，请启动服务完成恢复后再创建备份")
+        destination = (Path(output) if output is not None else _default_backup_path(paths, reason)).expanduser().resolve()
+        protected = protected_runtime_output_target(paths, destination)
+        if protected is not None:
+            raise BackupError(f"备份输出不能覆盖 MediaFlux 运行文件：{protected.name}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
         payloads: dict[str, Path] = {}
         database_snapshot = Path(temporary) / "mediaflux.db"
         if _sqlite_backup_file(paths.database_path, database_snapshot, source_connection):
@@ -206,28 +208,6 @@ def _create_backup_unlocked(
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
         return destination
-
-
-def create_backup(
-    paths: RuntimePaths,
-    *,
-    output: Path | None = None,
-    reason: str = "manual",
-    source_connection: sqlite3.Connection | None = None,
-    include_settings: bool = True,
-) -> Path:
-    """创建原子 ZIP，并与恢复/启动期迁移串行。"""
-    # 固定锁序：配置快照 -> 备份/恢复。恢复另外先持有 runtime
-    # lifecycle 独占锁，再按同样的 C -> B 顺序取得这两把锁。
-    with config_snapshot_guard(paths):
-        with _backup_operation_guard(paths):
-            return _create_backup_unlocked(
-                paths,
-                output=output,
-                reason=reason,
-                source_connection=source_connection,
-                include_settings=include_settings,
-            )
 
 
 def _safe_archive_name(name: str) -> str:

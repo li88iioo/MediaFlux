@@ -30,6 +30,16 @@ def query(sql="", limit=50):
         return sdk.diagnostics.query_db(sql, limit)
 
 
+def test_diagnostics_reads_the_configured_database_with_uri_characters():
+    with isolated_test_database("媒体 #1 %23.db") as path:
+        with db.get_conn() as conn:
+            conn.execute("INSERT INTO task_runs(task_name, trigger_type, status, started_at) "
+                         "VALUES ('uri-check', 'manual', 'success', '2026-11-01')")
+        assert "task_runs" in {row["table"] for row in query()["data"]["tables"]}
+        assert query("SELECT task_name FROM task_runs")["data"]["rows"] == [["uri-check"]]
+        assert not path.with_name("媒体 ").exists()
+
+
 class DiagnosticQueryTests(IsolatedDatabaseTestCase):
     def setUp(self):
         self.continuation = {
@@ -136,7 +146,7 @@ class DiagnosticQueryTests(IsolatedDatabaseTestCase):
                   "task_runs f, task_runs g, task_runs h, task_runs i, task_runs j, task_runs k, task_runs l")
 
     def test_readonly_connection_cannot_write_even_without_authorizer(self):
-        with diag.closing(diag._connect()) as conn, pytest.raises(sqlite3.OperationalError):
+        with db.readonly_connection(db.resolve_db_path()) as conn, pytest.raises(sqlite3.OperationalError):
             conn.execute("DELETE FROM task_runs")
 
 

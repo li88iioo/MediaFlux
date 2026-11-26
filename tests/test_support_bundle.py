@@ -302,6 +302,28 @@ class SupportBundleTests(unittest.TestCase):
             self.assertNotIn(b"oversized-secret", log_payload)
             self.assertIn("已截取末尾内容", log_payload.decode("utf-8"))
 
+    def test_bundle_keeps_complete_line_at_tail_byte_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._paths(root)
+            paths.log_dir.mkdir(parents=True)
+            log = paths.log_dir / "app.log"
+            tail = b"first in trace\nlast in trace\n"
+            with (
+                patch("app.modules.support_bundle._MAX_LOG_BYTES", len(tail)),
+                patch("app.modules.support_bundle.run_diagnostics", return_value=DiagnosticReport(())),
+            ):
+                for prefix, expected in ((b"discarded\n", tail), (b"partial ", b"last in trace\n")):
+                    with self.subTest(prefix=prefix):
+                        log.write_bytes(prefix + tail)
+                        output = create_support_bundle(paths, output=root / "support.zip", log_lines=2)
+                        with zipfile.ZipFile(output) as archive:
+                            payload = archive.read("logs.txt")
+                        if os.name == "posix":
+                            self.assertEqual(payload.split(b"\n", 1)[1], expected)
+                        else:
+                            self.assertIn("未收录应用日志", payload.decode())
+
     def test_bundle_creates_missing_explicit_output_parents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

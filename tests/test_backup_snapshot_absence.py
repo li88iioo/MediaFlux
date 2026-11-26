@@ -142,6 +142,32 @@ def test_deleted_token_is_restored_by_failure_rollback_or_prepared_recovery(tmp_
     assert not backup.recover_pending_restore(target)
 
 
+def test_backup_never_publishes_a_partially_restored_instance(tmp_path):
+    source = seed(tmp_path / "source", "new", token="new-token")
+    target = seed(tmp_path / "target", "old", token="old-token")
+    archive = backup.create_backup(source)
+    previous = backup.create_backup(target)
+    previous_bytes = previous.read_bytes()
+    replace = backup.os.replace
+
+    def interrupt_after_config(src, dst):
+        replace(src, dst)
+        if Path(dst) == target.env_file:
+            raise KeyboardInterrupt
+
+    with patch.object(backup.os, "replace", side_effect=interrupt_after_config), pytest.raises(KeyboardInterrupt):
+        backup.restore_backup(target, archive)
+    assert state(target) == ("old", "SNAPSHOT='new'\n", "old-token")
+
+    with pytest.raises(backup.BackupError, match="恢复"):
+        backup.create_backup(target, output=previous)
+    assert previous.read_bytes() == previous_bytes
+    assert backup.recover_pending_restore(target)
+    backup.create_backup(target, output=previous)
+    backup.restore_backup(source, previous)
+    assert state(source) == ("old", "SNAPSHOT='old'\n", "old-token")
+
+
 def test_committed_recovery_keeps_absence_and_cleans_saved_token(tmp_path):
     source = seed(tmp_path / "source", "new")
     target = seed(tmp_path / "target", "old", token="original-token")

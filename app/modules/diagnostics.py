@@ -11,7 +11,6 @@ import sqlite3
 import time
 from collections import deque
 from collections.abc import Callable
-from contextlib import closing
 from datetime import date as calendar_date, datetime
 from pathlib import Path
 from typing import Any
@@ -73,12 +72,8 @@ def _cell(value: Any) -> Any:
     return value
 
 
-def _connect() -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{db.resolve_db_path()}?mode=ro", uri=True, timeout=2)
-
-
 def _readable_schema() -> list[dict[str, Any]]:
-    with closing(_connect()) as conn:
+    with db.readonly_connection(db.resolve_db_path(), timeout=2) as conn:
         present = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -142,7 +137,7 @@ def query_db(sql: str = "", limit: int = 50) -> dict[str, Any]:
 
     deadline = time.monotonic() + _QUERY_SECONDS
     try:
-        with closing(_connect()) as conn:
+        with db.readonly_connection(db.resolve_db_path(), timeout=2) as conn:
             conn.set_authorizer(authorizer)
             conn.set_progress_handler(
                 lambda: 1 if time.monotonic() > deadline else 0, 10_000

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import unittest
+from http.client import IncompleteRead
 from unittest.mock import patch
 
 from app.cli import main
@@ -103,6 +104,9 @@ class UpdateCheckTests(unittest.TestCase):
         response.headers["Content-Length"] = str(1024 * 1024 + 1)
         with self.assertRaises(UpdateCheckError):
             check_for_updates(build=build(), opener=lambda *_a, **_k: response)
+
+        with patch.object(FakeResponse, "read", side_effect=IncompleteRead(b"[")), self.assertRaises(UpdateCheckError):
+            check_for_updates(build=build(), opener=lambda *_a, **_k: FakeResponse([]))
 
     def test_cli_json_output(self) -> None:
         result = type("Result", (), {"as_dict": lambda self: {

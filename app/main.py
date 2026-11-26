@@ -290,9 +290,6 @@ def _secret_key() -> str:
 
 def _initialize_runtime_storage() -> None:
     """Validate existing authorization before schema migration can create state."""
-    import sqlite3
-    from contextlib import closing
-
     from app.agent.feature_gate import (
         RUNTIME_FENCE_KEY,
         RuntimeFenceError,
@@ -308,7 +305,7 @@ def _initialize_runtime_storage() -> None:
             raise RuntimeFenceError("runtime_database_unavailable")
         if fresh:
             raise RuntimeFenceError("existing_runtime_requires_controlled_config_recovery")
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+        with database.readonly_connection(path) as conn:
             # Recognize application history before upgrading, not an arbitrary SQLite file.
             history = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='organize_log'").fetchone()
             columns = {row[1] for row in conn.execute('PRAGMA table_info(organize_log)')} if history else set()

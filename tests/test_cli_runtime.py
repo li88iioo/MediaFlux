@@ -13,6 +13,7 @@ import tempfile
 import textwrap
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from http.client import IncompleteRead
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -483,10 +484,15 @@ sys.addaudithook(audit)
                 self.assertEqual(request.call_args.args[0], "http://[::1]:1258/readyz")
 
     def test_status_rejects_non_object_and_malformed_responses_uniformly(self) -> None:
-        for body in (b"[]", b"not-json"):
+        for body in (b"[]", b"not-json", IncompleteRead(b'{"st', 12)):
             with self.subTest(body=body):
                 output = io.StringIO()
-                with patch("urllib.request.OpenerDirector.open", return_value=_Response(body)), redirect_stdout(output):
+                response = _Response(b"")
+                with (
+                    patch("urllib.request.OpenerDirector.open", return_value=response),
+                    patch.object(response, "read", side_effect=[body]),
+                    redirect_stdout(output),
+                ):
                     exit_code = main(["status"])
 
                 self.assertEqual(exit_code, 1)
@@ -633,19 +639,23 @@ sys.addaudithook(audit)
                 trash_dir=root / "trash",
             )
             paths.config_dir.mkdir()
-            paths.env_file.write_text("WEB_PORT=not-a-port\n")
             report = DiagnosticReport((DiagnosticCheck("ffprobe", "warning", "未找到 ffprobe"),))
-            output = io.StringIO()
-            with (
-                patch("app.runtime_paths.get_runtime_paths", return_value=paths),
-                patch("app.modules.runtime_diagnostics.run_diagnostics", return_value=report),
-                redirect_stdout(output),
+            for content, expected in (
+                ("WEB_PORT=not-a-port\n", "user.env 中的 WEB_PORT"),
+                ("WEB_PORT=23456\ninvalid setting\n", "user.env 第 2 行格式无效"),
             ):
-                exit_code = main(["doctor", "--json"])
-
-        checks = json.loads(output.getvalue())
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(next(check for check in checks if check["key"] == "runtime_config")["status"], "error")
+                paths.env_file.write_text(content, encoding="utf-8")
+                with (
+                    self.subTest(content=content),
+                    patch.dict(os.environ, {}, clear=True),
+                    patch("app.runtime_paths.get_runtime_paths", return_value=paths),
+                    patch("app.modules.runtime_diagnostics.run_diagnostics", return_value=report),
+                    redirect_stdout(io.StringIO()) as output,
+                ):
+                    self.assertEqual(main(["doctor", "--json"]), 1)
+                    check = next(row for row in json.loads(output.getvalue()) if row["key"] == "runtime_config")
+                    self.assertEqual(check["status"], "error")
+                    self.assertIn(expected, check["message"])
 
     def test_doctor_unreadable_config_path_returns_runtime_config_error_as_json(self) -> None:
         from app.modules.runtime_diagnostics import DiagnosticCheck, DiagnosticReport

@@ -239,6 +239,23 @@ class RuntimeLayoutTests(unittest.TestCase):
                 migrate_runtime_layout(make_paths(root))
             self.assertEqual(old.read_bytes(), b"unexpected content")
 
+    def test_backup_reports_legacy_lock_and_succeeds_after_offline_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_paths(Path(directory))
+            paths.env_file.write_text("WEB_PORT=1258\n")
+            (paths.data_dir / ".mediaflux-config-snapshot.lock").touch()
+            archive = paths.backup_dir / "settings.zip"
+            args = ["backup", "create", "--output", str(archive)]
+            with patch("app.runtime_paths.get_runtime_paths", return_value=paths):
+                with redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(main(args), 2)
+                self.assertIn("runtime-migrate", error.getvalue())
+                self.assertFalse(archive.exists())
+                self.assertEqual(migrate_runtime_layout(paths), 1)
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(args), 0)
+                    self.assertEqual(main(["backup", "verify", str(archive)]), 0)
+
     def test_cli_reports_migration_and_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))
