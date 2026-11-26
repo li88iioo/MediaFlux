@@ -750,6 +750,42 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("qBittorrent", bot.edits[-1][0])
         self.assertIn("确认后会保存订阅规则", bot.edits[-1][0])
 
+    def test_callback_preflight_outage_preserves_topic_card_for_retry(self):
+        import sqlite3
+        from contextlib import ExitStack
+
+        from app.agent.feature_gate import RuntimeFenceError
+        from app.modules import telegram_topic_routing as routing
+
+        owner = adapter.telegram_agent_owner(-100, 7)
+        session = "topic_session_41"
+        plan = "plan_1234567890abcdef"
+        with isolated_test_database(), ExitStack() as scope:
+            route = routing.create_session_callback_route(owner, session, 41)
+            for access_patch in self._patch_access():
+                scope.enter_context(access_patch)
+            for candidate in (False, True):
+                data = (f"agk:s:{route}:ref_{'a' * 24}:e" if candidate else f"agk:x:{route}:{plan}")
+                for failure in ("route", "runtime"):
+                    with self.subTest(candidate=candidate, failure=failure), ExitStack() as outage:
+                        bot = FakeBot()
+                        source = Message("原卡", user_id=0, message_id=33)
+                        source.message_thread_id = 41
+                        call = Call(data, source)
+                        if failure == "route":
+                            outage.enter_context(patch.object(routing.db, "kv_get",
+                                side_effect=sqlite3.OperationalError("fixture unavailable")))
+                        else:
+                            fault = RuntimeFenceError("runtime_changed_during_creation")
+                            outage.enter_context(patch("app.agent.kernel.bootstrap._capture_creation_binding", side_effect=fault))
+                        adapter.handle_agent_callback(bot, call, TELEBOT)
+                        self.assertEqual(len(bot.answers), 1)
+                        self.assertEqual(bot.answers[0][0], call.id)
+                        self.assertTrue(bot.answers[0][2]["show_alert"])
+                        self.assertIn("稍后重试", bot.answers[0][1])
+                        self.assertEqual((bot.edits, bot.sent), ([], []))
+            self.assertEqual(routing.resolve_session_callback_route(owner, route, 41), session)
+
     def test_confirm_callback_preserves_keyboard_for_replaced_plan(self):
         transport = FakeTelegramTransport(None)
         store = types.SimpleNamespace(load=AsyncMock(return_value=types.SimpleNamespace(
@@ -1817,6 +1853,17 @@ class TelegramAgentExecutorTests(unittest.TestCase):
                     self._registered_executor(max_queries=0, max_controls=2) as (bot, executor, submissions, finished):
                 try:
                     callback = self._registered_callback(bot, call_a)
+                    with patch.object(adapter, "get_agent_kernel_runtime", side_effect=RuntimeError("fixture reload")):
+                        callback(Call(call_a.data, source))
+                        first_job, _ = submissions.pop()
+                        first_job.result(2)
+                        self._wait_for_job_release(first_job, finished)
+                    self.assertIn("稍后重试", bot.answers[-1][1])
+                    self.assertEqual(bot.edits, [])
+                    self.assertEqual(executions, [])
+                    cold = SQLiteKernelStore(secret_provider=lambda: "registered-callback-test-secret")
+                    saved = asyncio.run(cold.load(owner=owner, session_id=session_id))
+                    self.assertEqual(saved.pending_effect_plan_id, preview.approval.plan_id)
                     callback(call_a)
                     job_a = submissions[0][0]
                     self.assertTrue(entered.wait(2))
@@ -1824,7 +1871,7 @@ class TelegramAgentExecutorTests(unittest.TestCase):
                     self.assertTrue(initial_edits)
                     callback(call_b)
                     self.assertIsNone(submissions[1][0], "同物理卡片必须在 executor 入口拒绝")
-                    self.assertEqual(execution.call_count, 1, "B 不得进入 handle_agent_callback")
+                    self.assertEqual(execution.call_count, 2, "B 不得进入 handle_agent_callback")
                     self.assertEqual(len(gated_transport.confirmations), 1)
                     self.assertEqual(bot.edits, initial_edits, "被拒 B 只能 ACK，不能修改原卡")
                     self.assertEqual(bot.answers[-1][0], call_b.id)
@@ -1860,7 +1907,7 @@ class TelegramAgentExecutorTests(unittest.TestCase):
                     assert (retry_job) is not None
                     retry_job.result(2)
                     self._wait_for_job_release(retry_job, finished)
-                    self.assertEqual(execution.call_count, 2)
+                    self.assertEqual(execution.call_count, 3)
                     self.assertEqual(len(gated_transport.confirmations), 1)
                     self.assertEqual(bot.edits, edits_before_retry)
                     self.assertIn("已处理或被替代", bot.answers[-1][1])

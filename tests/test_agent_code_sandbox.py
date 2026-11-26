@@ -13,6 +13,7 @@ import textwrap
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1191,7 +1192,12 @@ with ThreadPoolExecutor(4) as pool:
         self.assertEqual(list((workspace / "output").glob("*.sdk.json")), [])
 
     async def test_cancel_resource_search_releases_bridge_and_provider(self):
-        from app.indexers import runtime
+        await self._assert_cancelled_resource_search(bridge_first=False)
+
+    async def test_cancel_resource_search_bridge_first_has_no_failure_receipt(self):
+        await self._assert_cancelled_resource_search(bridge_first=True)
+
+    async def _assert_cancelled_resource_search(self, *, bridge_first):
         from app.indexers.registry import IndexerRegistry
         from app.indexers.result_store import IndexerResultStore
         from app.indexers.service import IndexerService
@@ -1213,20 +1219,91 @@ with ThreadPoolExecutor(4) as pool:
         service = IndexerService(registry=IndexerRegistry({"nyaa": GatedAdapter("nyaa")}),
                                  result_store=IndexerResultStore(),
                                  site_timeout_seconds=60, total_timeout_seconds=90)
+        await self._cancel_indexer_workspace_read(service, 'mf.resources.search("Demo", sites=["nyaa"])',
+                                                 entered, finished, bridge_first=bridge_first)
+        workspace, _ = sandbox._workspace_location(self.context.owner, self.context.session_id)
+        files = list((workspace / "output").glob("*.sdk.json"))
+        self.assertEqual(files, [], [json.loads(path.read_text()) for path in files])
+        self.assertFalse(self.background_processes())
+
+    async def test_cancel_missing_resource_batch_preserves_completed_checkpoint(self):
+        from app.indexers.providers.nyaa import NyaaAdapter
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from app.modules import missing_resources
+        from tests.test_missing_resources import _search_result, audit_for
+
+        entered, finished = asyncio.Event(), asyncio.Event()
+        episodes = []
+        adapter = NyaaAdapter(site_id="nyaa", site_name="Nyaa", base_url="https://fixture.invalid",
+                              http=SimpleNamespace(), default_enabled=True)
+        service = IndexerService(registry=IndexerRegistry({"nyaa": adapter}),
+                                 result_store=IndexerResultStore())
+
+        async def search(request, *_args, **_kwargs):
+            episodes.append(request.episode)
+            if request.episode is not None:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    finished.set()
+            return _search_result(items=[{
+                "result_id": "completed-episode-0001", "title": "Show.S01E01.1080p.WEB-DL",
+                "download_state": "ready", "download_kinds": ["magnet"],
+            }])
+
+        with (isolated_test_database("cancel-missing-checkpoint.db"),
+              patch.object(missing_resources, "audit_series_episodes", return_value=audit_for(episodes=[1, 2])),
+              patch.object(missing_resources, "get_indexer_service", return_value=service),
+              patch.object(service, "search_media", new=search)):
+            await self._cancel_indexer_workspace_read(service,
+                'mf.resources.search_missing([{"query":"Show","season":1,"episodes":[1,2]}], sites=["nyaa"])',
+                entered, finished, bridge_first=True)
+        self.assertEqual(episodes, [None, 2])
+        workspace, _ = sandbox._workspace_location(self.context.owner, self.context.session_id)
+        archived, = [json.loads(path.read_text()) for path in (workspace / "output").glob("*.sdk.json")]
+        self.assertTrue(archived["partial"])
+        self.assertNotIn("error", archived)
+        group, = archived["result"]["groups"]
+        self.assertEqual([item["episode"] for item in group["episodes"]], [1])
+        self.assertEqual(group["remaining_episodes"], [{"season": 1, "episode": 2}])
+        self.assertEqual(archived["result"]["result_ids"], ["completed-episode-0001"])
+
+    async def _cancel_indexer_workspace_read(self, service, code, entered, finished, *, bridge_first):
+        from app.indexers import runtime
+
+        dispatched = asyncio.Event()
+        dispatch = sandbox._SDKRequests.dispatch
+        wait_for_cancel = CancellationToken.wait
+
+        async def finish_dispatch(rpc, name):
+            try:
+                await dispatch(rpc, name)
+            finally:
+                dispatched.set()
+
+        async def wait_after_dispatch(token):
+            await dispatched.wait()
+            await wait_for_cancel(token)
+
         loop = asyncio.get_running_loop()
         runtime.bind_indexer_event_loop(loop)
         task = None
         try:
-            with patch.object(runtime, "get_indexer_service", return_value=service):
-                task = asyncio.create_task(self.execute('mf.resources.search("Demo", sites=["nyaa"])'))
+            with ExitStack() as scope:
+                scope.enter_context(patch.object(runtime, "get_indexer_service", return_value=service))
+                if bridge_first:
+                    # 同步桥与 RPC 完成后才唤醒宿主取消等待，固定两种合法的收尾顺序。
+                    scope.enter_context(patch.object(CancellationToken, "wait", new=wait_after_dispatch))
+                    scope.enter_context(patch.object(sandbox._SDKRequests, "dispatch", new=finish_dispatch))
+                task = asyncio.create_task(self.execute(code))
                 await asyncio.wait_for(entered.wait(), 30)
                 self.context.cancellation.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await asyncio.wait_for(task, 30)
                 await asyncio.wait_for(finished.wait(), 30)
-            workspace, _ = sandbox._workspace_location(self.context.owner, self.context.session_id)
-            self.assertEqual(list((workspace / "output").glob("*.sdk.json")), [])
-            self.assertFalse(self.background_processes())
         finally:
             if task is not None:
                 task.cancel()

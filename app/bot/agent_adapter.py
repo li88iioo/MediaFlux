@@ -711,23 +711,21 @@ def _send_agent_continuation_part(payload: Mapping[str, Any]) -> TelegramSendRes
         try:
             runtime = get_agent_kernel_runtime()
             plan = asyncio.run(runtime.session.pipeline.get_pending_plan(owner=owner, session_id=session_id))
-        except Exception as exc:  # noqa: BLE001 - outbox 保留暂不可核验的确认卡
-            # 状态不可读取不是计划失效：保持待交付，不能悄悄吞掉真实确认按钮。
-            return TelegramSendResult(False, error=f"AgentPlanUnavailable:{type(exc).__name__}", status_code=503)
-        if plan is not None and plan.plan_id == approval.plan_id:
-            import telebot
+            if plan is not None and plan.plan_id == approval.plan_id:
+                import telebot
 
-            markup = _approval_markup(
-                telebot, approval, owner=owner, session_id=session_id,
-                message_thread_id=route.get("message_thread_id"), bind_session=True,
-            )
-        else:
-            body = body.replace("⚠️ <b>等待确认</b>", "<b>原计划事实（已失效）</b>", 1)
-            body += "\n\n<i>该确认计划已失效或已被处理；以上仅为事实记录，没有执行新操作。</i>"
-    kwargs: dict[str, Any] = {"parse_mode": "HTML", "reply_markup": markup}
-    if "message_thread_id" in route:
-        kwargs["message_thread_id"] = route["message_thread_id"]
-    result, _ = call_telegram_delivery(lambda: bot.send_message(route["chat_id"], body, **kwargs))
+                markup = _approval_markup(
+                    telebot, approval, owner=owner, session_id=session_id,
+                    message_thread_id=route.get("message_thread_id"), bind_session=True,
+                )
+            else:
+                body = body.replace("⚠️ <b>等待确认</b>", "<b>原计划事实（已失效）</b>", 1)
+                body += "\n\n<i>该确认计划已失效或已被处理；以上仅为事实记录，没有执行新操作。</i>"
+        except Exception as exc:  # 计划读取与按钮路由写入都在请求 Telegram 之前。
+            return TelegramSendResult(False, error=f"AgentPlanUnavailable:{type(exc).__name__}", status_code=503)
+    result, _ = call_telegram_delivery(
+        lambda: bot.send_message(text=body, parse_mode="HTML", reply_markup=markup, **route)
+    )
     if result.ok and result.message_id <= 0:
         return TelegramSendResult(False, error="MissingTelegramReceipt")
     return result
@@ -936,65 +934,45 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
     ):
         bot.answer_callback_query(call.id, "操作过于频繁，请稍后重试", show_alert=True)
         return
-    if str(getattr(call, "data", "") or "").startswith("agk:s:"):
-        from app.bot.agent_candidates import CALLBACK_RE as _CANDIDATE_CALLBACK_RE
-        from app.bot.agent_candidates import handle_callback
-        from app.modules.telegram_topic_routing import resolve_session_callback_route
+    from app.bot.agent_candidates import CALLBACK_RE as candidate_pattern, handle_callback
+    from app.modules.telegram_topic_routing import resolve_session_callback_route
 
-        candidate_match = _CANDIDATE_CALLBACK_RE.fullmatch(
-            str(getattr(call, "data", "") or "")
-        )
-        if candidate_match is None:
+    data = str(getattr(call, "data", "") or "")
+    candidate = data.startswith("agk:s:")
+    match = (candidate_pattern if candidate else _CALLBACK_RE).fullmatch(data)
+    if match is None:
+        if candidate:
             bot.answer_callback_query(call.id, "候选按钮已失效，请重新搜索。", show_alert=True)
-            return
-        route_token = candidate_match.group("route")
+        else:
+            bot.answer_callback_query(call.id, "旧操作已失效，请重新发起", show_alert=True)
+            with suppress(Exception):
+                bot.edit_message_reply_markup(
+                    call.message.chat.id, call.message.message_id, reply_markup=None,
+                )
+        return
+    route_token = match.group("route")
+    try:
         session_id = (
-            resolve_session_callback_route(
-                owner, route_token, message_thread_id
-            )
-            if route_token
-            else telegram_agent_session_id(chat_id, user_id)
+            resolve_session_callback_route(owner, route_token, message_thread_id)
+            if route_token else telegram_agent_session_id(chat_id, user_id)
         )
-        if not session_id:
-            bot.answer_callback_query(
-                call.id, "该候选不属于当前话题或已过期，请重新搜索。", show_alert=True
-            )
-            return
-
+    except Exception as exc:
+        logger.warning("Telegram Agent 按钮路由读取失败 type=%s", type(exc).__name__)
+        bot.answer_callback_query(call.id, "当前按钮暂时无法核对，请稍后重试。", show_alert=True)
+        return
+    if not session_id:
+        notice = (
+            "该候选不属于当前话题或已过期，请重新搜索。"
+            if candidate else "该确认按钮已过期或不属于当前话题。"
+        )
+        bot.answer_callback_query(call.id, notice, show_alert=True)
+        return
+    if candidate:
         handle_callback(
-            bot,
-            call,
-            telebot_module,
-            owner=owner,
-            session_id=session_id,
+            bot, call, telebot_module, owner=owner, session_id=session_id,
             message_thread_id=message_thread_id,
         )
         return
-    match = _CALLBACK_RE.fullmatch(str(getattr(call, "data", "") or ""))
-    if match is None:
-        bot.answer_callback_query(call.id, "旧操作已失效，请重新发起", show_alert=True)
-        with suppress(Exception):
-            bot.edit_message_reply_markup(
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=None,
-            )
-        return
-    route_token = match.group("route")
-    if route_token:
-        from app.modules.telegram_topic_routing import resolve_session_callback_route
-
-        session_id = resolve_session_callback_route(
-            owner, route_token, message_thread_id
-        )
-        if not session_id:
-            bot.answer_callback_query(
-                call.id, "该确认按钮已过期或不属于当前话题。", show_alert=True
-            )
-            return
-    else:
-        # 兼容上线前签发、仅绑定 owner 的确认按钮。
-        session_id = telegram_agent_session_id(chat_id, user_id)
     envelope = EffectEnvelope(
         owner=owner,
         session_id=session_id,
@@ -1003,18 +981,19 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         channel="telegram",
         delivery_route=_delivery_route(call, owner=owner),
     )
-    runtime = get_agent_kernel_runtime()
-    plan_verified = False
-    if getattr(runtime, "store", None) is not None:
-        try:
-            state = asyncio.run(runtime.store.load(owner=owner, session_id=session_id))
-            if state.pending_effect_plan_id != envelope.plan_id:
-                bot.answer_callback_query(call.id, "该计划已处理或被替代，请使用当前消息中的按钮。", show_alert=True)
-                return
-            plan_verified = True
-        except Exception:  # noqa: BLE001 - 无法核对当前计划时不触发任何写入
-            bot.answer_callback_query(call.id, "当前计划暂时无法核对，请稍后重试。", show_alert=True)
-            return
+    try:
+        runtime = get_agent_kernel_runtime()
+        store = getattr(runtime, "store", None)
+        plan_matches = store is None or (
+            asyncio.run(store.load(owner=owner, session_id=session_id)).pending_effect_plan_id == envelope.plan_id
+        )
+    except Exception as exc:
+        logger.warning("Telegram Agent 计划读取失败 type=%s", type(exc).__name__)
+        bot.answer_callback_query(call.id, "当前计划暂时无法核对，请稍后重试。", show_alert=True)
+        return
+    if not plan_matches:
+        bot.answer_callback_query(call.id, "该计划已处理或被替代，请使用当前消息中的按钮。", show_alert=True)
+        return
     if match.group("action") == "e":
         bot.answer_callback_query(call.id, "只解释，不执行或修改计划，有效期不延长")
         try:
@@ -1049,7 +1028,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         message_thread_id=getattr(call.message, "message_thread_id", None),
     )
     progress = _ExistingMessageProgress(bot, call.message)
-    if plan_verified:
+    if store is not None:
         progress.update("正在核对确认计划…")
     observer = _TelegramEventObserver(progress)
     try:

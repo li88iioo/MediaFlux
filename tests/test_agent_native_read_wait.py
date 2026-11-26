@@ -272,25 +272,31 @@ def test_started_native_read_failure_never_reparks_or_calls_model(local_config, 
 
 @pytest.mark.parametrize("mode", ["different_query", "same_query", "same_query_retry"])
 def test_parallel_native_quota_reports_partial_without_discarding_other_rpc(local_config, monkeypatch, mode):
+    import fcntl
+
     clock = [100]
     monkeypatch.setattr(rate_limit.agent_rate_limiter, "_wall_clock", lambda: clock[0])
     entered, release = threading.Event(), threading.Event()
     original = sandbox.METHODS["diagnostics.component"]
     backend_calls = []
+    root, _ = _workspace_location(OWNER, SESSION)
+    gate = root / "work/quota-backend-entered.lock"
 
     def read(component):
         assert component == "qbittorrent", "被拒绝的读取不能进入后端"
         backend_calls.append(component)
         entered.set()
+        fcntl.flock(backend_entered, fcntl.LOCK_UN)
         assert release.wait(5)
         return original(component)
 
     monkeypatch.setitem(sandbox.METHODS, "diagnostics.component", read)
     query = "tmdb" if mode == "different_query" else "qbittorrent"
-    code = ("import json, time\nfrom concurrent.futures import ThreadPoolExecutor\n"
+    code = ("import fcntl, json\nfrom concurrent.futures import ThreadPoolExecutor\n"
             "with ThreadPoolExecutor(2) as pool:\n"
             "    first = pool.submit(mf.diagnostics.component, 'qbittorrent')\n"
-            "    time.sleep(.15)\n"
+            f"    with open('/work/{gate.name}') as signal:\n"
+            "        fcntl.flock(signal, fcntl.LOCK_SH)\n"
             "    try:\n"
             f"        mf.diagnostics.component({query!r})\n"
             "    except mf.Error as error:\n"
@@ -331,13 +337,18 @@ def test_parallel_native_quota_reports_partial_without_discarding_other_rpc(loca
         refused = next(call for call in calls if call["ok"] is False)
         assert refused["status"] == "rate_limited" and refused["execution_started"] is False
         assert '"code": "rate_limited", "execution_started": false' in result["data"]["stdout"]
+        assert result["data"]["exit_code"] == 0
+        assert result["data"]["stderr"] == ""
         completed = next(call for call in calls if call["ok"] is True)
-        root, _ = _workspace_location(OWNER, SESSION)
         archived = json.loads((root / completed["response_path"].lstrip("/")).read_text())
         assert archived["result"]["data"]["component"] == "qbittorrent"
         assert archived["result"]["ok"] is True
         assert await active.store.due_continuations() == []
-    asyncio.run(run())
+    gate.parent.mkdir(parents=True)
+    with gate.open("wb") as backend_entered:
+        # 子端的 /work 是同一目录的绑定挂载，先进入后端的读负责放行第二条 RPC。
+        fcntl.flock(backend_entered, fcntl.LOCK_EX)
+        asyncio.run(run())
 
 
 def test_native_read_only_resume_scope_ends_before_new_model_write(local_config, native_library_backend, monkeypatch):

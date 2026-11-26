@@ -724,19 +724,18 @@ async def get_session(request: Request, session_id: str):
         # 沿用公开计数字段；READ 等待与已确认后台操作共用结果观察器。
         pending_effect_count += (getattr(state, "metadata", {}).get("read_wait") or {}).get("state") in READ_WAIT_ACTIVE
         pending_approval = None
-        pending_plan_id = state.pending_effect_plan_id
-        if pending_plan_id and not (active_turn and active_turn["protected"]):
-            plan = await runtime.session.pipeline.get_pending_plan(owner=owner, session_id=normalized)
-            if plan is not None:
-                pending_approval = plan.public_approval_dict()
-                preview = next((row for row in reversed(state.conversation)
-                                if row.get("role") == "tool" and row.get("effect_plan_id") == plan.plan_id), {})
-                activities = public_activities(preview.get("activities"))
-                for activity in activities:
-                    if activity.get("method") == plan.tool_name and activity.get("status") == "running":
-                        activity["status"] = "approval_required"
-                if activities:
-                    pending_approval["activities"] = activities
+        if not (active_turn and active_turn["protected"]) and (
+            plan := await runtime.session.pipeline.get_pending_plan_from_state(state)
+        ) is not None:
+            pending_approval = plan.public_approval_dict()
+            preview = next((row for row in reversed(state.conversation)
+                            if row.get("role") == "tool" and row.get("effect_plan_id") == plan.plan_id), {})
+            activities = public_activities(preview.get("activities"))
+            for activity in activities:
+                if activity.get("method") == plan.tool_name and activity.get("status") == "running":
+                    activity["status"] = "approval_required"
+            if activities:
+                pending_approval["activities"] = activities
         last_turn = last_turn_view(events, active_turn)
         terminal_payload = events[-1].get("payload", {}) if last_turn else {}
         if not active_turn and last_turn and last_turn["status"] == "waiting":

@@ -194,6 +194,85 @@ class AgentKernelTransportTests(unittest.IsolatedAsyncioTestCase):
 
 class TelegramCancellationTests(unittest.IsolatedAsyncioTestCase):
     @patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value="")
+    async def test_stopping_old_telegram_query_preserves_new_question_in_sqlite(self, _preference):
+        from app.agent.kernel.state_types import CancellationToken
+
+        scope = {"owner": "tg:v1:-100\x1f7", "session_id": "topic-41"}
+        finishing, delivered = asyncio.Event(), asyncio.Event()
+        answering, release_answer = asyncio.Event(), asyncio.Event()
+        stop_processed = asyncio.Event()
+
+        class ReplyModel:
+            def __init__(self, answer):
+                self.answer = answer
+
+            async def stream(self, request, *, cancellation):
+                if self.answer == "第二个回答":
+                    answering.set()
+                    await release_answer.wait()
+                yield ModelEvent(ModelEventType.TEXT_DELTA, text=self.answer)
+                yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
+
+        def open_store():
+            return SQLiteKernelStore(secret_provider=lambda: "telegram-stop-test")
+
+        def make_transport(answer):
+            store = open_store()
+            catalog = ToolCatalog([])
+            session = AgentSession(
+                model=cast(ModelAdapter, ReplyModel(answer)), catalog=catalog, state_store=store,
+                pipeline=ToolPipeline(catalog=catalog, state_store=store), journal=store,
+            )
+            return TelegramKernelTransport(session)
+
+        async def hold_delivery(event):
+            if event.type == AgentEventType.TURN_COMPLETED:
+                finishing.set()
+                await delivered.wait()
+
+        with isolated_test_database():
+            old, new = make_transport("第一个回答"), make_transport("第二个回答")
+            cancel = old.session.cancel
+
+            async def observe_cancel(**kwargs):
+                try:
+                    return await cancel(**kwargs)
+                finally:
+                    stop_processed.set()
+
+            self.enterContext(patch.object(old.session, "cancel", side_effect=observe_cancel))
+            stop = CancellationToken()
+            first = asyncio.create_task(old.query(
+                QueryEnvelope(**scope, message="第一个问题"), observe=hold_delivery, cancellation=stop,
+            ))
+            try:
+                await asyncio.wait_for(finishing.wait(), 3)
+                async with asyncio.timeout(3):
+                    while await old.session.coordinator.describe(**scope):
+                        await asyncio.sleep(0.005)
+                second = asyncio.create_task(new.query(
+                    QueryEnvelope(**scope, request_id="new-question", message="第二个问题"),
+                ))
+                try:
+                    await asyncio.wait_for(answering.wait(), 3)
+                    stop.cancel("service_stopping")
+                    await asyncio.wait_for(stop_processed.wait(), 3)
+                    cold = await open_store().load(**scope)
+                    active = cold.metadata["active_publication"]
+                finally:
+                    release_answer.set()
+                    reply = await asyncio.wait_for(second, 3)
+                self.assertEqual(
+                    (active["request_id"], active["status"], reply.status, reply.answer),
+                    ("new-question", "running", "success", "第二个回答"),
+                )
+                final = await open_store().load(**scope)
+                self.assertEqual(final.conversation[-1]["content"], reply.answer)
+            finally:
+                delivered.set()
+                await asyncio.wait_for(first, 3)
+
+    @patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value="")
     async def test_stop_requested_before_turn_start_is_not_lost(self, _preference):
         import asyncio
 

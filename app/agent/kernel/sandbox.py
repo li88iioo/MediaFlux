@@ -22,6 +22,7 @@ from app import sdk
 from app.agent.errors import ToolPipelineError, ToolRateLimitError, _ReadPermitRejected
 from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.modules.agent_files import workspace_path
+from app.modules.media_library import MediaLibraryError
 from app.modules.process_lock import CrossProcessLock
 from app.runtime_paths import get_runtime_paths
 from app.sdk import METHODS, call_owner, describe_methods, describe_namespaces
@@ -274,8 +275,6 @@ class _SDKRequests:
 
         def remember(result):
             nonlocal checkpoint
-            if cancelled():
-                return
             snapshot = {**observation, "completed_at": datetime.now(timezone.utc).isoformat(),
                         "partial": True, "result": result}
             if not cancelled():
@@ -365,16 +364,18 @@ class _SDKRequests:
                 operation_id = await self.presentation.begin(method)
                 snapshot = await self.presentation.snapshot() if method == "resources.present" and bound.arguments.get("result_ids") else None
                 def invoke():
-                    # 技能保存/恢复是内部写入，也不能当作只读观察归档。
-                    if effect != "local_write":
-                        observation.update(method=method,
-                                           arguments=normalized,
-                                           called_at=datetime.now(timezone.utc).isoformat())
+                    if effect == "local_write":
+                        return function(**bound.arguments)  # 内部技能写入不归档。
+                    observation.update(method=method, arguments=normalized,
+                                       called_at=datetime.now(timezone.utc).isoformat())
                     try:
                         return function(**bound.arguments)
+                    except (InterruptedError, MediaLibraryError) as exc:
+                        if effect == "read" and (isinstance(exc, InterruptedError) or exc.code == "cancelled"):
+                            self.context.cancellation.raise_if_cancelled()
+                        raise
                     finally:
-                        if observation:
-                            observation["completed_at"] = datetime.now(timezone.utc).isoformat()
+                        observation["completed_at"] = datetime.now(timezone.utc).isoformat()
                 with call_owner(self.context.owner, session_id=self.context.session_id, publication_check=self.check_publication,
                                 cancelled=cancelled, read_checkpoint=remember, delivery_route=self.context.delivery_route,
                                 resource_candidates=snapshot, session_call=session_call):
@@ -394,7 +395,6 @@ class _SDKRequests:
             call = {"method": method, "ok": ok, "status": status}
             if observation:
                 call.update({key: result[key] for key in ("cached", "partial", "truncated", "has_more") if key in result})
-            self.calls.append(call)
             read_result = {**result, "ok": ok, "status": status, "summary": result.get("summary") or method}
         except asyncio.CancelledError:
             stopped.set()
@@ -411,22 +411,20 @@ class _SDKRequests:
             message = redact_sensitive_text(getattr(exc, "public_message", None) or str(exc))
             code = str(getattr(exc, "code", None) or type(exc).__name__)
             call = {"method": str(method), "ok": False, "status": code}
-            self.calls.append(call)
             error: dict[str, Any] = {"code": code, "message": message}
             if isinstance(exc, ToolRateLimitError):
                 error["rate_limit"] = dict(exc.rate_limit)
-            if isinstance(exc, _ReadPermitRejected):
-                error["execution_started"] = False
-                call["execution_started"] = False
-                self.refused_reads[read_key] = name
             execution_started = getattr(exc, "execution_started", None)
+            if isinstance(exc, _ReadPermitRejected):
+                self.refused_reads[read_key] = name
+                execution_started = False
             if isinstance(execution_started, bool):
-                error["execution_started"] = execution_started
-                call["execution_started"] = execution_started
+                error["execution_started"] = call["execution_started"] = execution_started
             encoded = json.dumps({**observation, "error": error}, ensure_ascii=False).encode()
             if method in METHODS:
                 activity = _sdk_activity(name, method, arguments if isinstance(arguments, dict) else {},
                                          status="failed", error=message)
+        self.calls.append(call)
         if activity:
             await self.context.report_progress({"activity": activity})
         if observation:

@@ -372,6 +372,33 @@ class AgentContinuationTelegramTests(unittest.TestCase):
         self.assertEqual(self.rows()[0]["status"], "retry_wait")
         self.assertIn("AgentPlanUnavailable", self.rows()[0]["last_error"])
 
+    def test_approval_route_write_failure_retries_same_outbox_card(self):
+        import sqlite3
+        from app.modules import telegram_topic_routing as routing
+
+        self.publish(self.prepare(approval=True))
+        with patch.object(routing.db, "kv_set", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertFalse(center.drain_telegram_notifications())
+        row, = self.rows()
+        self.assertEqual(self.bot.attempts, [])
+
+        with db.get_conn() as conn:
+            conn.execute("UPDATE telegram_notification_outbox SET next_attempt_at='2000-01-01'")
+        recover_notifications()
+        delivered = center.drain_telegram_notifications()
+        sent, = self.rows()
+        self.assertEqual(sent["id"], row["id"])
+        self.assertEqual(
+            (row["status"], delivered, sent["status"], len(self.bot.attempts)),
+            ("retry_wait", True, "sent", 1),
+        )
+        (chat_id, _, options), = self.bot.sent
+        self.assertEqual((str(chat_id), options["message_thread_id"]), (ROUTE["chat_id"], 42))
+        button = options["reply_markup"].keyboard[0][0].callback_data
+        prefix, action, token, plan_id = button.split(":")
+        self.assertEqual((prefix, action, plan_id), ("agk", "c", PLAN))
+        self.assertEqual(routing.resolve_session_callback_route(OWNER, token, 42), SESSION)
+
     def test_long_results_and_approval_keep_buttons_only_on_last_part(self):
         view = self.view(approval=True)
         view["approval"]["preview"] = {"summary": "长计划", "details": "长" * 12000}

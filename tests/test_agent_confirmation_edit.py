@@ -298,6 +298,87 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
     asyncio.run(run())
 
 
+def test_web_restore_keeps_approval_with_the_same_history_during_edit(rig, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from types import SimpleNamespace
+
+    from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
+    from app.agent.kernel.session import AgentSession
+    from app.agent.transports import WebKernelTransport
+    from app.routes import agent_api
+    from tests.test_agent_kernel_core import ScriptedModel
+    from tests.test_pending_explanation_transports import api_client
+
+    model = ScriptedModel([
+        [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
+            "rename-call", rig.tool.model_name,
+            {"label": "原名称", "object_id": "target-7", "signature": "fixture-proof"},
+        )), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
+        [ModelEvent(ModelEventType.TEXT_DELTA, text="名称修改结束，请核对执行回执。"),
+         ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
+    ])
+    session = AgentSession(model=model, catalog=rig.pipeline.catalog, pipeline=rig.pipeline,
+                           state_store=rig.store, journal=rig.store)
+    runtime = SimpleNamespace(session=session, store=rig.store, web=WebKernelTransport(session))
+    snapshot_read, allow_projection = Event(), Event()
+    project_candidates = agent_api.current_candidate_view
+
+    async def hold_original_snapshot(*, state, store):
+        if state.pending_effect_plan_id == original_id:
+            snapshot_read.set()
+            assert await asyncio.to_thread(allow_projection.wait, 10), "测试未释放旧标签页读取"
+        return await project_candidates(state=state, store=store)
+
+    csrf = {"X-CSRF-Token": "explain-csrf"}
+    details = f"/api/agent/sessions/{SESSION}"
+    with api_client(runtime, monkeypatch) as (client, owner), ThreadPoolExecutor(max_workers=1) as executor:
+        assert client.get("/_test_login").status_code == 200
+        query = client.post("/api/agent/query", headers=csrf, json={
+            "session_id": SESSION, "request_id": "preview-before-edit", "stream": False,
+            "message": "将对象名称改成原名称，先生成确认卡。",
+        })
+        assert query.status_code == 200 and query.json()["status"] == "approval_required", query.text
+        original_id = query.json()["approval"]["plan_id"]
+        assert client.get(details).json()["pending_approval"]["plan_id"] == original_id
+
+        monkeypatch.setattr(agent_api, "current_candidate_view", hold_original_snapshot)
+        restoring = executor.submit(client.get, details)
+        try:
+            assert snapshot_read.wait(10), "旧标签页未读取原确认快照"
+            edited = client.post("/api/agent/actions/confirm/edit", headers=csrf, json={
+                "session_id": SESSION, "plan_id": original_id, "request_id": "edit-other-tab",
+                "arguments": {"label": "另一标签页新名称"},
+            })
+            assert edited.status_code == 200 and edited.json()["plan"], edited.text
+        finally:
+            allow_projection.set()
+        split = restoring.result(timeout=10)
+        assert split.status_code == 200, split.text
+        recent = client.get(details)
+        assert recent.status_code == 200, recent.text
+        replacement_id = edited.json()["plan"]["plan_id"]
+        assert replacement_id != original_id
+        assert recent.json()["pending_approval"]["plan_id"] == replacement_id
+        assert any("另一标签页新名称" in row["content"] for row in recent.json()["messages"])
+        old = split.json()
+        assert not any("另一标签页新名称" in row["content"] for row in old["messages"])
+        assert old["pending_approval"] is None, (
+            f"旧历史没有编辑记录，却返回另一标签页的新确认卡 {old['pending_approval']['plan_id']}"
+        )
+
+        stale = client.post("/api/agent/actions/confirm", headers=csrf, json={
+            "session_id": SESSION, "plan_id": original_id, "request_id": "confirm-old-tab",
+        })
+        assert stale.status_code == 409 and rig.writes == [], stale.text
+        confirmed = client.post("/api/agent/actions/confirm", headers=csrf, json={
+            "session_id": SESSION, "plan_id": replacement_id, "request_id": "confirm-refreshed-tab",
+        })
+        assert confirmed.status_code == 200, confirmed.text
+        assert asyncio.run(rig.store.load(owner=owner, session_id=SESSION)).pending_effect_plan_id == ""
+        assert [write["label"] for write in rig.writes] == ["另一标签页新名称"]
+
+
 PRIVATE_EDIT_VALUES = {"access_code": "Ab12Cd34", "auto_access_code": False, "share_code": "Pq56Rs78",
                        "extraction_code": "Tt12Uu34", "passcode": "Vv56Ww78", "pin": "1234",
                        "accessCode": "Xx12Yy34", "share-code": "Zz56Aa78"}

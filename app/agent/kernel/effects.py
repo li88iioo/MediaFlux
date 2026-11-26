@@ -838,17 +838,19 @@ class EffectExecutor:
 
 
     async def get_pending_plan(self, *, owner: str, session_id: str) -> EffectPlan | None:
+        return await self.get_pending_plan_from_state(await self.state_store.load(owner=owner, session_id=session_id))
+
+    async def get_pending_plan_from_state(self, state: SessionState) -> EffectPlan | None:
         """只读卡片快照不争抢写锁；确认/编辑入口仍在锁内重新验证票据。"""
-        state = await self.state_store.load(owner=owner, session_id=session_id)
         generation = self._pending_generation(state)
         if not state.pending_effect_plan_id or generation is None:
             return None
         plan = await asyncio.to_thread(self.effect_store.get_active_plan,
-            owner=owner, session_id=session_id, generation=generation, plan_id=state.pending_effect_plan_id)
+            owner=state.owner, session_id=state.session_id, generation=generation, plan_id=state.pending_effect_plan_id)
         if plan is None:
             return None
         try:
-            deadline = await self._reference_deadline(plan.arguments, owner=owner, session_id=session_id)
+            deadline = await self._reference_deadline(plan.arguments, owner=state.owner, session_id=state.session_id)
         except ReferenceError:
             return None
         if deadline is None:

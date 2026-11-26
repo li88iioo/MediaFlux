@@ -140,6 +140,13 @@ class _KernelTransport:
             plan_id=normalized.plan_id, request_id=normalized.request_id,
         )
 
+    async def cancel(self, *, owner: str, session_id: str, request_id: str) -> bool:
+        return await self.session.cancel(
+            owner=_owner(owner),
+            session_id=_scope(session_id, "session_id"),
+            request_id=_scope(request_id, "request_id"),
+        )
+
 
 class WebKernelTransport(_KernelTransport):
     """Web 只取得真实 NDJSON 事件并转发控制命令。"""
@@ -180,13 +187,6 @@ class WebKernelTransport(_KernelTransport):
             owner=_owner(owner), session_id=_scope(session_id, "session_id"),
         )
 
-    async def cancel(self, *, owner: str, session_id: str, request_id: str) -> bool:
-        return await self.session.cancel(
-            owner=_owner(owner),
-            session_id=_scope(session_id, "session_id"),
-            request_id=_scope(request_id, "request_id"),
-        )
-
 
 class TelegramKernelTransport(_KernelTransport):
     """Telegram 消费与 Web 相同的事件，不自行实现 Agent 状态机。"""
@@ -203,13 +203,15 @@ class TelegramKernelTransport(_KernelTransport):
         observe: EventObserver | None = None,
         cancellation: CancellationToken | None = None,
     ) -> TurnView:
-        normalized = replace(request, channel="telegram")
-        events = self.session.run(normalized.to_agent_input())
+        agent_input = replace(request, channel="telegram").to_agent_input()
+        events = self.session.run(agent_input)
         cancel_task = None
 
         async def cancel_on_stop(token: CancellationToken):
             await token.wait()
-            await self.cancel(owner=normalized.owner, session_id=normalized.session_id)
+            await self.cancel(
+                owner=agent_input.owner, session_id=agent_input.session_id, request_id=agent_input.request_id,
+            )
 
         async def cancellable_events():
             nonlocal cancel_task
@@ -238,12 +240,6 @@ class TelegramKernelTransport(_KernelTransport):
         return await consume_events(
             events,
             observe=observe,
-        )
-
-    async def cancel(self, *, owner: str, session_id: str) -> bool:
-        return await self.session.cancel(
-            owner=_owner(owner),
-            session_id=_scope(session_id, "session_id"),
         )
 
 

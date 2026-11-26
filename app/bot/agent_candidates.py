@@ -13,6 +13,7 @@ from app.agent.kernel.references import ReferenceError
 from app.agent.kernel.state_types import (
     PublicationLease,
     SelectionInvalidError,
+    StalePublicationError,
     StateUpdate,
 )
 
@@ -176,8 +177,8 @@ def handle_callback(
     if not match:
         bot.answer_callback_query(call.id, "按钮无效，请重新搜索。", show_alert=True)
         return
-    runtime = get_agent_kernel_runtime()
     try:
+        runtime = get_agent_kernel_runtime()
         view, draft = asyncio.run(load_draft(runtime, owner=owner, session_id=session_id, handle=match.group("handle"), message_id=call.message.message_id))
         action = match.group("action")
         if draft["phase"] != "select":
@@ -208,9 +209,12 @@ def handle_callback(
             draft["phase"] = "previewing"
         draft["positions"] = sorted(selected)
         draft = asyncio.run(save_draft(runtime, owner=owner, session_id=session_id, view=view, draft=draft, expected=match.group("handle")))
-    except Exception as exc:  # noqa: BLE001 - 安全失败，不删除另一并发点击刚更新的键盘
+    except (SelectionInvalidError, StalePublicationError, ReferenceError) as exc:
         text = str(exc) if isinstance(exc, SelectionInvalidError) else "候选已失效，请重新搜索后选择。"
         bot.answer_callback_query(call.id, text, show_alert=True)
+        return
+    except Exception:
+        bot.answer_callback_query(call.id, "当前候选暂时无法核对，请稍后重试。", show_alert=True)
         return
     bot.answer_callback_query(call.id, "正在预检，尚未下载" if action == "p" else "选择已更新")
     if action != "p":

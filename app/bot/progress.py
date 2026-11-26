@@ -360,8 +360,10 @@ class TelegramProgress:
                         )
 
         if not self.mode:
-            result = self._send_real(rendered)
-            self.message_id = getattr(result, "message_id", None)
+            result = self._send_real_result(rendered)
+            self.message_id = (result.message_id or None) if result.ok else None
+            if not result.ok:
+                logger.info("Telegram 进度占位投递失败 %s", telegram_error_summary(result))
             if self.message_id is not None and callable(
                 getattr(self.bot, "edit_message_text", None)
             ):
@@ -443,77 +445,30 @@ class TelegramProgress:
         except (TypeError, ValueError):
             return None
 
-    def _send_real(self, rendered: str, *, reply_markup: Any = None) -> Any:
-        sender = getattr(self.bot, "send_message", None)
-        reply = getattr(self.bot, "reply_to", None)
-        target = sender if callable(sender) else reply
-        if not callable(target):
-            return None
-        kwargs: dict[str, Any] = {
-            "parse_mode": "HTML",
-            **telegram_message_options(
-                target, self.telebot,
-                reply_to_message_id=(
-                    getattr(self.source_message, "message_id", None)
-                    if callable(sender) else None
-                ),
-            ),
-        }
-        if reply_markup is not None:
-            kwargs["reply_markup"] = reply_markup
-        if self.message_thread_id is not None:
-            kwargs["message_thread_id"] = self.message_thread_id
-        if callable(sender):
-            return sender(self.chat_id, rendered, **kwargs)
-        if self.source_message is not None:
-            return target(self.source_message, rendered, **kwargs)
-        return None
-
     def _send_real_result(
-        self, rendered: str, *, reply_markup: Any = None,
+        self, rendered: str, *, reply_markup: Any = None, reply_to_source: bool = True,
     ) -> TelegramSendResult:
+        source = self.source_message if reply_to_source else None
         sender = getattr(self.bot, "send_message", None)
-        reply = getattr(self.bot, "reply_to", None)
-        if not callable(sender) and not (
-            callable(reply) and self.source_message is not None
-        ):
+        if callable(sender):
+            target = self.chat_id
+            source_id = getattr(source, "message_id", None)
+        elif source is not None and callable(sender := getattr(self.bot, "reply_to", None)):
+            target, source_id = source, None
+        else:
             return TelegramSendResult(
                 ok=False, error="TelegramSenderUnavailable", status_code=503,
             )
-        result, value = call_telegram_delivery(
-            lambda: self._send_real(rendered, reply_markup=reply_markup)
-        )
-        if result.ok and value is None:
-            return TelegramSendResult(
-                ok=False, error="TelegramSendReturnedNoMessage", status_code=503,
-            )
-        return result
-
-    def _send_followup_result(
-        self,
-        rendered: str,
-        *,
-        reply_markup: Any = None,
-    ) -> TelegramSendResult:
-        """发送终态的后续分段，不重复引用原始用户消息。"""
-
-        sender = getattr(self.bot, "send_message", None)
-        if not callable(sender):
-            return TelegramSendResult(
-                ok=False,
-                error="TelegramSenderUnavailable",
-                status_code=503,
-            )
         kwargs: dict[str, Any] = {
             "parse_mode": "HTML",
-            **telegram_message_options(sender, self.telebot),
+            **telegram_message_options(sender, self.telebot, reply_to_message_id=source_id),
         }
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
         if self.message_thread_id is not None:
             kwargs["message_thread_id"] = self.message_thread_id
         result, value = call_telegram_delivery(
-            lambda: sender(self.chat_id, rendered, **kwargs)
+            partial(sender, target, rendered, **kwargs)
         )
         if result.ok and value is None:
             return TelegramSendResult(
@@ -811,9 +766,10 @@ class TelegramProgress:
                     )
                     settled_text = continuation
                     self._mark_terminal_attempt("send", continuation)
-                    continuation_result = self._send_followup_result(
+                    continuation_result = self._send_real_result(
                         continuation,
                         reply_markup=continuation_markup,
+                        reply_to_source=False,
                     )
                     if continuation_result.ok:
                         result = continuation_result
