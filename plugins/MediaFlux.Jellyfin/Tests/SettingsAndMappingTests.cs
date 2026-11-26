@@ -28,7 +28,7 @@ public sealed class SettingsAndMappingTests
     [Fact]
     public void PluginAssemblyHasReleaseVersionAndUsesTheUpstreamApi()
     {
-        Assert.Equal("0.1.6.0", typeof(Plugin).Assembly.GetName().Version!.ToString());
+        Assert.Equal("0.1.7.0", typeof(Plugin).Assembly.GetName().Version!.ToString());
         Assert.Equal("Jellyfin.Api", typeof(global::Jellyfin.Api.Controllers.LibraryController).Assembly.GetName().Name);
     }
 
