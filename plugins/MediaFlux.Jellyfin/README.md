@@ -77,7 +77,7 @@ Jellyfin 12.2–12.4 的 `MediaSourceManager.GetPlaybackMediaSources` 对 `.strm
 
 ## 本地构建与官方 TestServer 测试
 
-使用 .NET SDK 10.0.402：
+使用 .NET SDK 10.0.404：
 
 ```bash
 dotnet build plugins/MediaFlux.Jellyfin/MediaFlux.Jellyfin.csproj -c Release

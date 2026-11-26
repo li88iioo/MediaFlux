@@ -6,8 +6,8 @@ if [ "$#" -ne 0 ]; then
   echo "Usage: $0" >&2
   exit 2
 fi
-if [ "$("$dotnet_bin" --version)" != "10.0.402" ]; then
-  echo "Packaging requires .NET SDK 10.0.402 (set DOTNET_BIN)." >&2
+if [ "$("$dotnet_bin" --version)" != "10.0.404" ]; then
+  echo "Packaging requires .NET SDK 10.0.404 (set DOTNET_BIN)." >&2
   exit 1
 fi
 "$dotnet_bin" build "$plugin/MediaFlux.Jellyfin.csproj" -c Release --nologo

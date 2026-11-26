@@ -76,7 +76,7 @@ args = sys.argv[1:]
 with Path(os.environ["COMMAND_LOG"]).open("a") as log:
     log.write(json.dumps(["dotnet", *args]) + "\\n")
 if args == ["--version"]:
-    print(os.environ.get("FAKE_SDK", "10.0.402"))
+    print(os.environ.get("FAKE_SDK", "10.0.404"))
 ''')
         self.env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
                     "DOTNET_BIN": str(self.bin / "dotnet"), "COMMAND_LOG": str(self.log),
@@ -169,10 +169,10 @@ if args == ["--version"]:
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual(commands[1], ["dotnet", "build", str(self.project), "-c", "Release", "--nologo"])
-        result = subprocess.run(["bash", str(script)], env={**self.env, "FAKE_SDK": "10.0.401"},
+        result = subprocess.run(["bash", str(script)], env={**self.env, "FAKE_SDK": "10.0.402"},
                                 capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("10.0.402", result.stderr)
+        self.assertIn("10.0.404", result.stderr)
 
     def test_verify_downloads_official_sources_and_selects_only_test_dependency(self):
         self.executable("curl", '''import io, json, os, sys, tarfile

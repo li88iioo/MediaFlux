@@ -11,8 +11,8 @@ if [ "$#" -gt 1 ] || [[ "$version" != 12.2 && "$version" != 12.3 && "$version" !
   echo "Usage: $0 [12.2|12.3|12.4]" >&2
   exit 2
 fi
-if [ "$("$dotnet_bin" --version)" != "10.0.402" ]; then
-  echo "Verification requires .NET SDK 10.0.402 (set DOTNET_BIN)." >&2
+if [ "$("$dotnet_bin" --version)" != "10.0.404" ]; then
+  echo "Verification requires .NET SDK 10.0.404 (set DOTNET_BIN)." >&2
   exit 1
 fi
 source_dir="$cache/jellyfin-$version"

@@ -144,6 +144,6 @@ bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
 bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.4
 ```
 
-需要 .NET SDK **10.0.402**、curl、tar，以及 GitHub codeload／NuGet 网络；可用 `DOTNET_BIN=/path/to/dotnet` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定缓存目录。默认缓存位于 `.superpowers/tmp/jellyfin-plugin/`。发布工作流独立于主程序 Docker/FPK 发布，只由 `jellyfin-plugin-v*` 标签触发；先完成多版本测试和 ZIP 发布，再更新稳定仓库清单，保留历史版本与校验和。
+需要 .NET SDK **10.0.404**、curl、tar，以及 GitHub codeload／NuGet 网络；可用 `DOTNET_BIN=/path/to/dotnet` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定缓存目录。默认缓存位于 `.superpowers/tmp/jellyfin-plugin/`。发布工作流独立于主程序 Docker/FPK 发布，只由 `jellyfin-plugin-v*` 标签触发；先完成多版本测试和 ZIP 发布，再更新稳定仓库清单，保留历史版本与校验和。
 
 MF HTTP 响应、媒体库管理器及云端行为为隔离模拟，不连接生产。自动化验证不等于运行完整生产 Jellyfin 或实际删除云盘文件。安装到实际实例后仍应先用单个可恢复测试条目确认挂载、权限及云端回执，再扩大使用范围。
