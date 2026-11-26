@@ -14,6 +14,7 @@ from app.modules.web_secret import signed_context_fingerprint
 from app.repositories import local_media as repository
 from app.sensitive_data import is_sensitive_key, redact_sensitive_text
 
+_POSITION_FIELDS = {"season": "season_override", "episode": "episode_override"}
 RETRYABLE = frozenset({"failed", "requires_manual"})
 SCOPES = frozenset({"all", "attention", "active", "history", "skipped", "latest_scan", *LOCAL_TASK_STATUSES})
 
@@ -150,11 +151,13 @@ def _preview(task: dict, changes: dict, *, require_source_digest: bool = False) 
         digest = digest.split(":")[1] if digest.startswith("preview:") else digest
         if require_source_digest and (not digest or inspection["digest"] != digest):
             raise LocalMediaServiceError("源文件范围已变化，请重新检查并确认整理预览")
+        media_type = changes.get("media_type", task["media_type"])
+        position = {} if str(media_type).strip().lower() == "movie" else task
         return service.preview("admin", inspection["inspection_id"],
-            tmdb_id=changes.get("tmdb_id", task["tmdb_id"]), media_type=changes.get("media_type", task["media_type"]),
+            tmdb_id=changes.get("tmdb_id", task["tmdb_id"]), media_type=media_type,
             rules_snapshot=task["rules_snapshot"], automatic=False,
-            season_override=changes.get("season", task["season_override"]),
-            episode_override=changes.get("episode", task["episode_override"]),
+            season_override=changes.get("season", position.get("season_override")),
+            episode_override=changes.get("episode", position.get("episode_override")),
             numbering_mode=changes.get("numbering_mode", task["numbering_mode"]))
     finally:
         service.inspections.discard("admin", inspection["inspection_id"])
@@ -169,9 +172,9 @@ def preview_local_task(task_id: int, **changes) -> dict:
 
 
 def prepare_local_task_retry(task_id: int, *, confirm_interrupted_write: bool = False, **changes) -> dict:
-    if set(changes) - {"tmdb_id", "media_type", "season", "episode", "numbering_mode"}:
+    if set(changes) - {"tmdb_id", "media_type", "numbering_mode", *_POSITION_FIELDS}:
         raise ValueError("本地任务重试参数无效")
-    changes = {key: value for key, value in changes.items() if key not in {"season", "episode"} or value is not None}
+    changes = {key: value for key, value in changes.items() if key not in _POSITION_FIELDS or value is not None}
     snapshot = _snapshot(task_id)
     task = snapshot["task"]
     if task["status"] not in RETRYABLE:
@@ -186,10 +189,9 @@ def prepare_local_task_retry(task_id: int, *, confirm_interrupted_write: bool = 
     for key in ("tmdb_id", "media_type", "numbering_mode"):
         if key in changes and not isinstance(changes[key], str):
             raise ValueError(f"{key}必须为字符串")
-    fields = {("season_override" if key == "season" else "episode_override" if key == "episode" else key): value
+    fields = {_POSITION_FIELDS.get(key, key): value
               for key, value in changes.items()}
-    confirmed_manual = task["trigger"] == "manual" and task["confirmation_actor"] and not interrupted
-    if changes or confirmed_manual:
+    if changes or (task["confirmation_actor"] and not interrupted):
         raw = _preview(task, changes, require_source_digest=bool(task["snapshot_digest"]))
         if raw.get("status") != "planned" or raw.get("pending_confirmations"):
             raise LocalMediaServiceError("重试计划仍需人工选择，请重新检查任务")

@@ -1250,9 +1250,10 @@ class LocalMediaService:
         if not videos:
             raise LocalMediaServiceError("选择路径中没有可整理的视频")
 
+        requested_tmdb_id = (tmdb_id or "").strip()
         requested_media_type = (media_type or "").strip().lower()
         if nsfw_only:
-            if (tmdb_id or "").strip():
+            if requested_tmdb_id:
                 raise LocalMediaServiceError(
                     "成人番号专用来源不能套用 TMDB 候选，只接受 MetaTube 精确番号结果"
                 )
@@ -1276,7 +1277,7 @@ class LocalMediaService:
         ) and effective_media_type != "tv":
             raise LocalMediaServiceError("只有剧集整理可以指定季数或集数")
         if (
-            not (tmdb_id or "").strip()
+            not requested_tmdb_id
             and (
                 normalized_numbering_mode != "auto"
                 or season_override is not None
@@ -1284,6 +1285,8 @@ class LocalMediaService:
             )
         ):
             raise LocalMediaServiceError("请先选择剧集候选，再指定编号方式或归档位置")
+        if effective_media_type == "movie":
+            normalized_numbering_mode = "auto"
 
         scan_result, snapshots_by_id = self._build_local_scan_result(
             inspection, videos, companions,
@@ -1295,7 +1298,6 @@ class LocalMediaService:
         fixed_match: MatchResult | None = None
         detail: dict[str, Any] = {}
         manual_pending_confirmations: list[dict[str, Any]] = []
-        requested_tmdb_id = (tmdb_id or "").strip()
         if requested_tmdb_id:
             fixed_match = self.scraper.match_from_tmdb(
                 requested_tmdb_id, effective_media_type,
@@ -1971,7 +1973,7 @@ class LocalMediaService:
         if source is None:
             raise LocalMediaServiceError("本地媒体来源不存在")
         rules = self._restore_rules_snapshot(task.rules_snapshot) if task.rules_snapshot else OrganizeRules.from_config()
-        paused = False
+        paused_client = None
         move_committed = False
         qb_task_retired = False
         committed_targets: list[str] = []
@@ -1994,17 +1996,15 @@ class LocalMediaService:
                     raise
                 preview = {"status": "requires_manual", "repreview_required": True,
                            "reason": f"预览前检查失败：{exc}；请重新检查并生成预览"}
+            expected_digest = task.snapshot_digest if web_preview or task.confirmation_actor or task.tmdb_id else ""
+            current_digest = preview.get("preview_digest") if web_preview else inspection.get("digest")
             if not preview.get("repreview_required") and (
-                (web_preview and preview.get("preview_digest") != task.snapshot_digest)
-                or (task.confirmation_actor and inspection["digest"] != task.snapshot_digest)
-                or (task.trigger == "manual" and not web_preview and not task.confirmation_actor)
+                ((expected_digest or task.confirmation_actor) and current_digest != expected_digest)
+                or (task.trigger == "manual" and not (web_preview or task.confirmation_actor))
             ):
                 preview = {"status": "requires_manual", "repreview_required": True,
                            "reason": "缺少有效预览或整理计划已变化，请重新检查并生成预览；本次未移动或清理文件"}
-            execution_digest = (
-                task.snapshot_digest if web_preview or task.confirmation_actor
-                else str(preview.get("digest") or inspection.get("digest") or "")
-            )
+            execution_digest = expected_digest or str(preview.get("digest") or inspection.get("digest") or "")
             pending_confirmations = list(preview.get("pending_confirmations") or [])
             unplanned = preview.get("status") != "planned"
             if unplanned or pending_confirmations:
@@ -2067,7 +2067,7 @@ class LocalMediaService:
                 with qb_control_write_lease():
                     local_media_repo.update_local_media_task(task_id, owner=owner, status="moving")
                     qb_client.pause_torrents(task.qb_hash)
-                    paused = True
+                    paused_client = qb_client
             else:
                 local_media_repo.update_local_media_task(task_id, owner=owner, status="moving")
             executable_plans = [item for item in preview["_move_plans"] if item.action != "skip"]
@@ -2160,22 +2160,26 @@ class LocalMediaService:
                 )
                 self._persist_committed_move_failure(owner, task_id, diagnostic)
                 raise LocalMediaPostMoveError(diagnostic) from exc
-            if paused and task.qb_hash and qb_client is not None:
-                try:
-                    with qb_control_write_lease():
-                        qb_client.resume_torrents(task.qb_hash)
-                except Exception as resume_exc:
-                    exc = LocalMediaServiceError(f"{exc}；qB 恢复失败: {resume_exc}")
+            diagnostic = str(exc)
             try:
-                local_media_repo.update_local_media_task(
-                    task_id, owner=owner, status="failed", error=str(exc)
-                )
-            except Exception as persist_exc:
-                logger.error(
-                    "持久化本地媒体提交前异常失败 task=%s type=%s",
-                    task_id,
-                    type(persist_exc).__name__,
-                )
+                if paused_client is not None:
+                    with qb_control_write_lease():
+                        paused_client.resume_torrents(task.qb_hash)
+            except Exception as resume_exc:
+                diagnostic = f"{exc}；qB 恢复失败: {resume_exc}"
+                raise LocalMediaServiceError(
+                    "本地整理失败，qB 恢复状态未确认。请核对 qB 任务并查看整理详情。"
+                ) from resume_exc
+            finally:
+                try:
+                    local_media_repo.update_local_media_task(
+                        task_id, owner=owner, status="failed", error=diagnostic,
+                    )
+                except Exception as persist_exc:
+                    logger.error(
+                        "持久化本地媒体提交前异常失败 task=%s type=%s",
+                        task_id, type(persist_exc).__name__,
+                    )
             raise
 
     @_local_media_operation

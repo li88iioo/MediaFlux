@@ -577,11 +577,7 @@ class LocalMoveTransaction:
                     if self._identity_or_none(target) is not None:
                         raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
                 if same_fs:
-                    if replace_same_path:
-                        os.replace(source, target)
-                        published_identity = plan.source.identity
-                    else:
-                        published_identity = self._publish_no_replace(source, target)
+                    published_identity = self._publish_no_replace(source, target)
                     target_created = True
                     # 发布已消耗源目录项，先登记补偿，再进行任何可能失败的读取。
                     # 此后失败必须恢复源文件，不能按复制失败清理唯一目标副本。
@@ -610,11 +606,7 @@ class LocalMoveTransaction:
                         )
                     if plan_action != "replace" and self._identity_or_none(target) is not None:
                         raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
-                    if replace_same_path:
-                        published_identity = self._identity(partial)
-                        os.replace(partial, target)
-                    else:
-                        published_identity = self._publish_no_replace(partial, target)
+                    published_identity = self._publish_no_replace(partial, target)
                     partial = None
                     target_created = True
                     self._require_identity(target, published_identity, label="事务目标")

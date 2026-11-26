@@ -560,20 +560,17 @@ class OrganizeCorrectionService:
             raise ValueError("日志必须且只能包含一个主视频快照")
         return videos[0]
 
-    def _match(self, tmdb_id: str, media_type: str, title: str = "",
-               year: str = "", *, provider: str = "", external_id: str = "",
-               rules: OrganizeRules | None = None,
-               source_values: tuple[str, ...] = ()) -> MatchResult:
+    def _match(self, tmdb_id: str, media_type: str, *, provider: str, external_id: str,
+               rules: OrganizeRules, source_values: tuple[str, ...]) -> MatchResult:
         """按来源边界解析人工候选；成人来源绝不接受 TMDB 回退。"""
-        effective_rules = rules or OrganizeRules.from_config().for_source("")
         normalized_provider = (provider or "").strip().lower()
-        if effective_rules.nsfw_exclusive:
+        if rules.nsfw_exclusive:
             if normalized_provider not in {"metatube", "clean_title"} or not (external_id or "").strip():
                 raise ValueError("请选择有效的成人内容候选")
             if normalized_provider == "clean_title":
                 source_seed = next((value for value in source_values if (value or "").strip()), "")
                 fallback = build_clean_title_candidate(
-                    source_seed, effective_rules.nsfw_strip_domains,
+                    source_seed, rules.nsfw_strip_domains,
                 )
                 if fallback is None:
                     raise ValueError("原文件名无法生成安全的清洗标题")
@@ -593,7 +590,7 @@ class OrganizeCorrectionService:
                     provider="clean_title", external_id=resolved_code,
                     metadata=metadata, status="matched", locked=True,
                 )
-            with self.organizer._nsfw_recognizer_lease(effective_rules) as recognizer:
+            with self.organizer._nsfw_recognizer_lease(rules) as recognizer:
                 if recognizer is None:
                     raise ValueError("成人来源未配置可用的 MetaTube 服务")
                 # 人工纠偏允许改正原来的错误番号，身份来自所选条目的真实详情。
@@ -601,15 +598,16 @@ class OrganizeCorrectionService:
             return result
         if normalized_provider not in {"", "tmdb"}:
             raise ValueError("普通媒体来源只允许使用 TMDB 候选")
-        media_type = "tv" if media_type == "tv" else "movie"
         resolved_tmdb_id = (tmdb_id or external_id or "").strip()
         result = self.scraper.match_from_tmdb(resolved_tmdb_id, media_type)
-        if not result.tmdb_id:
+        if result.need_confirm or not result.tmdb_id:
             raise ValueError(result.error or "TMDB 详情不存在")
         return result
 
-    def _verify_nsfw_target_identity(self, match: MatchResult, target_path: str) -> None:
+    def _verify_target_identity(self, match: MatchResult, target_path: str) -> None:
         if Organizer._match_provider(match) not in {"metatube", "clean_title"}:
+            if not match.title.strip():
+                raise ValueError("TMDB 详情缺少作品片名，请重新选择候选")
             return
         # 成人纠偏始终为 movie；target_path 即媒体根目录，身份只来自历史记录。
         plan = OrganizePlan(
@@ -636,7 +634,7 @@ class OrganizeCorrectionService:
         source_name = video.original_name or video.current_name
         parent_path = str(detail.get("original_path") or "")
         match = self._match(
-            tmdb_id, media_type, title, year,
+            tmdb_id, media_type,
             provider=provider, external_id=external_id, rules=rules,
             source_values=(video.original_name, video.current_name, parent_path),
         )
@@ -709,7 +707,7 @@ class OrganizeCorrectionService:
             parts.append(resolved_year)
         parts.extend(self.organizer.build_media_path_parts(match, parsed, rules))
         target_path = "/".join(parts)
-        self._verify_nsfw_target_identity(match, target_path)
+        self._verify_target_identity(match, target_path)
         self._verify_items(items)
         planned = []
         for item in items:
@@ -1736,7 +1734,7 @@ class OrganizeCorrectionService:
         if organize_rules_snapshot_changes(preview["rules_snapshot"], current_rules):
             raise DirectoryScrapeStateError("整理规则已变化，请重新预览并确认")
         rules = restore_organize_rules_snapshot(preview["rules_snapshot"], trusted_rules=current_rules)
-        self._verify_nsfw_target_identity(MatchResult(**preview["match"]), preview["target_path"])
+        self._verify_target_identity(MatchResult(**preview["match"]), preview["target_path"])
         before = organize_history_repo.capture_organize_business_snapshot(log_id)
         previous_log = db.get_organize_log(log_id)
         assert previous_log is not None

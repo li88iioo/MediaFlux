@@ -2283,6 +2283,46 @@ def create_web_task(case):
     )
 
 
+def test_correct_tv_task_to_movie_without_reusing_its_episode(local_preview):
+    from app.modules import local_media_tasks
+
+    case = local_preview
+    movies = case.target.parent / "movies"
+    movies.mkdir()
+    local_media_repo.upsert_local_library_target(case.source_id, "movie", str(movies))
+    case.inspection = case.service.inspect_source("admin", case.source_id, case.video)
+    case.preview = case.service.preview(
+        "admin", case.inspection["inspection_id"], "42", "tv",
+        season_override=2, episode_override=3, numbering_mode="standard",
+    )
+    task_id = create_web_task(case)
+    local_media_repo.update_local_media_task(task_id, status="requires_manual")
+    before = _require_task(task_id)
+    assert (before.season_override, before.episode_override, before.numbering_mode) == (2, 3, "standard")
+    case.scraper.result.title = "Selected Film"
+    selection = {"tmdb_id": "88", "media_type": "movie"}
+    with patch.object(local_media_tasks, "get_local_media_service", return_value=case.service), patch(
+        "app.modules.local_media_scheduler.get_local_media_scheduler",
+    ):
+        with pytest.raises(LocalMediaServiceError, match="只有剧集"):
+            local_media_tasks.preview_local_task(task_id, **selection, episode=3)
+        preview = local_media_tasks.preview_local_task(task_id, **selection)
+        assert preview["position_overrides"] == {"season": None, "episode": None}
+        assert preview["numbering_mode"] == "auto"
+        assert _require_task(task_id) == before and case.video.exists()
+        prepared = local_media_tasks.prepare_local_task_retry(task_id, **selection)
+        receipt = local_media_tasks.retry_local_task(task_id, **selection, expected_fingerprint=prepared["fingerprint"])
+        assert receipt["status"] == "accepted"
+
+    assert local_media_repo.claim_local_media_task(task_id)
+    result = case.service.execute_task("admin", task_id)
+    assert result["status"] == "completed"
+    task = _require_task(task_id)
+    assert (task.tmdb_id, task.media_type, task.season_override, task.episode_override) == ("88", "movie", None, None)
+    assert {Path(path).name for path in result["moved"]} == {"Selected Film.2026.mkv", "Selected Film.2026.en.srt"}
+    assert all(Path(path).is_relative_to(movies) for path in result["moved"])
+
+
 @pytest.mark.parametrize("phase", ["before_create", "after_create", "restart"])
 def test_web_new_sibling_requires_repreview_without_file_writes(local_preview, phase):
     case = local_preview
@@ -2530,6 +2570,59 @@ def test_telegram_replaces_web_ticket_and_writer_checks_new_source_digest(local_
     assert get_local_media_task_result_9 is not None
     assert get_local_media_task_result_9.snapshot_digest == current["digest"]
 
+
+
+@pytest.mark.parametrize("retry_entry", ["web", "native"])
+@pytest.mark.parametrize("add_episode", [False, True])
+def test_retry_of_confirmed_scan_keeps_the_selected_files(local_preview, retry_entry, add_episode):
+    from app.modules import local_media_tasks
+    from app.modules.local_move_transaction import LocalMoveTransaction
+
+    case = local_preview
+    task_id, _ = local_media_repo.admit_local_media_task(
+        case.source_id, "", str(case.source), trigger="scan", operation_token="manual-scan:fixture",
+    )
+    assert local_media_repo.claim_local_media_task(task_id)
+    case.scraper.result.need_confirm = True
+    assert case.service.execute_task("admin", task_id)["status"] == "requires_manual"
+    task = _require_task(task_id)
+    assert local_media_repo.claim_local_media_confirmation_task(
+        task_id, expected_version=task.version, expected_snapshot_digest=task.snapshot_digest,
+        confirmed_snapshot_digest=case.inspection["digest"], tmdb_id="42", media_type="tv",
+        rules_snapshot=case.preview["rules_snapshot"],
+    )
+    with patch.object(LocalMoveTransaction, "execute", side_effect=OSError("volume offline")):
+        with pytest.raises(OSError, match="volume offline"):
+            case.service.execute_task("admin", task_id)
+
+    if retry_entry == "web":
+        assert local_media_repo.reset_local_media_task(task_id)
+    else:
+        with patch.object(local_media_tasks, "get_local_media_service", return_value=case.service), patch(
+            "app.modules.local_media_scheduler.get_local_media_scheduler",
+        ):
+            prepared = local_media_tasks.prepare_local_task_retry(task_id)
+            assert local_media_tasks.retry_local_task(task_id, expected_fingerprint=prepared["fingerprint"])["ok"]
+    extra = case.source / "Example.Show.S01E02.mkv"
+    if add_episode:
+        extra.write_bytes(b"new episode")
+    assert local_media_repo.claim_local_media_task(task_id)
+    receipt = case.service.execute_task("admin", task_id)
+    if add_episode:
+        assert receipt["status"] == "requires_manual" and receipt["repreview_required"]
+        assert _require_task(task_id).status == "requires_manual"
+        assert not list(case.target.rglob("*"))
+        assert extra.read_bytes() == b"new episode" and case.video.read_bytes() == b"episode-one"
+        assert case.subtitle.exists() and case.junk.exists()
+        # 连续点击重试也不能将已拒绝的新成员变成确认过的快照。
+        assert local_media_repo.reset_local_media_task(task_id)
+        assert local_media_repo.claim_local_media_task(task_id)
+        assert case.service.execute_task("admin", task_id)["repreview_required"]
+        assert extra.exists() and not list(case.target.rglob("*"))
+    else:
+        assert receipt["status"] == _require_task(task_id).status == "completed"
+        assert {Path(path).read_bytes() for path in receipt["moved"]} == {b"episode-one", b"subtitle"}
+        assert not case.video.exists() and not case.junk.exists()
 
 
 @pytest.mark.parametrize("confirmation_entry", ["web", "tg"])

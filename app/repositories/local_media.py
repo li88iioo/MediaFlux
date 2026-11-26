@@ -1650,11 +1650,10 @@ def reset_local_media_task(
         "updated_at=?",
     ]
     params: list[object] = ["", db.now()]
+    # 无新计划时保留源快照，由执行器区分已选作品和允许重新扫描的任务。
     if preview_digest:
         assignments.extend(["snapshot_digest=?", "rules_snapshot=?"])
         params.extend([preview_digest, rules_snapshot])
-    else:
-        assignments.append("snapshot_digest=CASE WHEN snapshot_digest LIKE 'preview:%' THEN snapshot_digest ELSE '' END")
     if tmdb_id is not None:
         assignments.append("tmdb_id=?")
         params.append((tmdb_id or "").strip())

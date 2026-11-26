@@ -19,6 +19,7 @@ from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import (
     LocalMediaPostMoveError,
     LocalMediaService,
+    LocalMediaServiceError,
     LocalMovePlan,
 )
 from app.modules.local_storage import LocalFilesystemAdapter
@@ -81,6 +82,29 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         get_local_media_task_result = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result is not None
         self.assertEqual(get_local_media_task_result.status, "failed")
+
+    def test_resume_failure_reaches_the_caller_and_keeps_diagnostics_in_task_history(self):
+        root, source, target, task_id, service = self._fixture()
+        self.addCleanup(root.cleanup)
+        self.addCleanup(service.close)
+        qb = FakeQB()
+        with (
+            patch("app.modules.local_media_service.LocalMoveTransaction.execute", side_effect=OSError("move failed")),
+            patch.object(qb, "resume_torrents", side_effect=TimeoutError("resume timeout")) as resume,
+            self.assertRaisesRegex(LocalMediaServiceError, "qB.*核对") as caught,
+        ):
+            service.execute_task("admin", task_id, qb_client=qb)
+        resume.assert_called_once_with("hash-1")
+        self.assertEqual(qb.calls, [("pause", "hash-1")])
+        self.assertNotIn("resume timeout", str(caught.exception))
+        self.assertEqual((source / "Movie.2025.mkv").read_bytes(), b"movie")
+        self.assertTrue((source / "下载必看.txt").exists())
+        self.assertEqual(list(target.rglob("*.mkv")), [])
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
+        assert task is not None
+        self.assertEqual(task.status, "failed")
+        self.assertIn("move failed", task.error)
+        self.assertIn("resume timeout", task.error)
 
     def test_qb_delete_failure_keeps_junk_files(self):
         root, source, _target, task_id, service = self._fixture()

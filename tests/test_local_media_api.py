@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import re
 import tempfile
+from contextlib import closing, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import database as db
@@ -1241,6 +1243,113 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("季数必须是整数", response.json()["error"])
         service.preview.assert_not_called()
+
+
+@pytest.mark.parametrize("copy_publication", [False, True], ids=["rename", "copy"])
+def test_confirmed_replacement_preserves_subtitle_saved_during_move(tmp_path, copy_publication):
+    from app.clients.tmdb import TMDBClient
+    from app.modules.local_media_service import LocalMediaService
+    from app.modules.local_move_transaction import LocalMoveTransaction
+    from app.modules.local_storage import LocalFilesystemAdapter
+    from app.modules.organize import OrganizeRules
+    from app.modules.scraper import TMDBScraper
+    from tests.support import initialized_web_runtime
+    from tests.test_config_empty_values_api import login
+
+    source_root, library = tmp_path / "downloads", tmp_path / "library"
+    release = source_root / "release"
+    release.mkdir(parents=True)
+    library.mkdir()
+    incoming = {
+        "video": (release / "Fixture.Movie.2026.mkv", b"new downloaded video"),
+        "subtitle": (release / "Fixture.Movie.2026.zh.srt", b"downloaded subtitle"),
+    }
+    for path, contents in incoming.values():
+        path.write_bytes(contents)
+    junk = release / "site.url"
+    junk.write_bytes(b"release advertisement")
+    old_video, old_subtitle, user_subtitle = b"old video", b"old subtitle", b"user edited subtitle"
+
+    tmdb = Mock(spec=TMDBClient, api_key="fixture-key", config_error="")
+    tmdb.detail.return_value = {"id": 7654, "title": "Fixture Movie", "release_date": "2026-01-01"}
+    tmdb.get.return_value = tmdb.detail.return_value
+    rules = OrganizeRules(
+        region_split=False, year_split=False, conflict_strategy=2, clean_empty=True,
+        media_info_enabled=False, media_probe_enabled=False, emby_refresh=False,
+    )
+    device_policy = (
+        patch.object(LocalFilesystemAdapter, "same_filesystem", return_value=False)
+        if copy_publication else nullcontext()
+    )
+    with (
+        patch("socket.socket.connect", side_effect=AssertionError("network forbidden")) as connect,
+        patch("socket.socket.connect_ex", side_effect=AssertionError("network forbidden")) as connect_ex,
+        initialized_web_runtime(),
+        TestClient(create_app(start_background=False)) as web,
+        closing(TMDBScraper(tmdb)) as scraper,
+        closing(LocalMediaService(scraper=scraper)) as service,
+        patch("app.routes.local_media_api.get_local_media_service", return_value=service),
+        patch.object(OrganizeRules, "from_config", return_value=rules),
+        patch("app.routes.local_media_api.notify_local_media_task"),
+        device_policy,
+    ):
+        headers = login(web)
+        source_id = local_media_repo.create_local_media_source(
+            "Fixture", "", "", str(source_root),
+        )
+        local_media_repo.upsert_local_library_target(source_id, "movie", str(library))
+        url = "/api/local-media"
+        inspected = web.post(f"{url}/inspect", headers=headers, json={
+            "source_id": source_id, "path": str(release),
+        })
+        assert inspected.status_code == 200, inspected.text
+        scope = {"inspection_id": inspected.json()["inspection_id"]}
+        selection = {**scope, "tmdb_id": "7654", "media_type": "movie"}
+        first = web.post(f"{url}/preview", headers=headers, json=selection)
+        assert first.status_code == 200 and first.json()["status"] == "planned", first.text
+        targets = {item["role"]: Path(item["target_path"]) for item in first.json()["plans"]}
+        video_target, subtitle_target = targets["video"], targets["subtitle"]
+        video_target.parent.mkdir(parents=True)
+        video_target.write_bytes(old_video)
+        subtitle_target.write_bytes(old_subtitle)
+        confirmed = web.post(f"{url}/preview", headers=headers, json=selection)
+        assert confirmed.status_code == 200, confirmed.text
+        preview = confirmed.json()
+        assert {item["role"]: item["action"] for item in preview["plans"]} == {
+            "video": "replace", "subtitle": "replace",
+        }
+
+        backup_target = LocalMoveTransaction._backup_replaced_target
+
+        def save_user_subtitle(transaction, path, identity, *, transaction_target):
+            backup = backup_target(transaction, path, identity, transaction_target=transaction_target)
+            if path == subtitle_target:
+                with path.open("xb") as subtitle:
+                    subtitle.write(user_subtitle)
+            return backup
+
+        request = {**scope, "preview_digest": preview["preview_digest"]}
+        with patch.object(LocalMoveTransaction, "_backup_replaced_target", new=save_user_subtitle):
+            executed = web.post(f"{url}/execute", headers=headers, json=request)
+
+        assert subtitle_target.read_bytes() == user_subtitle, executed.text
+        assert executed.status_code == 400, executed.text
+        assert video_target.read_bytes() == old_video
+        for path, contents in incoming.values():
+            assert path.read_bytes() == contents
+        assert junk.read_bytes() == b"release advertisement"
+        [backup] = list(library.rglob(".*.mediaflux-replaced-*"))
+        assert backup.read_bytes() == old_subtitle
+        assert list(library.rglob(".*.mediaflux-partial-*")) == []
+
+        [task] = local_media_repo.list_local_media_tasks()
+        detail = web.get(f"{url}/tasks/{task.id}").json()
+        assert detail["task"]["status"] == "requires_manual", detail
+        assert [step["status"] for step in detail["steps"]] == ["rolled_back", "failed"]
+        assert web.post(f"{url}/execute", headers=headers, json=request).status_code == 400
+        assert web.get(f"{url}/tasks/{task.id}").json() == detail
+        connect.assert_not_called()
+        connect_ex.assert_not_called()
 
 
 if __name__ == "__main__":

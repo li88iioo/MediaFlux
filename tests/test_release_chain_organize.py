@@ -599,6 +599,30 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         self.enterContext(patch.object(service, "_run_post_actions", return_value=[]))
         return log_id, cloud, service
 
+    def test_movie_correction_needs_verified_detail_and_a_title_before_archiving(self):
+        log_id, cloud, service = self._fixture()
+        before = organize_history_repo.capture_organize_business_snapshot(log_id)
+        for detail, reason in (
+            ({"id": 999, "title": "Other"}, "身份不一致"),
+            ({"title": "Unknown ID"}, "缺少 ID"),
+            ({"id": 2, "title": " "}, "片名"),
+        ):
+            with self.subTest(detail=detail), patch.object(service.scraper, "get_detail", return_value=detail):
+                with self.assertRaisesRegex(ValueError, reason):
+                    service.preview_reorganize(log_id, "2", "movie", title="Second")
+                self.assertEqual(organize_history_repo.capture_organize_business_snapshot(log_id), before)
+                self.assertEqual(cloud.calls, [])
+
+        preview = service.preview_reorganize(log_id, "2", "movie")
+        old_preview = {**preview, "match": {**preview["match"], "title": ""}, "file_name": ".mkv"}
+        with self.assertRaisesRegex(ValueError, "片名"):
+            service._execute_reorganize(log_id, "old-preview", preview["version"], old_preview)
+        self.assertEqual(cloud.calls, [])
+        self.assertEqual(organize_history_repo.capture_organize_business_snapshot(log_id), before)
+        service._execute_reorganize(log_id, "verified-detail", preview["version"], preview)
+        self.assertIn("Second", cloud.files["video"].name)
+        self.assertEqual(service.detail(log_id)["tmdb_id"], "2")
+
     def test_confirmed_position_survives_next_preview_and_partial_override(self):
         import json
 

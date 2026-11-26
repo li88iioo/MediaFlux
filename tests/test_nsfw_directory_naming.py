@@ -246,10 +246,10 @@ class NsfwDirectoryNamingTests(unittest.TestCase):
                 provider="metatube", external_id=match.external_id, media_type="movie",
                 title="SODAH-003", original_parent_id="source", original_name="SODAH-003.mp4",
             )
-            service._verify_nsfw_target_identity(restored, preview["target_path"])
+            service._verify_target_identity(restored, preview["target_path"])
             db.update_organize_log(history_id, title="SODAH-004 人工纠正")
             with self.assertRaisesRegex(ValueError, "历史整理记录"):
-                service._verify_nsfw_target_identity(restored, preview["target_path"])
+                service._verify_target_identity(restored, preview["target_path"])
             cast(Mock, service.client.move).assert_not_called()
             cast(Mock, service.client.rename).assert_not_called()
 
