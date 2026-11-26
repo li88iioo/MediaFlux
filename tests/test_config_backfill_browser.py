@@ -250,6 +250,85 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         expect(model).to_have_value("second-only")
         expect(panel.locator('[data-key="AGENT_LLM_API_URL"]')).to_have_value("https://second.example.invalid/v1")
 
+    def _open_cache_policy_with_pending_receipt(self):
+        from playwright.sync_api import expect
+
+        key = "DOWNLOAD_TORRENT_RETENTION_DAYS"
+        self._write(**{key: "30"})
+        page = self.context.new_page()
+        page.goto(ORIGIN + "/downloads")
+        opener = page.locator("#torrentCachePolicyBtn")
+        days = page.locator("#torrentCacheRetentionDays")
+        save = page.locator("#torrentCachePolicySave")
+        opener.click()
+        expect(days).to_have_value("30")
+        days.fill("45")
+        # 延迟已持久化的 POST 回执。页面重开后的 GET 仍单独经过真实加载流程。
+        page.evaluate("""() => {
+            const send = window.fetch;
+            window.fetch = async (...args) => {
+                const response = await send(...args);
+                if (args[0] !== '/api/config' || args[1]?.method !== 'POST') return response;
+                window.fetch = send;
+                const body = await response.text();
+                await new Promise(resolve => { window.releaseReceipt = resolve; });
+                return new Response(body, {status: response.status});
+            };
+            const saveConfig = window.saveAppConfig;
+            window.receiptHandled = new Promise(done => {
+                window.saveAppConfig = (...args) => saveConfig(...args).finally(done);
+            });
+        }""")
+        save.click()
+        page.wait_for_function("typeof window.releaseReceipt === 'function'")
+        self.assertEqual(config.get(key), "45")
+        page.keyboard.press("Escape")
+        return page
+
+    def test_cache_policy_late_save_cannot_unlock_a_failed_reopen(self):
+        from playwright.sync_api import expect
+
+        page = self._open_cache_policy_with_pending_receipt()
+        opener = page.locator("#torrentCachePolicyBtn")
+        days = page.locator("#torrentCacheRetentionDays")
+        save = page.locator("#torrentCachePolicySave")
+        status = page.locator("#torrentCachePolicyState")
+        page.route("**/api/config", lambda route: route.fulfill(status=503, json={"error": "策略暂时不可读"}), times=1)
+        opener.click()
+        expect(status).to_contain_text("策略暂时不可读")
+        page.evaluate("async () => { window.releaseReceipt(); await window.receiptHandled; }")
+        expect(save).to_be_disabled()
+        expect(days).not_to_be_editable()
+        expect(status).to_contain_text("策略暂时不可读")
+        days.press("Enter")
+        self.assertEqual(self.config_posts, [(200, {"DOWNLOAD_TORRENT_RETENTION_DAYS": "45"})])
+
+        page.keyboard.press("Escape")
+        opener.click()
+        expect(days).to_have_value("45")
+        expect(save).to_be_enabled()
+
+    def test_cache_policy_reopened_form_saves_against_its_own_loaded_value(self):
+        from playwright.sync_api import expect
+
+        key = "DOWNLOAD_TORRENT_RETENTION_DAYS"
+        page = self._open_cache_policy_with_pending_receipt()
+        other = self.context.new_page()
+        other.goto(ORIGIN + "/downloads")
+        other.locator("#torrentCachePolicyBtn").click()
+        other.locator("#torrentCacheRetentionDays").fill("60")
+        other.locator("#torrentCachePolicySave").click()
+        expect(other.locator("#torrentCachePolicyState")).to_have_text("已保存")
+        other.close()
+        page.locator("#torrentCachePolicyBtn").click()
+        days = page.locator("#torrentCacheRetentionDays")
+        expect(days).to_have_value("60")
+        page.evaluate("async () => { window.releaseReceipt(); await window.receiptHandled; }")
+        days.fill("45")
+        with page.expect_response(lambda res: res.request.method == "POST" and res.url.endswith("/api/config")):
+            days.press("Enter")
+        self.assertEqual((self.config_posts[-1], config.get(key)), ((200, {key: "45"}), "45"))
+
     def test_downloader_url_save_rejects_an_invalid_draft_and_accepts_its_correction(self):
         from playwright.sync_api import expect
 

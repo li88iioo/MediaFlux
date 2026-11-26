@@ -682,6 +682,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.equal(attributes['aria-busy'], 'true');
               modalOptions.onRequestClose();
               assert.equal(attributes['aria-busy'], 'false');
+              assert.equal(loads[0].signal.aborted, true);
               assert.equal(closes, 1);
 
               const second = openTorrentCachePolicy();

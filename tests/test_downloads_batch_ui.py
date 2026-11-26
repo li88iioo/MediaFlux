@@ -314,6 +314,7 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                             calls.append((kind, parse_qs(urlsplit(route.request.url).query)))
                             if kind in hold:
                                 held.append(route)
+                                page.evaluate("n => console.debug('download-fixture-held:' + n)", len(held))
                             elif kind in failed:
                                 route.fulfill(status=503, json={"error": "隔离的读取失败"})
                             else:
@@ -322,6 +323,9 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                             route.fulfill(json={"qb": {"tasks": []}})
                         else:
                             route.abort()
+
+                    def next_held_read(count):
+                        return page.expect_console_message(lambda msg: msg.text == f"download-fixture-held:{count}")
 
                     page.route("**/*", route_request)
                     page.clock.install()
@@ -332,9 +336,9 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                     self.assertEqual(calls, [], "未打开的日志与待处理面板不应提前读取")
                     page.locator("#tabIssuesBtn").click()
                     expect(page.locator("#issueList")).to_contain_text("当前没有")
-                    for kind, tab, body, badge in (
-                        ("issues", "#tabIssuesBtn", "#issueList", "#tabIssuesBadge"),
-                        ("logs", "#tabLogsBtn", "#logList", "#tabLogsBadge"),
+                    for kind, tab, body, badge, pager in (
+                        ("issues", "#tabIssuesBtn", "#issueList", "#tabIssuesBadge", "#downloadIssue"),
+                        ("logs", "#tabLogsBtn", "#logList", "#tabLogsBadge", "#downloadLog"),
                     ):
                         # 另一入口在空结果之后产生新记录，重新激活面板必须读取。
                         state[kind] = result(kind, "重新激活后新增")
@@ -354,9 +358,8 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                         toolbar = page.locator("#issueBatchToolbar" if kind == "issues" else "#logBatchToolbar")
                         before = toolbar.bounding_box()
                         hold.add(kind)
-                        with page.expect_request(lambda request: urlsplit(request.url).path == "/api/downloads/" + kind):
+                        with next_held_read(1):
                             page.locator("#refreshBtn").click()
-                        self.assertEqual(len(held), 1)
                         self.assertTrue(page.evaluate("selector=>window.previousRow===document.querySelector(selector).firstElementChild", body))
                         expect(checkbox).to_be_checked()
                         self.assertEqual(toolbar.bounding_box(), before)
@@ -378,16 +381,13 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                         expect(page.locator(body)).to_contain_text("第一页")
                         page.wait_for_function("!loading")
                         hold.add(kind)
-                        next_button = "#downloadIssueNext" if kind == "issues" else "#downloadLogNext"
-                        with page.expect_request(lambda request: urlsplit(request.url).path == "/api/downloads/" + kind):
-                            page.locator(next_button).click()
-                        other = "logs" if kind == "issues" else "issues"
-                        other_calls = sum(item[0] == other for item in calls)
-                        with page.expect_request(lambda request: urlsplit(request.url).path == "/api/downloads/" + kind):
+                        read_start = len(calls)
+                        with next_held_read(1):
+                            page.locator(pager + "Next").click()
+                        with next_held_read(2):
                             page.clock.fast_forward(10_001)
-                        self.assertEqual([item[1]["page"] for item in calls if item[0] == kind][-2:], [["2"], ["2"]])
-                        self.assertEqual(sum(item[0] == other for item in calls), other_calls)
-                        self.assertEqual(len(held), 2)
+                        reads = [(name, query["page"]) for name, query in calls[read_start:]]
+                        self.assertEqual(reads, [(kind, ["2"]), (kind, ["2"])])
                         held.pop().fulfill(json=result(kind, "最新第二页", page=2, total=21))
                         expect(page.locator(body)).to_contain_text("最新第二页")
                         with page.expect_response(lambda response: urlsplit(response.url).path == "/api/downloads/" + kind) as stale:
@@ -396,8 +396,7 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                         hold.clear()
                         page.wait_for_function("!loading")
                         expect(page.locator(body)).not_to_contain_text("过期响应")
-                        page_info = "#downloadIssuePageInfo" if kind == "issues" else "#downloadLogPageInfo"
-                        expect(page.locator(page_info)).to_contain_text("第 2 / 2 页")
+                        expect(page.locator(pager + "PageInfo")).to_contain_text("第 2 / 2 页")
                         if kind == "issues":
                             # 重复/失败回执保留选择，混合受理仅取消已受理项的勾选。
                             batch_page: DownloadListPageFixture = {**result(kind, total=4), "page": 1, "items": [

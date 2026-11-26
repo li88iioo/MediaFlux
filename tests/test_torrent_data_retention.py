@@ -134,6 +134,26 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
             ).fetchone()[0]
         self.assertEqual(log_count, 1)
 
+    def test_notification_retry_preserves_completion_time_and_seed_expiry(self):
+        request_id = self._create_request("notify-retry", status="completed", age_days=8, qb_status="completed")
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE download_requests SET local_import_status='skipped',notification_event_status='completed',"
+                "notification_delivery_status='retry_wait' WHERE id=?", (request_id,),
+            )
+        completed_at = assert_present(download_requests_repo.get_download_request(request_id))["completed_at"]
+        tracker = DownloadTracker()
+        with (
+            patch.object(tracker, "_torrent_data_retention_days", return_value=0),
+            patch.object(tracker, "_qb_tasks", return_value=(True, [])),
+            patch.object(DownloadTracker, "_publish_lifecycle", return_value=False) as publish,
+        ):
+            self.assertEqual(tracker.run_once(), 1)
+        publish.assert_called_once_with(request_id)
+        row = assert_present(download_requests_repo.get_download_request(request_id))
+        self.assertEqual((row["status"], row["completed_at"]), ("completed", completed_at))
+        self.assertEqual(download_requests_repo.purge_expired_download_request_torrent_data(7), 1)
+
     def test_cleanup_respects_batch_limit(self):
         request_ids = [
             self._create_request(

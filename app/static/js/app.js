@@ -1066,6 +1066,8 @@
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || '配置保存失败');
+            // 即使表单已关闭也完成提交，只向原会话回填保存结果。
+            if (options.formSignal?.aborted) return data;
             applyConfigSaveSnapshot(snapshot);
             const hasPendingChanges = Object.keys(window.collectConfigFields(root)).length > 0;
             if (data && typeof data === 'object') {
@@ -1087,7 +1089,7 @@
             }
             return data;
         } catch (error) {
-            if (options.toast !== false) {
+            if (options.toast !== false && !options.formSignal?.aborted) {
                 window.showToast(error.message || '配置保存失败', 'error');
             }
             throw error;

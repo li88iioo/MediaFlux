@@ -974,15 +974,9 @@ const torrentCachePolicyButton=document.getElementById('torrentCachePolicyBtn');
 const torrentCachePolicySave=document.getElementById('torrentCachePolicySave');
 const torrentCacheRetentionDays=document.getElementById('torrentCacheRetentionDays');
 const torrentCachePolicyState=document.getElementById('torrentCachePolicyState');
-let torrentCachePolicyLoadGeneration=0;
-let torrentCachePolicyLoadController=null;
-function invalidateTorrentCachePolicyLoad(){
-    torrentCachePolicyLoadGeneration+=1;
-    torrentCachePolicyLoadController?.abort();
-    torrentCachePolicyLoadController=null;
-}
+let torrentCachePolicySession;
 function closeTorrentCachePolicy(){
-    invalidateTorrentCachePolicyLoad();
+    torrentCachePolicySession?.abort();
     torrentCachePolicySave?.setAttribute('aria-busy','false');
     torrentCachePolicyModal?.close();
 }
@@ -994,41 +988,38 @@ function setTorrentCachePolicyState(message,tone=''){
     torrentCachePolicyState.className='inline-save-state'+(tone?` is-${tone}`:'');
 }
 
+function setTorrentCachePolicyLocked(locked){
+    torrentCacheRetentionDays.readOnly=locked;
+    torrentCachePolicySave.disabled=locked;
+}
+
 async function openTorrentCachePolicy(){
     if(!torrentCachePolicyModal||!torrentCachePolicyForm)return;
-    invalidateTorrentCachePolicyLoad();
-    const generation=++torrentCachePolicyLoadGeneration;
-    const controller=new AbortController();
-    torrentCachePolicyLoadController=controller;
+    torrentCachePolicySession?.abort();
+    torrentCachePolicySession=new AbortController();
+    const {signal}=torrentCachePolicySession;
     torrentCachePolicyModal.open(torrentCachePolicyButton);
     setTorrentCachePolicyState('读取中…');
-    torrentCachePolicySave.disabled=true;
+    setTorrentCachePolicyLocked(true);
     torrentCachePolicySave.setAttribute('aria-busy','true');
-    torrentCacheRetentionDays.readOnly=true;
     try{
-        const config=await window.loadAppConfig({signal:controller.signal});
-        if(generation!==torrentCachePolicyLoadGeneration||controller.signal.aborted)return;
+        const config=await window.loadAppConfig({signal});
+        if(signal.aborted)return;
         window.fillConfigFields(torrentCachePolicyForm,config);
         if(!torrentCacheRetentionDays.value)torrentCacheRetentionDays.value='0';
         const managed=torrentCacheRetentionDays.dataset.managedByEnvironment==='true';
-        torrentCacheRetentionDays.readOnly=managed;
-        torrentCachePolicySave.disabled=managed;
+        setTorrentCachePolicyLocked(managed);
         setTorrentCachePolicyState(managed?'由部署环境管理':'');
     }catch(error){
-        if(error.name==='AbortError'||generation!==torrentCachePolicyLoadGeneration)return;
-        torrentCacheRetentionDays.readOnly=true;
-        torrentCachePolicySave.disabled=true;
+        if(signal.aborted)return;
         setTorrentCachePolicyState(error.message||'策略读取失败，请稍后重试','error');
-    }finally{
-        if(generation===torrentCachePolicyLoadGeneration){
-            torrentCachePolicyLoadController=null;
-            torrentCachePolicySave.setAttribute('aria-busy','false');
-        }
     }
+    torrentCachePolicySave.setAttribute('aria-busy','false');
 }
 
 async function saveTorrentCachePolicy(){
     if(!torrentCachePolicyForm||torrentCachePolicySave.disabled)return;
+    const {signal}=torrentCachePolicySession;
     const raw=String(torrentCacheRetentionDays.value||'').trim();
     if(!/^\d+$/.test(raw)||Number(raw)<0||Number(raw)>3650){
         setTorrentCachePolicyState('请输入 0 到 3650 的整数天数','error');
@@ -1036,23 +1027,21 @@ async function saveTorrentCachePolicy(){
         return;
     }
     torrentCacheRetentionDays.value=String(Number(raw));
-    torrentCachePolicySave.disabled=true;
-    torrentCacheRetentionDays.readOnly=true;
+    setTorrentCachePolicyLocked(true);
     torrentCachePolicySave.setAttribute('aria-busy','true');
     setTorrentCachePolicyState('保存中…');
     try{
-        const result=await window.saveAppConfig(torrentCachePolicyForm,{toast:false});
+        const result=await window.saveAppConfig(torrentCachePolicyForm,{toast:false,formSignal:signal});
+        if(signal.aborted)return;
         const hasPendingChanges=result?.__hasPendingConfigChanges===true;
         setTorrentCachePolicyState(hasPendingChanges?'上一版已保存，仍有未保存更改':'已保存',hasPendingChanges?'':'success');
         window.showToast?.(hasPendingChanges?'上一版已保存，仍有未保存更改':'种子缓存策略已保存',hasPendingChanges?'warning':'success');
     }catch(error){
+        if(signal.aborted)return;
         setTorrentCachePolicyState(error.message||'策略保存失败','error');
-    }finally{
-        const managed=torrentCacheRetentionDays.dataset.managedByEnvironment==='true';
-        torrentCacheRetentionDays.readOnly=managed;
-        torrentCachePolicySave.disabled=managed;
-        torrentCachePolicySave.removeAttribute('aria-busy');
     }
+    setTorrentCachePolicyLocked(false);
+    torrentCachePolicySave.setAttribute('aria-busy','false');
 }
 
 torrentCachePolicyButton?.addEventListener('click',openTorrentCachePolicy);

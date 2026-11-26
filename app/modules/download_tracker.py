@@ -484,29 +484,34 @@ class DownloadTracker:
                 matched_qb_task = self._match_qb(row, qb_tasks)
             if matched_qb_task is None:
                 matched_qb_task = self._persisted_qb_import_task(row)
-        statuses = [status for status in (effective_qb, effective_gy) if status]
+        statuses = {effective_qb, effective_gy} - {""}
         # successor 只接管用户明确重提的后端；旧请求仍需跟踪另一个活动后端，
         # 但不得再把审计根状态从 resubmitted 改回 downloading/completed。
-        try:
-            root_status = str(row["status"] or "")
-        except (KeyError, IndexError):
-            root_status = ""
+        root_status = str(row_value(row, "status", "") or "")
         if root_status != "resubmitted":
-            if updates.get("gy_status") == "completed" and all(status == "completed" for status in statuses):
+            if updates.get("gy_status") == "completed" and statuses == {"completed"}:
                 updates["error"] = ""
-            if any(status == "manual_review" for status in statuses):
+            if "manual_review" in statuses:
                 updates["status"] = "manual_review"
-                updates["completed_at"] = db.now()
             elif "submitting" in statuses:
                 updates["status"] = "submitting"
-            elif statuses and all(status in {"completed", "failed", "cancelled", "resubmitted"} for status in statuses):
+            elif statuses and statuses <= {"completed", "failed", "cancelled", "resubmitted"}:
                 updates["status"] = (
                     "completed" if "completed" in statuses else "failed" if "failed" in statuses else "cancelled"
                 )
-                updates["completed_at"] = db.now()
-            elif any(status in {"downloading", "completed", "outcome_unknown"} for status in statuses):
+            elif statuses & {"downloading", "completed", "outcome_unknown"}:
                 updates["status"] = "downloading"
         next_root_status = str(updates.get("status") or "")
+        if next_root_status in {"completed", "failed", "cancelled", "manual_review"}:
+            previous_end = None
+            if next_root_status == root_status:
+                # 与种子保留期共用旧记录的完成时间回退顺序。
+                previous_end = (
+                    row_value(row, "completed_at")
+                    or row_value(row, "updated_at")
+                    or row_value(row, "created_at")
+                )
+            updates["completed_at"] = previous_end or db.now()
         if (
             next_root_status in {"completed", "failed", "manual_review"}
             and root_status not in {"completed", "failed", "manual_review"}
