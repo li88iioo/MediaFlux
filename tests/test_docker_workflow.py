@@ -167,9 +167,9 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("npm ci --ignore-scripts --no-audit --no-fund", test_job)
         self.assertIn("--require-hashes -r requirements-release-runtime.lock", test_job)
         self.assertIn('python -m pip install "pytest==9.2.0"', test_job)
-        self.assertIn('python -m pip install "ruff==0.17.5"', test_job)
+        self.assertIn('python -m pip install "ruff==0.17.6"', test_job)
         self.assertIn('version("pytest") == "9.2.0"', test_job)
-        self.assertIn('version("ruff") == "0.17.5"', test_job)
+        self.assertIn('version("ruff") == "0.17.6"', test_job)
         self.assertIn(
             "ruff check app packaging tests --select F,E9",
             test_job,
@@ -193,7 +193,7 @@ class DockerWorkflowTests(unittest.TestCase):
     def test_type_check_gate_uses_ci_python_and_blocks_before_tests(self) -> None:
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
         self.assertIn('python -m pip install "pyrefly==1.4.1"', test_job)
-        self.assertIn('"types-PyYAML==6.0.12.20261113" "types-croniter==6.2.4.20261006"', test_job)
+        self.assertIn('"types-PyYAML==6.0.12.20261122" "types-croniter==6.2.4.20261122"', test_job)
         self.assertIn('version("pyrefly") == "1.4.1"', test_job)
         gate = 'pyrefly check --min-severity=warn --python-interpreter-path "$(command -v python)"'
         self.assertIn(gate, test_job)
@@ -240,9 +240,9 @@ class DockerWorkflowTests(unittest.TestCase):
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
         self.assertIn('PYTHONUNBUFFERED: "1"', test_job)
         self.assertNotIn("| tail", test_job)
-        self.assertIn("actions/setup-node@v6", test_job)
+        self.assertIn("actions/setup-node@v7", test_job)
         self.assertIn('node-version: "24.22.3"', test_job)
-        self.assertIn("npm install --global npm@12.2.2 --ignore-scripts", test_job)
+        self.assertIn("npm install --global npm@12.2.3 --ignore-scripts", test_job)
 
     def test_candidate_manifest_and_arm64_runtime_are_verified_before_promotion(
         self,
@@ -416,7 +416,7 @@ esac
         self.assertIn("packaging/scripts/generate_build_info.py", self.text)
         self.assertIn("packaging/scripts/docker_version_tag.py", self.text)
         context = self.text.split("      - name: Prepare build context", 1)[1].split(
-            "      - uses: docker/setup-qemu-action@v3", 1
+            "      - uses: docker/setup-qemu-action@v4", 1
         )[0]
         epoch = 'SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$BUILD_SHA")'
         generator = "python packaging/scripts/generate_build_info.py"

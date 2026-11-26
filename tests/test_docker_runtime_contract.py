@@ -104,7 +104,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
                 self.assertNotIn("command", service)
 
     def test_build_identity_arguments_are_scoped_after_dependency_installation(self) -> None:
-        self.assertIn("RUN npm install --global npm@12.2.2 --ignore-scripts", self.dockerfile)
+        self.assertIn("RUN npm install --global npm@12.2.3 --ignore-scripts", self.dockerfile)
         self.assertLess(
             self.dockerfile.index("RUN apk upgrade --no-cache"),
             self.dockerfile.index("RUN npm ci"),
@@ -446,7 +446,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
 
     def test_dockerfile_pins_multiarch_base_and_hashed_runtime_lock(self) -> None:
         self.assertIn(
-            "FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90",
+            "FROM python:3.13-slim@sha256:7249d5587b78209a006dc4a3b5340678f84ea729239193aa559962cd8c1fce50",
             self.dockerfile,
         )
         self.assertIn("COPY requirements-release-runtime.lock", self.dockerfile)

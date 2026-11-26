@@ -80,10 +80,10 @@ class StaticAssetBuildTests(unittest.TestCase):
 
     def test_package_manifest_pins_minifier_versions(self) -> None:
         package = json.loads((self.ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(package["packageManager"], "npm@12.2.2")
-        self.assertEqual(package["devDependencies"]["terser"], "5.51.2")
+        self.assertEqual(package["packageManager"], "npm@12.2.3")
+        self.assertEqual(package["devDependencies"]["terser"], "5.51.4")
         self.assertEqual(package["devDependencies"]["lightningcss"], "1.33.0")
-        self.assertEqual(package["devDependencies"]["lucide"], "1.74.0")
+        self.assertEqual(package["devDependencies"]["lucide"], "1.80.0")
         self.assertEqual(package["devDependencies"]["gsap"], "3.15.1")
         lock = json.loads((self.ROOT / "package-lock.json").read_text(encoding="utf-8"))
         for name, entry in lock["packages"].items():
@@ -202,7 +202,7 @@ class StaticAssetDockerContractTests(unittest.TestCase):
         )
         runtime = (
             "FROM python:3.13-slim@sha256:"
-            "e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90"
+            "7249d5587b78209a006dc4a3b5340678f84ea729239193aa559962cd8c1fce50"
         )
         self.assertIn(builder, dockerfile)
         self.assertIn("COPY package.json package-lock.json .npmrc ./", dockerfile)

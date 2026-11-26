@@ -6,14 +6,14 @@ RUN apk upgrade --no-cache
 WORKDIR /src
 
 COPY package.json package-lock.json .npmrc ./
-RUN npm install --global npm@12.2.2 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+RUN npm install --global npm@12.2.3 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
 RUN npm ci --ignore-scripts --no-audit --no-fund
 
 COPY packaging/scripts/minify_static.mjs /src/packaging/scripts/minify_static.mjs
 COPY app/static /src/app/static
 RUN npm run build:static -- --input /src/app/static --output /out
 
-FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+FROM python:3.13-slim@sha256:7249d5587b78209a006dc4a3b5340678f84ea729239193aa559962cd8c1fce50
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -32,6 +32,7 @@ WORKDIR /app
 # 本地与云端媒体规格探测依赖 ffprobe；Debian 的 ffmpeg 包同时提供该命令。
 # Agent 与源码部署共用 Bubblewrap 子进程，运行时加载系统 libseccomp2。
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends ffmpeg gosu bubblewrap libseccomp2 \
     && /usr/bin/ffprobe -version >/dev/null 2>&1 \
     && gosu --version >/dev/null 2>&1 \
