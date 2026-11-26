@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-26
+
+### Added
+
+- 光鸭批量审阅支持纠正同一部作品的多条待确认记录。可按片名或 TMDB ID 找到作品，在预览中核对每个文件的季集号与目标路径后提交。启用 Agent 识别复核后，遇到零候选的普通媒体，也可从原文件名和父目录补搜 TMDB，由用户确认建议。[批量纠正与只读复核](https://github.com/li88iioo/MediaFlux/commit/3d44ae98)
+
+### Fixed
+
+- 整季发布包使用各不相同的分集标题时，识别会保留共同剧名，减少手动刮削误报“目录包含多个不同媒体”。纠正剧集识别时要求明确集号，执行范围以确认时选中的文件为准。[剧名与分集标题](https://github.com/li88iioo/MediaFlux/commit/79641222) · [集号核验](https://github.com/li88iioo/MediaFlux/commit/3e1d204a) · [确认范围](https://github.com/li88iioo/MediaFlux/commit/ada883c6)
+- 光鸭整理成功后可回收已识别的发布附带宣传文件，字幕按同目录的视频归属处理。撤销整理会核对文件身份，替换归档时保留并发写入的新文件。本地整理的检查和执行也会选取相同的正片，避免样片干扰。[清理与撤销](https://github.com/li88iioo/MediaFlux/commit/023a4703) · [并发替换](https://github.com/li88iioo/MediaFlux/commit/ada883c6) · [本地正片筛选](https://github.com/li88iioo/MediaFlux/commit/4f837575)
+- 云端文件正在移动时，STRM 完整扫描会保留上次有效索引，等目录稳定后再更新。手动重试会补交尚未完成的路径刷新。媒体库发现失败时保留原刷新范围，已生成的 STRM 路径可独立于伴随元数据投递。[云端移动](https://github.com/li88iioo/MediaFlux/commit/d7c887a9) · [重试与调度](https://github.com/li88iioo/MediaFlux/commit/04a498d0) · [媒体库刷新](https://github.com/li88iioo/MediaFlux/commit/d1680857)
+- 媒体反代校验上游身份并统一处理按字节范围播放的请求。可选音轨协商超时时，可继续使用已取得的 HLS 播放流。看板的点播库统计和跳转排除了电视直播，播放历史按用户筛选。[反代校验](https://github.com/li88iioo/MediaFlux/commit/c21e7725) · [播放回退与历史](https://github.com/li88iioo/MediaFlux/commit/5f56840f) · [看板分区](https://github.com/li88iioo/MediaFlux/commit/b0ffb3d4)
+- 光鸭文件操作会核对确认时的账号和文件，翻页时可继续读取短页之后的项目。分享转存区分明确拒绝与结果待核对，活动下载保留所需的离线记录。GCID 导入可从中断恢复，并重新定位被替换的云盘目录。[目录操作](https://github.com/li88iioo/MediaFlux/commit/cddd2f38) · [转存与离线](https://github.com/li88iioo/MediaFlux/commit/91552fa0) · [GCID 恢复](https://github.com/li88iioo/MediaFlux/commit/e4ec7482) · [目标目录](https://github.com/li88iioo/MediaFlux/commit/7b987408)
+- 下载重试保留原完成时间，迟到的旧任务结果不会覆盖新一次提交。订阅检查按最新保存的暂停状态决定是否投递，RSS 按已保存的筛选条件处理。探索页可从各索引站失败的页码分别重试并保留选择，追更日历跨周后会刷新。[下载重试](https://github.com/li88iioo/MediaFlux/commit/6ba321f2) · [完成时间](https://github.com/li88iioo/MediaFlux/commit/3a0f3dfd) · [订阅投递](https://github.com/li88iioo/MediaFlux/commit/90982838) · [RSS 筛选](https://github.com/li88iioo/MediaFlux/commit/d8cbff85) · [探索与日历](https://github.com/li88iioo/MediaFlux/commit/e21e407b)
+- Telegram 下载通知在整理跳过 STRM 时能更新为最终状态，多次更新媒体详情会保留正确的分隔线。Web 确认后对应的 Telegram 卡片会失效，Agent 取消操作只停止指定轮次，发送进度消息失败后仍可交付最终回复。[下载状态](https://github.com/li88iioo/MediaFlux/commit/35022d49) · [通知排版](https://github.com/li88iioo/MediaFlux/commit/e2c54f1a) · [确认卡片](https://github.com/li88iioo/MediaFlux/commit/67edf1c9) · [Agent 取消与回复](https://github.com/li88iioo/MediaFlux/commit/e8ad6193)
+- 中断的备份操作可恢复，恢复期间能保留有效快照。只读安装可将诊断包写入数据目录，日志页重试会回到实际浏览的页码。版本更新检查和发布构建使用相同的版本排序规则。[备份恢复](https://github.com/li88iioo/MediaFlux/commit/32d54632) · [只读安装](https://github.com/li88iioo/MediaFlux/commit/18ea1714) · [日志重试](https://github.com/li88iioo/MediaFlux/commit/e05da7f1) · [版本排序](https://github.com/li88iioo/MediaFlux/commit/fdcf83db)
+
+### Changed
+
+- 更新 FastAPI、GuessIt、qBittorrent 客户端等 Python 运行依赖，以及前端图标和构建工具。Docker 运行镜像构建时同步安装当前 Debian 发行版的可用补丁。[运行依赖](https://github.com/li88iioo/MediaFlux/commit/4257614d) · [镜像与静态资源](https://github.com/li88iioo/MediaFlux/commit/8d1899e3)
+
+### 升级说明
+
+- 从 v0.1.18 升级的数据库跨度为 schema 47 → 47，本版不新增数据库版本迁移。升级前请备份完整数据目录。需要回退时先停止服务，使用离线恢复还原升级前的备份，再启动旧版。
+
 ## [0.1.18] - 2026-11-22
 
 ### Added
@@ -516,7 +541,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/li88iioo/MediaFlux/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/li88iioo/MediaFlux/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/li88iioo/MediaFlux/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/li88iioo/MediaFlux/compare/v0.1.15...v0.1.16
