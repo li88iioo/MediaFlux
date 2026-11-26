@@ -12,7 +12,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
-from app.clients.guangya import GuangYaClient, close_guangya_client, guangya_offline_task_state, single_bt_root_file
+from app.clients.guangya import (
+    GuangYaClient,
+    close_guangya_client,
+    guangya_offline_record_id,
+    guangya_offline_task_state,
+    single_bt_root_file,
+)
 from app.config import get, get_bool, get_int
 from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB
 from app.indexers.providers.base import augment_public_magnet
@@ -756,7 +762,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
 
 def prepare_offline_task_deletion(client: GuangYaClient, task_ids: list[str]) -> dict:
     """冻结选定任务的身份与终态，先给 MF 下载跟踪器留存结果的机会。"""
-    from app.repositories.download_requests import has_tracked_guangya_task
+    from app.modules.download_tracker import has_tracked_guangya_task
 
     if not isinstance(task_ids, list) or not task_ids or any(
         not isinstance(value, str) or not value.strip() for value in task_ids
@@ -764,15 +770,12 @@ def prepare_offline_task_deletion(client: GuangYaClient, task_ids: list[str]) ->
         raise ValueError("请选择光鸭离线列表中的真实任务 ID")
     if not client.logged_in:
         raise ValueError("光鸭未登录")
-    selected = sorted({value.strip() for value in task_ids})
+    selected = {value.strip() for value in task_ids}
     generation = client.credential_generation
-    items = {}
-    for task in client.list_offline_tasks():
-        raw = task["raw"]
-        identity = str(raw.get("taskId") or raw.get("taskID") or raw.get("id") or "").strip()
-        if identity in selected:
-            items[identity] = task
-    if client.credential_generation != generation or len(items) != len(selected):
+    tasks = client.list_offline_tasks()
+    items = {identity: task for task in tasks
+             if (identity := guangya_offline_record_id(task["raw"])) in selected}
+    if client.credential_generation != generation or items.keys() != selected:
         raise ValueError("光鸭账号或离线任务已变化，请重新读取列表")
     for task in items.values():
         # 旧接口的数字 3、4 也可能出现在重试或进行中，需有明确的失败证据。
@@ -780,12 +783,12 @@ def prepare_offline_task_deletion(client: GuangYaClient, task_ids: list[str]) ->
             str(task["status"]).strip() in {"3", "4"} and not task["error"]
         ):
             raise ValueError("所选任务仍在运行或终态尚未确认，删除记录不能用于取消任务")
-    if has_tracked_guangya_task(selected):
+    if has_tracked_guangya_task(tasks, selected):
         raise ValueError("所选离线任务仍在被 MediaFlux 跟踪，请等待原下载请求记录终态")
     return {
         "credential_generation": generation,
         "items": [{**{key: items[identity][key] for key in ("name", "status", "created_at", "target_dir", "size")},
-                   "id": identity} for identity in selected],
+                   "id": identity} for identity in sorted(selected)],
     }
 
 

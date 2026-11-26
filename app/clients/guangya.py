@@ -159,6 +159,11 @@ def guangya_offline_task_state(status: object) -> str:
     return "downloading"
 
 
+def guangya_offline_record_id(raw: dict) -> str:
+    """提取可用于离线记录操作的任务 ID。"""
+    return str(raw.get("taskId") or raw.get("taskID") or raw.get("id") or "").strip()
+
+
 def verify_guangya_write(
     check: Callable[[], bool], *, cancel_check: Callable[[], None] | None = None,
     attempts: int = 21,
@@ -1202,29 +1207,26 @@ def _offline_create_result(response: Any) -> dict:
     payload = response.json() if callable(getattr(response, "json", None)) else response
     payload = payload if isinstance(payload, dict) else {"raw": str(payload)}
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    scopes = (data, payload)
     task_ids = list(dict.fromkeys(
         str(item)
-        for source in (data, payload)
-        for key in ("taskId", "taskID", "task_id", "id")
-        for value in (source.get(key),)
+        for source in scopes
+        for value in map(source.get, ("taskId", "taskID", "task_id", "id"))
         for item in (value if isinstance(value, (list, tuple)) else (value,))
         if not isinstance(item, bool) and str(item).strip().lower() not in {"", "0", "none", "null"}
     ))
     message = str(payload.get("message") or payload.get("msg") or "").strip()
-    failure_message = message if message.lower() != "success" else ""
 
     def error_text(value) -> str:
-        if value is None or value is False or value == "":
-            return ""
         if isinstance(value, (list, tuple)):
-            return "; ".join(filter(None, (error_text(item) for item in value)))
+            return "; ".join(filter(None, map(error_text, value)))
         if isinstance(value, dict):
             return json.dumps(value, ensure_ascii=False, default=str) if value else ""
-        return str(value).strip()
+        return "" if value is None or value is False else str(value).strip()
 
     def normalized_flag(value) -> bool | None:
-        if isinstance(value, (int, float)):
-            return bool(value) if value in (0, 1) else None
+        if value in (0, 1):
+            return bool(value)
         return {
             "0": False, "false": False, "failed": False, "failure": False,
             "fail": False, "error": False, "errored": False,
@@ -1232,28 +1234,28 @@ def _offline_create_result(response: Any) -> dict:
             "ok": True, "completed": True, "complete": True,
         }.get(str(value).strip().lower())
 
-    error = next((detail for key in ("error", "errors") if (detail := error_text(payload.get(key)))), "")
-    rejected = bool(error)
-    accepted = bool(task_ids) or message.lower() == "success"
-    code = payload.get("code")
-    if not error and code is not None:
+    errors = (source.get(key) for source in scopes for key in ("error", "errors"))
+    error = next(filter(None, map(error_text, errors)), "")
+    flags = (normalized_flag(payload.get("success")), normalized_flag(payload.get("state")))
+    accepted = bool(task_ids) or payload.get("code") is not None or message.lower() == "success" or True in flags
+    # data.state 是任务运行状态。data.success 可以明确否决外层受理回执。
+    rejected = bool(error) or False in flags or normalized_flag(data.get("success")) is False
+    code_error = ""
+    for code in (data.get("code"), payload.get("code")):
         try:
-            rejected = int(code) not in (0, 200)
-            accepted = not rejected
-        except (TypeError, ValueError):
-            accepted = False
-        if not accepted:
-            error = failure_message or f"接口返回 code={code}"
-    if not error:
-        flags = [normalized_flag(payload[key]) for key in ("success", "state") if key in payload]
-        rejected = False in flags
-        accepted = accepted or True in flags
-        if rejected:
-            error = failure_message or "接口返回失败"
-    ok = accepted and not error
+            if code is None or int(code) in (0, 200):
+                continue
+            rejected = True
+        except (TypeError, ValueError, OverflowError):
+            pass  # 畸形 code 只能证明回执不可判读。
+        code_error = f"接口返回 code={code}"
+    ok = accepted and not rejected and not code_error
+    messages = (data.get("message"), data.get("msg"), message)
+    reason = next((str(msg) for msg in messages if msg and str(msg).strip().lower() != "success"), "")
+    failure = error or reason or code_error or ("接口返回失败" if rejected else "接口返回结果不明确")
     return {
         "ok": ok, "task_ids": task_ids, "response": payload,
-        "error": "" if ok else error or message or "接口返回结果不明确",
+        "error": "" if ok else failure,
         "outcome_unknown": not ok and not rejected,
     }
 
@@ -2071,17 +2073,17 @@ class GuangYaClient:
         """按普通只读链路验证可用性，允许既有 SDK 续签登录态。"""
         if not self.logged_in:
             return False
-        self._call_read(
+        response = self._call_read(
             "connection_probe",
             lambda: self.raw.fs_files(parent_id=None, page=0, page_size=1),
         )
+        self._extract_list(response)
         return True
 
     def access_token_validation_status(self) -> Literal["valid", "expired", "invalid", "unknown"]:
         """只读探测当前 Access Token，区分确定失效与本次无法确认。"""
         with self._token_lock:
-            if self._invalidate_if_stale():
-                return "invalid"
+            self._invalidate_if_stale()
             raw = self._raw
             if raw is None or not raw.token:
                 return "invalid"
@@ -2937,8 +2939,7 @@ class GuangYaClient:
             item = self.file_info(identity)
             if item is None or item.file_id != identity:
                 raise GuangYaShareError("选择的分享对象不存在，请重新读取目录", code="confirmation_stale")
-            items.append({key: getattr(item, key) for key in (
-                "file_id", "parent_id", "name", "is_dir", "size", "etag", "updated_at")})
+            items.append(file_snapshot(item))
         self._require_share_generation(generation)
         title = title.strip() or str(items[0]["name"] or "MediaFlux 分享") + (f" 等 {len(items)} 项" if len(items) > 1 else "")
         title = " ".join(redact_sensitive_text(title).split())[:180] or "MediaFlux 分享"
@@ -2964,18 +2965,19 @@ class GuangYaClient:
         expected = snapshot["items"]
         if revoke:
             current = self.prepare_user_share_revoke([item["share_id"] for item in expected])
-            matches = current["credential_generation"] == snapshot["credential_generation"] and all(
+            matches = all(
                 all(live[key] == item[key] for key in ("share_id", "title", "status", "updated_at"))
                 for live, item in zip(current["items"], expected)
             )
         else:
             current = self.prepare_user_share([item["file_id"] for item in expected], **snapshot["policy"])
-            matches = current["credential_generation"] == snapshot["credential_generation"] and all(
-                all(live[key] == item[key] for key in ("file_id", "parent_id", "name", "is_dir", "size"))
-                and (not item["etag"] or live["etag"] in {"", item["etag"]})
+            matches = current["policy"] == snapshot["policy"] and all(
+                live[key] == value
                 for live, item in zip(current["items"], expected)
-            ) and current["policy"] == snapshot["policy"]
-        if not matches:
+                for key, value in item.items()
+                if key not in {"etag", "updated_at"} or value
+            )
+        if not matches or current["credential_generation"] != snapshot["credential_generation"]:
             raise GuangYaShareError("光鸭分享对象或策略已变化，请重新预检", code="confirmation_stale")
         if cancel_check is not None:
             cancel_check()
@@ -3297,7 +3299,7 @@ class GuangYaClient:
         """兼容光鸭不同版本的任务字段命名。"""
         if not isinstance(raw, dict):
             return {"id": "", "name": str(raw), "raw": raw}
-        task_id = raw.get("taskId") or raw.get("taskID") or raw.get("id") or raw.get("resId") or ""
+        task_id = guangya_offline_record_id(raw) or raw.get("resId") or ""
         name = (raw.get("name") or raw.get("taskName") or raw.get("fileName")
                 or raw.get("title") or raw.get("url") or "未命名任务")
         status = raw.get("status") if raw.get("status") is not None else raw.get("state")

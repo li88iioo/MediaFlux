@@ -53,6 +53,8 @@ def test_same_generation_including_zero_uses_only_frozen_ids(generation, revoke)
     snapshot = client.prepare_user_share_revoke(["20002"]) if revoke else client.prepare_user_share(["file-1"])
     if revoke:
         client.shares.reverse()
+    else:
+        client.files[0].updated_at = 100  # 预览未报告的时间可以补齐。
     result = client.submit_prepared_user_share(snapshot, revoke=revoke)
     assert result["status"] == "completed" and result["verified"]
     assert client.writes[0][1] == (["20002"] if revoke else ["file-1"])
@@ -80,6 +82,19 @@ def test_generation_changes_fail_before_provider_write(revoke, point):
     with pytest.raises(GuangYaShareError) as error:
         client.submit_prepared_user_share(snapshot, revoke=revoke, cancel_check=cancel_check)
     assert error.value.code == "confirmation_stale" and client.writes == []
+
+
+@pytest.mark.parametrize(("old_etag", "etag", "updated_at"), [("", "", 200), ("", "", 0), ("v1", "", 100)])
+def test_share_rechecks_recorded_file_version_before_creating_link(old_etag, etag, updated_at):
+    client = ShareClient()
+    file = GuangYaFile("file-1", "定稿.srt", False, size=40, updated_at=100, etag=old_etag)
+    client.files = [file]
+    snapshot = client.prepare_user_share([file.file_id])
+    file.etag, file.updated_at = etag, updated_at
+    with pytest.raises(GuangYaShareError) as error:
+        client.submit_prepared_user_share(snapshot)
+    assert error.value.code == "confirmation_stale"
+    assert client.writes == []
 
 
 @pytest.mark.parametrize("revoke", [False, True])

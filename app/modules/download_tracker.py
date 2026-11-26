@@ -121,6 +121,17 @@ class _GYTaskIndex:
                 if key:
                     matches[key] = None if key in matches else task
 
+    def match(self, row) -> tuple[list[str], int, list[dict]]:
+        """返回批次 ID、计划批次数（旧单任务为零）和已匹配的云端记录。"""
+        task_ids = DownloadTracker._parse_gy_task_ids(row)
+        expected_batches = max(len(task_ids), int(row_value(row, "gy_batch_count", 0) or 0))
+        if task_ids or expected_batches > 1:
+            return task_ids, expected_batches, [
+                self.by_id[task_id] for task_id in task_ids if task_id in self.by_id
+            ]
+        task = DownloadTracker._match_gy(row, self)
+        return [], 0, [task] if task else []
+
 
 class DownloadTracker:
     def __init__(self) -> None:
@@ -397,69 +408,55 @@ class DownloadTracker:
                     updates["error"] = qb_error
 
         if gy_available and gy_status in {"submitted", "downloading", "outcome_unknown"}:
-            task_ids = self._parse_gy_task_ids(row)
-            expected_batches = max(len(task_ids), int(row_value(row, "gy_batch_count", 0) or 0))
-            if task_ids or expected_batches > 1:
-                task_by_id = gy_tasks.by_id
-                matched = [task_by_id[task_id] for task_id in task_ids if task_id in task_by_id]
-                progress_values = [
+            task_ids, expected_batches, matched = gy_tasks.match(row)
+            expected_matches = max(1, expected_batches)
+            if matched:
+                gy_progress = sum(
                     max(0.0, min(float(task.get("progress") or 0), 1.0)) for task in matched
-                ]
-                gy_progress = sum(progress_values) / expected_batches if matched else None
-                gy_log_task_id = task_ids[0] if task_ids else None
-                if expected_batches > len(task_ids):
-                    updates["gy_status"] = "manual_review"
-                    gy_error = (
-                        "光鸭仅返回部分任务 ID，部分提交可能已经生效；"
-                        "请核对云端任务，勿直接重复提交"
-                    )
-                elif len(matched) < expected_batches:
-                    if self._record_missing_and_check_expiry(row, "gy_task_missing_since", updates):
-                        updates["gy_status"] = "manual_review"
-                        gy_error = "光鸭后端任务长时间未找到，请核对云端任务后人工处理"
-                    elif row_value(row, "gy_task_missing_since", ""):
-                        updates["gy_status"] = "downloading"
+                ) / expected_matches
+            gy_log_task_id = task_ids[0] if task_ids else None
+            if expected_batches > len(task_ids):
+                updates["gy_status"] = "manual_review"
+                gy_error = (
+                    "光鸭仅返回部分任务 ID，部分提交可能已经生效；"
+                    "请核对云端任务，勿直接重复提交"
+                )
+            elif len(matched) == expected_matches:
+                matched_gy_tasks = matched
+                updates["gy_task_missing_since"] = None
+                # 批次齐全才归并；混合终态保留准入，不能把部分成功当成可重投失败。
+                states = {self._gy_task_state(task) for task in matched}
+                if "downloading" in states:
+                    state = "downloading"
+                elif len(states) == 1:
+                    state = states.pop()
                 else:
-                    matched_gy_tasks = matched
-                    updates["gy_task_missing_since"] = None
-                    # 批次齐全才归并；混合终态保留准入，不能把部分成功当成可重投失败。
-                    states = {self._gy_task_state(task) for task in matched}
-                    if "downloading" in states:
-                        updates["gy_status"] = "downloading"
-                    elif states == {"completed"}:
-                        updates["gy_status"] = "completed"
-                    else:
-                        updates["gy_status"] = "failed" if states == {"failed"} else "manual_review"
+                    state = "manual_review"
+                updates["gy_status"] = state
+                if expected_batches:
+                    if state in {"failed", "manual_review"}:
                         gy_error = "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
-            else:
-                task = self._match_gy(row, gy_tasks)
-                if task:
-                    matched_gy_tasks = [task]
-                    gy_progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
-                    updates["gy_status"] = self._gy_task_state(task)
-                    if updates["gy_status"] == "failed":
-                        gy_error = "光鸭下载失败，请人工核验"
-                    elif updates["gy_status"] == "manual_review":
-                        gy_error = "光鸭下载仅部分完成，已停止自动整理，请人工核验"
-                    updates["gy_task_missing_since"] = None
-                    if task.get("id"):
-                        matched_task_id = str(task["id"])
+                else:
+                    gy_error = {
+                        "failed": "光鸭下载失败，请人工核验",
+                        "manual_review": "光鸭下载仅部分完成，已停止自动整理，请人工核验",
+                    }.get(state, "")
+                    if matched_task_id := str(matched[0].get("id") or ""):
                         updates["gy_task_id"] = matched_task_id
                         if int(row_value(row, "gy_isolated", 0) or 0):
                             updates["gy_task_ids"] = json.dumps([matched_task_id], ensure_ascii=False)
                             updates["gy_batch_count"] = 1
-                elif gy_status == "outcome_unknown":
-                    updates["gy_status"] = "manual_review"
-                    gy_error = (
-                        "光鸭提交结果未知且无法匹配云端任务；"
-                        "请人工核对后再决定是否重试"
-                    )
-                elif self._record_missing_and_check_expiry(row, "gy_task_missing_since", updates):
-                    updates["gy_status"] = "manual_review"
-                    gy_error = (
-                        "光鸭云端任务长时间无法匹配，可能已完成或提交失败；"
-                        "请核对云端文件后人工处理"
-                    )
+            elif not expected_batches and gy_status == "outcome_unknown":
+                updates["gy_status"] = "manual_review"
+                gy_error = "光鸭提交结果未知且无法匹配云端任务；请人工核对后再决定是否重试"
+            elif self._record_missing_and_check_expiry(row, "gy_task_missing_since", updates):
+                updates["gy_status"] = "manual_review"
+                gy_error = (
+                    "光鸭后端任务长时间未找到，请核对云端任务后人工处理" if expected_batches
+                    else "光鸭云端任务长时间无法匹配，可能已完成或提交失败；请核对云端文件后人工处理"
+                )
+            elif expected_batches and row_value(row, "gy_task_missing_since", ""):
+                updates["gy_status"] = "downloading"
             errors = dict.fromkeys(
                 str(task.get("error") or "").strip()
                 for task in matched_gy_tasks
@@ -1307,13 +1304,14 @@ class DownloadTracker:
     @staticmethod
     def _match_gy(row, tasks: list[dict] | _GYTaskIndex):
         index = tasks if isinstance(tasks, _GYTaskIndex) else _GYTaskIndex(tasks)
-        task_id = str(row_value(row, "gy_task_id", "") or "")
-        if task_id:
-            return index.by_id.get(task_id)
+        if task_id := row_value(row, "gy_task_id"):
+            return index.by_id.get(str(task_id))
         # 只有请求独占的暂存目录能证明任务归属，历史共享目录必须按来源唯一匹配。
         if int(row_value(row, "gy_isolated", 0) or 0):
-            return index.unique_target.get(str(row_value(row, "gy_target_dir", "") or ""))
-        return index.unique_source.get(str(row_value(row, "source_value", "") or ""))
+            candidates, field = index.unique_target, "gy_target_dir"
+        else:
+            candidates, field = index.unique_source, "source_value"
+        return candidates.get(str(row_value(row, field) or ""))
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1326,6 +1324,13 @@ class DownloadTracker:
                 )
             self._wake_event.wait(timeout=30)
             self._wake_event.clear()
+
+
+def has_tracked_guangya_task(tasks: list[dict], selected: set[str]) -> bool:
+    """保护仍被跟踪的离线记录，包括靠目录或来源关联的单批任务。"""
+    index = _GYTaskIndex(tasks)
+    bindings = download_requests_repo.list_tracked_guangya_task_bindings()
+    return any(task["id"] in selected for _, _, matched in map(index.match, bindings) for task in matched)
 
 
 _tracker = DownloadTracker()

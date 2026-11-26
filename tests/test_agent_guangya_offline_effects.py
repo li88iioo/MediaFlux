@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from copy import deepcopy
 from dataclasses import replace
 from io import BytesIO
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app import database as db, sdk
 from app.agent.confirmation import SQLiteConfirmationStore
@@ -23,8 +25,10 @@ from app.agent.kernel.ports import sdk_effects
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
 from app.agent.kernel.sandbox import _SDKRequests
 from app.clients.guangya import GuangYaClient
+from app.config import web_credentials
 from app.indexers import downloads
-from app.modules import agent_files, download_dispatcher, offline
+from app.main import create_app
+from app.modules import agent_files, download_dispatcher, download_tracker, offline
 from app.repositories import download_requests
 from tests.support import initialized_web_runtime
 from tests.test_agent_sdk_cloud_effects import _context, _deny_network
@@ -474,14 +478,104 @@ def test_record_deletion_verifies_only_selected_and_leaves_download_history(clou
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("change", ["running", "tracking", "account", "cancel", "record", "missing", "rejected"])
+def test_record_deletion_waits_for_idless_web_download_history(cloud_backend, monkeypatch):
+    def provider_request(endpoint, **options):
+        response = cloud_backend._request(endpoint, **options)
+        if endpoint.endswith("/create_task"):
+            cloud_backend.records["cloud-task-1"].update(
+                parentId=options["json"]["parentId"], url=options["json"]["url"], status=2,
+            )
+            return FakeResponse({"code": 0})
+        return response
+
+    cloud_backend.transport.request.side_effect = provider_request
+    cloud_backend.add_record("unrelated")
+    cloud_backend.add_record("leave-alone")
+    monkeypatch.setattr(download_tracker, "GuangYaClient", lambda: cloud_backend)
+
+    def csrf(page):
+        match = re.search(r'name="csrf_token" (?:value|content)="([^"]+)"', page.text)
+        assert match is not None
+        return match.group(1)
+
+    def history(web):
+        result = web.get("/api/downloads/logs", params={"source": "guangya"})
+        assert result.status_code == 200, result.text
+        log, = result.json()["items"]
+        return log
+
+    with TestClient(create_app(start_background=False)) as web:
+        username, password = web_credentials()
+        login = web.post("/login", data={
+            "username": username, "password": password, "csrf_token": csrf(web.get("/login")),
+        }, follow_redirects=False)
+        assert login.status_code == 302
+        result = web.post("/api/downloads/direct/submit", data={"url": URL, "target": "guangya"},
+                          headers={"X-CSRF-Token": csrf(web.get("/downloads"))})
+        assert result.status_code == 200 and result.json()["status"] == "submitted", result.text
+        request_id = result.json()["request_id"]
+        row = download_requests.get_download_request(request_id)
+        assert row is not None
+        assert (row["gy_isolated"], row["gy_target_dir"], row["gy_task_id"], row["gy_task_ids"]) == (
+            1, "staging-1", "", "[]",
+        )
+        assert history(web)["status"] == "submitted"
+
+        async def run():
+            store = SQLiteKernelStore()
+            context = await _context(store)
+            effects = executor(store)
+            args = {"task_ids": ["cloud-task-1", "unrelated"]}
+            with pytest.raises(ToolPipelineError, match="仍在被 MediaFlux 跟踪"):
+                await effects.prepare(DELETE, args, context=context)
+            assert cloud_backend.deletes == []
+            assert (await effects.prepare(DELETE, {"task_ids": ["unrelated"]}, context=context)).effect_plan
+
+            assert download_tracker.DownloadTracker().run_once() == 1
+            settled = download_requests.get_download_request(request_id)
+            assert settled is not None
+            assert (settled["gy_status"], settled["gy_task_id"]) == ("completed", "cloud-task-1")
+            log = history(web)
+            assert (log["request_id"], log["status"], log["backend_task_id"]) == (
+                request_id, "success", "cloud-task-1",
+            )
+
+            plan = (await effects.prepare(DELETE, args, context=context)).effect_plan
+            assert plan is not None
+            cold = executor(SQLiteKernelStore())
+            confirmed = await cold.execute_confirmed(plan.plan_id, context=context)
+            assert confirmed.outcome.public_content["status"] == "completed"
+            with pytest.raises(ToolPipelineError):
+                await cold.execute_confirmed(plan.plan_id, context=context)
+            assert cloud_backend.deletes == [["cloud-task-1", "unrelated"]]
+            assert set(cloud_backend.records) == {"leave-alone"}
+            assert cloud_backend.cloud_files == {"cloud-file": "原文件.mp4"}
+            assert history(web) == log
+
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", [
+    "running", "resource-id-only", "tracking", "tracking-legacy-source", "account", "cancel", "record", "missing",
+    "rejected",
+])
 def test_record_deletion_refuses_running_unverified_or_changed_records(cloud_backend, change):
     async def run():
         cloud_backend.add_record("done")
+        cloud_backend.records["done"]["url"] = URL
         store = SQLiteKernelStore()
         context = await _context(store)
         effects = executor(store)
         args = {"task_ids": ["done"]}
+        if change == "resource-id-only":
+            record = cloud_backend.records["done"]
+            record["resId"] = record.pop("taskId")
+            task, = cloud_backend.list_offline_tasks()
+            assert task["id"] == "done"
+            with pytest.raises(ToolPipelineError, match="光鸭账号或离线任务已变化"):
+                await effects.prepare(DELETE, args, context=context)
+            assert cloud_backend.deletes == []
+            return
         if change == "running":
             cloud_backend.records["done"]["status"] = 1
             with pytest.raises(ToolPipelineError, match="删除记录不能用于取消任务"):
@@ -491,10 +585,11 @@ def test_record_deletion_refuses_running_unverified_or_changed_records(cloud_bac
 
         plan = (await effects.prepare(DELETE, args, context=context)).effect_plan
         assert plan is not None
-        if change == "tracking":
+        if change in {"tracking", "tracking-legacy-source"}:
             row = download_dispatcher.create_request(downloads.direct_url_input(URL), "", "")
             download_requests.update_download_request(
-                row["id"], status="downloading", targets="guangya", gy_status="downloading", gy_task_ids='["done"]',
+                row["id"], status="downloading", targets="guangya", gy_status="downloading",
+                gy_task_ids='["done"]' if change == "tracking" else "[]",
             )
         elif change == "account":
             cloud_backend.credential_generation += 1

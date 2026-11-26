@@ -352,7 +352,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
         raw = Mock()
         raw.request.side_effect = [
             FakeResponse({"code": 0, "msg": "success", "data": {"taskId": "task-a"}}),
-            FakeResponse({"code": 503, "msg": "cloud capacity limited", "data": {}}),
+            FakeResponse({"code": 0, "data": {"success": False, "error": "cloud capacity limited"}}),
         ]
         client = client_with_raw(self, raw)
 
@@ -430,6 +430,12 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
         cases = [
             ({"error": "quota exceeded"}, "quota exceeded"),
             ({"errors": ["quota exceeded"]}, "quota exceeded"),
+            ({"code": 0, "data": {"error": 0}}, "0"),
+            ({"code": 0, "data": {"error": True}}, "True"),
+            ({"code": True}, "code=True"),
+            ({"code": 0, "data": {"success": False, "message": "quota exceeded"}}, "quota exceeded"),
+            ({"msg": "success", "data": {"errors": ["quota exceeded"]}}, "quota exceeded"),
+            ({"code": 200, "data": {"code": 403, "msg": "quota exceeded"}}, "quota exceeded"),
             ({"success": 0}, "接口返回失败"),
             ({"success": "false"}, "接口返回失败"),
             ({"success": "error"}, "接口返回失败"),
@@ -459,7 +465,8 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
                         self.assertEqual(result["remaining_indexes"], [0])
 
     def test_unrecognized_create_receipts_remain_unknown(self):
-        for payload in ([], {"code": "unrecognized"}, {"state": "pending"}):
+        for payload in ([], {"code": "unrecognized"}, {"state": "pending"},
+                        {"code": 200, "data": {"code": {}}}):
             with self.subTest(payload=payload):
                 raw = Mock()
                 raw.request.return_value = FakeResponse(payload)
@@ -474,6 +481,8 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
     def test_selected_task_submission_accepts_normalized_success_payloads(self):
         cases = [
             {"code": 0},
+            {"code": "200", "data": {"error": False, "errors": [{}, [], None, ""]}},
+            {"code": False},
             {"success": True},
             {"success": 1},
             {"success": "true"},
@@ -483,6 +492,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             {"msg": "success"},
             {"message": "SUCCESS"},
             {"data": {"taskId": "task-normalized"}},
+            {"code": 0, "data": {"taskId": "queued-task", "state": 0}},
             {"data": {"taskID": ["task-a", "task-b"]}, "task_id": "task-a"},
         ]
 

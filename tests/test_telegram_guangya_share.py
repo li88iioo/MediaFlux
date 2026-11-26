@@ -1218,6 +1218,10 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
         self.assertNotIn("request", agent_receipt)
         self.assertNotIn("仅 Web 知道", repr(agent_receipt) + telegram_receipt)
         self.assertEqual(self.client.get(f"/api/share/requests/{request_id}").json()["status"], "manual_review")
+        history = self.client.get("/api/downloads/logs", params={"source": "guangya_share"})
+        self.assertEqual(history.status_code, 200)
+        statuses = [row["status"] for row in history.json()["items"] if row["request_id"] == request_id]
+        self.assertEqual(statuses, ["outcome_unknown"])
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 1)
 

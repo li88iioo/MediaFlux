@@ -106,9 +106,13 @@ class GuangYaRecycleGenerationTests(unittest.TestCase):
                     self.assertEqual(client.writes, [])
 
     def test_changed_or_missing_selected_objects_do_not_restore(self):
-        for field, value in (("name", "replaced.mkv"), ("size", 456), ("etag", "other-content"), ("file_id", "new-id")):
+        for field, value in (
+            ("name", "replaced.mkv"), ("size", 456), ("etag", "other-content"), ("file_id", "new-id"),
+            ("parent_id", "another-folder"), ("updated_at", 200),
+        ):
             with self.subTest(field=field):
                 client = _RecycleClient(7)
+                client.items[0].updated_at = 100
                 snapshot = self.prepare(client, "restore")
                 setattr(client.items[0], field, value)
                 with self.assertRaises(recycle.GuangYaRecycleStale):
@@ -120,6 +124,7 @@ class GuangYaRecycleGenerationTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 client = _RecycleClient(7)
                 snapshot = self.prepare(client, operation)
+                client.items[0].updated_at = 200  # 首次快照没有时间戳。
                 client.items.append(GuangYaFile("new", "new.mkv", False, parent_id="source"))
                 if operation == "clear":
                     with self.assertRaises(recycle.GuangYaRecycleStale):

@@ -298,6 +298,23 @@ class GuangYaBrowserFileChangeTests(InitializedWebTestCase):
         self.assertIn("暂未确认", task["error"])
         self.provider.copy.assert_called_once_with(["folder"], "target")
 
+    def test_empty_file_copy_requires_a_zero_byte_target(self):
+        source = replace(self.files["movie"], size=0, etag="")
+        self.files["movie"] = source
+        for size, expected in ((8192, "manual_review"), (0, "completed")):
+            with self.subTest(size=size):
+                self.files.pop("new-copy", None)
+                self.provider.copy.reset_mock()
+
+                def copy(file_ids, parent_id):
+                    self.files["new-copy"] = replace(source, file_id="new-copy", parent_id=parent_id, size=size)
+                    return ""  # 旧版接口没有任务 ID，只能从目标目录核验。
+
+                self.provider.copy.side_effect = copy
+                task = self._run(self._payload("copy"))
+                self.assertEqual(task["status"], expected, task)
+                self.provider.copy.assert_called_once_with(["movie"], "target")
+
     def test_directory_entry_alone_does_not_prove_copy_completed(self):
         self.provider.task_status.return_value = {"data": {"status": 3}}
         task = self._run(self._payload("copy", "folder"))

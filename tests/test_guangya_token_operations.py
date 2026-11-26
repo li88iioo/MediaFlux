@@ -869,6 +869,25 @@ class GuangYaTokenClientTests(unittest.TestCase):
             persisted = json.loads(token_file.read_text(encoding="utf-8"))
             self.assertEqual(persisted["access_token"], "rotated-access-9999")
 
+    def test_connection_requires_a_readable_root_listing(self):
+        from app import sdk
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory)
+            original = token_file.read_bytes()
+            with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
+                client = GuangYaClient(token_file=token_file)
+                assert client._raw is not None
+                with patch.object(client._raw, "fs_files", return_value={"data": {"state": "processing"}}) as read, \
+                     patch("app.modules.guangya_account.GuangYaClient", return_value=client):
+                    receipt = sdk.cloud.connection()
+            self.assertEqual(receipt["status"], "unavailable")
+            self.assertTrue(receipt["configured"])
+            self.assertIsNone(receipt["reachable"])
+            self.assertFalse(receipt["ok"])
+            read.assert_called_once_with(parent_id=None, page=0, page_size=1)
+            self.assertEqual(token_file.read_bytes(), original)
+
     def test_access_token_probe_stays_read_only_through_actual_expiry(self):
         for remaining, expected in ((30, "valid"), (0, "expired")):
             with self.subTest(remaining=remaining), tempfile.TemporaryDirectory() as directory:

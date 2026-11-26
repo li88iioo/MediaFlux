@@ -914,11 +914,10 @@ def finish_share_transfer_request(
 ) -> bool:
     """原子落盘分享转存结果，并接入既有 tracker 所读取的请求状态。"""
     timestamp = db.now()
-    normalized_failure = (
-        failure_status if failure_status in {"failed", "manual_review"} else "failed"
-    )
-    gy_status = "completed" if success else normalized_failure
-    log_status = "success" if success else "failed"
+    gy_status = "manual_review" if failure_status == "manual_review" else "failed"
+    if success:
+        gy_status = "completed"
+    log_status = {"completed": "success", "manual_review": "outcome_unknown"}.get(gy_status, "failed")
     safe_error = (error or "")
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -2046,18 +2045,15 @@ def _active_download_request_predicate(*, include_local_import: bool = False) ->
     return f"(status!='cancelled' AND ({' OR '.join(clauses)}))"
 
 
-def has_tracked_guangya_task(task_ids: list[str]) -> bool:
-    """判断指定离线任务是否仍被下载跟踪器用作终态证据。"""
+def list_tracked_guangya_task_bindings() -> list[sqlite3.Row]:
+    """读取离线任务跟踪所需的活动请求字段。"""
     with db.get_conn() as conn:
         return conn.execute(
-            "WITH selected AS (SELECT value FROM json_each(?)) "
-            "SELECT 1 FROM download_requests "
-            "WHERE gy_status IN ('submitting','submitted','downloading','outcome_unknown') "
-            "AND (gy_task_id IN (SELECT value FROM selected) OR EXISTS ("
-            "SELECT 1 FROM json_each(CASE WHEN json_valid(gy_task_ids) THEN gy_task_ids ELSE '[]' END) "
-            "WHERE value IN (SELECT value FROM selected))) LIMIT 1",
-            (json.dumps(task_ids),),
-        ).fetchone() is not None
+            "SELECT gy_task_id,gy_task_ids,gy_batch_count,"
+            "gy_isolated,gy_target_dir,source_value FROM download_requests "
+            "WHERE kind<>'guangya_share' "
+            "AND gy_status IN ('submitting','submitted','downloading','outcome_unknown')",
+        ).fetchall()
 
 
 def list_active_download_requests(

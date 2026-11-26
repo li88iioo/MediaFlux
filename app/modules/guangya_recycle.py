@@ -70,17 +70,17 @@ def _submit(client: GuangYaClient, snapshot: dict[str, Any], *, clear: bool,
             cancel_check: Callable[[], None] | None) -> dict[str, Any]:
     if client.credential_generation != snapshot["credential_generation"]:
         raise GuangYaRecycleStale("光鸭登录凭据已变化，请重新查询回收站")
-    current = _read(client)
     expected = snapshot["items"]
     if clear:
-        matches = current == snapshot
+        current = _read(client)
+        matches = current["items"] == expected
     else:
-        by_id = {item["file_id"]: item for item in current["items"]}
+        current = prepare_restore(client, [item["file_id"] for item in expected])
         matches = all(
-            item["file_id"] in by_id
-            and all(by_id[item["file_id"]][key] == item[key] for key in ("name", "is_dir", "size"))
-            and (not item["etag"] or by_id[item["file_id"]]["etag"] in {"", item["etag"]})
-            for item in expected
+            live[key] == value
+            for live, item in zip(current["items"], expected)
+            for key, value in item.items()
+            if key not in {"etag", "updated_at"} or value
         )
     if not matches or current["credential_generation"] != snapshot["credential_generation"]:
         raise GuangYaRecycleStale("光鸭回收站内容已变化，请重新查询后再确认")

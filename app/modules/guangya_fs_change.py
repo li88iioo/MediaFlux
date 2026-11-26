@@ -1926,16 +1926,15 @@ def _copy_target_entry(
     if len(matches) != 1:
         return None
     copied = matches[0]
-    if copied.file_id in {"", "0", source["file_id"]} or copied.parent_id != target_id:
-        return None
-    if copied_id and copied.file_id != copied_id:
+    if (copied.file_id in {"", "0", source["file_id"]} or copied.parent_id != target_id
+            or copied_id and copied.file_id != copied_id):
         return None
     if copied.is_dir:
         return copied
-    size = max(0, int(source.get("size") or 0))
-    valid = ((not size or (copied.size or 0) == size)
-             and (not source.get("etag") or (copied.etag or "") in {"", str(source["etag"])}))
-    return copied if valid else None
+    size = source.get("size")
+    size_matches = size in (None, "") or copied.size == max(0, int(size))
+    etag_matches = not source.get("etag") or (copied.etag or "") in {"", str(source["etag"])}
+    return copied if size_matches and etag_matches else None
 
 
 def update_fs_change_plan_execution(
