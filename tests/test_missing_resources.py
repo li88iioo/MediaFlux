@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import fields, replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
@@ -259,7 +259,7 @@ def test_invalid_targets_never_start_audit_or_indexer(backend, items):
         {"page": True},
         {"page": 0},
         pytest.param({"page": 101}, id="page_above_indexer_maximum"),
-        {"as_of": (datetime.now().astimezone().date() + timedelta(days=1)).isoformat()},
+        pytest.param({"as_of": "2024-03-01"}, id="tomorrow"),
         {"preference_overrides": {"preferred_server": "emby"}},
         {"preference_overrides": {"max_episode_size_gb": -1}},
         {"sites": "nyaa"},
@@ -267,9 +267,11 @@ def test_invalid_targets_never_start_audit_or_indexer(backend, items):
     ],
 )
 def test_invalid_options_never_start_io(backend, kwargs):
-    with patch.object(
-        actions, "get_indexer_service", wraps=actions.get_indexer_service
-    ) as service:
+    with (
+        patch.object(actions, "datetime", wraps=datetime) as clock,
+        patch.object(actions, "get_indexer_service", wraps=actions.get_indexer_service) as service,
+    ):
+        clock.now.return_value = datetime(2024, 2, 29, 12)
         with pytest.raises((TypeError, ValueError)):
             sdk.resources.search_missing([{"query": "Show", "season": 1}], **kwargs)
     service.assert_not_called()

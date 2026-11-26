@@ -523,6 +523,33 @@ class CalendarSourceWaitTests(unittest.TestCase):
         self.assertEqual(data["days"][2]["items"][0]["free_progress"], source.entries[0].free_progress)
         self.assertEqual(source.calls, 1)
 
+    def test_monday_refreshes_last_weeks_cache_and_waits_for_current_facts(self):
+        self.now = datetime(2026, 9, 13, 23, 45)
+        source = GatedSource()
+        service = self.service(source)
+        previous = CalendarService(
+            providers={"tencent": Source()}, cache=service.cache, metadata=RawMetadata(),
+            http_factory=NoNetwork, clock=lambda: self.now, submit=lambda job: job(),
+        )
+        self.addCleanup(previous.shutdown)
+        self.assertEqual(previous.get_week()["items_count"], 1)
+        previous.shutdown()
+
+        self.now += timedelta(minutes=20)
+        source.entries = (entry(source_id="new-week", events=(CalendarEvent("2026-09-14", "10:00", "周一更新"),)),)
+        page = service.get_week()
+        self.assertEqual((page["sources"][0]["status"], page["items_count"]), ("stale", 0))
+        self.assertEqual(page["unscheduled"][0]["free_progress"], entry().free_progress)
+        self.assertTrue(source.entered.wait(2))
+        entered = self.observe_waiters(service)
+        waiting = self.readers.submit(service.get_week, wait_sources=("tencent",))
+        self.assertTrue(entered.wait(2))
+        source.release.set()
+        week = waiting.result(timeout=2)
+        self.assertEqual([card["source_id"] for card in week["days"][0]["items"]], ["new-week"])
+        self.assertEqual(service.get_week()["days"], week["days"])
+        self.assertEqual(source.calls, 1)
+
     def test_wait_deadline_preserves_ready_facts_while_selected_source_is_blocked(self):
         ready, blocked = GatedSource(), GatedSource("iqiyi")
         service = self.service(ready, blocked, source_timeout=1)

@@ -138,9 +138,6 @@
         activeResourceSiteId: '',
         resourceSort: 'relevance_desc',
         resourceSourceOrder: new Map(),
-        resourcePage: 1,
-        resourceHasMore: false,
-        resourceLoadingMore: false,
         resourceSiteStatuses: [],
         resourceSearchProgress: null,
         resourceSearchContext: null,
@@ -1518,9 +1515,6 @@
         state.activeResourceSiteId = '';
         state.resourceSort = 'relevance_desc';
         state.resourceSourceOrder.clear();
-        state.resourcePage = 1;
-        state.resourceHasMore = false;
-        state.resourceLoadingMore = false;
         state.resourceSiteStatuses = [];
         state.resourceSearchProgress = null;
         state.resourceSearchContext = null;
@@ -2114,15 +2108,24 @@
         return [...state.resourceResults.values()].filter((result) => resourceSiteKey(result) === siteId).length;
     }
 
-    function mergeResourceSiteStatuses(statuses, siteId = '') {
-        if (!siteId) return asArray(statuses).map((status) => ({...status}));
-        const merged = new Map(state.resourceSiteStatuses.map((status) => [String(status.site_id || ''), {...status}]));
-        asArray(statuses).forEach((status) => merged.set(String(status.site_id || ''), {...status}));
-        return [...merged.values()];
+    function mergeResourceSiteStatuses(statuses, keepExisting) {
+        const all = keepExisting ? [...state.resourceSiteStatuses, ...statuses] : statuses;
+        return [...new Map(all.map((site) => [site.site_id, site])).values()];
     }
 
-    function resourceSearchSiteStatuses(statuses, diagnostics) {
-        const normalized = asArray(statuses).map((site) => ({...site, diagnostics: asArray(site.diagnostics)}));
+    function resourceNextPage() {
+        const sites = state.resourceSiteStatuses.filter((site) => site.has_more === true && site.pagination_supported !== false);
+        const previousPage = Math.min(...sites.map((site) => site.requested_page));
+        return {
+            page: previousPage + 1,
+            siteIds: sites.filter((site) => site.requested_page === previousPage).map((site) => site.site_id),
+        };
+    }
+
+    function resourceSearchSiteStatuses(statuses, diagnostics, requestedPage) {
+        const normalized = asArray(statuses).map((site) => ({
+            requested_page: requestedPage, ...site, diagnostics: asArray(site.diagnostics),
+        }));
         asArray(diagnostics).forEach((diagnostic) => {
             const diagnosticName = String(diagnostic?.site_name || diagnostic?.site_id || '').trim().toLocaleLowerCase();
             if (!diagnosticName) return;
@@ -2134,6 +2137,7 @@
             }
             if (site) return;
             normalized.push({
+                requested_page: requestedPage,
                 ...diagnostic,
                 site_id: diagnostic.site_id || diagnostic.site_name,
                 site_name: diagnostic.site_name || diagnostic.site_id,
@@ -2328,10 +2332,10 @@
         return true;
     }
 
-    function retryResourceSite(siteId) {
+    function retryResourceSite(siteId, page) {
         const context = state.resourceSearchContext;
         if (!context || !siteId) return Promise.resolve();
-        return loadResources(context.item, context.detail, context.detailRequestId, {siteId, merge: true});
+        return loadResources(context.item, context.detail, context.detailRequestId, {siteId, page});
     }
 
     function updateResourceSiteStatuses(panel) {
@@ -2428,7 +2432,7 @@
                     event.stopPropagation();
                     retry.disabled = true;
                     retry.setAttribute('aria-busy', 'true');
-                    retryResourceSite(siteId).catch(() => {});
+                    retryResourceSite(siteId, site.requested_page).catch(() => {});
                 });
                 message.append(retry);
             });
@@ -3020,17 +3024,10 @@
         const loadMore = node('button', 'jump-btn discovery-resource-load-more', '加载更多资源');
         loadMore.type = 'button';
         loadMore.addEventListener('click', async () => {
-            if (state.resourceSearchController || state.resourceLoadingMore || !state.resourceHasMore) return;
             const context = state.resourceSearchContext;
-            if (!context) return;
-            const siteIds = state.resourceSiteStatuses
-                .filter((status) => status.has_more === true && status.pagination_supported !== false)
-                .map((status) => String(status.site_id || ''))
-                .filter(Boolean);
-            if (!siteIds.length) return;
-            await loadResources(context.item, context.detail, context.detailRequestId, {
-                append: true, page: state.resourcePage + 1, siteIds,
-            });
+            const next = resourceNextPage();
+            if (state.resourceSearchController || !context || !next.siteIds.length) return;
+            await loadResources(context.item, context.detail, context.detailRequestId, next);
         });
         pagination.append(loadMore);
         panel.append(mediaHeader, sites, head, list, pagination, resourceBulkToolbar(), notice);
@@ -3054,12 +3051,10 @@
         const list = panel?.querySelector('[data-discovery-resource-list]');
         const sites = elements.dialogBody.querySelector('[data-discovery-resource-sites]');
         if (!panel || !list || !sites) return false;
-        const siteId = String(options.siteId || '');
-        const merge = Boolean(options.merge && siteId);
-        const append = Boolean(options.append);
-        const resort = Boolean(options.resort);
-        const requestedPage = Math.max(1, Number.parseInt(options.page || 1, 10) || 1);
-        const siteIds = asArray(options.siteIds).map((value) => String(value || '')).filter(Boolean);
+        const {page: requestedPage = 1, siteId = '', siteIds = [], resort = false} = options;
+        const append = requestedPage > 1;
+        const keepSiteStatuses = append || Boolean(siteId);
+        const previousSiteStatuses = state.resourceSiteStatuses;
         const previousContext = state.resourceSearchContext;
         const sameSearchContext = Boolean(previousContext
             && previousContext.item === item
@@ -3069,14 +3064,12 @@
         const sourceOrderOffset = append && state.resourceSourceOrder.size
             ? Math.max(...state.resourceSourceOrder.values()) + 1 : 0;
         const preserveExistingResults = sameSearchContext && state.resourceResults.size > 0 && !append;
-        const resourceSkeletonShownAt = !append && !merge && !resort && !preserveExistingResults ? Date.now() : 0;
+        const resourceSkeletonShownAt = !keepSiteStatuses && !resort && !preserveExistingResults ? Date.now() : 0;
         if (resourceSkeletonShownAt) list.replaceChildren(resourceLoadingRows());
         const searchPayload = resourceSearchPayload(item, detail, requestedPage);
         if (siteId) searchPayload.sites = [siteId];
         else if (siteIds.length) searchPayload.sites = siteIds;
-        const currentSearchSiteIds = Array.isArray(searchPayload.sites)
-            ? new Set(searchPayload.sites.map((value) => String(value || '')))
-            : null;
+        const currentSearchSiteIds = searchPayload.sites ? new Set(searchPayload.sites) : null;
         if (!searchPayload.title) {
             list.replaceChildren(emptyPanel('缺少可用于资源检索的标题。'));
             return false;
@@ -3085,7 +3078,6 @@
         const pagination = panel.querySelector('[data-resource-pagination]');
         const loadMoreButton = pagination?.querySelector('.discovery-resource-load-more');
         const {controller, resourceSearchRequestId} = beginResourceSearch();
-        state.resourceLoadingMore = append;
         state.resourceSearchProgress = {phase: 'searching', status: 'pending', text: '正在搜索站点'};
         updateResourceSiteStatuses(panel);
         if (loadMoreButton) {
@@ -3103,11 +3095,9 @@
             }
             const firstSnapshot = !initialized;
             const results = uniqueResourceResults(extractItems(payload));
+            const incomingStatuses = resourceSearchSiteStatuses(payload.site_statuses, payload.diagnostics, requestedPage);
             if (firstSnapshot && eventType === 'progress' && results.length === 0) {
-                const incomingStatuses = resourceSearchSiteStatuses(payload.site_statuses, payload.diagnostics);
-                state.resourceSiteStatuses = mergeResourceSiteStatuses(
-                    incomingStatuses, merge ? siteId : append ? '__append__' : '',
-                );
+                state.resourceSiteStatuses = mergeResourceSiteStatuses(incomingStatuses, keepSiteStatuses);
                 updateResourceSearchProgress(payload, eventType, receivedResultCount, currentSearchSiteIds);
                 updateResourceSiteStatuses(panel);
                 return;
@@ -3133,7 +3123,7 @@
                     : []);
                 initialized = true;
                 if (!terminalNoFreshResults) {
-                    if (merge) {
+                    if (siteId && !append) {
                         [...state.resourceResults.entries()].forEach(([resultId, result]) => {
                             if (resourceSiteKey(result) !== siteId) return;
                             state.resourceResults.delete(resultId);
@@ -3190,17 +3180,10 @@
                     .forEach((id, index) => state.resourceSourceOrder.set(id, sourceOrderOffset + index));
             }
 
-            const incomingStatuses = resourceSearchSiteStatuses(payload.site_statuses, payload.diagnostics);
-            state.resourceSiteStatuses = mergeResourceSiteStatuses(
-                incomingStatuses, merge ? siteId : append ? '__append__' : '',
-            );
-            state.resourcePage = append ? requestedPage : 1;
-            if (typeof payload.has_more === 'boolean') state.resourceHasMore = payload.has_more;
+            state.resourceSiteStatuses = mergeResourceSiteStatuses(incomingStatuses, keepSiteStatuses);
             receivedResultCount = receivedResultIds.size;
             updateResourceSearchProgress(payload, eventType, receivedResultCount, currentSearchSiteIds);
             updateResourceSiteStatuses(panel);
-            const currentPagination = panel.querySelector('[data-resource-pagination]');
-            if (currentPagination) currentPagination.hidden = !state.resourceHasMore;
             list.querySelector('[data-resource-filter-empty]')?.remove();
             renderResourceResultsList(changedIds);
             if (terminalNoFreshResults) {
@@ -3228,6 +3211,7 @@
             if (resourceSkeletonShownAt && remainingSkeletonTime > 0) await delay(remainingSkeletonTime);
             if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return false;
             const resultCount = state.resourceResults.size;
+            if (append) state.resourceSiteStatuses = previousSiteStatuses;
             if (error.isIndexerSearchError) {
                 state.resourceSearchProgress = {
                     phase: 'incomplete',
@@ -3255,7 +3239,7 @@
                 text: '搜索中断 · 本次搜索未完成',
             };
             updateResourceSiteStatuses(panel);
-            if (append) {
+            if (append && !siteId) {
                 renderResourceNotice({type: 'warning', message: `更多资源搜索中断，本次未完成；已保留 ${resultCount} 条结果`});
                 return false;
             }
@@ -3266,18 +3250,19 @@
                 });
                 return false;
             }
-            if (merge) {
+            if (siteId) {
                 const current = state.resourceSiteStatuses.find((status) => String(status.site_id || '') === siteId) || {};
                 state.resourceSiteStatuses = mergeResourceSiteStatuses([{
                     ...current,
                     site_id: siteId,
                     site_name: current.site_name || siteId,
+                    requested_page: requestedPage,
                     status: 'error',
                     count: resourceSiteResultCount(siteId),
                     message: error.message || '站点检索失败，请稍后重试',
                     code: error.payload?.code || 'unavailable',
                     retryable: true,
-                }], siteId);
+                }], true);
                 updateResourceSiteStatuses(panel);
                 renderResourceNotice({type: 'error', message: `${current.site_name || siteId} 检索失败，其他源站结果已保留`});
                 renderIcons(elements.dialogBody);
@@ -3304,12 +3289,10 @@
             return false;
         } finally {
             if (resourceSearchRequestId === state.resourceSearchRequestId) {
-                state.resourceLoadingMore = false;
-                const currentPagination = elements.dialogBody.querySelector('[data-resource-pagination]');
-                const currentLoadMore = currentPagination?.querySelector('.discovery-resource-load-more');
-                if (currentLoadMore) {
-                    currentLoadMore.disabled = false;
-                    currentLoadMore.textContent = '加载更多资源';
+                if (loadMoreButton) {
+                    pagination.hidden = !resourceNextPage().siteIds.length;
+                    loadMoreButton.disabled = false;
+                    loadMoreButton.textContent = '加载更多资源';
                 }
                 state.resourceSearchController = null;
             }

@@ -785,6 +785,63 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertFalse(page.locator('[data-resource-pagination]').is_visible())
         self.assertEqual(page.locator("[data-resource-result-id='btbtla-page-1']").get_attribute('data-resource-result-id'), 'btbtla-page-1')
 
+    def test_site_retry_resumes_failed_page_and_keeps_other_site_pagination(self):
+        page = self.enterContext(self.open_profile())
+        load_more = page.locator(".discovery-resource-load-more")
+        names = {"btbtla": "综合", "nyaa": "Nyaa"}
+
+        def complete(index, requested_page, *, next_sites=(), done_sites=(), failed_sites=()):
+            items, statuses = [], []
+            for site_id in (*next_sites, *done_sites, *failed_sites):
+                failed = site_id in failed_sites
+                has_more = None if failed else site_id in next_sites
+                statuses.append({
+                    "site_id": site_id, "site_name": names[site_id],
+                    "status": "error" if failed else "success",
+                    "message": "请求超时" if failed else "", "retryable": failed,
+                    "pagination_supported": True, "requested_page": requested_page,
+                    "has_more": has_more, "next_page": requested_page + 1 if has_more else None,
+                })
+                if not failed:
+                    items.append({
+                        "result_id": f"{site_id}-{requested_page}", "site_id": site_id,
+                        "title": f"{names[site_id]} 第 {requested_page} 页", "download_state": "ready",
+                    })
+            payload = self.progress_payload(items, statuses, complete=True)
+            payload.update(page=requested_page, has_more=bool(next_sites))
+            self.push_event(page, index, "complete", payload)
+            page.wait_for_function("index => window.__readerCancelCalls.includes(index)", arg=index)
+
+        def request(index, trigger, expected):
+            trigger.click()
+            page.wait_for_function("count => window.__resourceSearchRequests.length === count", arg=index + 1)
+            payload = page.evaluate("index => JSON.parse(window.__resourceSearchRequests[index].body)", index)
+            self.assertEqual((payload["page"], payload["sites"]), expected)
+
+        complete(0, 1, next_sites=("btbtla", "nyaa"))
+        original = page.locator("[data-resource-result-id='btbtla-1'] .discovery-resource-select")
+        original.check()
+        request(1, load_more, (2, ["btbtla", "nyaa"]))
+        complete(1, 2, next_sites=("nyaa",), failed_sites=("btbtla",))
+        request(2, load_more, (3, ["nyaa"]))
+        complete(2, 3, next_sites=("nyaa",))
+
+        page.locator("[data-resource-site-filter='btbtla']").focus()
+        request(3, page.locator("[data-resource-site-retry='btbtla']"), (2, ["btbtla"]))
+        complete(3, 2, next_sites=("btbtla",))
+        self.assertTrue(original.is_checked())
+        page.locator("[data-resource-site-filter='btbtla']").click()
+        self.assertTrue(page.locator("[data-resource-result-id='btbtla-2']").is_visible())
+        self.assertTrue(page.locator("[data-resource-result-id='nyaa-3']").is_hidden())
+
+        request(4, load_more, (3, ["btbtla"]))
+        complete(4, 3, done_sites=("btbtla",))
+        request(5, load_more, (4, ["nyaa"]))
+        complete(5, 4, done_sites=("nyaa",))
+        self.assertTrue(original.is_checked())
+        self.assertFalse(load_more.is_visible())
+        self.assertEqual(page.locator("[data-resource-result-id]").count(), 7)
+
     def test_json_response_remains_a_single_complete_snapshot(self):
         payload = {
             "items": [{"result_id": "json-result", "site_id": "alpha", "site_name": "Alpha", "title": "JSON 兼容结果"}],

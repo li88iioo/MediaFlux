@@ -670,7 +670,6 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "message.classList.toggle('is-visible'",
             "data-resource-site-retry",
             "function retryResourceSite",
-            "{siteId, merge: true}",
             "searchPayload.sites = [siteId]",
             "其他源站结果已保留",
         ):
@@ -909,7 +908,6 @@ class DiscoveryResourceSiteFilterContractTests(unittest.TestCase):
         self.assertNotIn("entry.status === 'fallback'", self.script)
         self.assertIn("const siteName = resourceSiteName(siteId, site.site_name);", self.script)
         self.assertRegex(self.script, re.compile(r"createFilterButton\(\s*siteId,", re.S))
-        self.assertIn("retryResourceSite(siteId)", self.script)
 
 
 @unittest.skipIf(sync_playwright is None, "未安装 Playwright")
@@ -1641,7 +1639,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.add_script_tag(path=str(ROOT / "app/static/js/lucide.min.js"))
         page.evaluate("window.renderLucideIcons = () => lucide.createIcons()")
         page.add_script_tag(content=self.script)
-        page.locator(".discovery-card").first.wait_for()
+        page.locator(".discovery-card:not(.discovery-skeleton)").first.wait_for()
         self.assertEqual(errors, [])
         return page, errors
 

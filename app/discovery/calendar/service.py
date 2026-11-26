@@ -75,16 +75,22 @@ class CalendarService:
     def get_week(self, *, force=False, wait_sources=(), cancelled=None):
         if self.closed:
             raise SourceUnavailable("日历服务正在停止")
+        today, week_start = calendar_dates(self._now())
+
+        def previous_week(payload):
+            return str(payload.get("fetched_at", ""))[:10] < week_start
+
+        def current_facts(payload):
+            return payload is not None and not previous_week(payload) and not self._empty_partial(payload)
+
         for source in self.providers:
             cached = self.cache.get(self.key(source))
-            if (force or cached.status not in {"fresh", "error"}
-                    or (cached.status == "fresh" and (cached.last_error or self._empty_partial(cached.payload)
-                                                     or self._needs_platform_posters(cached.payload)))):
-                # 历史空partial不算一次成功；来源失败也不能等到原1小时TTL才允许再试。
+            if (cached.status == "fresh" and not force and not cached.last_error and current_facts(cached.payload)
+                    and not self._needs_platform_posters(cached.payload)):
+                if self._needs_metadata(cached.payload):
+                    self._schedule(source, metadata_only=True)
+            elif force or cached.status != "error":
                 self._schedule(source)
-            elif (cached.status == "fresh" and not cached.last_error and cached.payload
-                  and self._needs_metadata(cached.payload)):
-                self._schedule(source, metadata_only=True)
         # 对话等待平台事实发布，页面仍立即返回。共享同一采集任务，不等待可选的海报/TMDB补全。
         deadline = time.monotonic() + self.source_timeout + 1
         with self._guard:
@@ -92,15 +98,12 @@ class CalendarService:
             while waiting:
                 if self._closed or (cancelled is not None and cancelled()):
                     raise SourceUnavailable("日历查询已停止")
-                waiting = {source for source in waiting if source in self._pending and not (
-                    (cached := self.cache.get(self.key(source))).status in {"fresh", "stale"}
-                    and cached.payload and not self._empty_partial(cached.payload)
-                )}
+                waiting = {source for source in waiting if source in self._pending
+                           and not current_facts(self.cache.get(self.key(source)).payload)}
                 remaining = deadline - time.monotonic()
                 if not waiting or remaining <= 0:
                     break
                 self._guard.wait(min(remaining, 0.25))
-        today, week_start = calendar_dates(self._now())
         start = datetime.fromisoformat(week_start).date()
         labels = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
         days = [{"date": (start + timedelta(days=i)).isoformat(), "weekday": i + 1,
@@ -117,7 +120,8 @@ class CalendarService:
                      "fetched_at": "", "sampled": 0, "ignored": 0, "covered_dates": []}
             payload = cached.payload if cached.status in {"fresh", "stale"} else None
             if payload and payload.get("version") == 1 and payload.get("source") == source:
-                stale = cached.status == "stale" or bool(cached.last_error)
+                old_week = previous_week(payload)
+                stale = old_week or cached.status == "stale" or bool(cached.last_error)
                 metadata_pending |= not stale and self._needs_metadata(payload)
                 state.update(status="stale" if stale else payload.get("status", "partial"),
                              message=cached.last_error or str(payload.get("message", ""))[:400],
@@ -145,8 +149,6 @@ class CalendarService:
                     identities.add(entry.stable_id)
                     card = {**entry.to_dict(), "source_name": name, "stale": stale,
                             **{key: raw.get(key, value) for key, value in _empty().items()}}
-                    # 原始缓存属于上周且抓取失效时，不把旧规则装作本周已核验安排。
-                    old_week = stale and state["fetched_at"][:10] < week_start
                     if entry.events:
                         # 只使用源给出的真实日期，不把上周事件自动改成这周，也不由进度猜排期。
                         by_date = {}
