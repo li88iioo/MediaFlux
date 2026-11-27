@@ -27,7 +27,7 @@ from .base import (
 )
 
 _DETAIL_PATH = re.compile(r"^/view/\d+$")
-_SIZE_TEXT = re.compile(r"^[0-9]+(?:\.[0-9]+)?\s*[KMGTPE]?i?B$", re.IGNORECASE)
+_BYTE_UNIT = re.compile(r"(?<=[0-9])\s*bytes?$", re.IGNORECASE)
 
 
 class NyaaAdapter(DirectResultAdapter):
@@ -224,7 +224,7 @@ class NyaaAdapter(DirectResultAdapter):
                 torrent_url = fixed_host_join(base_url, torrent_anchor.get("href"))
             except HttpSecurityError:
                 torrent_url = None
-        size_text = self._select_size_text(cells)
+        size_text, size_bytes = self._select_size(cells)
         published_at = self._select_published_at(row)
         seeders, leechers, downloads = self._select_counters(row, cells)
         kinds = tuple(kind for kind, present in (("magnet", magnet), ("torrent", torrent_url)) if present)
@@ -235,7 +235,7 @@ class NyaaAdapter(DirectResultAdapter):
             detail_url=detail_url,
             category=category,
             size_text=size_text,
-            size_bytes=parse_size_bytes(size_text),
+            size_bytes=size_bytes,
             seeders=seeders,
             leechers=leechers,
             downloads=downloads,
@@ -247,12 +247,13 @@ class NyaaAdapter(DirectResultAdapter):
         )
 
     @staticmethod
-    def _select_size_text(cells) -> str | None:
+    def _select_size(cells) -> tuple[str | None, int | None]:
         for cell in cells:
             text = cell.get_text(" ", strip=True)
-            if text and _SIZE_TEXT.fullmatch(text):
-                return text
-        return None
+            size_bytes = parse_size_bytes(_BYTE_UNIT.sub(" B", text))
+            if size_bytes is not None:
+                return text, size_bytes
+        return None, None
 
     @staticmethod
     def _select_published_at(row) -> datetime | None:

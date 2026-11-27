@@ -120,6 +120,31 @@ class IndexerRankingTests(unittest.TestCase):
                         self.assertIsNone(result["recommendation"]["selected"])
                         self.assertEqual(result["download_plan"]["result_ids"], [])
 
+    def test_agent_recommendation_uses_whole_title_evidence_from_any_alias(self):
+        from app.sdk import resources
+
+        for title, aliases, release, matches in (
+            ("You", [], "Young.Sheldon", False),
+            ("It", [], "Little.Bird", False),
+            ("24", [], "North.Shore.2024", False),
+            ("You", [], "[You]你", True),
+            ("北岸", ["North Shore S01E02 1081p"], "北岸 North.Shore", True),
+            ("North Shore S01E02 1081p", ["北岸"], "北岸 North.Shore", True),
+        ):
+            with self.subTest(title=title, release=release):
+                item = self._item(f"{release}.S01E02.1080p").to_public_dict()
+                item["result_id"] = "fixture_episode_0002"
+                ranked = resources.rank_episode(
+                    {"items": [item], "request": {"title": title, "aliases": aliases}}, 1, 2,
+                )
+                self.assertEqual(ranked["recommendation"]["matched_count"], int(matches))
+                self.assertEqual(ranked["download_plan"]["result_ids"], [item["result_id"]] if matches else [])
+
+    def test_spelling_variant_remains_a_fuzzy_candidate_for_provider_selection(self):
+        item = rank_item(self._item("The Colour Room"), media=None, fallback_query="The Color Room")
+        self.assertIn("title_similar", item.match_reasons)
+        self.assertEqual(match_priority(item), 2)
+
     def test_captioned_episode_is_ranked_before_truncating_search_results(self):
         from app.indexers.ranking import candidate_sort_key
         media = IndexerMediaSearchRequest.create(title="理想禁区", media_type="tv", season=1, episode=7)

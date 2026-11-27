@@ -119,7 +119,10 @@ def _contains_evidence(raw_candidate: str, normalized_candidate: str, evidence: 
         return False
     compact = evidence.replace(" ", "")
     if not (_HAN_ONLY.fullmatch(compact) and len(compact) <= 4):
-        return True
+        # 拉丁片名和数字也需要词界，不能把 You / 24 命中在 Young / 2024 内。
+        left = r"(?<![a-z0-9])" if evidence[0].isascii() else ""
+        right = r"(?![a-z0-9])" if evidence[-1].isascii() else ""
+        return re.search(left + re.escape(evidence) + right, normalized_candidate) is not None
 
     raw = unicodedata.normalize("NFKC", (raw_candidate or "")).casefold()
     for match in re.finditer(re.escape(compact), raw):
@@ -157,13 +160,14 @@ def rank_media_identity(
         if not evidence:
             continue
         if candidate == evidence:
-            ratio, kind = 1.0, "title_exact"
+            best_ratio, best_kind = 1.0, "title_exact"
+            break
         elif _contains_evidence(title, candidate, evidence):
-            ratio, kind = min(0.98, len(evidence) / max(len(candidate), 1) + 0.45), "title_contains"
-        else:
-            ratio, kind = SequenceMatcher(None, evidence, candidate).ratio(), "title_similar"
-        if ratio > best_ratio:
-            best_ratio, best_kind = ratio, kind
+            ratio = min(0.98, len(evidence) / len(candidate) + 0.45)
+            best_ratio = max(ratio, best_ratio) if best_kind == "title_contains" else ratio
+            best_kind = "title_contains"
+        elif best_kind != "title_contains":
+            best_ratio = max(best_ratio, SequenceMatcher(None, evidence, candidate).ratio())
     score = 0.0
     reasons: list[str] = []
     if best_kind == "title_exact":
@@ -174,7 +178,7 @@ def rank_media_identity(
         reasons.append(best_kind)
     elif best_ratio >= 0.55:
         score += 20 + 24 * best_ratio
-        reasons.append(best_kind)
+        reasons.append("title_similar")
     elif best_ratio >= 0.35:
         score += 10 + 15 * best_ratio
         reasons.append("title_weak")
