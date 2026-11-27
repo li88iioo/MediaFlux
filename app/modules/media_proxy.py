@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from functools import partial
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
+from sqlite3 import Row
 from typing import Any, Awaitable, Callable, TypedDict
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
@@ -5957,12 +5958,12 @@ class MediaProxyManager:
                     f"仍有 {len(failures)} 个媒体反代实例关闭失败"
                 ) from failures[0]
 
-    def request_reconcile(self) -> bool:
-        """从同步配置接口线程安全地请求热重载；返回是否已成功排队。"""
+    def request_reconcile(self, *, instance_id: int | None = None) -> bool:
+        """从同步配置接口请求协调；指定 ID 时只排队该实例。"""
         loop = self._loop
         if self._stopping or loop is None or loop.is_closed() or not loop.is_running():
             return False
-        coroutine = self.reconcile()
+        coroutine = self.reconcile(instance_id=instance_id)
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         except RuntimeError:
@@ -6054,43 +6055,50 @@ class MediaProxyManager:
         except Exception as exc:
             logger.warning("媒体反代热重载失败 type=%s", type(exc).__name__)
 
-    async def reconcile(self) -> dict[str, Any]:
+    async def reconcile(self, *, instance_id: int | None = None) -> dict[str, Any]:
         async with self._lock:
             if self._stopping:
                 return {"started": [], "stopped": [], "failed": {}}
-            instance_rows = await asyncio.to_thread(
-                media_proxy_repo.list_media_proxy_instances
-            )
-            raw_rows = {int(row["id"]): row for row in instance_rows}
+            if instance_id is None:
+                instance_rows = await asyncio.to_thread(media_proxy_repo.list_media_proxy_instances)
+            else:
+                selected = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
+                instance_rows = [selected] if selected is not None else []
             rows: dict[int, Any] = {}
             stopped: list[int] = []
             started: list[int] = []
             failed: dict[int, str] = {}
 
-            for instance_id, row in raw_rows.items():
+            for row in instance_rows:
+                row_id = int(row["id"])
                 if not int(row["enabled"] or 0):
-                    rows[instance_id] = row
+                    rows[row_id] = row
                     continue
                 try:
                     resolved = resolve_proxy_instance(row)
                     _proxy_upstream_identity(resolved)
-                    rows[instance_id] = resolved
+                    rows[row_id] = resolved
                 except ValueError as exc:
                     message = str(exc)
-                    failed[instance_id] = message
+                    failed[row_id] = message
                     await asyncio.to_thread(
                         media_proxy_repo.update_media_proxy_instance,
-                        instance_id,
+                        row_id,
                         {"status": "error", "last_error": message},
                     )
-                    runtime = self._runtimes.get(instance_id)
+                    runtime = self._runtimes.get(row_id)
                     if runtime:
                         await self._stop_runtime(runtime)
-                        if self._runtimes.get(instance_id) is runtime:
-                            self._runtimes.pop(instance_id, None)
-                        stopped.append(instance_id)
+                        if self._runtimes.get(row_id) is runtime:
+                            self._runtimes.pop(row_id, None)
+                        stopped.append(row_id)
 
-            for instance_id, runtime in list(self._runtimes.items()):
+            if instance_id is None:
+                active_runtimes = list(self._runtimes.items())
+            else:
+                runtime = self._runtimes.get(instance_id)
+                active_runtimes = [(instance_id, runtime)] if runtime is not None else []
+            for instance_id, runtime in active_runtimes:
                 row = rows.get(instance_id)
                 if not row or not int(row["enabled"] or 0):
                     await self._stop_runtime(runtime)
@@ -6401,30 +6409,45 @@ def _proxy_credentials(rows) -> tuple[str, ...]:
                         | {profile.credential for profile in list_configured_profiles()}, key=len, reverse=True))
 
 
+def media_proxy_runtime_snapshot(manager: MediaProxyManager) -> tuple[dict[int, dict[str, Any]] | None, str]:
+    try:
+        return manager.status(), ""
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+def media_proxy_instance_status(row: Row, runtime: dict[int, dict[str, Any]] | None) -> str:
+    """只有本进程仍存活的监听任务能证明实例正在运行。"""
+    if runtime is None:
+        return "unknown"
+    if runtime.get(int(row["id"]), {}).get("running") is True:
+        return "running"
+    if not row["enabled"]:
+        return "disabled"
+    return "error" if row["status"] == "error" else "stopped"
+
+
 def playback_proxy_instances() -> dict:
     """只读当前配置、有效上游和本进程运行事实，不启动监听或探测上游。"""
     rows = media_proxy_repo.list_media_proxy_instances()
     known_credentials = _proxy_credentials(rows)
-    runtime_error = ""
-    try:
-        runtime = get_media_proxy_manager().status()
-    except Exception as exc:
-        runtime, runtime_error = {}, type(exc).__name__
+    runtime, runtime_error = media_proxy_runtime_snapshot(get_media_proxy_manager())
     instances = []
     for row in rows:
-        item = dict(row)
-        effective, configuration_error = item, ""
+        instance_id = int(row["id"])
+        configuration_error = ""
         try:
             effective = resolve_proxy_instance(row)
         except ValueError as exc:
-            configuration_error = str(exc)
+            effective, configuration_error = dict(row), str(exc)
+        effective.pop("status", None)
         credentials = (*known_credentials, str(effective.get("api_key") or ""))
-        item.update(instance_id=int(row["id"]), enabled=bool(row["enabled"]),
+        status = media_proxy_instance_status(row, runtime)
+        item = dict(row)
+        item.update(instance_id=instance_id, enabled=bool(row["enabled"]),
                     effective_config=effective, configuration_error=configuration_error,
-                    runtime=runtime.get(int(row["id"])), runtime_scope="current_process",
-                    runtime_status=("unknown" if runtime_error else "disabled" if not row["enabled"] else
-                                    "running" if (runtime.get(int(row["id"])) or {}).get("running") else
-                                    str(row["status"] or "stopped")))
+                    runtime=(runtime or {}).get(instance_id), runtime_scope="current_process",
+                    status=status, runtime_status=status, last_recorded_status=row["status"])
         instances.append(_proxy_public(item, credentials))
     return {"ok": not bool(runtime_error), "status": "partial" if runtime_error else "ready" if rows else "not_configured",
             "summary": f"读取 {len(instances)} 个媒体反代实例",
@@ -6535,7 +6558,7 @@ def apply_playback_proxy_change(operation: str, instance_id: int, enabled: bool 
             data = {"operation": operation, "instance_id": instance_id, "cache_entries_cleared": cleared}
             if operation == "set_enabled":
                 try:
-                    refreshed = manager.request_reconcile()
+                    refreshed = manager.request_reconcile(instance_id=instance_id)
                 except Exception:
                     refreshed = False
                 return {"ok": True, "status": "completed", "summary": f"媒体反代实例 {instance_id} 启停配置已保存",

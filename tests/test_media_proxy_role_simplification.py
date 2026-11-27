@@ -191,6 +191,52 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
                     self.assertEqual(instance["has_api_key"], bool(expected))
                     self.assertEqual(instance["api_key"], "********" if expected else "")
 
+    def test_web_toggle_reconciles_only_the_selected_instance(self):
+        from app.modules import media_proxy
+        from app.repositories import media_proxy as repository
+        from app.routes import media_proxy_api
+
+        config = {
+            "name": "Fixture proxy",
+            "server_type": "jellyfin",
+            "upstream_url": "http://127.0.0.1:8096",
+            "api_key": "",
+            "listen_host": "127.0.0.1",
+        }
+        target_id = repository.add_media_proxy_instance(**config, listen_port=18106)
+        sibling_id = repository.add_media_proxy_instance(**config, listen_port=18107)
+        target, sibling = MagicMock(), MagicMock()
+        sibling.bind = ("127.0.0.1", 18108)
+        sibling.task.done.return_value = False
+        replacement = MagicMock()
+        manager = media_proxy.MediaProxyManager()
+        manager._runtimes = {target_id: target, sibling_id: sibling}
+        request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(
+            background_services_enabled=True, media_proxy_manager=manager,
+        ))})
+
+        async def check():
+            with (
+                patch.object(media_proxy_api, "require_api_login"),
+                patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop,
+                patch.object(manager, "_start_runtime", new=AsyncMock(return_value=replacement)) as start,
+            ):
+                disabled = await media_proxy_api.update_instance(
+                    target_id, request, {**config, "listen_port": 18106, "enabled": False},
+                )
+                self.assertEqual(disabled.status_code, 200)
+                self.assertEqual(json.loads(bytes(disabled.body))["runtime"]["stopped"], [target_id])
+                self.assertIs(manager._runtimes[sibling_id], sibling)
+                stop.assert_awaited_once_with(target)
+                start.assert_not_awaited()
+
+                refreshed = await manager.reconcile()
+                self.assertEqual(refreshed["started"], [sibling_id])
+                self.assertEqual(refreshed["stopped"], [sibling_id])
+                self.assertIs(manager._runtimes[sibling_id], replacement)
+
+        asyncio.run(check())
+
     def test_unavailable_configured_source_can_be_disabled_without_losing_bindings(self):
         from app.modules import media_proxy, media_server_profiles
         from app.repositories import media_proxy as repository

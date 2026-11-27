@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import Counter
 from typing import Any
 
 from app.modules.media_library import (
@@ -304,15 +303,13 @@ def execute_change(snapshot: dict, *, check_cancelled=None) -> dict:
                 elif operation == "remove_from_playlist" and checked["entries"]:
                     client.write("DELETE", f"/Playlists/{playlist_id}/Items", params={"EntryIds": ",".join(checked["entries"])})
                 after = _playlist_snapshot(client, user_id, playlist_id)
-                previous = checked.get("members", [])
-                expected_ids = (checked["ids"] if operation == "create_playlist" else
-                    [row["item_id"] for row in previous] + checked["ids"] if operation == "add_to_playlist" else
-                    [row["item_id"] for row in previous if row["entry_id"] not in checked["entries"]])
-                if Counter(row["item_id"] for row in after["members"]) != Counter(expected_ids) or after["name"] != checked["name"]:
+                removed = set(checked.get("entries", []))
+                retained = [row for row in checked.get("members", []) if row["entry_id"] not in removed]
+                expected_ids = [row["item_id"] for row in retained] + checked.get("ids", [])
+                members = after["members"]
+                if [row["item_id"] for row in members] != expected_ids or after["name"] != checked["name"]:
                     raise ValueError("playlist verification failed")
-                if operation == "remove_from_playlist" and Counter(
-                    (row["item_id"], row["entry_id"]) for row in after["members"]
-                ) != Counter((row["item_id"], row["entry_id"]) for row in previous if row["entry_id"] not in checked["entries"]):
+                if removed and [row["entry_id"] for row in members] != [row["entry_id"] for row in retained]:
                     raise ValueError("playlist entry verification failed")
                 data = {**scope, "playlist_id": playlist_id, "name": checked["name"], "action": checked["action"],
                         "member_count": len(after["members"]), "items": after["members"],

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
+from starlette.requests import Request
 
 from app import database as db, sdk
 from app.agent.confirmation import SQLiteConfirmationStore
@@ -27,6 +28,7 @@ from app.agent.kernel.ports.sdk_effects import playback_tools
 from app.agent.kernel.state_types import CancellationToken
 from app.modules import media_proxy as service
 from app.repositories import media_proxy as repository
+from app.routes import media_proxy_api
 from tests.support import isolated_test_database
 from tests.test_agent_sdk_effects import context_for
 
@@ -90,6 +92,14 @@ def record(instance_id, index, status=502):
         + " tail-fact NATIVE_PROXY_PRIVATE_KEY password=VERY_PRIVATE https://private.invalid/?token=PRIVATE")
 
 
+def web_instances(manager):
+    request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(media_proxy_manager=manager))})
+    with patch.object(media_proxy_api, "require_api_login"):
+        response = asyncio.run(media_proxy_api.list_instances(request))
+    assert response.status_code == 200
+    return json.loads(bytes(response.body))
+
+
 def test_only_native_entries_and_real_instance_id_contract():
     old = {"media_proxy." + name for name in ("status_summary", "playback_failure_summary", "test_instance", "set_instance_enabled", "restart_instance")}
     assert not old & {spec.name for spec in build_tool_catalog().visible()}
@@ -121,9 +131,29 @@ def test_instances_keep_full_configuration_runtime_errors_and_real_ids(backend):
     unknown = sdk.playback.instances()
     assert unknown["status"] == "partial" and not unknown["ok"]
     assert unknown["data"]["instances"][0]["runtime_status"] == "unknown"
+    assert web_instances(backend.manager)[0]["status"] == "unknown"
     backend.clear.assert_not_called()
     backend.manager.request_restart.assert_not_called()
     backend.manager.request_reconcile.assert_not_called()
+
+
+@pytest.mark.parametrize(("running", "stored_status", "expected"), [
+    (None, "running", "stopped"),
+    (False, "running", "stopped"),
+    (True, "stopped", "running"),
+    (None, "error", "error"),
+])
+def test_web_and_agent_use_observed_listener_state(backend, running, stored_status, expected):
+    identifier = add()
+    repository.update_media_proxy_instance(identifier, {"status": stored_status})
+    backend.manager.status.return_value = {} if running is None else {identifier: {"running": running}}
+
+    agent_row, = sdk.playback.instances()["data"]["instances"]
+    web_row, = web_instances(backend.manager)
+
+    assert agent_row["status"] == agent_row["runtime_status"] == web_row["status"] == expected
+    assert agent_row["last_recorded_status"] == stored_status
+    assert "status" not in agent_row["effective_config"]
 
 
 def test_failures_read_all_stored_facts_in_pages_without_top_eight_loss(backend):
@@ -205,6 +235,9 @@ def test_probe_timeout_and_missing_target_preserve_unknown_not_healthy(backend):
 def test_disabled_config_source_stops_probe_before_network_access(backend, monkeypatch):
     identifier = add(config_source="configured:jellyfin")
     monkeypatch.setenv("JELLYFIN_ENABLED", "0")
+    instance, = sdk.playback.instances()["data"]["instances"]
+    assert instance["instance_id"] == identifier and instance["configuration_error"]
+    assert instance["runtime_status"] == "stopped"
     with patch.object(service, "_pin_upstream_target") as pin:
         result = sdk.playback.test(identifier)
 
@@ -243,7 +276,7 @@ def test_cold_sqlite_confirmation_only_operates_real_target_once(backend, operat
         if operation == "set_enabled":
             assert row["enabled"] == 0
             assert result.outcome.public_content["data"]["runtime_refreshed"]
-            backend.manager.request_reconcile.assert_called_once_with()
+            backend.manager.request_reconcile.assert_called_once_with(instance_id=target)
             backend.manager.request_restart.assert_not_called()
         else:
             assert row["enabled"] == 1

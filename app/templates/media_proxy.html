@@ -324,7 +324,13 @@
     }
 
     async function request(path,options={}){const response=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const data=await response.json();if(!response.ok)throw new Error(data.error||'请求失败');return data;}
-    function statusMeta(instance){if(instance.status==='running')return ['running','运行中'];if(instance.status==='error')return ['failed','启动失败'];if(!instance.enabled)return ['paused','已停用'];return ['paused','已停止'];}
+    function statusMeta(instance){
+        if(instance.status==='running')return ['running','运行中'];
+        if(instance.status==='error')return ['failed','启动失败'];
+        if(instance.status==='unknown')return ['paused','状态未知'];
+        if(!instance.enabled)return ['paused','已停用'];
+        return ['paused','已停止'];
+    }
     function setNotice(text,error=false){const root=document.getElementById('proxySaveState');root.textContent=text;root.classList.toggle('is-error',error);}
     function profileState(profile){if(!profile.configured)return ['未完成配置','failed'];if(!profile.enabled)return ['已在看板停用','paused'];return ['可用于反代','running'];}
     function renderProfiles(){

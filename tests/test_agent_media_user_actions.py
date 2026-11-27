@@ -311,6 +311,25 @@ def test_create_private_playlist_is_user_bound_and_verified(backend):
                                                    "UserId": "viewer", "MediaType": "Video", "IsPublic": False}
 
 
+@pytest.mark.parametrize("operation,arguments,playlist_id", [
+    ("create_playlist", {"name": "按放映顺序", "item_ids": ["movie2", "movie1"]}, "created1"),
+    ("add_to_playlist", {"playlist_id": "playlist1", "item_ids": ["movie2"]}, "playlist1"),
+])
+def test_playlist_receipt_checks_playback_order_after_a_write(backend, operation, arguments, playlist_id):
+    client = backend.client
+    snapshot = prepare(backend, operation, **arguments)
+
+    def reordered_write(*args, **kwargs):
+        response = client.request(*args, **kwargs)
+        client.members[playlist_id].reverse()
+        return response
+
+    client._session.request = reordered_write
+    result = media_user.execute_change(snapshot)
+    assert result["status"] == "outcome_unknown" and result["data"]["playlist_id"] == playlist_id
+    assert len(client.calls) == 1
+
+
 @pytest.mark.parametrize("failure", ["existing_name", "emby", "default_user"])
 def test_create_requires_unique_name_supported_private_owner_and_configured_user(backend, failure):
     if failure == "emby":

@@ -13,6 +13,8 @@ from app.modules.media_proxy import (
     ProxyUpstreamBodyTooLarge,
     clear_signed_url_cache,
     get_media_proxy_manager,
+    media_proxy_instance_status,
+    media_proxy_runtime_snapshot,
     probe_media_proxy_instance,
     signed_url_cache_metrics,
     validate_listen_host,
@@ -58,8 +60,8 @@ def _boolean_value(value, *, default: bool = False) -> bool:
     raise ValueError("转发头信任开关无效")
 
 
-def _instance_json(row, runtime: dict | None = None) -> dict:
-    runtime = runtime or {}
+def _instance_json(row, runtime: dict[int, dict[str, Any]] | None) -> dict:
+    status = media_proxy_instance_status(row, runtime)
     config_source = str(row["config_source"] or "custom")
     source_label = "自定义上游"
     upstream_url = str(row["upstream_url"] or "")
@@ -93,7 +95,7 @@ def _instance_json(row, runtime: dict | None = None) -> dict:
             )
         ),
         "enabled": bool(row["enabled"]),
-        "status": "running" if runtime.get("running") else (row["status"] or "stopped"),
+        "status": "stopped" if status == "disabled" else status,
         "last_error": row["last_error"] or "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -231,18 +233,18 @@ def _validated_binding(data: dict, instance) -> tuple[dict | None, str]:
     }, ""
 
 
-async def _reconcile(request: Request):
+async def _reconcile(request: Request, instance_id: int):
     if not bool(getattr(request.app.state, "background_services_enabled", False)):
         return {"started": [], "stopped": [], "failed": {}}
-    return await _manager(request).reconcile()
+    return await _manager(request).reconcile(instance_id=instance_id)
 
 
 @router.get("")
 async def list_instances(request: Request):
     require_api_login(request)
-    runtime = _manager(request).status()
+    runtime, _ = media_proxy_runtime_snapshot(_manager(request))
     return api_response([
-        _instance_json(row, runtime.get(int(row["id"])))
+        _instance_json(row, runtime)
         for row in await asyncio.to_thread(media_proxy_repo.list_media_proxy_instances)
     ])
 
@@ -344,9 +346,10 @@ async def create_instance(request: Request, data: dict = Body(...)):
         )
     except sqlite3.IntegrityError:
         return api_error("监听地址和端口已被其他实例占用", 409)
-    result = await _reconcile(request)
+    result = await _reconcile(request, instance_id)
     row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
-    return api_response({"success": True, "instance": _instance_json(row), "runtime": result}, 201)
+    runtime, _ = media_proxy_runtime_snapshot(_manager(request))
+    return api_response({"success": True, "instance": _instance_json(row, runtime), "runtime": result}, 201)
 
 
 @router.put("/{instance_id}")
@@ -363,9 +366,10 @@ async def update_instance(instance_id: int, request: Request, data: dict = Body(
     except sqlite3.IntegrityError:
         return api_error("监听地址和端口已被其他实例占用", 409)
     clear_signed_url_cache(instance_id)
-    result = await _reconcile(request)
+    result = await _reconcile(request, instance_id)
     row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
-    return api_response({"success": True, "instance": _instance_json(row), "runtime": result})
+    runtime, _ = media_proxy_runtime_snapshot(_manager(request))
+    return api_response({"success": True, "instance": _instance_json(row, runtime), "runtime": result})
 
 
 @router.delete("/{instance_id}")
@@ -378,7 +382,7 @@ async def delete_instance(instance_id: int, request: Request):
         media_proxy_repo.update_media_proxy_instance, instance_id, {"enabled": 0}
     )
     clear_signed_url_cache(instance_id)
-    await _reconcile(request)
+    await _reconcile(request, instance_id)
     if not await asyncio.to_thread(media_proxy_repo.delete_media_proxy_instance, instance_id):
         return api_error("媒体反代实例不存在", 404)
     return api_response({"success": True})
@@ -390,7 +394,7 @@ async def reload_instance(instance_id: int, request: Request):
     if not await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id):
         return api_error("媒体反代实例不存在", 404)
     clear_signed_url_cache(instance_id)
-    result = await _reconcile(request)
+    result = await _reconcile(request, instance_id)
     return api_response({"success": True, "runtime": result})
 
 
