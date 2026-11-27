@@ -2318,19 +2318,23 @@ class Resources:
     @sdk_method('read')
     def search_missing(items: list[dict], as_of: str | None = None, sites: list[str] | None = None,
                        page: int = 1, max_episodes: int | None = None, limit_per_episode: int = 8,
-                       preference_overrides: dict | None = None) -> dict:
+                       preference_overrides: dict | None = None, *, resolution: str = "",
+                       dynamic_range: str = "", exclude_hdr: bool = False) -> dict:
         """批量核对已播缺集并搜索资源，保持只读。items 为1–12项，每项必填 query/season，
         可选 tmdb_id/library_name/episodes。默认每部20集；指定 episodes 最多100集，max_episodes 可缩小。
         默认采用用户偏好，preference_overrides 可覆盖；page/sites 选择来源页。
+        resolution/dynamic_range/exclude_hdr 与 resources.search 同义，每次季查及精确补查先硬筛再排序。
+        明确要求 SDR 用 dynamic_range="SDR"；exclude_hdr=True 只排除已标 HDR。
         单季最多6次、整批24次搜索，共享45秒；limit_per_episode 仅限制每集推荐ID数量。
 
         返回：
-        - items：按 result_id 去重的原始候选全文。
+        - items：按 result_id 去重的候选全文，已应用画质硬条件及已核实的年份限制。
         - groups[]：query/season/status/audit、remaining_episodes/failed_episodes/stop_reason。
         - groups[].episodes[]：season/episode/recommended_result_ids/search。
           search.recommendation.selected 为首选或 None，source_url 可为空；search.result_ids 引用根 items，
           按逐集排名排列。quality/preference_match 以 result_id 为键保存判据，未设偏好时后者为空。
         - groups[].searches[]：实际请求页，以 result_ids 引用根 items，保留 site_statuses/next_page。
+          request 保留启用的硬条件，technical_filter 和 year_filter 报告对应的排除范围。
           两处 search 都保留 request、状态、错误和覆盖，不重复嵌入候选全文。
         - result_ids/verification_targets：首选ID及完整季集关联，传递给展示或下载时一起保留。
         partial/has_more/complete 是覆盖；失败或剩余目标是未完成范围，不等于没有资源。
@@ -2345,7 +2349,9 @@ class Resources:
 
         return search_missing(items, owner=_owner(), as_of=as_of, sites=sites, page=page,
                               max_episodes=max_episodes, limit_per_episode=limit_per_episode,
-                              preference_overrides=preference_overrides, cancelled=_CALL_CANCELLED.get() or (lambda: False),
+                              preference_overrides=preference_overrides, resolution=resolution,
+                              dynamic_range=dynamic_range, exclude_hdr=exclude_hdr,
+                              cancelled=_CALL_CANCELLED.get() or (lambda: False),
                               checkpoint=_READ_CHECKPOINT.get())
 
     @staticmethod

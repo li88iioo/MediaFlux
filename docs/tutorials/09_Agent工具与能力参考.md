@@ -99,7 +99,7 @@
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
 | `library.search(...)`（工作区 SDK） | READ | 共用服务按标题或演员元数据搜索；保留真实对象 ID、准确总数、分页与来源范围。`count_only=True` 只统计；旧工具入口已退役。 |
-| `resources.search_missing`（SDK） | READ | items统一单集、单季和最多12部/季的已播缺集资源检索；保留真实result_ids、完整verification_targets和来源分页/partial/未完成目标，不自动下载。 |
+| `resources.search_missing`（SDK） | READ | 按作品、季和指定库核对截至 as_of 已播的缺集，支持 sites、resolution、dynamic_range、exclude_hdr 硬条件。每批最多 12 部/季，返回逐集候选、verification_targets、分页与待补查范围。 |
 | `resources.missing_workflows`（SDK） | READ | 当前用户的持久补库流程、全部成员、真实workflow_id/item_id/revision/request_id与状态；total/has_more/next_offset用于分页。 |
 | `library.connection`（SDK） | READ | 当前配置单槽位或全部媒体服务器的连接与身份诊断；server=all/jellyfin/emby，保留产品、版本、兼容性、disabled/unknown与安全错误；固定目标拒绝凭据重定向，不返回地址或凭据，失败不当空结果。 |
 | `library.libraries(server="auto")`（SDK） | READ | 返回真实库 ID、名称和类型；auto 遵循已保存的首选服务器，多源未选定时需明确服务器。 |

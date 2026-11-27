@@ -130,6 +130,21 @@ def _contains_evidence(raw_candidate: str, normalized_candidate: str, evidence: 
     return False
 
 
+def release_title_years(title: str, *, media: IndexerMediaSearchRequest | None = None) -> set[int]:
+    """提取发布名中的年份，排除技术数字和已知作品名内的数字。"""
+    year_text = _TECHNICAL_YEAR_VALUE.sub(" ", title)
+    if media is not None:
+        names = sorted((_normalize(name) for name in (media.title, media.original_title, media.english_title)),
+                       key=len, reverse=True)
+        for name in names:
+            if _YEAR.search(name):
+                normalized_title = f" {_normalize(year_text)} "
+                if f" {name} " in normalized_title:
+                    year_text = normalized_title.replace(f" {name} ", " ", 1)
+                    break
+    return {int(value) for value in _YEAR.findall(year_text)}
+
+
 def rank_media_identity(
     title: str, *, media: IndexerMediaSearchRequest | None, fallback_query: str,
 ) -> tuple[float, list[str]]:
@@ -165,8 +180,7 @@ def rank_media_identity(
         reasons.append("title_weak")
 
     request_year = media.year if media is not None else None
-    year_text = _TECHNICAL_YEAR_VALUE.sub(" ", title)
-    title_years = {int(value) for value in _YEAR.findall(year_text)}
+    title_years = release_title_years(title, media=media) if request_year else set()
     if request_year and request_year in title_years:
         score += 9
         reasons.append("year_match")

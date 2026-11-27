@@ -1,14 +1,34 @@
 """资源卡片的安全快照与冷恢复；不包含模型引用工具或最近候选仓。"""
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
-from copy import deepcopy
 from collections.abc import Mapping
+from copy import deepcopy
 from datetime import date, datetime
 from typing import Any
 
 from app.indexers.models import IndexerItem
+
+
+def _observed_sites(result: dict, page: int) -> dict[str, bool | None]:
+    sites: dict[str, bool | None] = dict.fromkeys(result.get("sites_attempted") or ())
+    for status in result.get("site_statuses") or ():
+        site = status.get("site_id")
+        has_more = status.get("has_more")
+        if site in sites and status.get("requested_page") == page and isinstance(has_more, bool):
+            sites[site] = has_more
+    return sites if any(has_more is not None for has_more in sites.values()) else {}
+
+
+def _set_candidate_target(source: dict, target: dict) -> None:
+    query = source["query"]
+    ranked = {**query, **target}
+    if ranked != query:
+        for page in source["pages"]:
+            page.setdefault("_coverage_query", query)
+        source["query"] = ranked
 
 
 def capture_candidates(result: dict, arguments: dict, service, search_id: str) -> dict:
@@ -60,14 +80,18 @@ def capture_candidates(result: dict, arguments: dict, service, search_id: str) -
     query = {key: deepcopy(value) for key, value in (result.get("request") or arguments).items() if key != "page"}
     if "aliases" in query:
         query["aliases"] = list(query["aliases"] or [])
+    page = {"page": result.get("page", arguments.get("page", 1)),
+            **{key: result[key] for key in ("partial", "truncated", "complete", "has_more") if key in result}}
     source = {"query": query, "result_ids": [item["result_id"] for item in candidates], "_display_items": display,
-              "pages": [{"page": arguments.get("page", 1),
-                **{key: deepcopy(result[key]) for key in ("partial", "truncated", "complete", "has_more", "page") if key in result}}]}
+              "pages": [page]}
     if "groups" in result:
         source["matching_ids"] = [item["result_id"] for item in candidates if item["result_id"] in qualities]
-    elif recommendation := result.get("recommendation"):
-        query.update(recommendation["target"])
-        source["matching_ids"] = [item["result_id"] for item in matched_episode_items(result)]
+    else:
+        if sites := _observed_sites(result, page["page"]):
+            page["_site_pages"] = sites
+        if recommendation := result.get("recommendation"):
+            _set_candidate_target(source, recommendation["target"])
+            source["matching_ids"] = [item["result_id"] for item in matched_episode_items(result)]
     return {"search_id": search_id,
             "search_status": str(result.get("status") or ("partial" if result.get("partial") else "success")),
             "candidates": candidates,
@@ -114,7 +138,12 @@ def merge_candidates(previous: dict | None, current: dict) -> dict:
     """保留会话实际观察与各自查询；展示和冻结仍由明确的ID选择触发。"""
     merged = deepcopy(current)
     sources = candidate_sources(previous) if previous else []
+    order = max((page.get("_observation", 0) for source in sources for page in source["pages"]), default=0)
     for source in candidate_sources(current):
+        for page in source["pages"]:
+            if "_observation" not in page:
+                order += 1
+                page["_observation"] = order
         same = next((item for item in sources if item["query"] == source["query"]), None)
         if same is None:
             sources.append(source)
@@ -168,7 +197,7 @@ def reranked_candidates(snapshot: dict | None, result: dict) -> dict | None:
         return None
     assert source is not None
     ids = {item["result_id"] for item in items}
-    source["query"].update(result["recommendation"]["target"])
+    _set_candidate_target(source, result["recommendation"]["target"])
     source["result_ids"] = [item["result_id"] for item in items]
     source["matching_ids"] = [item["result_id"] for item in matched_episode_items({"items": items})]
     source["_display_items"] = [candidate_item({**known[item["result_id"]], "quality": item["quality"]}, position)
@@ -176,6 +205,46 @@ def reranked_candidates(snapshot: dict | None, result: dict) -> dict | None:
     return {**snapshot, "_sources": [source],
             **{key: [deepcopy(item) for item in snapshot[key] if item["result_id"] in ids]
                for key in ("candidates", "_private_items", "_verification_targets")}}
+
+
+def _coverage_limits(sources: list[dict], considered: set[int]) -> tuple[bool, bool]:
+    """跨站点子集只合并原查询条件一致的逐站分页事实。"""
+    site_pages: dict[tuple[str, str], dict[int, tuple[int, bool]]] = {}
+    selected_pages: dict[tuple[str, str], dict[int, dict]] = {}
+    for index, source in enumerate(sources):
+        for page in source["pages"]:
+            number = page.get("page")
+            if not isinstance(number, int) or number < 1:
+                continue
+            query = page.get("_coverage_query", source["query"])
+            conditions = json.dumps({key: value for key, value in query.items() if key != "sites"}, sort_keys=True)
+            order = page.get("_observation", 0)
+            if index in considered:
+                scope = json.dumps(query, sort_keys=True)
+                observed = selected_pages.setdefault((conditions, scope), {})
+                if order >= observed.get(number, {}).get("_observation", 0):
+                    observed[number] = page
+            for site, has_more in page.get("_site_pages", {}).items():
+                if has_more is not None:
+                    observed_site = site_pages.setdefault((conditions, site), {})
+                    if order >= observed_site.get(number, (0, False))[0]:
+                        observed_site[number] = (order, has_more)
+
+    incomplete = unread = False
+    for (conditions, _), observed in selected_pages.items():
+        incomplete |= any(page.get("partial") or page.get("truncated") or page.get("complete") is False
+                          for page in observed.values())
+        if all("_site_pages" in page for page in observed.values()):
+            sites = {site for page in observed.values() for site in page["_site_pages"]}
+            for site in sites:
+                pages = site_pages.get((conditions, site), {})
+                last = max(pages, default=0)
+                unread |= not last or len(pages) != last or pages[last][1]
+        else:
+            # 旧快照和批量缺集搜索只保留整批分页，沿用原有判断。
+            last = max(observed)
+            unread |= len(observed) != last or bool(observed[last].get("has_more"))
+    return incomplete, unread
 
 
 def select_candidates(snapshot: Mapping[str, Any] | None, result_ids: list[str], specifications: dict) -> dict:
@@ -194,8 +263,9 @@ def select_candidates(snapshot: Mapping[str, Any] | None, result_ids: list[str],
     by_id = _candidate_facts(snapshot)
     if not set(result_ids).issubset(by_id):
         raise ValueError("result_ids 必须全部来自当前会话实际读取的资源搜索结果")
-    queries, allowed, considered = [], set(), set()
-    for source in candidate_sources(snapshot):
+    queries, allowed, considered, considered_sources = [], set(), set(), set()
+    sources = candidate_sources(snapshot)
+    for index, source in enumerate(sources):
         identities = [identity for identity in result_ids if identity in source["result_ids"]]
         if not identities:
             continue
@@ -204,27 +274,25 @@ def select_candidates(snapshot: Mapping[str, Any] | None, result_ids: list[str],
         if any(inherited.get(key) and value and inherited[key] != value for key, value in specifications.items()):
             continue
         considered.update(identities)
+        considered_sources.add(index)
         quality = {**specifications, **{key: value for key, value in inherited.items() if value and not specifications.get(key)}}
         filtered, technical_filter = filter_technical_candidates([by_id[identity] for identity in identities], quality)
         if "matching_ids" in source:
             filtered = [item for item in filtered if item["result_id"] in source["matching_ids"]]
         allowed.update(item["result_id"] for item in filtered)
-        queries.append({key: deepcopy(value) for key, value in source.items() if key not in {"_display_items", "matching_ids"}})
+        queries.append({key: deepcopy(value) for key, value in source.items()
+                        if key not in {"_display_items", "matching_ids", "pages"}})
         queries[-1].update(query={**query, **quality},
-                           result_ids=[item["result_id"] for item in filtered], technical_filter=technical_filter)
+                           result_ids=[item["result_id"] for item in filtered], technical_filter=technical_filter,
+                           pages=[{key: value for key, value in page.items() if not key.startswith("_")}
+                                  for page in source["pages"]])
         if query != queries[-1]["query"]:
             queries[-1]["source_query"] = query
     if considered != set(result_ids):
         raise ValueError("展示不能替换原搜索规格；请按用户要求重新搜索")
     selected = [by_id[identity] for identity in result_ids if identity in allowed]
     pages = [page for query in queries for page in query["pages"]]
-    incomplete = unread = False
-    for query in queries:
-        observed = {page["page"]: page for page in query["pages"] if isinstance(page.get("page"), int)}
-        if observed:
-            incomplete |= any(page.get("partial") or page.get("truncated") or page.get("complete") is False for page in observed.values())
-            last = max(observed)
-            unread |= bool(observed[last].get("has_more")) or len(observed) != last
+    incomplete, unread = _coverage_limits(sources, considered_sources)
     limitations = (["部分来源返回不完整"] if incomplete else []) + (["尚有未读取页"] if unread else [])
     notice = "；".join(limitations) + "，结果仅覆盖已返回范围。" if limitations else ""
     return {"ok": True, "status": "found" if selected else "empty",

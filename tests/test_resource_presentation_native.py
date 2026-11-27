@@ -24,7 +24,8 @@ from app.agent.kernel.ports.sdk_effects import resource_download_tool
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import CancellationToken, StateUpdate
 from app.agent.kernel.tool_calls import ToolCallContext
-from app.indexers.models import AggregatedIndexerResult, IndexerItem
+from app.indexers.models import AggregatedIndexerResult, IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest
+from app.indexers.providers.base import DirectResultAdapter
 from app.indexers.providers.nyaa import NyaaAdapter
 from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
@@ -330,6 +331,87 @@ def test_rpc_same_query_pages_and_research_keep_every_real_id(native, resource_q
             rejected, _ = await display(pipeline, foreign, ids[:1])
             assert 'error' in rejected
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(('last_a', 'last_b'), [(2, 1), (3, 1), (2, 2)],
+                         ids=['subset-last-page', 'empty-tail-and-gap', 'other-site-still-open'])
+def test_rpc_site_subset_pagination_coverage(native, monkeypatch, last_a, last_b):
+    keep_end_items = (last_a, last_b) == (2, 1)
+
+    class PagedIndexer(DirectResultAdapter):
+        default_enabled = True
+        capabilities = IndexerCapabilities(pagination_supported=True, download_kinds=('magnet',))
+
+        def __init__(self, site_id, last_page, hash_prefix):
+            self.site_id = self.site_name = site_id
+            self.base_url = f'https://{site_id}.invalid'
+            self.last_page = last_page
+            self.hash_prefix = hash_prefix
+
+        async def search(self, request: IndexerSearchRequest) -> IndexerPage:
+            items = []
+            if request.page == 1 or request.page < self.last_page or keep_end_items and request.page == self.last_page:
+                items.append(IndexerItem(self.site_id, self.site_name, 'Example.2024.S01E02.1080p.SDR.WEB-DL',
+                    download_state='ready', download_kinds=('magnet',),
+                    magnet='magnet:?xt=urn:btih:' + f'{self.hash_prefix + request.page:040x}'))
+            return IndexerPage(items, page=request.page, has_more=request.page < self.last_page, pagination_supported=True)
+
+    sites = ['fixture-a', 'fixture-b']
+    a = PagedIndexer(sites[0], last_a, 100)
+    b = PagedIndexer(sites[1], last_b, 200)
+    service = IndexerService(registry=IndexerRegistry({site.site_id: site for site in (a, b)}),
+                             result_store=IndexerResultStore())
+    monkeypatch.setattr('app.indexers.runtime.get_indexer_service', lambda: service)
+
+    async def exercise():
+        pipeline = native.pipeline()
+        context = await context_for(native.store)
+        conditions = {'year': 2024, 'season': 1, 'episode': 2, 'media_type': 'tv', 'resolution': '1080p',
+                      'dynamic_range': 'SDR', 'sort_mode': 'seeders_desc'}
+        first = await read(pipeline, context, sites=sites, **conditions)
+        assert {site['site_id']: site['next_page'] for site in first['site_statuses']} == {
+            'fixture-a': 2, 'fixture-b': 2 if last_b > 1 else None}
+        identities = [item['result_id'] for item in first['items']]
+        assert len(identities) == 2
+
+        async def check_coverage(unread):
+            response, view = await display(pipeline, context, identities)
+            assert response['result']['result_ids'] == identities and view
+            notice = '尚有未读取页，结果仅覆盖已返回范围。' if unread else ''
+            assert response['result']['coverage_notice'] == notice
+            assert view.get('coverage_notice', '') == notice
+
+        await check_coverage(True)
+        if last_a == 3:
+            end = await read(pipeline, context, page=3, sites=['fixture-a'], **conditions)
+            assert not end['items'] and not end['has_more']
+            await read(pipeline, context, page=2, sites=['fixture-a'], **{**conditions, 'resolution': '2160p'})
+            # 两站都已看到末页，A 站第2页却只在另一套筛选条件下读取。
+            await check_coverage(True)
+        second = await read(pipeline, context, page=2, sites=['fixture-a'], **conditions)
+        assert second['has_more'] is (last_a == 3)
+        if last_b > 1:
+            await check_coverage(True)
+            end = await read(pipeline, context, page=2, sites=['fixture-b'], **conditions)
+            assert not end['items'] and not end['has_more']
+        await check_coverage(False)
+        if keep_end_items:
+            assert second['items']
+            identities.extend(item['result_id'] for item in second['items'])
+            await check_coverage(False)
+            # 重读同一站、同一页时，以最后观察到的页状态为准。
+            a.last_page = 3
+            refreshed = await read(pipeline, context, page=2, sites=sites, **conditions)
+            assert refreshed['has_more']
+            await check_coverage(True)
+
+    async def run():
+        try:
+            await exercise()
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize('count', [20, 50])

@@ -22,6 +22,7 @@ from app.clients.base import (
     MediaItem,
     MediaSearchResult,
     MediaServerClient,
+    SeriesCandidate,
     SeriesSearchResult,
     close_media_server_client,
 )
@@ -806,21 +807,28 @@ def _media_identity_inventory_source_payload(
             "inventories": inventories, "error": error}
 
 
-def _complete_series_matches(search, query: str) -> list:
+SERIES_ABSENT_SOURCE_STATUSES = frozenset({"not_found", "excluded"})
+
+
+def _series_search_truncated(search: SeriesSearchResult) -> bool:
+    return search.truncated or search.total > len(search.candidates)
+
+
+def _complete_series_matches(search: SeriesSearchResult, query: str) -> list[SeriesCandidate]:
     """只在候选集合完整且身份唯一时选择；绝不从截断结果中猜测。"""
-    candidates = list(search.candidates or [])
-    if not candidates or search.truncated or int(search.total or 0) > len(candidates):
+    candidates = search.candidates
+    if not candidates or _series_search_truncated(search):
         return []
     target = _normalize_series_identity_title(query)
     exact = [
         item for item in candidates
         if target and _normalize_series_identity_title(item.name) == target
     ]
-    selected = exact or (candidates if int(search.total or 0) == 1 else [])
+    selected = exact or (candidates if search.total == 1 else [])
     if len(selected) <= 1:
         return selected
-    mapped_ids = {str(item.tmdb_id or "") for item in selected}
-    years = {str(item.year or "") for item in selected}
+    mapped_ids = {item.tmdb_id for item in selected}
+    years = {item.year for item in selected}
     # 同一服务器中同 TMDB ID、同年份的多媒体库副本可以安全合并。
     if len(mapped_ids) == 1 and "" not in mapped_ids and len(years) == 1:
         return selected
@@ -1003,7 +1011,7 @@ def _series_source_payload(
                     max_episodes=max_episodes,
                     include_specials=include_specials,
                     library_name=resolved_library_name,
-                    search_truncated=provider_search.truncated,
+                    search_truncated=_series_search_truncated(provider_search),
                 )
 
         # 有稳定身份时先精确查找；未命中且提供了标题，才进行既有标题回退。
@@ -1012,24 +1020,38 @@ def _series_source_payload(
         ) if query else SeriesSearchResult()
         candidates = _public_series_candidates(title_search, provider_search)
         # 标题回退不能抹去精确身份枚举尚未完成的事实（别名、多副本均可能漏读）。
-        search_truncated = title_search.truncated or bool(provider_search and provider_search.truncated)
+        search_truncated = _series_search_truncated(title_search) or (
+            provider_search is not None and _series_search_truncated(provider_search)
+        )
         selected_items = _complete_series_matches(title_search, query)
-        if not selected_items:
+        mapped_ids = {item.tmdb_id for item in selected_items if item.tmdb_id}
+        title_ids = {
+            MediaServerClient._provider_tmdb_id({"Tmdb": item.tmdb_id})
+            for item in title_search.candidates
+        }
+        requested_id = MediaServerClient._provider_tmdb_id({"Tmdb": explicit_tmdb_id})
+        only_other_versions = (
+            bool(requested_id) and provider_search is not None and not provider_search.candidates
+            and bool(title_ids) and "" not in title_ids and requested_id not in title_ids
+        )
+        empty_status = ""
+        if only_other_versions:
+            # 精确查询和标题查询完整时，所有同名候选都有明确的其他身份。
+            empty_status = "not_found" if search_truncated else "excluded"
+        elif not selected_items:
+            empty_status = "not_found" if not title_search.total or not title_search.candidates else "ambiguous"
+        elif explicit_tmdb_id and mapped_ids and mapped_ids != {explicit_tmdb_id}:
+            if search_truncated:
+                empty_status = "not_found"
+            elif "" in title_ids:
+                empty_status = "ambiguous"
+            else:
+                empty_status = "conflict"
+        if empty_status:
             return _empty_series_source_result(
                 server_type=server_type,
                 server_name=server_name,
-                status="not_found" if not title_search.total or not title_search.candidates else "ambiguous",
-                candidates=candidates,
-                truncated=search_truncated,
-                library_name=resolved_library_name,
-            )
-
-        mapped_ids = {str(item.tmdb_id or "") for item in selected_items} - {""}
-        if explicit_tmdb_id and mapped_ids and mapped_ids != {explicit_tmdb_id}:
-            return _empty_series_source_result(
-                server_type=server_type,
-                server_name=server_name,
-                status="conflict",
+                status=empty_status,
                 candidates=candidates,
                 truncated=search_truncated,
                 library_name=resolved_library_name,
@@ -1458,7 +1480,7 @@ def count_series_episodes(
             summary = f"有多个媒体库与「{library_name}」相似，暂时无法确定范围"
             status = "library_ambiguous"
             suggestions = ["请使用媒体服务器中显示的完整媒体库名称重试。"]
-        elif statuses == {"not_found"}:
+        elif statuses <= SERIES_ABSENT_SOURCE_STATUSES:
             scope_label = (
                 f"「{library_name}」媒体库" if library_name else "已配置的媒体库"
             )
@@ -1509,7 +1531,7 @@ def count_series_episodes(
     count = len(episode_union)
     incomplete = any(
         source["truncated"] or source["ignored_unknown"]
-        or source["status"] not in found_statuses | {"not_found"}
+        or source["status"] not in found_statuses | SERIES_ABSENT_SOURCE_STATUSES
         for source in safe_sources
     )
     status = "partial" if incomplete else "success"

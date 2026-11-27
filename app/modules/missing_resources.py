@@ -16,6 +16,7 @@ from typing import Any
 from app import database as db
 from app.database import media_owner_digest
 from app.indexers.models import IndexerMediaSearchRequest
+from app.indexers.ranking import filter_technical_candidates, release_title_years, technical_filter_arguments
 from app.indexers.runtime import get_indexer_service, run_indexer_awaitable_sync
 from app.indexers.service import search_payload
 from app.modules.episode_audit import (
@@ -151,6 +152,7 @@ def _season(
     per_episode,
     preferences,
     overrides,
+    quality,
     budget,
     cancelled,
     progress,
@@ -237,10 +239,13 @@ def _season(
         : maximum if maximum is not None else max(20, len(requested or []))
     ]
     detail = (audit.mapping_context or {}).get("detail") or {}
+    first_air_year = data.get("first_air_year")
+    release_years = {first_air_year, *data.get("aired_years", [])} if first_air_year else set()
     request = IndexerMediaSearchRequest.create(
         title=proof["title"],
         original_title=" ".join(str(detail.get("original_name") or "").split())[:120],
         aliases=[item["query"]],
+        year=first_air_year,
         media_type="tv",
         season=item["season"],
         page=page,
@@ -258,7 +263,7 @@ def _season(
         group["verification"]["resource_search_attempted"] = True
         current = replace(request, episode=episode)
         raw = {
-            "request": asdict(current),
+            "request": {**asdict(current), **quality},
             "items": [],
             "ok": False,
             "status": "unavailable",
@@ -283,6 +288,15 @@ def _season(
             raw.update(
                 search_payload(service, result), ok=bool(result.sites_succeeded)
             )
+            if quality:
+                raw["items"], raw["technical_filter"] = filter_technical_candidates(raw["items"], quality)
+            if release_years:
+                candidates = raw["items"]
+                raw["items"] = [candidate for candidate in candidates
+                                if not (years := release_title_years(candidate["title"], media=request))
+                                or years & release_years]
+                raw["year_filter"] = {"verified_years": sorted(release_years),
+                                      "excluded": len(candidates) - len(raw["items"])}
             raw["status"] = (
                 "partial"
                 if raw["partial"]
@@ -494,10 +508,16 @@ def search_missing(
     max_episodes: int | None = None,
     limit_per_episode: int = 8,
     preference_overrides: dict | None = None,
+    resolution: str = "",
+    dynamic_range: str = "",
+    exclude_hdr: bool = False,
     cancelled: Callable[[], bool] = lambda: False,
     checkpoint: Callable[[dict], None] | None = None,
 ) -> dict:
     targets = _targets(items)
+    quality = {key: value for key, value in technical_filter_arguments({
+        "resolution": resolution, "dynamic_range": dynamic_range, "exclude_hdr": exclude_hdr,
+    }).items() if value}
     when = (
         datetime.now().astimezone().date()
         if as_of is None
@@ -559,6 +579,7 @@ def search_missing(
                 per_episode=limit_per_episode,
                 preferences=preferences,
                 overrides=overrides,
+                quality=quality,
                 budget=budget,
                 cancelled=cancelled,
                 progress=lambda group: publish(index, group),

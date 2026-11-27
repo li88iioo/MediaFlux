@@ -262,6 +262,9 @@ def test_invalid_targets_never_start_audit_or_indexer(backend, items):
         pytest.param({"as_of": "2024-03-01"}, id="tomorrow"),
         {"preference_overrides": {"preferred_server": "emby"}},
         {"preference_overrides": {"max_episode_size_gb": -1}},
+        {"resolution": "4K"},
+        {"dynamic_range": "未知"},
+        {"exclude_hdr": "false"},
         {"sites": "nyaa"},
         {"sites": [1]},
     ],
@@ -631,6 +634,89 @@ def test_wrong_work_season_and_unknown_coverage_are_never_promoted(backend, titl
     )
 
 
+@pytest.mark.parametrize(("hard", "kept", "unknown"), [
+    ({"dynamic_range": "SDR"}, {"sdr"}, 1),
+    ({"exclude_hdr": True}, {"sdr", "unmarked"}, 0),
+])
+def test_hard_quality_rejects_season_pack_before_exact_fallback(backend, hard, kept, unknown):
+    backend.audit.return_value = audit_for(episodes=[2, 3])
+
+    async def search(request, *_args, **_kwargs):
+        episode = request.episode
+        versions = [("pack", "S01E02-E03.2160p.HDR10")] if episode is None else [
+            ("hdr", f"S01E{episode:02d}.1080p.HDR10.HEVC"),
+            ("unmarked", f"S01E{episode:02d}.1080p.AVC"),
+            ("sdr", f"S01E{episode:02d}.1080p.SDR.HEVC"),
+            ("low", f"S01E{episode:02d}.720p.SDR"),
+        ]
+        return _search_result(items=[
+            {"result_id": f"fixture-release-{episode}-{version}", "title": f"Show.{title}",
+             "download_state": "ready", "download_kinds": ["magnet"]}
+            for version, title in versions
+        ])
+
+    backend.service.search_media.side_effect = search
+    result = sdk.resources.search_missing([{"query": "Show", "season": 1}], resolution="1080p", **hard,
+                                          preference_overrides={"preferred_resolution": "2160p"})
+    searches = result["groups"][0]["searches"]
+    assert [search["request"]["episode"] for search in searches] == [None, 2, 3]
+    assert searches[0]["result_ids"] == []
+    assert {item["result_id"].rsplit("-", 1)[-1] for item in result["items"]} == kept
+    assert {goal["episode"] for goal in result["verification_targets"]} == {2, 3}
+    for search in searches[1:]:
+        assert search["technical_filter"]["requested"] == {"resolution": "1080p", **hard}
+        assert search["technical_filter"]["unknown_excluded"] == unknown
+        assert search["technical_filter"]["mismatched_excluded"] == 2
+
+
+def test_homonymous_missing_search_uses_tmdb_years_and_preserves_verified_later_season_year(backend):
+    def audit(arguments, **_):
+        if not arguments.get("tmdb_id"):
+            return _audit_result(status="ambiguous", ok=False)
+        identity = arguments["tmdb_id"]
+        evidence = audit_for(season=2, episodes=[2], identity=identity)
+        year, aired = (2020, 2022) if identity == "110" else (2024, 2024)
+        evidence.data.update(first_air_year=year, aired_years=[aired], target_episode=2)
+        return evidence
+
+    backend.audit.side_effect = audit
+    backend.service.search_media.side_effect = lambda request, *_a, **_kw: _search_result(items=[
+        {"result_id": f"release-version-{year}", "title": f"Show.{year}.S02E02.1080p.SDR",
+         "download_state": "ready", "download_kinds": ["magnet"]}
+        for year in (2022, 2024)
+    ])
+    ambiguous = sdk.resources.search_missing([{"query": "Show", "season": 2, "episodes": [2]}])
+    assert ambiguous["groups"][0]["status"] == "ambiguous"
+    assert ambiguous["result_ids"] == []
+    backend.service.search_media.assert_not_awaited()
+
+    result = sdk.resources.search_missing([
+        {"query": "Show", "tmdb_id": identity, "season": 2, "episodes": [2]}
+        for identity in ("110", "220")
+    ])
+    assert {call.args[0].year for call in backend.service.search_media.await_args_list} == {2020, 2024}
+    assert [group["searches"][0]["year_filter"]["excluded"] for group in result["groups"]] == [1, 1]
+    assert {(goal["tmdb_id"], goal["result_id"]) for goal in result["verification_targets"]} == {
+        ("110", "release-version-2022"), ("220", "release-version-2024"),
+    }
+
+
+def test_numbers_in_known_series_title_are_not_a_conflicting_release_year(backend):
+    evidence = audit_for("1923", episodes=[2])
+    evidence.data.update(first_air_year=2022, aired_years=[2022], target_episode=2)
+    backend.audit.return_value = evidence
+    backend.service.search_media.side_effect = lambda *_args, **_kwargs: _search_result(items=[
+        {"result_id": identity, "title": title, "download_state": "ready", "download_kinds": ["magnet"]}
+        for identity, title in (
+            ("fixture-title-number", "1923.S01E02.1080p"),
+            ("fixture-other-version", "1923.2021.S01E02.2160p"),
+        )
+    ])
+    result = sdk.resources.search_missing([{"query": "1923", "season": 1, "episodes": [2]}])
+    assert result["result_ids"] == ["fixture-title-number"]
+    assert result["groups"][0]["searches"][0]["year_filter"] == {"verified_years": [2022], "excluded": 1}
+
+
 def test_batch_deduplicates_input_and_preserves_every_target_of_shared_pack(backend):
     backend.audit.side_effect = lambda args, **kwargs: audit_for(
         args["query"],
@@ -775,6 +861,8 @@ class MissingResourceInventoryFreshnessTests(unittest.TestCase):
                 self.assertEqual(
                     group["verification"]["verified_missing"], not bool(after)
                 )
+                self.assertEqual(group["audit"]["data"]["first_air_year"], 2020)
+                self.assertEqual(group["audit"]["data"]["aired_years"], [2020])
                 if not after:
                     self.assertEqual(
                         (group["missing_total"], group["processed"]),

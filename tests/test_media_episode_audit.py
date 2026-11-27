@@ -135,7 +135,7 @@ class SeriesSourcePayloadTests(unittest.TestCase):
     def test_incomplete_identity_lookup_cannot_be_erased_by_title_fallback(self):
         from app.modules.media_subscriptions import MediaSubscriptionService
 
-        for title_id, expected in ((None, "not_found"), ("", "unmapped"), ("12345", "ready"), ("2", "conflict")):
+        for title_id, expected in ((None, "not_found"), ("", "unmapped"), ("12345", "ready"), ("2", "not_found")):
             with self.subTest(title_id=title_id):
                 candidates = [] if title_id is None else [
                     SeriesCandidate("series-1", "The Show", "2026", title_id)
@@ -296,6 +296,72 @@ class EpisodeAuditTests(unittest.TestCase):
             "app.modules.episode_audit.TMDBClient", return_value=_FakeTMDB()
         ):
             return audit_series_episodes(dict(self.arguments))
+
+    def _audit_cross_server_titles(self, emby: _FakeMediaClient, *, tmdb_id: str = "12345"):
+        target = SeriesCandidate("target-item", "The Show", "2026", "12345")
+        exact = SeriesSearchResult(candidates=[target], total=1)
+        jellyfin = _FakeMediaClient(
+            exact, provider_search=exact,
+            inventories={"target-item": SeriesEpisodeInventory(episodes=[(1, 1)], total=1)},
+        )
+        sources = [("jellyfin", "Jellyfin", "", jellyfin), ("emby", "Emby", "", emby)]
+        with (
+            patch("app.services._configured_media_sources", return_value=sources),
+            patch("app.modules.episode_audit.TMDBClient", return_value=_FakeTMDB()),
+        ):
+            return audit_series_episodes({**self.arguments, "tmdb_id": tmdb_id, "season": 1}, refresh=True)
+
+    def test_complete_other_tmdb_versions_do_not_block_the_exact_series_audit(self):
+        first = SeriesCandidate("other-item", "The Show", "2018", "54321")
+        second = SeriesCandidate("third-item", "The Show", "2022", "23456")
+        for alternatives in ([first], [first, second]):
+            with self.subTest(alternatives=len(alternatives)):
+                emby = _FakeMediaClient(SeriesSearchResult(candidates=alternatives, total=len(alternatives)))
+                result = self._audit_cross_server_titles(emby)
+
+                self.assertEqual(result.status, "updates_available")
+                self.assertEqual(result.data["local_episode_count"], 1)
+                self.assertTrue(result.data["local_inventory_complete"])
+                self.assertEqual(result.data["sources"][1]["status"], "excluded")
+                self.assertEqual(result.data["sources"][1]["local_episode_count"], 0)
+                self.assertEqual(result.data["missing_sample"], [{"season": 1, "episode": 2}])
+                self.assertIsNotNone(missing_episode_verification(result, season=1, episode=2))
+
+    def test_other_version_does_not_prove_absence_when_either_lookup_is_incomplete(self):
+        other = SeriesCandidate("other-item", "The Show", "2018", "54321")
+        title_search = SeriesSearchResult(candidates=[other], total=1)
+        for incomplete in ("provider_truncated", "provider_total", "title_total"):
+            with self.subTest(incomplete=incomplete):
+                provider = SeriesSearchResult(truncated=incomplete == "provider_truncated",
+                                              total=int(incomplete == "provider_total"))
+                titles = SeriesSearchResult(candidates=[other], total=2) if incomplete == "title_total" else title_search
+                result = self._audit_cross_server_titles(_FakeMediaClient(titles, provider_search=provider))
+
+                self.assertEqual(result.status, "inconclusive")
+                self.assertEqual(result.data["local_episode_count"], 1)
+                self.assertFalse(result.data["local_inventory_complete"])
+                self.assertTrue(result.data["sources"][1]["truncated"])
+                self.assertNotEqual(result.data["sources"][1]["status"], "excluded")
+                self.assertIsNone(missing_episode_verification(result, season=1, episode=2))
+
+    def test_other_version_does_not_discard_unmapped_or_conflicting_evidence(self):
+        other = SeriesCandidate("other-item", "The Show", "2018", "54321")
+        unknown = SeriesCandidate("unmapped-item", "The Show")
+        result = self._audit_cross_server_titles(
+            _FakeMediaClient(SeriesSearchResult(candidates=[other, unknown], total=2))
+        )
+        self.assertEqual(result.status, "ambiguous")
+        self.assertFalse(result.data["local_inventory_complete"])
+        self.assertIsNone(missing_episode_verification(result, season=1, episode=2))
+
+        result = self._audit_cross_server_titles(
+            _FakeMediaClient(SeriesSearchResult(candidates=[other], total=1),
+                             inventories={"other-item": SeriesEpisodeInventory(episodes=[(1, 2)], total=1)}),
+            tmdb_id="",
+        )
+        self.assertEqual(result.status, "conflict")
+        self.assertIsNone(result.data["local_episode_count"])
+        self.assertIsNone(missing_episode_verification(result, season=1, episode=2))
 
     def test_shared_audit_facts_and_cache_are_independent_of_native_response(self):
         from datetime import datetime

@@ -18,6 +18,7 @@ from app.discovery.models import ProviderError, ProviderNotConfigured
 from app.logger import get_logger
 from app.modules.media_identity import normalize_audit_date, normalize_episode_verification
 from app.services import (
+    SERIES_ABSENT_SOURCE_STATUSES,
     inspect_library_series_sources, inspect_series_episode_sources, media_server_config_key, search_media_servers,
 )
 from app.discovery.models import normalize_search_query
@@ -169,7 +170,8 @@ def _base_data(arguments: dict[str, Any], sources: list[dict] | None = None) -> 
         "local_episode_count": len(local) if verified else None,
         "latest_local": dict(zip(("season", "episode"), max(local))) if local else None,
         "local_inventory_complete": verified and all(
-            source.get("status") in {"ready", "not_found"} and not source.get("truncated") and not source.get("ignored_unknown")
+            (source.get("status") == "ready" or source.get("status") in SERIES_ABSENT_SOURCE_STATUSES)
+            and not source.get("truncated") and not source.get("ignored_unknown")
             for source in (sources or [])
         ),
         "expected_aired": None, "latest_aired": None, "missing_count": None,
@@ -418,6 +420,8 @@ def _audit_uncached(arguments: dict[str, Any]) -> EpisodeAuditResult:
         data = _base_data(arguments, sources)
         data["tmdb_id"] = tmdb_id
         data["mapping_status"] = mapping_status
+        first_air = _parse_air_date(details.get("first_air_date"))
+        data["first_air_year"] = first_air.year if first_air and 1800 <= first_air.year <= 2200 else None
         raw_seasons = details.get("seasons", [])
         if not isinstance(raw_seasons, list):
             raise TypeError("invalid seasons")
@@ -445,6 +449,7 @@ def _audit_uncached(arguments: dict[str, Any]) -> EpisodeAuditResult:
 
         as_of = date.fromisoformat(arguments["as_of"])
         expected: set[tuple[int, int]] = set()
+        aired_years: set[int] = set()
         episode_airing: dict[tuple[int, int], bool | None] = {}
         future_count = 0
         unknown_air_date = 0
@@ -501,6 +506,7 @@ def _audit_uncached(arguments: dict[str, Any]) -> EpisodeAuditResult:
                     unknown_air_date += 1
                 elif aired <= as_of:
                     expected.add((season_number, episode_number))
+                    aired_years.add(aired.year)
                 else:
                     future_count += 1
             if remote_truncated:
@@ -536,6 +542,7 @@ def _audit_uncached(arguments: dict[str, Any]) -> EpisodeAuditResult:
         "latest_aired": dict(zip(("season", "episode"), latest_aired)) if latest_aired else None,
         "title": str(details.get("name") or (ready[0].get("selected") or {}).get("name") or arguments["query"]),
         "expected_aired": len(expected),
+        "aired_years": sorted(aired_years),
         "missing_count": len(missing),
         "missing_sample": sample,
         "missing_sample_truncated": False,
