@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
+from app import sdk
 from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaSearchHit
 from app.modules.organize import OrganizeRules
 from app.routes import guangya_api
@@ -189,6 +190,35 @@ def test_search_api_returns_empty_page_with_no_continuation(search_api):
     }
     provider.search_files.assert_called_once_with("没有命中", page=0, page_size=20)
     provider.close.assert_called_once()
+
+
+def test_agent_finds_same_name_files_then_resolves_only_the_selected_path(search_api, monkeypatch):
+    _, provider, factory = search_api
+    monkeypatch.setattr("app.clients.guangya.GuangYaClient", factory)
+    first = GuangYaFile("copy-a", "样片.mkv", False, parent_id="staging")
+    second = GuangYaFile("copy-b", "样片.mkv", False, parent_id="season")
+    provider.search_files.side_effect = [
+        ([GuangYaSearchHit(first, "离线")], True), ([GuangYaSearchHit(second, "第一季")], False),
+    ]
+    provider.file_info.side_effect = {
+        "copy-b": second, "season": GuangYaFile("season", "第一季", True, parent_id="show"),
+        "show": GuangYaFile("show", "剧集", True, parent_id="0"),
+    }.get
+    page = sdk.cloud.search_files("样片", page_size=1)
+    other = sdk.cloud.search_files("样片", page=page["next_page"], page_size=1)
+    assert [p["items"][0]["parent_name"] for p in (page, other)] == ["离线", "第一季"]
+    assert other["next_page"] is None
+    provider.file_info.assert_not_called()
+    selected = sdk.cloud.info(other["items"][0]["file_id"], include_path=True)["item"]
+    assert selected["path"] == "/剧集/第一季/样片.mkv"
+    assert provider.file_info.call_args_list == [call("copy-b"), call("season"), call("show")]
+    with pytest.raises(RuntimeError, match="文件或目录不存在"):
+        sdk.cloud.info("already-removed", include_path=True)
+    assert provider.search_files.call_args_list == [
+        call("样片", page=i, page_size=1) for i in (0, 1)
+    ]
+    provider.iter_dir.assert_not_called()
+    provider.list_dir.assert_not_called()
 
 
 @pytest.mark.parametrize(("params", "status"), [

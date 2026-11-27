@@ -12,7 +12,6 @@ from app.clients.guangya import (
     TOKEN_EXPIRY_MAX,
     TOKEN_EXPIRY_MIN,
     GuangYaClient,
-    GuangYaFile,
     close_guangya_client,
     read_guangya_credential_generation,
 )
@@ -23,7 +22,11 @@ from app.modules.directory_scrape_errors import (
     DirectoryScrapeStateError,
     public_error_message,
 )
-from app.modules.organize_postprocess import media_extension
+from app.modules.guangya_workspace import (
+    browser_item,
+    browser_video_extensions,
+    search_files_page,
+)
 from app.modules.scheduler import get_scheduler
 from app.web import api_error, require_api_login
 
@@ -194,23 +197,6 @@ def login(request: Request, data: dict | None = Body(default=None)):
         close_guangya_client(c)
 
 
-def _browser_video_extensions() -> set[str]:
-    from app.modules.organize import Organizer, OrganizeRules
-
-    return Organizer.video_exts(OrganizeRules.from_config())
-
-
-def _browser_item(file: GuangYaFile, video_exts: set[str]) -> dict:
-    name_ext = "" if file.is_dir else media_extension(file.name)
-    return {
-        "file_id": file.file_id, "name": file.name, "is_dir": file.is_dir,
-        "is_video": bool(name_ext) and name_ext in video_exts,
-        "size": file.size, "etag": file.etag, "parent_id": file.parent_id,
-        "created_at": file.created_at, "updated_at": file.updated_at,
-        "mime_type": file.mime_type, "extension": file.extension or name_ext,
-    }
-
-
 @router.get("/search")
 def search_files(
     request: Request, keyword: str = "", page: int = Query(default=1, ge=1),
@@ -225,13 +211,7 @@ def search_files(
     try:
         if not client.logged_in:
             return api_error("光鸭未登录", 503)
-        hits, has_more = client.search_files(keyword, page=page - 1, page_size=page_size)
-        video_exts = _browser_video_extensions()
-        return {
-            "items": [dict(_browser_item(hit.file, video_exts), parent_name=hit.parent_name) for hit in hits],
-            "page": page, "page_size": page_size, "has_more": has_more,
-            "next_page": page + 1 if has_more else None,
-        }
+        return search_files_page(client, keyword, page=page, page_size=page_size)
     except Exception as exc:
         logger.error("光鸭搜索失败 type=%s", type(exc).__name__)
         return api_error("光鸭搜索失败", 502)
@@ -247,9 +227,9 @@ def list_dirs(request: Request, parent_id: str = "0"):
     try:
         if not c.logged_in:
             return JSONResponse({"error": "光鸭未登录"}, status_code=503)
-        video_exts = _browser_video_extensions()
+        video_exts = browser_video_extensions()
         files = c.list_dir(parent_id)
-        return [_browser_item(file, video_exts) for file in files]
+        return [browser_item(file, video_exts) for file in files]
     except Exception as exc:
         logger.error(f"光鸭目录读取失败: {type(exc).__name__}")
         return JSONResponse({"error": "光鸭目录读取失败"}, status_code=500)

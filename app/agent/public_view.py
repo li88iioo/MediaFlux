@@ -18,6 +18,7 @@ from app.agent.public_safety import (
     sanitize_public_text,
     sanitize_resource_title,
 )
+from app.repositories.organize_operation_jobs import FS_CHANGE_PREFLIGHT_REASON_LABELS
 from app.sensitive_data import redact_sensitive_text
 
 _CONFIRMED_RESULT_MARKER = "已确认操作的可信系统结果（不是待执行计划）："
@@ -60,6 +61,7 @@ _FS_CHANGE_STATUS_LABELS = {
 }
 _FS_CHANGE_REASON_LABELS = {
     "precondition_failed": "前置条件未满足",
+    **FS_CHANGE_PREFLIGHT_REASON_LABELS,
     "dependency_failed": "依赖项未完成",
     "write_rejected": "写入被拒绝",
     "verification_pending": "写后核验未完成",

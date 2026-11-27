@@ -105,6 +105,10 @@ class GuangYaFSCopyPending(GuangYaFSChangeError):
 class GuangYaFSChangeStale(GuangYaFSChangeError):
     """冻结计划已过期或云端对象已变化。"""
 
+    def __init__(self, message: str, *, reason: str = "precondition_failed") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -1753,10 +1757,10 @@ def _preflight_operation(
                 cache=path_cache, directory_cache=directory_cache)
                 or not _frozen_path_matches(client, {"file_id": parent_id, "is_dir": True},
                                             item["parent_path"], path_cache, cancel_check)):
-            raise GuangYaFSChangeStale("新建目录的父目录已变化，请重新预览")
+            raise GuangYaFSChangeStale("新建目录的父目录已变化，请重新预览", reason="target_changed")
         siblings = _list_map(client, parent_id, directory_cache)
         if _name_conflict(siblings, str(item.get("name") or "")):
-            raise GuangYaFSChangeStale("新建目录名称已被占用，请重新预览")
+            raise GuangYaFSChangeStale("新建目录名称已被占用，请重新预览", reason="name_conflict")
         return
     source = source_snapshot if source_snapshot is not None else item.get("source")
     if source_snapshot is not None and not _stage_identity_matches(item, source_snapshot, created_targets):
@@ -1773,15 +1777,15 @@ def _preflight_operation(
             _find_current(client, source, cache=path_cache, directory_cache=directory_cache), source,
             exact_updated_at=source_snapshot is not None)
     if not source_matches:
-        raise GuangYaFSChangeStale("光鸭对象已变化，请重新预览")
+        raise GuangYaFSChangeStale("光鸭对象已变化，请重新预览", reason="source_changed")
     assert isinstance(source, dict)
     if "expected_tree" in item and not _guard_tree_matches(client, source, item["expected_tree"], cancel_check):
-        raise GuangYaFSChangeStale("残留目录内容已变化，保留原目录并停止后续写入")
+        raise GuangYaFSChangeStale("残留目录内容已变化，保留原目录并停止后续写入", reason="source_changed")
     parent_path = item["source_parent_path"]
     if source_snapshot is not None and source["parent_id"] != item["source"]["parent_id"]:
         parent_path = item["target_path"]  # 已核验的移动/复制半步沿原目标路径继续。
     if not _frozen_path_matches(client, source, _full_path(parent_path, source["name"]), path_cache, cancel_check):
-        raise GuangYaFSChangeStale("光鸭对象父路径已变化，请重新预览")
+        raise GuangYaFSChangeStale("光鸭对象父路径已变化，请重新预览", reason="source_changed")
     if op == "copy" and source_snapshot is not None:
         if _verified_copy(client, item, created_targets, "", cancel_check,
                           name=source_snapshot["name"], copied_id=source_snapshot["file_id"],
@@ -1791,10 +1795,10 @@ def _preflight_operation(
         if not isinstance(item.get("copy_snapshot"), dict):
             raise GuangYaFSChangeStale("复制计划缺少完整目录快照，请重新预览")
         if _copy_tree_snapshot(client, source["file_id"], cancel_check) != item["copy_snapshot"]:
-            raise GuangYaFSChangeStale("复制源目录内容已变化，请重新预览")
+            raise GuangYaFSChangeStale("复制源目录内容已变化，请重新预览", reason="source_changed")
     if item.get("require_empty") and (completed_objects is not None or not dependencies):
         if _list_map(client, str(source["file_id"]), directory_cache):
-            raise GuangYaFSChangeStale("目录仍包含内容，未执行空目录清理")
+            raise GuangYaFSChangeStale("目录仍包含内容，未执行空目录清理", reason="directory_not_empty")
     if op in {"rename", "relocate"} and not item.get("move_first"):
         siblings = _list_map(client, str(source.get("parent_id") or "0"), directory_cache)
         if _name_conflict(
@@ -1802,7 +1806,7 @@ def _preflight_operation(
             str(item.get("new_name") or ""),
             exclude_id=str(source.get("file_id") or ""),
         ):
-            raise GuangYaFSChangeStale("改名目标已被占用，请重新预览")
+            raise GuangYaFSChangeStale("改名目标已被占用，请重新预览", reason="name_conflict")
     if op in {"move", "relocate", "copy"}:
         target_id = _directory_id(
             item,
@@ -1816,7 +1820,7 @@ def _preflight_operation(
                 cache=path_cache, directory_cache=directory_cache)
                 or not _frozen_path_matches(client, {"file_id": target_id, "is_dir": True},
                                             item["target_path"], path_cache, cancel_check)):
-            raise GuangYaFSChangeStale("目标目录已变化，请重新预览")
+            raise GuangYaFSChangeStale("目标目录已变化，请重新预览", reason="target_changed")
         siblings = _list_map(client, target_id, directory_cache)
         target_name = str(item.get("new_name") or source.get("name") or "")
         exclude_id = str(source.get("file_id") or "") if op != "copy" or source_snapshot else ""
@@ -1824,7 +1828,7 @@ def _preflight_operation(
             (item.get("move_first") or op == "copy" and source_snapshot is None)
             and _name_conflict(siblings, str(source.get("name") or ""), exclude_id=exclude_id)
         ):
-            raise GuangYaFSChangeStale("目标目录中已有同名对象，请重新预览")
+            raise GuangYaFSChangeStale("目标目录中已有同名对象，请重新预览", reason="name_conflict")
 
 
 def _written_source(client, item, created_targets, directory_cache=None):
@@ -2231,18 +2235,20 @@ def _apply_fs_operation(
     return created_id
 
 
-def _preflight_fs_change_plan(client, operations, outcomes, cancel_check):
+def _preflight_fs_change_plan(client, operations, result, cancel_check):
     """首次执行需整单通过写前核对；中断恢复则按已记录的阶段逐项核对。"""
     path_cache = {}
     directory_cache = {}
-    for item, outcome in zip(operations, outcomes):
+    for item, outcome in zip(operations, result["operation_items"]):
         if cancel_check is not None:
             cancel_check()
         try:
             _preflight_operation(client, item, allow_pending_target=True, cancel_check=cancel_check,
                                  path_cache=path_cache, directory_cache=directory_cache)
-        except GuangYaFSChangeStale:
-            outcome.update(status="blocked", reason="precondition_failed")
+        except GuangYaFSChangeStale as exc:
+            outcome.update(status="blocked", reason=exc.reason)
+            result["stats"]["precondition_failed"] += 1
+            result["stats"]["failed"] += 1
             raise
 
 
@@ -2615,7 +2621,7 @@ def execute_fs_change_plan(
             raise GuangYaFSChangeError("光鸭变更计划没有可执行对象")
         _validate_plan_names(operations)
         if not recovering:
-            _preflight_fs_change_plan(client, operations, outcomes, cancel_check)
+            _preflight_fs_change_plan(client, operations, result, cancel_check)
             execution["strm_scope"] = cloud_change_sources(client) if plan.get("trigger_strm") else None
             _append_journal(plan_id, {"action": "preflight", "status": "completed", "total": len(operations)})
         _reset_fs_checkpoint_cursor(plan_id, execution)

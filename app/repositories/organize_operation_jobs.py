@@ -62,10 +62,16 @@ _ALLOWED_OPERATION_ITEM_OPS = {
 _ALLOWED_OPERATION_ITEM_STATUSES = {
     "completed", "partial", "failed", "blocked", "not_started", "unknown",
 }
+FS_CHANGE_PREFLIGHT_REASON_LABELS = {
+    "target_changed": "目标目录已变化",
+    "source_changed": "源对象或所在路径已变化",
+    "name_conflict": "目标名称已被占用",
+    "directory_not_empty": "待清理目录仍包含内容",
+}
 _ALLOWED_OPERATION_ITEM_REASONS = {
     "precondition_failed", "dependency_failed", "write_rejected",
     "verification_pending", "write_outcome_unknown", "execution_error",
-    "audit_unavailable", "cancelled",
+    "audit_unavailable", "cancelled", *FS_CHANGE_PREFLIGHT_REASON_LABELS,
 }
 logger = logging.getLogger(__name__)
 

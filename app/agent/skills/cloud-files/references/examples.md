@@ -15,6 +15,8 @@ print(mf.cloud.account())
 
 ## 02 定位目录、找文件、保存事实
 
+在整个云盘按名称找文件，用 `mf.cloud.search_files(keyword)` 查询索引，一次取一页。需要更多结果时传返回的 `next_page`。同名文件按 `file_id` 区分，`parent_name` 只表示直接父目录；要核实某条的完整位置，用 `mf.cloud.info(file_id, include_path=True)["item"]["path"]`。用户限定目录时从该目录读取。
+
 “看看根目录下有什么”，读取一次，保留完整结果只展示必要字段：
 
 ```python
@@ -44,16 +46,21 @@ print(mf.cloud.info(file_id))
 
 ## 03 批量改名、移动、复制、建目录与回收
 
-从第 02 节得到实际对象，将用户要求转换为一份 `operations`。`target_path` 是目标**目录**绝对路径，文件新名另放 `new_name`。缺失的各层目录用 `create_directory` 列入同一批，后续即可移动或复制到它们。以下按任务选用，`file_id` 来自真实清单：
+从第 02 节得到实际对象，将用户要求转换为一份 `operations`。`target_path` 是目标目录绝对路径，文件新名放在 `new_name`。如果目标是已经核实的现有目录，保存同一次读取所得的路径和真实目录 ID，一并交给 `move`、`copy` 或 `relocate` 预检。以下 `file_id` 和 `target_directory_id` 均来自用户选中的真实条目。根目录对应路径 `/` 和 ID `0`，示例用 `cloud.info` 核对非根目录。
 
 ```python
+target = mf.cloud.info(target_directory_id, include_path=True)["item"]
+assert target["is_dir"]
+destination = {"target_path": target["path"], "target_id": target["file_id"]}
 rename = {"op": "rename", "file_id": file_id, "new_name": new_name}
-move = {"op": "move", "file_id": file_id, "target_path": target_path}
-copy = {"op": "copy", "file_id": file_id, "target_path": target_path, "new_name": new_name}
-relocate = {"op": "relocate", "file_id": file_id, "target_path": target_path, "new_name": new_name}
+move = {"op": "move", "file_id": file_id, **destination}
+copy = {"op": "copy", "file_id": file_id, **destination, "new_name": new_name}
+relocate = {"op": "relocate", "file_id": file_id, **destination, "new_name": new_name}
 trash = {"op": "trash", "file_id": file_id}
 mkdir = {"op": "create_directory", "parent_path": parent_path, "name": directory_name}
 ```
+
+重做预览时沿用已选目标的路径和 ID。若预检报告目标身份变化，先回读目录并重新确认选择。新建目录可以同时提供已核实的现有 `parent_path` 和 `parent_id`。缺失的各层目录用 `create_directory` 列入同一批，随后以路径引用这些新目录。
 
 复制省略 `new_name` 则保留原名；复制改名作用于副本，源文件不变。例如只改名时 `operations = [rename]`；批量时按选中对象逐条构造。先保存完整操作，再作为本脚本最后一个调用提交：
 

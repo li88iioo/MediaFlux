@@ -9,7 +9,11 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from app.repositories.organize_operation_jobs import CLOUD_COPY_PENDING_CODE, sanitize_organize_operation_result
+from app.repositories.organize_operation_jobs import (
+    CLOUD_COPY_PENDING_CODE,
+    FS_CHANGE_PREFLIGHT_REASON_LABELS,
+    sanitize_organize_operation_result,
+)
 from app.sensitive_data import redact_sensitive_text
 
 # 递增规则：仅追加字段不升版本；语义变化或字段移除必须升版本并保留读取兼容。
@@ -225,26 +229,31 @@ def project_organize_status(
         max(0, min(_int(queue_raw.get("total")), 1_000_000_000)) if isinstance(queue_raw, dict) else 0
     )
 
+    batch = "该批光鸭操作" if operation_ref else ""
+    recent = batch or "最近一次光鸭整理任务"
     if running:
-        ok, status, summary = True, "running", "光鸭整理任务正在运行"
+        ok, status, summary = True, "running", f"{batch or '光鸭整理任务'}正在运行"
         suggestions: list[str] = []
     elif task_status == "queued":
-        ok, status, summary = True, "queued", "光鸭整理操作正在排队"
+        ok, status, summary = True, "queued", f"{batch or '光鸭整理操作'}正在排队"
         suggestions = ["任务会在当前整理操作结束后自动执行。"]
         if raw.get("error_code") == CLOUD_COPY_PENDING_CODE:
             summary = "光鸭复制仍在处理中，完成后将继续原计划"
             suggestions = ["系统会继续跟踪原任务；无需再次确认或重复提交复制。"]
     elif task_status == "manual_review":
-        ok, status, summary = False, "attention", "光鸭操作需要进一步核验"
+        ok, status, summary = False, "attention", f"{batch or '光鸭操作'}需要进一步核验"
         suggestions = ["请先核对光鸭目标目录，确认远端结果后再决定是否重新执行。"]
     elif task_status == "failed":
-        ok, status, summary = False, "attention", "最近一次光鸭整理任务未成功"
-        suggestions = ["请到网盘整理页查看任务详情后再决定是否重试。"]
+        ok, status, summary = False, "attention", f"{recent}未成功"
+        suggestions = [
+            "请核对该批操作的逐项回执后再决定是否重试。" if batch
+            else "请到网盘整理页查看任务详情后再决定是否重试。"
+        ]
     elif task_status == "completed":
-        ok, status, summary = True, "completed", "最近一次光鸭整理任务已完成"
+        ok, status, summary = True, "completed", f"{recent}已完成"
         suggestions = []
     elif task_status == "partial":
-        ok, status, summary = False, "attention", "最近一次光鸭整理任务部分完成"
+        ok, status, summary = False, "attention", f"{recent}部分完成"
         suggestions = (
             ["已恢复的下载整理会由下载跟踪器重新核验落稳后继续，无需再次提交整理；可查询下载任务进度。其他未恢复或失败项仍需单独核对。"]
             if resumed_count else ["请到网盘整理页核对失败项后再决定是否重试。"]
@@ -252,16 +261,17 @@ def project_organize_status(
         if protected_count and not resumed_count:
             suggestions = ["请先核对下载任务状态；已完成下载的待确认项可从原整理日志查看详情并纠正后重新整理。"]
     elif task_status in {"stopped", "cancelled"}:
-        ok, status, summary = True, "stopped", "最近一次光鸭整理任务已停止"
+        ok, status, summary = True, "stopped", f"{recent}已停止"
         suggestions = []
     else:
         ok, status, summary = (
             True,
             "idle",
             (
-                f"光鸭整理任务当前空闲，另有 {queue_total} 项操作排队"
-                if queue_total
-                else "光鸭整理任务当前空闲"
+                f"{batch}状态暂未确认" if batch else (
+                    f"光鸭整理任务当前空闲，另有 {queue_total} 项操作排队"
+                    if queue_total else "光鸭整理任务当前空闲"
+                )
             ),
         )
         suggestions = []
@@ -286,11 +296,21 @@ def project_organize_status(
         suggestions.append("已完成的云端变更无需重复执行；恢复 STRM 调度后执行同步补齐，不要重新下载或整理。")
     if task_status in {"partial", "failed", "manual_review"}:
         if raw.get("error_code") == "GuangYaFSChangeStale":
-            attempted = any(item.get("status") not in {"not_started", "blocked"} for item in safe_result.get("operation_items", []))
-            problems.append(
-                "执行期间凭据或对象状态已变化；已发生的变更以逐项回执为准，剩余操作未继续"
-                if attempted else "冻结计划、凭据或对象状态已变化，本次变更未执行；请重新读取目录并生成预览"
-            )
+            items = safe_result.get("operation_items", [])
+            if any(item["status"] not in {"not_started", "blocked"} for item in items):
+                problems.append("执行期间凭据或对象状态已变化；已发生的变更以逐项回执为准，剩余操作未继续")
+            else:
+                blocked_reasons = [item.get("reason", "") for item in items if item["status"] == "blocked"]
+                blocked = sum(reason == "precondition_failed" or reason in FS_CHANGE_PREFLIGHT_REASON_LABELS
+                              for reason in blocked_reasons)
+                if blocked:
+                    # 旧回执可能已保存逐项阻断，却未累计统计。未开始项仍不计入失败。
+                    for key in ("precondition_failed", "failed"):
+                        stats[key] = max(stats.get(key, 0), blocked)
+                reason = next((FS_CHANGE_PREFLIGHT_REASON_LABELS[code] for code in blocked_reasons
+                               if code in FS_CHANGE_PREFLIGHT_REASON_LABELS), "")
+                problems.append(f"{reason}，本批未执行。请重新读取目录并生成预览" if reason else
+                                "冻结计划、凭据或对象状态已变化，本次变更未执行；请重新读取目录并生成预览")
         for key, description in (
             ("precondition_failed", "项写前核对未通过，后续动作未执行"),
             ("verification_failed", "项写后状态未核验通过，不能据此认定未执行，请勿直接重复提交"),

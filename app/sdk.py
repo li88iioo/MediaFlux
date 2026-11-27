@@ -1258,7 +1258,7 @@ def _cloud_client():
 
 
 class Cloud:
-    """光鸭云盘目录、文件、回收站和后台任务。"""
+    """光鸭文件、回收站和后台任务。按文件名全盘找用 search_files，盘点指定目录用 list。"""
     @staticmethod
     @sdk_method('read')
     def organize_status(run_id: int | None = None) -> dict:
@@ -1368,6 +1368,15 @@ class Cloud:
 
     @staticmethod
     @sdk_method('read')
+    def search_files(keyword: str, *, page: int = 1, page_size: int = 20) -> dict:
+        """按名称查询光鸭全盘索引，一次读取一页；items 保留同名项目的 file_id、parent_id、parent_name，按 next_page 续查。完整路径可对选中的 ID 用 cloud.info(include_path=True) 核验。"""
+        from app.modules.guangya_workspace import search_files_page
+
+        with _cloud_client() as client:
+            return search_files_page(client, keyword, page=page, page_size=page_size)
+
+    @staticmethod
+    @sdk_method('read')
     def list(parent_id: str = "0", *, recursive: bool = False, query: str = "",
              kinds: builtins.list[str] | None = None, limit: int | None = None, offset: int = 0,
              max_items: int = 100_000, max_depth: int = 64, max_dirs: int = 64) -> dict:
@@ -1435,9 +1444,21 @@ class Cloud:
 
     @staticmethod
     @sdk_method('read')
-    def info(file_id: str) -> dict:
-        """按真实 file_id 回读光鸭文件或目录属性；item 为 null 表示不存在，不代表其他操作成功。"""
+    def info(file_id: str, *, include_path: bool = False) -> dict:
+        """按真实 file_id 回读属性，item 为 null 表示不存在。include_path=True 时沿父目录核验完整 path，缺失或无法核实时会报错。"""
+        from app.modules.guangya_workspace import file_location
+
+        if type(include_path) is not bool:
+            raise ValueError("include_path 必须是布尔值")
         with _cloud_client() as client:
+            if include_path:
+                cancelled = _CALL_CANCELLED.get()
+
+                def check_cancelled():
+                    if cancelled and cancelled():
+                        raise InterruptedError("云盘路径核验已停止")
+
+                return {"item": file_location(client, file_id, check_cancelled=check_cancelled)}
             item = client.file_info(file_id)
             return {"item": asdict(item) if item is not None else None}
 
@@ -1547,7 +1568,15 @@ class Cloud:
     @staticmethod
     @sdk_method('write')
     def change(operations: builtins.list[dict], trigger_strm: bool = True) -> dict:
-        """同批变更提交一份operations，每项用op指定动作，如{'op':'copy','file_id':file_id,'target_path':'/备份','new_name':'副本.mkv'}。target_path是目录，文件新名另用new_name；rename改名，move移动，copy复制（可给副本新名），relocate移动并改名。缺失的每层目录用create_directory及parent_path/name列入同一批，随后即可move/copy到新目录。trash移入回收站；batch_files按非根目录及trash_filter/target_path/cleanup_empty_dirs完整展开，重名默认保留两份。预检不写云盘；确认后执行冻结计划，返回operation_ref，原脚本不重跑。"""
+        """同批变更提交一份 operations，每项用 op 指定动作。rename 改名，move 移动，copy 复制，relocate 移动并改名。target_path 是目录，文件新名用 new_name。
+
+        move、copy、relocate 的现有目标已核实时，同时传该次读取所得的 target_path 和 target_id，例如
+        {'op':'copy','file_id':file_id,'target_path':target['path'],'target_id':target['file_id'],'new_name':'副本.mkv'}。
+        预检复核路径与 ID。身份不符时重新核对目标，确认新选择后再生成预览。
+        用 create_directory 的 parent_path/name 将缺失的每层目录列入同一批。已核实的现有父目录可同时传 parent_id。指向本批新建目录的操作用路径。
+        trash 移入回收站。batch_files 按非根目录及 trash_filter/target_path/cleanup_empty_dirs 完整展开，重名默认保留两份。
+        预检为只读。确认后执行冻结计划，返回 operation_ref，原脚本不重跑。
+        """
         from app.modules.guangya_fs_change import build_fs_change_plan, submit_fs_change_plan
         from app.repositories.organize_operation_jobs import organize_operation_public_ref
 

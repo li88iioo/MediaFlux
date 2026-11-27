@@ -258,9 +258,10 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
             {"op": "move", "file_id": "move", "target_path": "/target"},
         ])
         before = deepcopy(client.directories)
-        outcomes = [{"status": "not_started"} for _ in plan["operations"]]
+        result = {"operation_items": [{"status": "not_started"} for _ in plan["operations"]],
+                  "stats": {"failed": 0, "precondition_failed": 0}}
         with mock.patch.object(client, "file_info", wraps=client.file_info) as info:
-            guangya_fs_change._preflight_fs_change_plan(client, plan["operations"], outcomes, None)
+            guangya_fs_change._preflight_fs_change_plan(client, plan["operations"], result, None)
         self.assertEqual(Counter(call.args[0] for call in info.call_args_list),
                          {"rename": 1, "move": 1, "source": 1, "target": 1})
         self.assertEqual(client.directories, before)
@@ -284,10 +285,11 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
             for i in range(20)
         ])
         before = deepcopy(client.directories)
+        result = {"operation_items": [{"status": "not_started"} for _ in plan["operations"]],
+                  "stats": {"failed": 0, "precondition_failed": 0}}
         with mock.patch.object(client, "file_info", wraps=client.file_info) as info, \
              mock.patch.object(client, "list_dir", wraps=client.list_dir) as listing:
-            guangya_fs_change._preflight_fs_change_plan(
-                client, plan["operations"], [{"status": "not_started"} for _ in plan["operations"]], None)
+            guangya_fs_change._preflight_fs_change_plan(client, plan["operations"], result, None)
         # 20 个源对象及两侧各 7 层目录；原实现共 114 次详情/列表请求。
         self.assertLessEqual(info.call_count, 34)
         self.assertEqual(Counter(call.args[0] for call in listing.call_args_list), {source: 1, target: 1})
@@ -1059,6 +1061,63 @@ print(json.dumps({"pid": os.getpid(), "job_id": row["job_id"], "stats": result["
                 ):
                     for public_payload in (public.data, receipt.data):
                         self.assertNotIn(private, json.dumps(public_payload))
+
+    def test_replaced_target_blocks_the_batch_with_a_specific_persistent_receipt(self):
+        operations = [
+            {"op": "move", "file_id": file_id, "target_path": "/target", "target_id": "target"}
+            for file_id in ("move", "rename")
+        ]
+        client, plan = self._file_id_plan(operations=operations)
+        queued = self._submit_shared(plan)
+        job_id = queued["task_id"]
+        claimed = claim_organize_operation_job(job_id)
+        assert claimed is not None
+        client.rename("target", "old-target")
+        replacement_id = client.create_dir("target")
+        with self.assertRaisesRegex(guangya_fs_change.GuangYaFSChangeStale, "目标目录身份已变化"):
+            self._file_id_plan(client, operations)
+
+        manager = OrganizeTaskManager()
+        self.assertTrue(manager._lock.acquire(blocking=False))
+        manager._task = {"id": job_id, "status": "running", "durable": True,
+                         "owner_digest": claimed["owner_digest"]}
+        with (
+            mock.patch.object(guangya_fs_change, "execute_fs_change_plan", new=partial(
+                guangya_fs_change.execute_fs_change_plan, client_factory=lambda: cast(GuangYaClient, client))),
+            mock.patch.object(manager, "_wake_download_tracker"),
+            mock.patch.object(client, "move", wraps=client.move) as moved,
+        ):
+            manager._run_durable_operation(dict(claimed))
+        moved.assert_not_called()
+        self.assertEqual(client.directories[replacement_id], [])
+
+        persisted = get_organize_operation_job(job_id)
+        assert persisted is not None
+        self.assertEqual(persisted["status"], "failed")
+        stored = json.loads(persisted["result_json"])
+        self.assertEqual({key: stored["stats"][key] for key in ("total", "moved", "failed", "precondition_failed")},
+                         {"total": 2, "moved": 0, "failed": 1, "precondition_failed": 1})
+        self.assertEqual([(item["status"], item.get("reason")) for item in stored["operation_items"]],
+                         [("blocked", "target_changed"), ("not_started", None)])
+
+        public_ref = organize_operation_public_ref(job_id)
+        accepted = ToolResult(True, "accepted", "已提交", data={"operation_ref": public_ref})
+        context = ToolContext(owner="queue-owner")
+        for current in (manager, OrganizeTaskManager()):
+            with mock.patch("app.modules.organize_tasks.get_organize_manager", return_value=current):
+                public = ToolResult(**get_organize_operation_status(public_ref, owner=context.owner))
+                receipt = asyncio.run(wait_for_effect_completion(accepted, tool="cloud.change", context=context))
+            self.assertEqual(public.summary, "该批光鸭操作未成功")
+            self.assertEqual(public.data["task"]["operation_ref"], public_ref)
+            self.assertEqual(receipt.status, "failed")
+            self.assertEqual(receipt.data["stats"], stored["stats"])
+            for outcome in (public, receipt):
+                assert outcome.error is not None
+                self.assertIn("目标目录已变化", outcome.error)
+                self.assertIn("本批未执行", outcome.error)
+                self.assertIn("生成预览；1 项写前核对未通过", outcome.error)
+                self.assertNotIn("/target", outcome.error)
+                self.assertNotIn(replacement_id, outcome.error)
 
     def test_preflight_stale_reason_survives_live_history_and_restart(self):
         queued, _ = self._enqueue(self._confirmed_plan())

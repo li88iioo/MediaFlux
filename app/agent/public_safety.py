@@ -225,6 +225,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "guangya.fs.change.execute": "光鸭文件变更",
     "cloud.change": "光鸭文件变更",
     "cloud.list": "光鸭文件查询",
+    "cloud.search_files": "光鸭文件搜索",
     "cloud.read_text": "读取光鸭文本正文",
     "cloud.info": "光鸭对象详情",
     "cloud.preview_names": "光鸭名称预览",

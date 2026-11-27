@@ -124,6 +124,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         manager.task_result.assert_called_once_with(
             _OPERATION_REF, owner="webk:v1:owner-safe"
         )
+        self.assertEqual(result.summary, "该批光鸭操作已完成")
         self.assertEqual(
             result.data["task"]["stats"],
             {
@@ -940,6 +941,17 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已发生的变更以逐项回执为准", result.error)
         assert result.error is not None
         self.assertNotIn("本次变更未执行", result.error)
+
+    def test_legacy_batch_preflight_receipt_counts_only_the_recorded_blocked_item(self):
+        from app.modules.organize_results import project_organize_status
+
+        result = project_organize_status({"status": "failed", "error_code": "GuangYaFSChangeStale", "result": {
+            "stats": {"total": 2, "failed": 0, "precondition_failed": 0}, "operation_items": [
+                {"position": 1, "operation": "move", "status": "blocked", "reason": "precondition_failed"},
+                {"position": 2, "operation": "move", "status": "not_started"},
+            ]}}, overview={}, operation_ref=_OPERATION_REF)
+        self.assertEqual(result["data"]["task"]["stats"], {"total": 2, "failed": 1, "precondition_failed": 1})
+        self.assertIn("本次变更未执行", result["error"])
 
     def test_task_projection_passes_sanitized_operation_items_and_keeps_legacy_stats(self):
         from app.modules.organize_results import project_organize_status

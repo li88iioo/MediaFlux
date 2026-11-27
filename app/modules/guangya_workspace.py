@@ -1,12 +1,19 @@
 """光鸭真实身份读取、完整分页与路径边界；不保存目录观察或会话状态。"""
 from __future__ import annotations
+
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from typing import Any
-from app.clients.guangya import file_extension, GuangYaClient, GuangYaFile
-from app.modules.organize import DEFAULT_ORGANIZE_METADATA_EXTS, DEFAULT_ORGANIZE_VIDEO_EXTS
-from app.modules.organize_postprocess import SUBTITLE_EXTS
+
+from app.clients.guangya import GuangYaClient, GuangYaFile, file_extension
+from app.modules.organize import (
+    DEFAULT_ORGANIZE_METADATA_EXTS,
+    DEFAULT_ORGANIZE_VIDEO_EXTS,
+    Organizer,
+    OrganizeRules,
+)
+from app.modules.organize_postprocess import SUBTITLE_EXTS, media_extension
 
 _MAX_DEPTH = 64
 _IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif"}
@@ -18,6 +25,36 @@ class GuangYaWorkspaceError(RuntimeError):
 
 class GuangYaWorkspaceStale(GuangYaWorkspaceError):
     """真实对象身份或目录边界已变化。"""
+
+
+def browser_video_extensions() -> set[str]:
+    return Organizer.video_exts(OrganizeRules.from_config())
+
+
+def browser_item(file: GuangYaFile, video_exts: set[str]) -> dict:
+    name_ext = "" if file.is_dir else media_extension(file.name)
+    return {
+        "file_id": file.file_id, "name": file.name, "is_dir": file.is_dir,
+        "is_video": bool(name_ext) and name_ext in video_exts,
+        "size": file.size, "etag": file.etag, "parent_id": file.parent_id,
+        "created_at": file.created_at, "updated_at": file.updated_at,
+        "mime_type": file.mime_type, "extension": file.extension or name_ext,
+    }
+
+
+def search_files_page(client: GuangYaClient, keyword: str, *, page: int, page_size: int) -> dict:
+    """按云盘索引查询一页，保留同名对象和上游提供的父目录名。"""
+    if not isinstance(keyword, str) or not keyword.strip():
+        raise ValueError("请输入搜索关键词")
+    if type(page) is not int or page < 1 or type(page_size) is not int or not 1 <= page_size <= 100:
+        raise ValueError("页码须从 1 开始，每页须为 1 到 100 项")
+    hits, has_more = client.search_files(keyword.strip(), page=page - 1, page_size=page_size)
+    video_exts = browser_video_extensions()
+    return {
+        "items": [dict(browser_item(hit.file, video_exts), parent_name=hit.parent_name) for hit in hits],
+        "page": page, "page_size": page_size, "has_more": has_more,
+        "next_page": page + 1 if has_more else None,
+    }
 
 
 def file_location(client: GuangYaClient, file_id: str, *, check_cancelled: Callable[[], None] = lambda: None) -> dict:

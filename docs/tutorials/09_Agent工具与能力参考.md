@@ -274,7 +274,8 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | `cloud.set_organize_schedule`（工作区 SDK） | WRITE | 预检并在用户确认后修改光鸭定时整理三项白名单策略，不立即运行整理。 |
 | `cloud.organize_status` | READ | 读取整理概览；按 `run_id` 查询原持久运行。文件操作的 `GY-` 编号用 `cloud.operation` 查询。 |
 | `activity.organize_logs`（SDK） | READ | 按来源、状态、关键词分页查看完整整理时间线；保留真实 ID、路径和脱敏错误，总数/分类计数与 Web 同源，支持按 kind/id 继续读取时间线。本地待确认使用 `origin="local", status="manual"`，终态使用 `success`/`failed`；原始状态、触发来源和时间戳均保留，供脚本统计。 |
-| `cloud.list` / `cloud.info` | READ | 使用真实目录/文件ID读取完整属性；list支持递归、名称/类型过滤和offset/limit，total为实际总数，扫描不完整直接报错。 |
+| `cloud.search_files` | READ | 按文件或目录名称查全盘索引，按 next_page 翻页；同名项目保留各自的 ID 和父目录。 |
+| `cloud.list` / `cloud.info` | READ | 在指定目录内列举、过滤或递归盘点；info 按真实 ID 读属性，include_path=True 可核实完整路径。 |
 | `cloud.preview_names` | READ | 按真实ID预览删除旧Mbps字段、字面替换或media_hygiene；返回完整名称、冲突与operations，无序号、TTL或私有计划。 |
 | `cloud.preview_cleanup` | READ | 检查整理/离线来源或真实来源ID；只显式quarantine_ids进入隔离区，其余残留保留。候选分页，operations为完整选择；空目录要求原子回收能力。 |
 | `cloud.change` | WRITE/DANGER | 提交预览operations或真实ID操作；expected/expected_tree保留预览快照，require_empty要求真空目录。单次最多200对象与200新建目录，超限报错。沿用SQLite冻结确认与持久operation_ref；取消不写、未知结果先核验，不重放脚本。 |
