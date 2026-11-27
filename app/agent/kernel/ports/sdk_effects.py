@@ -58,7 +58,11 @@ def subscription_tools() -> tuple[KernelToolSpec, ...]:
     from app.modules.media_subscriptions import MediaSubscriptionError, get_media_subscription_service
 
     def risk_for(operation, arguments):
-        return RiskLevel.WRITE if operation == "create" and arguments.get("action") == "auto" else RiskLevel.DANGER if operation == "delete" or (operation == "update" and arguments.keys() - {"subscription_id", "enabled"}) else RiskLevel.LOW_WRITE
+        if operation == "download_candidate" or (operation == "create" and arguments.get("action") == "auto"):
+            return RiskLevel.WRITE
+        if operation == "delete" or (operation == "update" and arguments.keys() - {"subscription_id", "enabled"}):
+            return RiskLevel.DANGER
+        return RiskLevel.LOW_WRITE
 
     def prepare(arguments, context, *, operation):
         try:
@@ -67,12 +71,15 @@ def subscription_tools() -> tuple[KernelToolSpec, ...]:
                 context.cancellation.raise_if_cancelled()
                 prepared = (notifications.prepare_rule_change(operation, values) if operation.endswith("notification")
                             else get_media_subscription_service().prepare_change(operation, values))
+                preview = ToolResult(**prepared["preview"])
+                if preview.status == "no_changes":
+                    return DefaultProjector().project(preview)
                 risk = risk_for(operation, prepared["arguments"])
                 return PreparedEffect(preview=prepared["preview"], arguments=prepared["arguments"],
                     snapshot_fingerprint=prefix + _fingerprint(prepared["snapshot"]),
                     metadata={"risk": risk.value, "subscription_snapshot": prepared["snapshot"],
                               "confirmation": build_confirmation_contract(tool_name="subscriptions." + operation,
-                                  risk=risk, preview=ToolResult(**prepared["preview"]))})
+                                  risk=risk, preview=preview)})
         except (AgentRuntimeDisabled, RuntimeFenceError, MediaSubscriptionError, ValueError, TypeError) as exc:
             raise ToolPipelineError(str(exc), code=getattr(exc, "code", "invalid_arguments")) from exc
 
@@ -105,6 +112,7 @@ def subscription_tools() -> tuple[KernelToolSpec, ...]:
                 "seasons": {"type": "array", "maxItems": 20, "items": {"type": "integer", "minimum": 1, "maximum": 100}},
                 "include_specials": {"type": "boolean"}, "action": {"type": "string", "enum": ["notify", "confirm", "auto"]},
                 "download_target": {"type": "string", "enum": ["qb", "guangya", "both"]},
+                "sites": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 16, "items": {"type": "string"}}]},
                 "check_interval_minutes": {"type": "integer", "minimum": 5, "maximum": 10080}}
     schemas = {
         "create": ({"provider": {"type": "string", "enum": ["tmdb", "douban", "bangumi"]},
@@ -114,6 +122,9 @@ def subscription_tools() -> tuple[KernelToolSpec, ...]:
                     "download_target": settings["download_target"], "enabled": {"type": "boolean"},
                     "sites": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 6, "items": {"type": "string"}}]}}, ["provider", "external_id", "media_type"]),
         "update": ({**identity, **settings}, ["subscription_id"]),
+        "download_candidate": ({**identity, "candidate_id": {"type": "integer", "minimum": 1, "maximum": 2**63 - 1},
+                                "target": {"type": "string", "enum": ["", "qb", "guangya", "both"]}},
+                               ["subscription_id", "candidate_id"]),
         "delete": (identity, ["subscription_id"]),
         "set_notification": ({**identity, **{key: {"type": "boolean"} for key in ("enabled", "notify_on_missing", "notify_on_satisfied", "notify_on_error")}}, ["subscription_id"]),
         "reset_notification": (identity, ["subscription_id"]),
@@ -122,7 +133,7 @@ def subscription_tools() -> tuple[KernelToolSpec, ...]:
         description=sdk.METHODS["subscriptions." + operation].__doc__ or "",
         effect=ToolEffect.DANGER if operation == "delete" else ToolEffect.WRITE,
         effect_resolver=(lambda args: ToolEffect.DANGER if risk_for("update", args) is RiskLevel.DANGER else ToolEffect.WRITE) if operation == "update" else None,
-        metadata={"risk": "danger" if operation == "delete" else "low_write"},
+        metadata={"risk": risk_for(operation, {}).value},
         input_schema={"type": "object", "properties": props, "required": required, "additionalProperties": False},
         prepare=partial(prepare, operation=operation), execute_confirmed=partial(execute, operation=operation))
         for operation, (props, required) in schemas.items())

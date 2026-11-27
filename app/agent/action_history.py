@@ -71,6 +71,7 @@ _TOOL_LABELS = {
     "rss.update_subscription": "RSS 订阅配置修改",
     "rss.delete_subscription": "RSS 订阅删除",
     'subscriptions.create': "媒体追更创建",
+    "subscriptions.download_candidate": "媒体追更候选提交",
     "media.create_subscription": "媒体追更创建",
     'subscriptions.delete': "媒体追更删除",
     "media.delete_subscription": "媒体追更删除",
@@ -323,6 +324,7 @@ _SAFE_FIELDS = {
         "runtime_refreshed",
     },
     'subscriptions.update': {"operation", "subscription_number", "enabled", "affected", "updated_fields", "expired_candidates", "cancelled_admissions", "cancelled_runs", "in_flight_dispatches", "runtime_refreshed"},
+    "subscriptions.download_candidate": {"subscription_id", "candidate_id", "request_id", "target", "status", "duplicate", "created"},
     "media.set_subscription_policy": {
         "subscription_number",
         "updated_fields",
@@ -614,6 +616,8 @@ _SAFE_ERROR_CODES = {
     "execution_interrupted",
 }
 _COUNT_FIELDS = {
+    "subscription_id",
+    "candidate_id",
     "request_id",
     "source_request_id",
     "failed_sources",

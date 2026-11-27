@@ -184,6 +184,15 @@ def test_entry_pages_preserve_full_titles_real_ids_and_delivery_without_source_s
             ]
             == ids[123]
         )
+        seed_rss_entry_state(ids[1], "downloaded")
+        selected = [ids[1], ids[101]]
+        first = sdk.rss.entries(entry_ids=selected, limit=1)["data"]
+        assert first["total"] == 2 and first["items"][0]["id"] == ids[101]
+        last = sdk.rss.entries(**first["next"])["data"]
+        assert [(row["id"], row["status"]) for row in last["items"]] == [(ids[1], "downloaded")]
+        assert last["next"] is None
+        assert sdk.rss.entries(entry_ids=selected, status="pending")["data"]["total"] == 1
+        assert sdk.rss.entries(entry_ids=[])["data"]["total"] == 0
 
 
 def test_download_configuration_failure_does_not_freeze_an_unexecutable_plan():

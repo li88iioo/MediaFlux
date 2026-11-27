@@ -39,6 +39,8 @@
 
 收藏用 watchlist；作品追更用 `subscriptions`：`list` 按 next 读全，`get` 查策略/工作流，`check_updates` 实时续页，每项最多搜首个缺集；暂停/partial/unknown 不算无更新。
 
+用户要处理订阅通知里的候选时，查 `subscriptions.candidates(subscription_id)`，用返回的候选编号预览 `subscriptions.download_candidate(subscription_id, candidate_id)`。用户换下载目标时传 target；已提交项用 request_id 查下载时间线。调整以后搜索的站点用 `subscriptions.update(subscription_id, sites=[...])`。排查每日摘要未收到时，查 `automation.digests()` 的 delivery_ready 和 delivery_blocked_reason。
+
 明确追更才按真实身份 `create`，非 TMDB 须确认映射；按意图选 season、action（notify 提醒/confirm 人工确认/auto 持续自动下载）、目标与周期，整理/STRM 沿配置。创建不立即搜索下载；回执编号为 `data.subscription_number`；不支持固定星期、独立画质/字幕硬过滤。`update` 的 enabled 暂停/恢复，`delete` 保留已提交下载/文件；保存后回读 get。全局通知用 `notification/set_notification`，default 不等于显式关闭；auto 与通知变更须用户授权确认。
 
-源规则用 `rss`：`subscriptions/subscription` 查配置，`create/update` 保存；立即拉取用 `refresh(subscription_ids=...)` → 回执 run_id 给 `activity(run_id=...)` → `entries` 按 next 读全 → `download(entry_ids=...)` 投递所选项 → entries.delivery 跟踪。保存不刷新/下载。
+源规则用 `rss`：`subscriptions/subscription` 查配置，`create/update` 保存；立即拉取用 `refresh(subscription_ids=...)` → 回执 run_id 给 `activity(run_id=...)` → `entries` 按 next 读全 → `download(entry_ids=...)` 投递所选项 → `entries(entry_ids=原条目编号列表)` 跨状态读取每项的 delivery。保存不刷新/下载。

@@ -234,8 +234,14 @@ def test_media_subscriptions_have_one_native_create_and_no_legacy_actions():
 
     assert {"subscriptions.list", "subscriptions.get", "subscriptions.create", "subscriptions.update", "subscriptions.delete",
             "subscriptions.check_updates", "subscriptions.notification", "subscriptions.set_notification", "subscriptions.reset_notification", "subscriptions.today"} <= sdk.METHODS.keys()
+    assert sdk.METHOD_EFFECTS["subscriptions.candidates"] == "read"
+    assert sdk.METHOD_EFFECTS["subscriptions.download_candidate"] == "write"
     assert "automation.create_media_rule" not in sdk.METHODS
     assert {tool.name for tool in automation_tools()} == {"automation.set_digest"}
-    assert {tool.name for tool in subscription_tools()} == {"subscriptions.create", "subscriptions.update", "subscriptions.delete", "subscriptions.set_notification", "subscriptions.reset_notification"}
+    assert {tool.name for tool in subscription_tools()} == {
+        "subscriptions.create", "subscriptions.update", "subscriptions.delete",
+        "subscriptions.set_notification", "subscriptions.reset_notification",
+        "subscriptions.download_candidate",
+    }
     for name in ("actions", "queries", "policy", "common", "consumption_actions"):
         assert importlib.util.find_spec("app.agent.domains.subscriptions." + name) is None

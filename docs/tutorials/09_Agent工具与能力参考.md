@@ -211,6 +211,8 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | `subscriptions.list(status="", enabled=None, limit=200, before_updated_at=None, before_id=None)` | READ | 完整持久订阅、真实 id、revision、last_error、缺失与工作流；按 next 续读，不再裁成16条摘要。持久状态不等于实时库存。 |
 | `subscriptions.check_updates(subscription_id=None, limit=8, before_updated_at=None, before_id=None)` | READ | 分页实时比较 TMDB 已播与 Jellyfin/Emby 库存，保留全部缺失差异与不完整原因；每项资源搜索仍限首个缺集及有界候选，按 next 读完。不提交下载，不创建后台检查。 |
 | `subscriptions.get(subscription_id)` | READ | 精确真实 ID 读取完整配置/策略、修订号、已保存错误与缺失；不存在直接报错。 |
+| `subscriptions.candidates(subscription_id, limit=50, offset=0)` | READ | 分页查看指定订阅已保存的候选。用候选编号选片，已提交项可用请求编号查询下载时间线。 |
+| `subscriptions.download_candidate(subscription_id, candidate_id, target="")` | WRITE | 预览并确认提交一个已保存的候选。默认沿用订阅下载目标；用户可以为本次指定目标。 |
 | `subscriptions.update(subscription_id, **显式变更)` | LOW_WRITE / DANGER | 启停与策略合并；未传字段保留，单独恢复启用保留在途工作；暂停/策略变化使未提交工作失效。完整配置/修订/准入作用域CAS，已进入提交阶段无法撤回，不立即检查下载。 |
 | `subscriptions.create(provider, external_id, media_type, season=None, check_interval_minutes=4320, action="confirm", download_target="guangya", sites=None, enabled=True)` | LOW_WRITE / WRITE | 唯一媒体追更创建/恢复入口；精确来源与已确认映射，支持单季、站点、策略、目标及启停。默认3天；原自动规则的每周语义显式传10080。auto确认后持续自动下载，仅沿已有整理/STRM联动，不支持固定星期或独立4K/字幕硬过滤。 |
 | `subscriptions.delete(subscription_id)` | DANGER | 确认后软删除并停止后续检查，失效未提交工作；保留下载、媒体文件和历史。 |
@@ -224,7 +226,7 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | `subscriptions.set_notification(subscription_id, **显式通知开关)` | LOW_WRITE | 未传开关保留，以完整原规则与订阅版本做事务CAS；模型不能指定owner/chat/route，沿原通知中心授权。 |
 | `subscriptions.reset_notification(subscription_id)` | LOW_WRITE | 确认后删除显式规则，恢复默认并返回explicit=false/revision=0；已默认时不生成新写计划，已入队消息仍沿原授权处理。 |
 | `rss.activity` | READ | 最近24小时成功下载总数与逐订阅计数；全局总数不受分页影响，可用 `next` 续页。 |
-| `rss.entries` | READ | 真实条目 ID、完整标题、状态与持久 delivery；offset/next 真实分页。 |
+| `rss.entries` | READ | 普通列表默认待处理。传 `entry_ids` 可跨状态核对指定条目的完整标题、状态和投递回执，按 `data.next` 续页。 |
 | `rss.mark` | WRITE | 确认后原子标记选定 entry_ids；不覆盖正在提交或已下载条目。 |
 | `rss.refresh` | WRITE | 刷新 subscription_ids 或 scope=all_configured，不自动下载；run_id 可用 rss.activity(run_id=...) 查询。 |
 | `rss.download` | DANGER | 指定 pending entry_ids，或省略 ID 选择最近 limit 项（默认10，可按 subscription_id 过滤）；确认冻结完整集合及 qB/光鸭目标，has_more 明示剩余。 |
@@ -238,7 +240,7 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `automation.digests()`（SDK） | READ | 完整读取当前身份全部每日媒体动态/异常摘要规则，保留真实 rule_id、revision 和 settings_error，默认没有开启。 |
+| `automation.digests()`（SDK） | READ | 查看当前身份的每日动态或异常摘要规则、时间与修订号。规则已启用却收不到通知时，查看 `delivery_ready` 和 `delivery_blocked_reason` 核对当前投递条件。 |
 | `automation.set_digest(...)`（SDK） | WRITE | 确认后新增或修改每日摘要规则；新增需 hour，修改用真实 rule_id，未传设置保留。按本机时区定时汇总，停用不依赖当前目标；投递 owner/context 由宿主绑定，不能传 chat。复用原表、定时和通知队列。 |
 
 ### 2.11 文件名识别、发布格式教学与识别配置

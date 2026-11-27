@@ -255,9 +255,10 @@ def upsert_media_subscription(
         return subscription_id, False
 
 
-def get_media_subscription(subscription_id: int, *, include_deleted: bool = False) -> sqlite3.Row | None:
+def get_media_subscription(subscription_id: int, *, include_deleted: bool = False,
+                           connection: sqlite3.Connection | None = None) -> sqlite3.Row | None:
     deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
-    with get_conn() as conn:
+    with nullcontext(connection) if connection is not None else get_conn() as conn:
         return conn.execute(
             "SELECT * FROM media_subscriptions WHERE id=?" + deleted_clause,
             (subscription_id,),
@@ -1069,22 +1070,29 @@ def replace_media_subscription_candidates(
     return published
 
 
-def get_media_subscription_candidate(candidate_id: int) -> sqlite3.Row | None:
-    with get_conn() as conn:
-        _expire_media_subscription_candidates_conn(conn, candidate_id=candidate_id)
+def get_media_subscription_candidate(
+    candidate_id: int, *, connection: sqlite3.Connection | None = None, refresh_expiry: bool = True,
+) -> sqlite3.Row | None:
+    with nullcontext(connection) if connection is not None else get_conn() as conn:
+        if refresh_expiry:
+            _expire_media_subscription_candidates_conn(conn, candidate_id=candidate_id)
         return conn.execute(
-            "SELECT * FROM media_subscription_candidates WHERE id=?", (candidate_id,)
+            "SELECT * FROM media_subscription_candidates WHERE id=? AND "
+            "(? OR status!='available' OR datetime(expires_at)>datetime('now','localtime'))",
+            (candidate_id, refresh_expiry),
         ).fetchone()
 
 
 def list_media_subscription_candidates(
-    subscription_id: int, *, statuses: tuple[str, ...] = ("available",), limit: int = 200
+    subscription_id: int, *, statuses: tuple[str, ...] = ("available",), limit: int = 200,
+    offset: int = 0, connection: sqlite3.Connection | None = None, refresh_expiry: bool = True,
 ) -> list[sqlite3.Row]:
     """先按状态筛选再排序限量；空状态集合仅用于显式历史查询。"""
     clause = f" AND c.status IN ({','.join('?' for _ in statuses)})" if statuses else ""
-    params: list[Any] = [subscription_id, *statuses, max(1, min((limit or 200), 500))]
-    with get_conn() as conn:
-        _expire_media_subscription_candidates_conn(conn, subscription_id=subscription_id)
+    params: list[Any] = [subscription_id, *statuses, refresh_expiry, max(1, min((limit or 200), 500)), offset]
+    with nullcontext(connection) if connection is not None else get_conn() as conn:
+        if refresh_expiry:
+            _expire_media_subscription_candidates_conn(conn, subscription_id=subscription_id)
         return conn.execute(
             "SELECT c.*,a.id AS delivery_admission_id,a.status AS delivery_status,"
             "a.error AS delivery_error,a.request_id AS delivery_request_id,"
@@ -1098,12 +1106,22 @@ def list_media_subscription_candidates(
             "WHERE a2.candidate_id=c.id ORDER BY a2.id DESC LIMIT 1) "
             "LEFT JOIN download_requests r ON r.id=COALESCE(a.request_id,c.request_id) "
             "WHERE c.subscription_id=?" + clause +
-            " ORDER BY c.media_key,c.relevance_score DESC,c.seeders DESC,c.id DESC LIMIT ?",
+            " AND (? OR c.status!='available' OR datetime(c.expires_at)>datetime('now','localtime'))"
+            " ORDER BY c.media_key,c.relevance_score DESC,c.seeders DESC,c.id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
 
 
-def update_media_subscription_candidate(candidate_id: int, **fields: Any) -> bool:
+def _available_candidate_matches(
+    conn: sqlite3.Connection, candidate_id: int, expected: Mapping[str, Any],
+) -> bool:
+    row = get_media_subscription_candidate(candidate_id, connection=conn, refresh_expiry=False)
+    return row is not None and row["status"] == "available" and dict(row) == expected
+
+
+def update_media_subscription_candidate(
+    candidate_id: int, *, expected_candidate: Mapping[str, Any] | None = None, **fields: Any,
+) -> bool:
     allowed = {"status", "request_id", "expires_at"}
     assignments: list[str] = []
     params: list[Any] = []
@@ -1116,6 +1134,10 @@ def update_media_subscription_candidate(candidate_id: int, **fields: Any) -> boo
     assignments.append("updated_at=?")
     params.extend((now(), candidate_id))
     with get_conn() as conn:
+        if expected_candidate is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            if not _available_candidate_matches(conn, candidate_id, expected_candidate):
+                return False
         cur = conn.execute(
             f"UPDATE media_subscription_candidates SET {','.join(assignments)} WHERE id=?", params
         )
@@ -1210,7 +1232,7 @@ def get_active_media_download_request(media_key: str) -> sqlite3.Row | None:
     """读取去重准入实际绑定的请求，供追更投影下载状态。"""
     with get_conn() as conn:
         return conn.execute(
-            "SELECT r.status,r.qb_status,r.gy_status,r.attention_cleared_at "
+            "SELECT r.id,r.status,r.qb_status,r.gy_status,r.attention_cleared_at "
             "FROM media_download_admissions a JOIN download_requests r ON r.id=a.request_id "
             f"WHERE a.media_key=? AND a.status IN {_ACTIVE_DOWNLOAD_ADMISSION_STATES}",
             (media_key,),
@@ -1452,6 +1474,7 @@ def claim_media_download_admission(
     subscription_revision: int,
     require_active_check: bool = False,
     check_run_id: int | None = None,
+    expected_candidate: Mapping[str, Any] | None = None,
 ) -> int | None:
     stamp = now()
     with get_conn() as conn:
@@ -1475,7 +1498,9 @@ def claim_media_download_admission(
             "AND s.revision=? AND c.id=? AND c.status='available'" + status_clause,
             active_params,
         ).fetchone()
-        if active is None:
+        if active is None or (
+            expected_candidate is not None and not _available_candidate_matches(conn, candidate_id, expected_candidate)
+        ):
             conn.rollback()
             return 0
         duplicate = conn.execute(
@@ -1506,6 +1531,7 @@ def begin_media_download_dispatch(
     subscription_revision: int,
     require_active_check: bool = False,
     check_run_id: int | None = None,
+    expected_candidate: Mapping[str, Any] | None = None,
 ) -> bool:
     """在外部副作用前原子领取下载；领取后该次提交不可再撤销。"""
     status_clause = ""
@@ -1528,11 +1554,14 @@ def begin_media_download_dispatch(
             "AND revision=?" + status_clause,
             active_params,
         ).fetchone()
-        if active is None:
+        if active is None or (
+            expected_candidate is not None
+            and not _available_candidate_matches(conn, int(expected_candidate["id"]), expected_candidate)
+        ):
             conn.execute(
                 "UPDATE media_download_admissions SET status='cancelled',error=?,completed_at=?,updated_at=? "
                 "WHERE id=? AND status='claimed'",
-                ("订阅已暂停、删除或配置已变更", stamp, stamp, admission_id),
+                ("订阅或候选已变化，未提交下载", stamp, stamp, admission_id),
             )
             return False
         cur = conn.execute(

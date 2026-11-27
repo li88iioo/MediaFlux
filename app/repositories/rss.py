@@ -511,8 +511,12 @@ def list_rss_entries(
     *,
     order: str = "published_desc",
     offset: int = 0,
+    entry_ids: Sequence[int] | None = None,
 ) -> RSSEntryPage:
     filters, params = _rss_entry_filters(sub_id, status, keyword)
+    if entry_ids is not None:
+        filters += " AND e.id IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(list(entry_ids)))
     source_sql = (
         " FROM rss_entries e LEFT JOIN rss_items i ON e.rss_item_id=i.id "
         "LEFT JOIN rss_entry_media m ON m.rss_entry_id=e.id" + _RSS_REQUEST_JOIN + filters

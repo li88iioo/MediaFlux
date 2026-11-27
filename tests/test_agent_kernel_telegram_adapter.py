@@ -750,6 +750,62 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("qBittorrent", bot.edits[-1][0])
         self.assertIn("确认后会保存订阅规则", bot.edits[-1][0])
 
+    def test_subscription_create_approval_distinguishes_same_title_before_confirmation(self):
+        from app.discovery.models import MediaCard
+        from app.modules.media_subscriptions import MediaSubscriptionService
+
+        title = "同名 & <作品>"
+        cases = (("101", "2019", 1), ("202", "2024", 2))
+        cards = {identifier: MediaCard("tmdb", identifier, "tv", title, year=year)
+                 for identifier, year, _ in cases}
+        discovery = types.SimpleNamespace(get_detail=lambda provider, media_type, identifier: cards[identifier])
+        with isolated_test_database(), patch("app.modules.media_subscriptions.get_discovery_service", return_value=discovery):
+            service = MediaSubscriptionService()
+            for identifier, year, season in cases:
+                with self.subTest(identifier=identifier):
+                    prepared = service.prepare_change("create", {
+                        "provider": "tmdb", "external_id": identifier, "media_type": "tv", "season": season,
+                        "action": "auto", "download_target": "both",
+                    })
+                    approval = ApprovalView(
+                        plan_id=f"subscription_plan_{identifier}", tool_name="subscriptions.create", effect="WRITE",
+                        preview=prepared["preview"], result={}, expires_at="2026-09-03T12:00:00Z",
+                        confirmation={"action": "创建媒体追更订阅"},
+                    )
+                    transport = FakeTelegramTransport(TurnView("tg_session", "turn", "request", "approval_required", approval=approval))
+                    runtime = types.SimpleNamespace(telegram=transport, store=FakeStore())
+                    bot = FakeBot()
+                    config_patch, enabled_patch, limiter_patch = self._patch_access()
+                    with (config_patch, enabled_patch, limiter_patch,
+                          patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime)):
+                        self.assertTrue(adapter.handle_agent_message(bot, TELEBOT, Message("创建媒体追更订阅")))
+                    body, _, _, options = bot.edits[-1]
+                    self.assertIn(f"<b>作品</b>：同名 &amp; &lt;作品&gt; · {year} · 剧集", body)
+                    self.assertIn(f"第 {season} 季", body)
+                    self.assertIn(f"TMDB #{identifier}", body)
+                    self.assertIn("<b>追更策略</b>：自动下载", body)
+                    self.assertIn("<b>下载目标</b>：光鸭云盘 + qBittorrent", body)
+                    self.assertEqual(options["reply_markup"].buttons[0].callback_data, f"agk:c:{approval.plan_id}")
+                    self.assertFalse(transport.confirmations)
+
+    def test_subscription_change_approval_shows_saved_subscription_identity(self):
+        from app.modules.media_subscriptions import MediaSubscriptionService
+        from app.repositories.media_subscriptions import add_media_subscription
+
+        with isolated_test_database():
+            subscription_id = add_media_subscription(provider="tmdb", external_id="202", tmdb_id="202",
+                media_type="tv", title="同名剧", year="2024", monitor_mode="selected", seasons=[2])
+            service = MediaSubscriptionService()
+            for operation, change in (("update", {"enabled": False}), ("delete", {})):
+                with self.subTest(operation=operation):
+                    prepared = service.prepare_change(operation, {"subscription_id": subscription_id, **change})
+                    approval = ApprovalView("subscription_plan_202", f"subscriptions.{operation}", "WRITE",
+                                            prepared["preview"], {}, "2026-09-03T12:00:00Z")
+                    body = adapter._render_approval_turn(TurnView("tg_session", "turn", "request", "approval_required", approval=approval))
+                    self.assertIn(f"<b>订阅编号</b>：#{subscription_id}", body)
+                    self.assertIn("<b>作品</b>：同名剧", body)
+                    self.assertIn("第 2 季", body)
+
     def test_callback_preflight_outage_preserves_topic_card_for_retry(self):
         import sqlite3
         from contextlib import ExitStack

@@ -26,6 +26,7 @@ from app.modules.telegram_notification_center import publish_notification_event
 from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
+    allows_notification,
 )
 from app.notifier import NotificationEvent
 from app.repositories import media_automation_rules as rules
@@ -137,9 +138,24 @@ def digest_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_digest(rule: dict[str, Any]) -> dict[str, Any]:
+    settings = rule["settings"]
+    settings_error = rule.get("settings_error")
+    importance = NotificationImportance.ERROR if settings.get("errors_only") else NotificationImportance.RESULT
+    blocked_reason = ""
+    if settings_error:
+        blocked_reason = settings_error
+    elif not rule["enabled"]:
+        blocked_reason = "每日摘要已停用"
+    elif not is_agent_enabled():
+        blocked_reason = "Media Agent 已关闭"
+    elif not _authorized_notification_chat(rule):
+        blocked_reason = "已绑定的 Telegram 通知目标或授权已失效，请核对通知配置"
+    elif not allows_notification(importance):
+        blocked_reason = "Telegram 主动通知开关或通知等级限制了该摘要"
     return {"rule_id": rule["id"], **{key: rule[key] for key in ("kind", "enabled", "revision", "next_run_at", "created_at", "updated_at")},
-            "settings": {key: rule["settings"].get(key) for key in _DIGEST_DEFAULTS},
-            **({"settings_error": rule["settings_error"]} if rule.get("settings_error") else {})}
+            "settings": {key: settings.get(key) for key in _DIGEST_DEFAULTS},
+            "delivery_ready": not blocked_reason, "delivery_blocked_reason": blocked_reason,
+            **({"settings_error": settings_error} if settings_error else {})}
 
 
 def digests(*, owner: str) -> dict[str, Any]:

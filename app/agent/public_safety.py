@@ -309,6 +309,8 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     'subscriptions.delete': "删除媒体追更",
     "media.delete_subscription": "删除媒体追更",
     'subscriptions.get': "媒体追更策略",
+    "subscriptions.candidates": "媒体追更候选查询",
+    "subscriptions.download_candidate": "媒体追更候选提交",
     "media.get_subscription_policy": "媒体追更策略",
     "media.get_subscription_summary": "媒体追更订阅摘要",
     "media.preferences": "媒体偏好",

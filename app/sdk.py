@@ -171,7 +171,7 @@ class Session:
 
 
 class Subscriptions:
-    """媒体追更订阅：真实订阅ID、完整分页、已播与库存核对、策略及全局通知配置。"""
+    """媒体追更订阅：真实订阅与候选编号、已播与库存核对、策略及全局通知配置。"""
     @staticmethod
     @sdk_method('read')
     def list(status: str = "", enabled: bool | None = None, limit: int = 200,
@@ -196,6 +196,27 @@ class Subscriptions:
         return get_media_subscription_service().get_subscription(strict_subscription_id(subscription_id))
 
     @staticmethod
+    @sdk_method('read')
+    def candidates(subscription_id: int, limit: int = 50, offset: int = 0) -> dict:
+        """分页读取此订阅已持久化的可用和已提交候选，按 next_offset 续读。
+
+        用 items[].candidate_id 调用 download_candidate。已提交项的 request_id 可用于
+        activity.timeline("download", request_id)。只读本地记录，候选过期后请在媒体追更页重新检查。
+        """
+        from app.modules.media_subscriptions import get_media_subscription_service
+
+        return get_media_subscription_service().list_candidate_page(subscription_id, limit=limit, offset=offset)
+
+    @staticmethod
+    @sdk_method('write')
+    def download_candidate(subscription_id: int, candidate_id: int, target: str = "") -> dict:
+        """确认后提交 subscriptions.candidates 返回的持久候选编号；省略 target 沿用订阅下载目标。
+
+        每次确认只提交一个候选。订阅或候选变化时重新核对；重复、部分受理或结果未知沿原请求查询。
+        """
+        raise ValueError("媒体追更候选提交须通过工作区的确认执行器调用")
+
+    @staticmethod
     @sdk_method('write')
     def create(provider: str, external_id: str, media_type: str, *, season: int | None = None,
                check_interval_minutes: int = 4320, action: str = "confirm", download_target: str = "guangya",
@@ -214,13 +235,18 @@ class Subscriptions:
     def update(subscription_id: int, *, enabled: bool | EllipsisType = ..., monitor_mode: str | EllipsisType = ...,
                seasons: builtins.list[int] | EllipsisType = ..., include_specials: bool | EllipsisType = ...,
                action: str | EllipsisType = ..., download_target: str | EllipsisType = ...,
+               sites: builtins.list[str] | None | EllipsisType = ...,
                check_interval_minutes: int | EllipsisType = ...) -> dict:
-        """确认后更新指定订阅，未传字段保持原值；enabled控制暂停/恢复，策略含missing/future/selected、季度/特别篇、notify/confirm/auto、目标及周期。暂停/改策略使未提交工作失效，单独恢复启用保留在途工作；已进入提交阶段无法撤回，auto持续下载须确认。"""
+        """确认后更新指定订阅，未传字段保持原值。enabled 控制暂停/恢复，sites=[] 或 null 恢复自动选站。
+
+        支持范围、季度、特别篇、候选策略、下载目标及周期。暂停或修改策略使未提交工作失效，
+        单独恢复启用保留在途工作。已进入提交阶段的下载不能撤回。
+        """
         from app.modules.media_subscriptions import get_media_subscription_service
 
         args = {key: value for key, value in {"subscription_id": subscription_id, "enabled": enabled, "monitor_mode": monitor_mode,
             "seasons": seasons, "include_specials": include_specials, "action": action, "download_target": download_target,
-            "check_interval_minutes": check_interval_minutes}.items() if value is not Ellipsis}
+            "sites": sites, "check_interval_minutes": check_interval_minutes}.items() if value is not Ellipsis}
         service = get_media_subscription_service()
         prepared = service.prepare_change("update", args)
         return service.apply_change("update", prepared["arguments"], expected_snapshot=prepared["snapshot"])
@@ -289,7 +315,7 @@ class Automation:
     @staticmethod
     @sdk_method('read')
     def digests() -> dict:
-        """完整读取当前身份全部每日摘要规则的真实rule_id、revision、启停、时间、设置及已保存的settings_error；默认未开启。其他身份不可见，不暴露通知目标。"""
+        """读取当前身份的每日摘要规则、时间和修订号。用 delivery_ready 查询当前能否投递，delivery_blocked_reason 解释阻塞原因；实际送达以投递记录为准。"""
         from app.modules.media_automation_rules import digests
 
         return digests(owner=_owner())
@@ -511,10 +537,11 @@ class RSS:
 
     @staticmethod
     @sdk_method('read')
-    def entries(subscription_id: int | None = None, status: str = "pending", limit: int = 100, offset: int = 0, query: str = "") -> dict:
-        """按真实条目 ID 分页读取本地条目与持久 delivery；next 续页，标题不截断，不返回 payload/凭据。"""
+    def entries(subscription_id: int | None = None, status: str | None = None, limit: int = 100,
+                offset: int = 0, query: str = "", *, entry_ids: list[int] | None = None) -> dict:
+        """读取本地条目与持久 delivery。普通列表默认 pending；追问已选条目传 entry_ids，默认跨状态，空数组返回零项。其余过滤条件取交集，按 data.next 续页。"""
         from app.modules.rss_delivery import entries
-        return entries(subscription_id, status, limit, offset, query)
+        return entries(subscription_id, status, limit, offset, query, entry_ids=entry_ids)
 
     @staticmethod
     @sdk_method('write')

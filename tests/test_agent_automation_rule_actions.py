@@ -108,6 +108,8 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
             stopped = set_digest(stop, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
             self.assertTrue(stopped["ok"])
             self.assertFalse(stopped["data"]["enabled"])
+            self.assertFalse(stopped["data"]["delivery_ready"])
+            self.assertIn("停用", stopped["data"]["delivery_blocked_reason"])
             self.assertEqual(stopped["data"]["settings"]["minute"], 17)
             self.assertTrue(stopped["data"]["settings"]["errors_only"])
             with self.assertRaises(AgentToolError):
@@ -439,21 +441,56 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             notification_route_settings("not-an-authenticated-owner")
 
-    def test_web_rule_remains_bound_to_original_configured_chat(self):
-        from app.modules.media_automation_rules import (
-            _authorized_notification_chat,
-            notification_route_settings,
-        )
-        from app.repositories.agent_jobs import agent_job_owner_digest
+    def test_digest_readback_reports_destination_change_without_rebinding(self):
+        owner = self.context.owner
+        args = {"enabled": True, "hour": 21, "send_empty": True}
+        snapshot = prepare_set_digest(args, owner=owner)["snapshot"]
+        saved = set_digest(args, owner=owner, expected_snapshot=snapshot)["data"]
+        due = datetime.fromisoformat(saved["next_run_at"])
+        [ready] = digests(owner=owner)["data"]["items"]
+        self.assertTrue(ready["delivery_ready"])
+        self.assertEqual(ready["delivery_blocked_reason"], "")
+        original_get = config.get
 
-        settings = notification_route_settings(self.context.owner)
-        rule = {
-            "owner_digest": agent_job_owner_digest(self.context.owner),
-            "settings": settings,
-        }
-        self.assertEqual(_authorized_notification_chat(rule), "123")
-        with patch("app.modules.media_automation_rules.config.get", return_value="999"):
-            self.assertEqual(_authorized_notification_chat(rule), "")
+        with patch("app.modules.media_automation_rules.publish_notification_event", return_value=Mock(status="queued")) as publish:
+            with patch.object(config, "get", side_effect=lambda key, *args, **kwargs: (
+                "987654321" if key == "TG_CHAT_ID" else original_get(key, *args, **kwargs)
+            )):
+                [blocked] = digests(owner=owner)["data"]["items"]
+                self.assertTrue(blocked["enabled"])
+                self.assertFalse(blocked["delivery_ready"])
+                self.assertIn("Telegram 通知目标", blocked["delivery_blocked_reason"])
+                self.assertNotIn("987654321", blocked["delivery_blocked_reason"])
+                self.assertNotIn("notification_chat_id", blocked["settings"])
+                self.assertEqual(blocked["next_run_at"], saved["next_run_at"])
+                self.assertEqual(drain_automation_rules(now=due), 0)
+                publish.assert_not_called()
+
+            [restored] = digests(owner=owner)["data"]["items"]
+            self.assertTrue(restored["delivery_ready"])
+            self.assertEqual(restored["delivery_blocked_reason"], "")
+            self.assertEqual((restored["rule_id"], restored["revision"]), (saved["rule_id"], saved["revision"]))
+            retry = due + timedelta(minutes=5)
+            self.assertEqual(datetime.fromisoformat(restored["next_run_at"]), retry)
+            self.assertEqual(drain_automation_rules(now=retry), 1)
+            publish.assert_called_once()
+            self.assertEqual(publish.call_args.kwargs["chat_id"], "123")
+
+    def test_digest_readback_uses_existing_notification_policy(self):
+        owner = self.context.owner
+        for errors_only in (False, True):
+            args = {"enabled": True, "hour": 21, "errors_only": errors_only}
+            snapshot = prepare_set_digest(args, owner=owner)["snapshot"]
+            set_digest(args, owner=owner, expected_snapshot=snapshot)
+
+        original_get = config.get
+        with patch.object(config, "get", side_effect=lambda key, *args, **kwargs: (
+            "essential" if key == "TG_NOTIFICATION_LEVEL" else original_get(key, *args, **kwargs)
+        )):
+            items = {row["settings"]["errors_only"]: row for row in digests(owner=owner)["data"]["items"]}
+        self.assertTrue(items[True]["delivery_ready"])
+        self.assertFalse(items[False]["delivery_ready"])
+        self.assertIn("通知等级", items[False]["delivery_blocked_reason"])
 
     def test_daily_digest_preserves_topic_when_disabled_and_routes_after_reenable(self):
         from app.repositories.agent_jobs import agent_job_owner_digest

@@ -86,8 +86,12 @@ def normalize(operation: str, arguments: dict) -> dict:
 
 
 def entries(
-    subscription_id=None, status="pending", limit=100, offset=0, query=""
+    subscription_id=None, status=None, limit=100, offset=0, query="", *, entry_ids=None
 ) -> dict:
+    if entry_ids is not None and entry_ids != []:
+        entry_ids = _ids(entry_ids)
+    if status is None:
+        status = "pending" if entry_ids is None else "all"
     if subscription_id is not None:
         from app.modules.rss_subscriptions import subscription_id as validate_id
 
@@ -112,6 +116,7 @@ def entries(
         offset=offset,
         keyword=query,
         order="received_desc",
+        entry_ids=entry_ids,
     )
     items = [
         {
@@ -150,6 +155,7 @@ def entries(
                 "limit": limit,
                 "offset": offset + len(items),
                 "query": query,
+                **({"entry_ids": entry_ids} if entry_ids is not None else {}),
             }
             if has_more
             else None,

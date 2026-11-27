@@ -285,6 +285,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "创建或恢复订阅并安排后续检查，不会立即搜索资源或提交下载；若选择auto，之后匹配资源无需再次确认即可持续提交。只沿已有整理/STRM联动。",
         "reversibility": "可暂停或软删除；已提交下载与媒体文件不受影响。",
     },
+    "subscriptions.download_candidate": {
+        "action": "提交媒体追更候选",
+        "object": "确认卡中的持久候选与下载目标",
+        "impact": "复核媒体库库存与原候选后提交下载，后续进度可用原请求编号查询。",
+        "reversibility": "尚未确认时可取消。已经提交的任务由下载器控制。",
+    },
     "media.create_subscription": {
         "action": "创建媒体追更订阅",
         "object": "你刚才选定的影视条目和季度",

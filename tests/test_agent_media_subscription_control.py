@@ -1,28 +1,34 @@
 """媒体追更订阅的安全摘要、自然语言路由与确认写入回归。"""
 
 from __future__ import annotations
-from tests.support import seed_external_mapping
-from typing import Any
-
 import json
+import os
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 from app import database as db
-from app.repositories import media_subscriptions as media_subscriptions_repo
-from app.repositories import discovery as discovery_repo
-from app.database import media_owner_digest
 from app import sdk
-from app.modules.media_subscriptions import MediaSubscriptionError, get_media_subscription_service
 from app.agent.errors import AgentToolError
 from app.agent.rate_limit import agent_rate_limiter
+from app.database import media_owner_digest
 from app.discovery.models import MediaCard
+from app.modules.media_subscriptions import (
+    MediaSubscriptionError,
+    get_media_subscription_service,
+)
+from app.repositories import discovery as discovery_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from tests.agent_kernel_test_harness import (
     get_kernel_test_service as get_agent_service,
 )
 from tests.agent_kernel_test_harness import (
     reset_kernel_test_service as reset_agent_service_for_tests,
 )
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import (
+    IsolatedDatabaseTestCase,
+    seed_external_mapping,
+    seed_media_subscription_candidates,
+)
 
 
 class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
@@ -448,6 +454,177 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertIn("private-site", detail["sites"])
         self.assertIn("last_error", detail)
         self.assertIn("revision", detail)
+
+    def test_subscription_sites_update_preserves_scope_and_invalidates_old_work(self) -> None:
+        self._seed_inflight_state()
+        service = get_agent_service()
+        before = sdk.subscriptions.get(self.sid)
+        prepared = service.prepare("subscriptions.update", {
+            "subscription_id": self.sid, "sites": [" NYAA ", "nyaa"],
+        })
+        self.assertEqual(prepared["result"]["data"]["effective"]["sites"], ["nyaa"])
+        self.assertEqual(sdk.subscriptions.get(self.sid)["sites"], before["sites"])
+        receipt = service.confirm(prepared["action_plan"]["plan_id"])["result"]
+        self.assertEqual(receipt["data"]["sites"], ["nyaa"])
+        self.assertEqual(receipt["data"]["expired_candidates"], 1)
+        self.assertEqual(receipt["data"]["cancelled_admissions"], 1)
+        after = sdk.subscriptions.get(self.sid)
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        for field in ("action", "download_target", "seasons", "monitor_mode", "check_interval_minutes"):
+            self.assertEqual(after[field], before[field], field)
+        reset = service.prepare("subscriptions.update", {"subscription_id": self.sid, "sites": []})
+        service.confirm(reset["action_plan"]["plan_id"])
+        self.assertEqual(sdk.subscriptions.get(self.sid)["sites"], [])
+
+    def _candidate_download_fixture(self):
+        from app.indexers.providers.base import IndexerAdapter
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from app.modules import download_dispatcher, media_subscriptions
+        from tests.test_indexer_service import item
+        from tests.test_media_subscription_candidate_failover import OfflineSource
+
+        torrent_hash = f"{self.sid:040x}"
+        magnet = f"magnet:?xt=urn:btih:{torrent_hash}"
+        release = item("nyaa", "追更样本 S01E01 1080p", magnet=magnet)
+        alternative = item("nyaa", "追更样本 S01E01 720p", magnet=magnet)
+        adapter = OfflineSource([release, alternative])
+        indexer = IndexerService(
+            registry=IndexerRegistry(cast(dict[str, IndexerAdapter], {"nyaa": adapter})),
+            result_store=IndexerResultStore(),
+        )
+        media_subscriptions_repo.update_media_subscription_config(self.sid, download_target="qb", sites_json='["nyaa"]')
+        candidate_ids = seed_media_subscription_candidates(
+            self.sid, "tmdb:86034:tv:S01E001", season=1, episode=1,
+            candidates=[{**result.to_public_dict(), "result_id": indexer.result_store.put(result)}
+                        for result in (release, alternative)],
+            expires_at="2099-01-01 00:00:00",
+        )
+        self.enterContext(patch.dict(os.environ, {"QB_URL": "http://qb.invalid"}))
+        self.enterContext(patch.object(media_subscriptions, "get_indexer_service", return_value=indexer))
+        self.enterContext(patch.object(media_subscriptions, "inspect_series_episode_sources",
+                                       return_value=[{"status": "ready", "episodes": []}]))
+        backend = self.enterContext(patch.object(download_dispatcher, "_submit_qb",
+                                                 return_value={"ok": True, "task_id": torrent_hash}))
+        return candidate_ids, adapter, backend
+
+    def test_candidate_query_pages_persistent_ids_and_excludes_expired_without_writing(self) -> None:
+        (first, second), adapter, backend = self._candidate_download_fixture()
+        page = sdk.subscriptions.candidates(self.sid, limit=1)
+        tail = sdk.subscriptions.candidates(self.sid, limit=1, offset=page["next_offset"])
+        self.assertEqual({page["items"][0]["candidate_id"], tail["items"][0]["candidate_id"]}, {first, second})
+        self.assertIsNone(tail["next_offset"])
+        self.assertNotIn("result_id", page["items"][0])
+        self.assertEqual((page["items"][0]["season"], page["items"][0]["episode"]), (1, 1))
+
+        media_subscriptions_repo.update_media_subscription_candidate(second, expires_at="2000-01-01 00:00:00")
+        self.assertEqual([item["candidate_id"] for item in sdk.subscriptions.candidates(self.sid)["items"]], [first])
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT status FROM media_subscription_candidates WHERE id=?", (second,),
+            ).fetchone()["status"], "available")
+        self.assertEqual(adapter.resolve_titles, [])
+        backend.assert_not_called()
+
+    def test_candidate_confirmation_reuses_web_admission_and_returns_original_request(self) -> None:
+        from app.repositories import download_requests
+
+        (first, second), adapter, backend = self._candidate_download_fixture()
+        service = get_agent_service()
+        method = "subscriptions.download_candidate"
+        arguments = {"subscription_id": self.sid, "candidate_id": first}
+        initial = service.prepare(method, arguments, owner="first-owner")
+        parallel = service.prepare(method, arguments, owner="second-owner")
+        self.assertEqual(initial["result"]["data"]["target"], "qb")
+        self.assertEqual(initial["result"]["data"]["candidate_id"], first)
+        self.assertEqual(media_subscriptions_repo.list_active_media_download_admissions(self.sid), [])
+        self.assertEqual(adapter.resolve_titles, [])
+        backend.assert_not_called()
+
+        confirmed = service.confirm(initial["action_plan"]["plan_id"], owner="first-owner")["result"]
+        self.assertEqual(confirmed["status"], "accepted", confirmed)
+        request_id = confirmed["data"]["request_id"]
+        request = download_requests.get_download_request(request_id)
+        assert request is not None
+        self.assertEqual(request["origin"], "indexer:nyaa")
+        admission, = media_subscriptions_repo.list_active_media_download_admissions(self.sid)
+        self.assertEqual((admission["candidate_id"], admission["request_id"]), (first, request_id))
+        with self.assertRaises(AgentToolError):
+            service.confirm(initial["action_plan"]["plan_id"], owner="first-owner")
+
+        duplicate = service.confirm(parallel["action_plan"]["plan_id"], owner="second-owner")["result"]
+        self.assertEqual((duplicate["status"], duplicate["data"]["request_id"]), ("conflict", request_id))
+        repeat = service.invoke(method, arguments)["result"]
+        self.assertEqual((repeat["status"], repeat["data"]["request_id"]), ("no_changes", request_id))
+        alternative = service.prepare(method, {**arguments, "candidate_id": second})
+        other = service.confirm(alternative["action_plan"]["plan_id"])["result"]
+        self.assertEqual((other["status"], other["data"]["request_id"]), ("conflict", request_id))
+        listed = {item["candidate_id"]: item for item in sdk.subscriptions.candidates(self.sid)["items"]}
+        self.assertEqual((listed[first]["status"], listed[first]["request_id"]), ("submitted", request_id))
+        self.assertEqual(len(adapter.resolve_titles), 1)
+        backend.assert_called_once()
+
+    def test_candidate_unknown_receipt_preserves_the_original_request(self) -> None:
+        (candidate_id, _), _, backend = self._candidate_download_fixture()
+        backend.return_value = {
+            "ok": False, "failure_code": "qb_outcome_unknown", "outcome_unknown": True,
+        }
+        service = get_agent_service()
+        method = "subscriptions.download_candidate"
+        arguments = {"subscription_id": self.sid, "candidate_id": candidate_id}
+        prepared = service.prepare(method, arguments)
+        result = service.confirm(prepared["action_plan"]["plan_id"])["result"]
+        self.assertEqual(result["status"], "outcome_unknown")
+        self.assertGreater(result["data"]["request_id"], 0)
+        repeat = service.invoke(method, arguments)["result"]
+        self.assertEqual((repeat["status"], repeat["data"]["request_id"]), ("no_changes", result["data"]["request_id"]))
+        backend.assert_called_once()
+
+    def test_candidate_confirmation_rejects_cross_scope_and_configuration_changes(self) -> None:
+        (candidate_id, _), adapter, backend = self._candidate_download_fixture()
+        service = get_agent_service()
+        method = "subscriptions.download_candidate"
+        other = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="555", tmdb_id="555", media_type="tv", title="同名的另一订阅",
+        )
+        with self.assertRaises(AgentToolError) as unrelated:
+            service.prepare(method, {"subscription_id": other, "candidate_id": candidate_id})
+        self.assertEqual(unrelated.exception.code, "not_found")
+
+        prepared = service.prepare(method, {"subscription_id": self.sid, "candidate_id": candidate_id})
+        get_media_subscription_service().update_subscription(self.sid, {"sites": ["mikan"]})
+        with self.assertRaises(AgentToolError) as stale:
+            service.confirm(prepared["action_plan"]["plan_id"])
+        self.assertEqual(stale.exception.code, "confirmation_stale")
+        self.assertEqual(adapter.resolve_titles, [])
+        backend.assert_not_called()
+
+    def test_candidate_change_during_resolution_cancels_admission_before_submission(self) -> None:
+        (candidate_id, _), adapter, backend = self._candidate_download_fixture()
+        service = get_agent_service()
+        prepared = service.prepare("subscriptions.download_candidate", {
+            "subscription_id": self.sid, "candidate_id": candidate_id,
+        })
+        resolve_candidate = adapter.resolve
+
+        async def resolve_after_candidate_refresh(stored_result):
+            media_subscriptions_repo.update_media_subscription_candidate(candidate_id, expires_at="2098-01-01 00:00:00")
+            return await resolve_candidate(stored_result)
+
+        with (
+            patch.object(adapter, "resolve", side_effect=resolve_after_candidate_refresh),
+            self.assertRaises(AgentToolError) as stale,
+        ):
+            service.confirm(prepared["action_plan"]["plan_id"])
+        self.assertEqual(stale.exception.code, "confirmation_stale")
+        with db.get_conn() as conn:
+            admission = conn.execute(
+                "SELECT status,request_id FROM media_download_admissions WHERE candidate_id=?", (candidate_id,),
+            ).fetchone()
+        self.assertEqual(tuple(admission), ("cancelled", None))
+        self.assertEqual(len(adapter.resolve_titles), 1)
+        backend.assert_not_called()
 
     def test_realtime_update_query_checks_all_subscriptions_and_returns_safe_candidates(
         self,

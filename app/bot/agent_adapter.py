@@ -93,6 +93,7 @@ _TOOL_PROGRESS_LABELS = {
     "local_media": "正在检查本地媒体",
     "automation": "正在检查自动化任务",
 }
+_DOWNLOAD_TARGET_LABELS = {"guangya": "光鸭云盘", "qb": "qBittorrent", "qbittorrent": "qBittorrent"}
 
 
 def telegram_user_is_allowed(user_id: object) -> bool:
@@ -286,6 +287,52 @@ def _render_stream_preview(value: object, *, status: str = "正在输出…") ->
     return chunks[0] + "\n\n<i>" + html.escape(note[:80]) + "</i>"
 
 
+def _subscription_preview_lines(data: Mapping[str, Any], tool_name: str) -> list[str]:
+    lines: list[str] = []
+    title = sanitize_public_text(data.get("title"), limit=180)
+    year = str(data.get("year") or "").strip()
+    media_type = str(data.get("media_type") or "")
+    type_label = {"tv": "剧集", "movie": "电影"}.get(media_type)
+    work = " · ".join(value for value in (title, year if re.fullmatch(r"[0-9]{4}", year) else None, type_label) if value)
+    if work:
+        lines.append(f"<b>作品</b>：{html.escape(work)}")
+
+    provider = {"tmdb": "TMDB", "douban": "豆瓣", "bangumi": "Bangumi"}.get(str(data.get("provider")))
+    external_id = str(data.get("external_id") or "")
+    tmdb_id = str(data.get("tmdb_id") or "")
+    identities = [f"{provider} #{external_id}"] if provider and re.fullmatch(r"[1-9][0-9]{0,19}", external_id) else []
+    if re.fullmatch(r"[1-9][0-9]{0,19}", tmdb_id) and (provider != "TMDB" or not identities):
+        identities.append(f"TMDB #{tmdb_id}")
+    if identities:
+        lines.append("<b>媒体编号</b>：" + " · ".join(identities))
+    number = data.get("subscription_number")
+    if type(number) is int and number > 0:
+        lines.append(f"<b>订阅编号</b>：#{number}")
+
+    creating = tool_name == "subscriptions.create"
+    effective = data if creating else data.get("effective")
+    settings = effective if isinstance(effective, Mapping) else {}
+    seasons = [settings.get("season")] if creating else (
+        settings.get("seasons") if settings.get("monitor_mode") == "selected" else None
+    )
+    if media_type != "movie" and isinstance(seasons, list):
+        selected = sorted({season for season in seasons if type(season) is int and 0 <= season <= 100})
+        if selected:
+            lines.append("<b>季度</b>：第 " + "、".join(map(str, selected)) + " 季")
+
+    if tool_name != "subscriptions.delete":
+        action = str(settings.get("action") or "")
+        policy_label = {"notify": "仅提醒", "confirm": "人工确认", "auto": "自动下载"}.get(action)
+        if policy_label:
+            lines.append(f"<b>追更策略</b>：{policy_label}")
+        if action in {"confirm", "auto"}:
+            target = str(settings.get("download_target") or "")
+            target_label = "光鸭云盘 + qBittorrent" if target == "both" else _DOWNLOAD_TARGET_LABELS.get(target)
+            if target_label:
+                lines.append(f"<b>下载目标</b>：{target_label}")
+    return lines
+
+
 def _preview_lines(
     approval: ApprovalView,
     *,
@@ -304,12 +351,10 @@ def _preview_lines(
     lines = ["⚠️ <b>等待确认</b>", f"<b>{html.escape(action)}</b>", html.escape(summary)]
     data = preview.get("data")
     if isinstance(data, dict):
+        if approval.tool_name in {"subscriptions.create", "subscriptions.update", "subscriptions.delete"}:
+            lines.extend(_subscription_preview_lines(data, approval.tool_name))
         target = str(data.get("target") or "").strip().lower()
-        target_label = {
-            "guangya": "光鸭云盘",
-            "qb": "qBittorrent",
-            "qbittorrent": "qBittorrent",
-        }.get(target, _safe_text(target, limit=40))
+        target_label = _DOWNLOAD_TARGET_LABELS.get(target, _safe_text(target, limit=40))
         if target_label:
             lines.append(f"<b>目标</b>：{html.escape(target_label)}")
         for folder in data.get("receiving_folders", [])[:3]:
