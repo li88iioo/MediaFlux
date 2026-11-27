@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from contextlib import contextmanager
 from typing import Any, cast
+from unittest.mock import patch
 
 from app import database as db
-from app.repositories import download_requests as download_requests_repo
-from app.repositories import agent_download_verification as agent_download_verification_repo
 from app import sdk
+from app.agent.kernel.projection import DefaultProjector
 from app.agent.models import ToolResult
-from app.repositories import activity
+from app.repositories import activity, organize_confirmations
+from app.repositories import (
+    agent_download_verification as agent_download_verification_repo,
+)
+from app.repositories import download_requests as download_requests_repo
 from app.repositories.activity import timeline_snapshot
 from tests.support import IsolatedDatabaseTestCase
 
@@ -34,6 +38,19 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
             identifier, targets="guangya", status="downloading", gy_status="downloading"
         )
         return identifier
+
+    def record_organize_receipt(self, identifier, source_id, stats):
+        task_id = f"timeline-organize-{identifier}"
+        run_id = db.add_task_run("guangya_organize", "download")
+        db.finish_task_run(run_id, "success", result=json.dumps({
+            "task_id": task_id, "sources": [{"id": source_id, "stats": {
+                **stats, "notification_context": {"download_request_ids": [identifier]},
+            }}],
+        }))
+        download_requests_repo.update_download_request(
+            identifier, organize_run_id=run_id, organize_task_id=task_id, gy_target_dir=source_id, gy_isolated=1,
+        )
+        return task_id
 
     def test_stages_use_persisted_request_links_not_equal_titles(self):
         identifier = self.make_request()
@@ -251,6 +268,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
                 "title",
                 "request",
                 "organize_evidence",
+                "destination_evidence",
                 "kind",
                 "stages",
                 "explanation",
@@ -267,6 +285,175 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         )
         native = sdk.activity.timeline("download", identifier)
         self.assertEqual(native["data"]["activities"], result["data"]["activities"])
+
+    def test_guangya_receiving_distinguishes_routing_staging_recycle_and_finalized_parent(self):
+        identifier = self.make_request()
+
+        def guangya():
+            return sdk.activity.timeline("download", identifier)["data"]["destination_evidence"]["guangya"]
+
+        download_requests_repo.update_download_request(
+            identifier, gy_status="failed", gy_requested_target_dir="receive-dir", gy_target_dir="receive-dir",
+        )
+        failed = guangya()
+        self.assertEqual(failed["requested_directory_id"], "receive-dir")
+        self.assertIsNone(failed["receiving"])
+        self.assertEqual(failed["check_directory_ids"], [])
+
+        download_requests_repo.update_download_request(identifier, status="submitting", gy_status="submitting")
+        self.assertTrue(download_requests_repo.bind_download_request_guangya_staging(
+            identifier, staging_id="staging-dir", parent_id="receive-dir",
+            staging_name="MF-《示例》（第一季）", target_name="下载 / MF-《示例》（第一季）",
+        ))
+        staging = guangya()
+        self.assertEqual(staging["status"], "submitting")
+        self.assertEqual(staging["receiving"], {
+            "kind": "staging", "state": "recorded", "directory_id": "staging-dir",
+            "directory_name": "MF-《示例》（第一季）", "parent_id": "receive-dir", "parent_name": "下载",
+        })
+        self.assertEqual(staging["check_directory_ids"], ["staging-dir"])
+
+        download_requests_repo.update_download_request(
+            identifier, status="completed", gy_status="completed", organize_status="requires_manual",
+            gy_staging_cleanup_status="retained",
+        )
+        pending = guangya()
+        self.assertEqual(pending["organize_status"], "requires_manual")
+        self.assertEqual(pending["receiving"]["state"], "retained")
+        audit_id = db.add_organize_delete_audit(
+            trigger="download_staging_cleanup", file_id="staging-dir", reason="测试", status="pending",
+        )
+        self.assertEqual(guangya()["receiving"]["state"], "unverified")
+        self.assertEqual(guangya()["check_directory_ids"], [])
+        db.update_organize_delete_audit(audit_id, status="success")
+        self.assertEqual(guangya()["receiving"]["state"], "recycled")
+        download_requests_repo.update_download_request(identifier, gy_staging_name="")
+        data = sdk.activity.timeline("download", identifier)["data"]
+        receiving = data["destination_evidence"]["guangya"]["receiving"]
+        self.assertEqual(receiving["directory_id"], "staging-dir")
+        self.assertIn("原目录名未留存", receiving["historical_path_note"])
+        self.assertTrue(any("是否已入库未知" in gap for gap in data["gaps"]))
+        self.assertEqual(guangya()["check_directory_ids"], [])
+
+        download_requests_repo.update_download_request(
+            identifier, organize_status="skipped", gy_isolated=0, gy_staging_cleanup_status="completed",
+            gy_target_dir="receive-dir", gy_target_name="现在的默认配置名", gy_staging_name="原暂存目录",
+        )
+        finalized = guangya()
+        self.assertEqual(finalized["receiving"], {
+            "kind": "finalized", "state": "recorded", "directory_id": "receive-dir",
+        })
+        self.assertEqual(finalized["check_directory_ids"], ["receive-dir"])
+        download_requests_repo.update_download_request(identifier, gy_target_dir="0", gy_staging_cleanup_status="")
+        self.assertEqual(guangya()["receiving"]["kind"], "direct")
+        self.assertEqual(guangya()["check_directory_ids"], [])
+
+    def test_both_targets_keep_qb_observation_and_historical_guangya_separate(self):
+        identifier = self.make_request()
+        successor = self.make_request("successor")
+        download_requests_repo.update_download_request(
+            identifier, targets="both", status="manual_review", qb_status="completed", qb_task_id="a" * 40,
+            qb_content_path="/private-qb-volume/《本地内容》（2025）", gy_status="failed", gy_isolated=1,
+            gy_target_dir="old-staging", gy_staging_name="旧暂存",
+        )
+        with db.get_conn() as conn:
+            conn.execute("UPDATE download_requests SET qb_save_path=? WHERE id=?", ("/private-qb-volume", identifier))
+        self.assertTrue(download_requests_repo.mark_download_request_resubmitted(
+            identifier, successor_request_id=successor, targets="guangya",
+        ))
+        evidence = sdk.activity.timeline("download", identifier)["data"]["destination_evidence"]
+        self.assertEqual(evidence["qb"]["observed_content_name"], "《本地内容》（2025）")
+        self.assertEqual(evidence["qb"]["task_hash"], "a" * 40)
+        self.assertEqual(evidence["qb"]["save_path_policy"], "configured")
+        self.assertEqual(evidence["qb"]["status"], "completed")
+        self.assertFalse(evidence["qb"]["historical"])
+        self.assertTrue(evidence["guangya"]["historical"])
+        self.assertEqual(evidence["guangya"]["receiving"]["directory_id"], "old-staging")
+        self.assertEqual(evidence["guangya"]["check_directory_ids"], [])
+        self.assertNotIn("private-qb-volume", json.dumps(evidence))
+
+    def test_destination_and_organize_receipts_filter_sensitive_values_before_sdk_projection(self):
+        identifier = self.make_request()
+        name = "《合法作品》（第01集）.mkv"
+        fake_url = "https://private-download.invalid/watch?X-Emby-Token=unpublished-token"
+        self.record_organize_receipt(identifier, "staging-29", {
+            "media_items": [
+                {"title": "《合法作品》（第一季）", "filename": name, "media_type": "movie/tv", "episode": 1},
+                {"title": fake_url, "filename": "WEB_SECRET_KEY=unpublished-key",
+                 "tmdb_id": {"nested_secret": "unpublished-struct"}, "media_type": "来源/私有分类路径"},
+            ],
+            "strm_changes": [
+                {"file_id": "video-29", "parent_id": "archive-29", "name": name,
+                 "rel_dir": "剧集/《合法作品》（2025）/Season 01", "kind": "video", "action": "upsert"},
+                {"file_id": fake_url, "parent_id": "C:\\private-parent-mount", "name": fake_url,
+                 "rel_dir": "/mnt/private-absolute-root/Series", "action": "upsert"},
+                {"file_id": "video-30", "name": "电影%EF%BC%8Fprivate-encoded-child",
+                 "rel_dir": "C:/private-drive-mount/Series", "action": "remove"},
+                {"file_id": "video-31", "rel_dir": "Series/../private-traversal-name"},
+            ],
+        })
+        download_requests_repo.update_download_request(
+            identifier, gy_staging_name=fake_url, gy_staging_parent_dir="/private-root/parent",
+            gy_requested_target_dir=fake_url, targets="both", qb_status="completed",
+            qb_content_path="/media/X-Emby-Token=unpublished-qb-key",
+        )
+        native = sdk.activity.timeline("download", identifier)
+        data = native["data"]
+        self.assertEqual(data["organize_evidence"]["media"][0]["media_type"], "movie/tv")
+        self.assertNotIn("media_type", data["organize_evidence"]["media"][1])
+        self.assertEqual(data["organize_evidence"]["files"][0]["name"], name)
+        self.assertEqual(data["organize_evidence"]["files"][0]["rel_dir"], "剧集/《合法作品》（2025）/Season 01")
+        self.assertEqual(data["destination_evidence"]["guangya"]["receiving"], {
+            "kind": "staging", "state": "recorded", "directory_id": "staging-29",
+        })
+        model = json.loads(DefaultProjector().project(native).model_message())["data"]
+        self.assertEqual(model["destination_evidence"]["guangya"]["check_directory_ids"], ["staging-29"])
+        self.assertEqual(model["organize_evidence"]["files"][0]["file_id"], "video-29")
+        self.assertEqual(model["organize_evidence"]["files"][0]["parent_id"], "archive-29")
+        for public in (json.dumps(data), json.dumps(model)):
+            for private in ("unpublished-", "private-download.invalid", "private-parent-mount", "private-absolute-root",
+                            "private-drive-mount", "private-traversal-name", "private-encoded-child", "private-root"):
+                with self.subTest(private=private):
+                    self.assertNotIn(private, public)
+
+    def test_confirmed_receipt_is_scoped_to_the_bound_source_and_timeline(self):
+        identifier = self.make_request()
+        other = self.make_request("another")
+        task_id = self.record_organize_receipt(identifier, "owned-staging", {"need_confirm": 1})
+        for token, source, request, status in (
+            ("owned-executed", "owned-staging", identifier, "completed"),
+            ("owned-pending", "owned-staging", identifier, "pending"),
+            ("other-request", "owned-staging", other, "completed"),
+            ("other-source", "other-staging", identifier, "completed"),
+        ):
+            organize_confirmations.create_organize_confirmation(
+                token=token, fingerprint=token, chat_id="unpublished-chat", source_name="测试",
+                directory_path="历史来源", organize_task_id=task_id, expires_at="2090-01-01",
+                payload={"source_dir_id": source, "download_request_ids": [request]},
+            )
+            organize_confirmations.update_organize_confirmation(token, status=status, result_json=json.dumps({
+                "strm_changes": [{"file_id": token + "-video", "parent_id": "actual-archive", "action": "upsert"}],
+            }))
+
+        original = db.get_conn
+        statements = []
+
+        @contextmanager
+        def traced():
+            with original() as conn:
+                conn.set_trace_callback(statements.append)
+                yield conn
+
+        with patch.object(db, "get_conn", traced):
+            snapshot = activity.snapshot("download", identifier)
+        assert snapshot is not None
+        self.assertNotIn("destination_evidence", snapshot)
+        self.assertFalse(any("organize_confirmations" in sql or "organize_delete_audit" in sql for sql in statements))
+        data = sdk.activity.timeline("download", identifier)["data"]
+        self.assertEqual(data["organize_evidence"]["files"], [
+            {"file_id": "owned-executed-video", "parent_id": "actual-archive", "action": "upsert"},
+        ])
+        self.assertNotIn("unpublished-chat", json.dumps(data))
 
     def test_download_exposes_only_its_bound_source_receipt(self):
         identifier = self.make_request()

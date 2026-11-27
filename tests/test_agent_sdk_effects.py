@@ -961,7 +961,7 @@ def test_native_library_refresh_rpc_direct_with_durable_receipt(native_library_b
         request.write_text(json.dumps({'method': 'library.refresh', 'arguments': {'server': 'jellyfin', 'library_id': 'anime'}}))
         try:
             await bridge.dispatch(request.name)
-            assert bridge.proposal is None and not bridge.approval_ready.is_set()
+            assert bridge.proposal is None and not bridge.stop_ready.is_set()
             response = json.loads((tmp_path / 'run/mf-responses/refresh.json').read_text())
             assert response['result']['status'] == 'accepted'
             assert response['result']['data']['library_id'] == 'anime'

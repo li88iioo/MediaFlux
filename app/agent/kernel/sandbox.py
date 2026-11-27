@@ -5,22 +5,28 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import sys
+import threading
 import time
 import uuid
-import subprocess
-from functools import lru_cache
-import threading
 from dataclasses import replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app import sdk
 from app.agent.errors import ToolPipelineError, ToolRateLimitError, _ReadPermitRejected
-from app.agent.public_safety import public_tool_label, sanitize_public_text
+from app.agent.public_safety import (
+    public_tool_label,
+    sanitize_public_text,
+    sanitize_untrusted_filename,
+)
+from app.indexers.ranking import TECHNICAL_FILTER_CHOICES
 from app.modules.agent_files import workspace_path
 from app.modules.media_library import MediaLibraryError
 from app.modules.process_lock import CrossProcessLock
@@ -34,6 +40,7 @@ from .projection import ToolOutcome, _json_safe
 from .state_types import SessionBusyError, _PublicationUnprotected
 from .task_state import identity, observation_patch, read_observations
 from .tool_calls import PipelineResult, SDKReadRetry
+from .ux_display import display_text
 
 if TYPE_CHECKING:
     from .effects import EffectExecutor
@@ -46,30 +53,156 @@ _CLIENT = Path(__file__).with_name("workspace_client.py")
 _SKILLS = Path(__file__).parent.parent / "skills"
 _OUTPUT_CHARS = 16_000
 _REQUEST_BYTES = 4 * 1024 * 1024
+_SCOPED_READS = {"library.episodes", "library.audit", "library.updates", "resources.search"}
+_SCOPE_UNKNOWN = "查询范围未确认"
+_SITE_ID = re.compile(r"[a-z0-9_-]{1,32}")
+_SCOPE_SITE_LIMIT = 12
 
 
-def _sdk_activity(identity, method, arguments, *, status="running", result=None, error=""):
+def _resource_scope(result: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    request = result.get("request")
+    attempted, succeeded = result.get("sites_attempted"), result.get("sites_succeeded")
+    if (not isinstance(request, dict) or not {"year", "sites"} <= request.keys()
+            or not isinstance(attempted, list) or not isinstance(succeeded, list)):
+        return None, _SCOPE_UNKNOWN
+    year = request["year"]
+    if year is not None and (type(year) is not int or not 1800 <= year <= 2200):
+        return None, _SCOPE_UNKNOWN
+    default = request["sites"] is None
+    # 站点以索引器回执为准。该列表已通过注册表选站，允许公开的扩展站点 ID。
+    sites = list(dict.fromkeys(site for site in attempted if isinstance(site, str) and _SITE_ID.fullmatch(site)))[:_SCOPE_SITE_LIMIT]
+    returned = [site for site in sites if site in succeeded]
+    scope: dict[str, Any] = {"year": year, "site_scope": "default" if default else "selected",
+                             "sites_attempted": sites, "sites_succeeded": returned}
+    parts = [f"年份条件 {year}" if year is not None else "未指定年份"]
+    if default:
+        parts.append("未指定站点（默认范围）")
+
+    technical = result.get("technical_filter")
+    if isinstance(technical, dict) and isinstance(requested := technical.get("requested"), dict):
+        filters = {key: value for key, choices in TECHNICAL_FILTER_CHOICES.items()
+                   if (value := requested.get(key)) and type(value) is type(choices[0]) and value in choices}
+        if filters:
+            filter_scope: dict[str, Any] = {"requested": filters}
+            if technical.get("basis") == "release_title_only":
+                filter_scope["basis"] = "release_title_only"
+            if technical.get("stream_verified") is False:
+                filter_scope["stream_verified"] = False
+            scope["technical_filter"] = filter_scope
+            labels = ["排除已标 HDR" if key == "exclude_hdr" else str(value) for key, value in filters.items()]
+            if filter_scope.get("basis") == "release_title_only" and filter_scope.get("stream_verified") is False:
+                labels.append("按发布名筛选，未核验文件")
+            parts.append("规格筛选条件 " + "、".join(labels))
+
+    if len(sites) < len(attempted):
+        scope["sites_limited"] = True
+        parts.append("站点列表仅展示部分")
+    if sites:
+        parts.append("站点范围 " + "、".join(sites))
+    if missing := [site for site in sites if site not in returned]:
+        parts.append("未取得结果 " + "、".join(missing))
+    return scope, " · ".join(parts)
+
+
+def _annotate_sdk_scope(call: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any] | None = None) -> str:
+    """同一份宿主投影供短回执和处理过程使用，范围不代表读取成功。"""
+    method = call["method"]
+    if method not in _SCOPED_READS:
+        return ""
+    call["scope"] = None
+    if result is None or result.get("status") == "cancelled":
+        return "查询未执行" if call.get("execution_started") is False else _SCOPE_UNKNOWN
+    if method == "resources.search":
+        call["scope"], summary = _resource_scope(result)
+        return summary
+
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return _SCOPE_UNKNOWN
+    scope: dict[str, Any]
+    if method == "library.episodes" and arguments.get("series_id"):
+        server = data.get("server")
+        if not data.get("series_id") or server not in ("jellyfin", "emby"):
+            return _SCOPE_UNKNOWN
+        scope = {"library_scope": "series", "server": server}
+        parts = [f"指定剧集库存（{'Jellyfin' if server == 'jellyfin' else 'Emby'}）"]
+    elif method == "library.updates" or data.get("library_name") == "":
+        scope = {"library_scope": "all_configured"}
+        parts = ["未指定库（全库范围）"]
+    elif arguments.get("library_name") and isinstance(name := data.get("library_name"), str):
+        safe_name = name if display_text(name, limit=80) == name else None
+        scope = {"library_scope": "named", "library_name": safe_name}
+        parts = [f"库名条件「{safe_name}」" if safe_name else "已指定库（名称不公开）"]
+    else:
+        return _SCOPE_UNKNOWN
+    if method == "library.updates" and isinstance(items := data.get("items"), list):
+        scope["batch_size"] = len(items)
+        parts.append(f"批量 {len(items)} 项")
+    cutoff = data.get("as_of")
+    if method == "library.episodes" or (method == "library.updates" and arguments.get("media_type") == "movie"):
+        scope.update(as_of=None, as_of_source="not_applicable")
+        parts.append("无播出截止日")
+    elif isinstance(cutoff, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", cutoff):
+        default = arguments.get("as_of") is None
+        scope.update(as_of=cutoff, as_of_source="default" if default else "specified")
+        parts.append(f"截止日未指定（默认 {cutoff}）" if default else f"截止日 {cutoff}")
+    else:
+        scope.update(as_of=None, as_of_source="unknown")
+        parts.append("截止日未确认")
+    call["scope"] = scope
+    return " · ".join(parts)
+
+
+def _activity_subject(method, arguments, result):
+    if method == "activity.timeline":
+        kind = arguments.get("kind")
+        label = {"download": "下载请求", "organize": "整理记录", "local_media": "本地任务"}.get(kind) if isinstance(kind, str) else None
+        number = arguments.get("identifier")
+        return f"{label} #{number}" if label and type(number) is int and number > 0 else ""
+    if method == "cloud.info":
+        if "item" in result and result["item"] is None:
+            return "未找到该文件或目录"
+        item = result.get("item")
+        return sanitize_untrusted_filename(item["name"]) if isinstance(item, dict) and isinstance(item.get("name"), str) else ""
+    if method != "cloud.list":
+        return next((arguments[key] for key in ("query", "title", "keyword")
+                     if isinstance(arguments.get(key), str) and arguments[key].strip()), "")
+    root, parent_id = result.get("root"), result.get("parent_id")
+    path = root.get("path") if isinstance(root, dict) else None
+    if path == "/" or parent_id == "0":
+        return "根目录"
+    if isinstance(path, str) and path.startswith("/"):
+        path = sanitize_untrusted_filename(path, limit=len(path))
+        if directory := sanitize_public_text(path.strip("/").replace("/", " › "), limit=160):
+            return directory
+    return f"目录 ID {parent_id}" if isinstance(parent_id, str) and parent_id.isdecimal() else ""
+
+
+def _sdk_activity(identity, method, arguments, *, status="running", result=None, error="", scope_summary=""):
     if method.startswith(("session.", "skills.")):
         return None
-    parts = [str(arguments[key]) for key in ("query", "title", "keyword")
-             if isinstance(arguments.get(key), str) and arguments[key].strip()][:1]
+    result = result if isinstance(result, dict) else {}
+    subject = _activity_subject(method, arguments, result)
+    parts = [subject] if subject else []
     if error:
         parts.append(error)
-    elif isinstance(result, dict):
-        summary = result.get("summary") or result.get("message")
-        if isinstance(summary, str):
+    elif result:
+        data = result["data"] if isinstance(result.get("data"), dict) else result
+        summary = None if method == "cloud.list" else result.get("summary") or result.get("message")
+        if isinstance(summary, str) and summary:
             parts.append(summary)
-        else:
-            items = result.get("items")
-            if isinstance(items, list):
-                parts.append(f"本次返回 {len(items)} 项")
-        if result.get("partial") is True:
+        elif isinstance(items := data.get("items"), list):
+            parts.append(f"本次返回 {len(items)} 项")
+        if result.get("partial") is True or data.get("partial") is True:
             parts.append("结果不完整")
-        if result.get("has_more") is True:
+        if result.get("has_more") is True or data.get("has_more") is True:
             parts.append("还有后续页")
+    if scope_summary:
+        parts = [scope_summary, *(safe for part in parts if (safe := sanitize_public_text(part, limit=300)))]
+    separator = " · " if scope_summary or method == "cloud.list" else "；"
     return {"id": identity, "kind": "tool", "method": method,
             "label": public_tool_label(method), "status": status,
-            "summary": sanitize_public_text("；".join(parts), limit=300)}
+            "summary": sanitize_public_text(separator.join(parts), limit=300)}
 
 
 @lru_cache(maxsize=1)
@@ -173,8 +306,8 @@ class _SDKRequests:
         self.session_service = SessionService(effects, context)
         self.presentation = ResourcePresentation(context, effects, self.session_service.snapshots)
         self.proposal: PipelineResult | None = None
-        self.approval_ready = asyncio.Event()
-        self.read_wait_ready = asyncio.Event()
+        self.stop_ready = asyncio.Event()
+        self.quota_stop_request: str | None = None
         self.read_retry: SDKReadRetry | None = None
         self.refused_reads: dict[str, str] = {}
         self.settled_confirmations: list[str] = []
@@ -187,6 +320,10 @@ class _SDKRequests:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         self.requests_fd = os.open(root / "run/mf-requests", flags)
         self.responses_fd = os.open(root / "run/mf-responses", flags)
+
+    @property
+    def stopping(self):
+        return self.proposal is not None or self.quota_stop_request is not None
 
     def read(self, name):
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
@@ -253,7 +390,50 @@ class _SDKRequests:
         self.sync_deadline()
         return result
 
+    async def admit_read(self, name, method, arguments, normalized):
+        # 只串行化准入。配额拒绝、确认和写入共用停止边界，已准入的读取仍可并行。
+        async with self.effect_lock:
+            if self.stopping:
+                return False
+            try:
+                await self.effects.admit_call(method, normalized, self.context, effect=ToolEffect.READ)
+            except _ReadPermitRejected as exc:
+                if exc.rate_limit.get("reason") != "quota":
+                    raise
+                self.context.cancellation.raise_if_cancelled()
+                parallel = any(other != name and not task.done() for other, task in self.pending.items())
+                can_resume = (self.context.current_task is not None and self.context.continuation_binding is not None
+                              and (not self.context.read_only or self.context.lease.continuation_id))
+                # 持久任务的首次并发拒绝可交给脚本，让它收取其它在途回执。
+                if can_resume and parallel and not self.refused_reads:
+                    raise
+                self.quota_stop_request = name
+                if can_resume and not parallel:
+                    invocation = {"v": 1, "method": method,
+                                  "arguments": json.loads(json.dumps(normalized, allow_nan=False)), "rpc_id": name}
+                    try:
+                        tool_calls.resumed_sdk_read_arguments(invocation)
+                    except ValueError:
+                        pass  # 无法无损保存的读取仍停止脚本，跳过自动续行。
+                    else:
+                        self.read_retry = SDKReadRetry(exc, invocation, tuple(self.settled_confirmations))
+                call = {"method": method, "ok": False, "status": exc.code,
+                        "execution_started": False, "rate_limit": dict(exc.rate_limit)}
+                scope_summary = _annotate_sdk_scope(call, normalized)
+                self.calls.append(call)
+                activity = _sdk_activity(name, method, arguments, status="failed", error="已达读取额度",
+                                         scope_summary=scope_summary)
+                try:
+                    if activity:
+                        await self.context.report_progress({"activity": activity})
+                finally:
+                    self.stop_ready.set()
+                return False
+        return True
+
     async def dispatch(self, name):
+        if self.stopping:
+            return
         method = ""
         arguments = {}
         read_result = None
@@ -302,6 +482,8 @@ class _SDKRequests:
             current_task = self.context.current_task
             if not method.startswith("session.") and method not in {"skills.save", "skills.restore"} and self.context.task_budget is not None:
                 async with self.effect_lock:
+                    if self.stopping:
+                        return
                     try:
                         await self.context.task_budget()
                         self.sync_deadline()
@@ -313,10 +495,12 @@ class _SDKRequests:
             activity = _sdk_activity(name, method, arguments)
             if activity:
                 await self.context.report_progress({"activity": activity})
+            if self.stopping:
+                return
             if effect == "write":
                 async with self.effect_lock:
-                    if self.proposal is not None:
-                        raise ToolPipelineError("已有操作等待确认；本次调用未执行", code="approval_pending")
+                    if self.stopping:
+                        return
                     prepared = await self.effects.prepare(method, normalized, context=self.context)
                     if prepared.effect_plan is not None and prepared.tool.metadata.get("confirmation_required") is False:
                         # 免确认写仍复用冻结、一次领取和持久回执；不终止脚本或生成用户卡片。
@@ -332,37 +516,16 @@ class _SDKRequests:
                         self.calls.append({"method": method, "ok": True, "status": "approval_required"})
                         await self.context.report_progress({"activity": _sdk_activity(
                             name, method, arguments, status="approval_required")})
-                        self.approval_ready.set()
+                        self.stop_ready.set()
                         return
                     result = dict(prepared.outcome.public_content)
             else:
-                if effect == "read":
-                    try:
-                        await self.effects.admit_call(method, normalized, self.context, effect=ToolEffect.READ)
-                    except _ReadPermitRejected as exc:
-                        # 无持久任务的脚本仍可自行catch额度错误；有任务时仅冻结本次未进后端的调用。
-                        # 并发脚本保留原响应语义，不能为等待一项而丢弃其它在途RPC。
-                        if (exc.rate_limit.get("reason") != "quota" or self.context.current_task is None
-                                or self.context.continuation_binding is None or self.proposal is not None
-                                or (self.context.read_only and not self.context.lease.continuation_id)
-                                or len(self.pending) > 1):
-                            raise
-                        invocation = {
-                            "v": 1, "method": method, "arguments": json.loads(json.dumps(normalized, allow_nan=False)),
-                            "rpc_id": name,
-                        }
-                        try:
-                            tool_calls.resumed_sdk_read_arguments(invocation)
-                        except ValueError:
-                            raise exc  # 无法无损保存时维持原可 catch 的拒绝响应。
-                        self.read_retry = SDKReadRetry(exc, invocation, tuple(self.settled_confirmations))
-                        self.calls.append({"method": method, "ok": False, "status": "rate_limited", "execution_started": False})
-                        await self.context.report_progress({"activity": _sdk_activity(name, method, arguments,
-                            status="failed", error=str(exc))})
-                        self.read_wait_ready.set()
-                        return
+                if effect == "read" and not await self.admit_read(name, method, arguments, normalized):
+                    return
                 operation_id = await self.presentation.begin(method)
                 snapshot = await self.presentation.snapshot() if method == "resources.present" and bound.arguments.get("result_ids") else None
+                if self.stopping:
+                    return
                 def invoke():
                     if effect == "local_write":
                         return function(**bound.arguments)  # 内部技能写入不归档。
@@ -388,11 +551,11 @@ class _SDKRequests:
             # 只有拒绝后新发起的同参数读取可清算；拒绝前已在途的成功不能冒充重试。
             if prior_refusal is not None and ok and self.refused_reads.get(read_key) == prior_refusal:
                 self.refused_reads.pop(read_key)
-            activity = _sdk_activity(name, method, arguments,
-                status="failed" if not ok else "partial" if result.get("partial") or status == "partial" else "success",
-                result=result)
             encoded = json.dumps({**observation, "result": result}, ensure_ascii=False, allow_nan=False).encode()
             call = {"method": method, "ok": ok, "status": status}
+            activity = _sdk_activity(name, method, arguments,
+                status="failed" if not ok else "partial" if result.get("partial") or status == "partial" else "success",
+                result=result, scope_summary=_annotate_sdk_scope(call, normalized, result))
             if observation:
                 call.update({key: result[key] for key in ("cached", "partial", "truncated", "has_more") if key in result})
             read_result = {**result, "ok": ok, "status": status, "summary": result.get("summary") or method}
@@ -402,12 +565,13 @@ class _SDKRequests:
                 # 已完成的批内读取仍归档到同一工作区；在途/取消后结果不补发。
                 self.write(name, json.dumps(checkpoint, ensure_ascii=False, allow_nan=False).encode())
                 call = {"method": method, "ok": checkpoint["result"].get("ok") is not False, "status": "partial", "called_at": observation["called_at"]}
+                _annotate_sdk_scope(call, observation["arguments"], checkpoint["result"])
                 self.calls.append(call)
                 self.completed_responses.append((name, call))
             raise
         except Exception as exc:
-            if exc is budget_error:
-                raise  # 真实宿主预算拒绝交给 poller；SDK 业务错误仍返回可 catch 的响应。
+            if exc is budget_error or self.quota_stop_request == name:
+                raise  # 宿主停止后不再向脚本写响应；SDK 业务错误仍可由脚本捕获。
             message = redact_sensitive_text(getattr(exc, "public_message", None) or str(exc))
             code = str(getattr(exc, "code", None) or type(exc).__name__)
             call = {"method": str(method), "ok": False, "status": code}
@@ -422,8 +586,11 @@ class _SDKRequests:
                 error["execution_started"] = call["execution_started"] = execution_started
             encoded = json.dumps({**observation, "error": error}, ensure_ascii=False).encode()
             if method in METHODS:
+                activity_message = ("已达读取额度" if isinstance(exc, _ReadPermitRejected)
+                                    and exc.rate_limit.get("reason") == "quota" else message)
                 activity = _sdk_activity(name, method, arguments if isinstance(arguments, dict) else {},
-                                         status="failed", error=message)
+                                         status="failed", error=activity_message,
+                                         scope_summary=_annotate_sdk_scope(call, {}))
         self.calls.append(call)
         if activity:
             await self.context.report_progress({"activity": activity})
@@ -447,7 +614,7 @@ class _SDKRequests:
                     task.result()  # 响应写入等基础设施错误交给父端立即停止执行。
             with os.scandir(self.requests_fd) as entries:
                 for entry in entries:
-                    if len(self.pending) >= 4 or self.read_retry is not None:
+                    if len(self.pending) >= 4 or self.stopping:
                         break
                     name = entry.name
                     if not tool_calls.SDK_REQUEST_NAME.fullmatch(name) or name in self.accepted:
@@ -512,7 +679,7 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
     timeout = arguments.get("timeout_seconds", 120)
     process = None
     io_error = None
-    finished = stopped = poller = approval = read_wait = None
+    finished = stopped = poller = stop_ready = None
     try:
         try:
             with paths["stdout"].open("wb") as stdout, paths["stderr"].open("wb") as stderr:
@@ -528,9 +695,8 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
                 poller = asyncio.create_task(rpc.poll())
                 finished = asyncio.create_task(process.wait())
                 stopped = asyncio.create_task(context.cancellation.wait())
-                approval = asyncio.create_task(rpc.approval_ready.wait())
-                read_wait = asyncio.create_task(rpc.read_wait_ready.wait())
-                await asyncio.wait((finished, stopped, poller, approval, read_wait), return_when=asyncio.FIRST_COMPLETED)
+                stop_ready = asyncio.create_task(rpc.stop_ready.wait())
+                await asyncio.wait((finished, stopped, poller, stop_ready), return_when=asyncio.FIRST_COMPLETED)
                 context.cancellation.raise_if_cancelled()
                 if poller.done():
                     poller.result()
@@ -545,10 +711,10 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
                 await process.wait()
             archive_error = await rpc.close()
             io_error = io_error or archive_error
-            for task in (finished, stopped, approval, read_wait):
+            for task in (finished, stopped, stop_ready):
                 if task is not None and not task.done():
                     task.cancel()
-            await asyncio.gather(*(t for t in (finished, stopped, approval, read_wait) if t is not None), return_exceptions=True)
+            await asyncio.gather(*(t for t in (finished, stopped, stop_ready) if t is not None), return_exceptions=True)
             for name in ("mf-requests", "mf-responses"):
                 shutil.rmtree(root / "run" / name)
         context.cancellation.raise_if_cancelled()
@@ -633,15 +799,16 @@ async def run_code(pipeline: ToolPipeline, arguments: dict[str, Any], context: T
         status, summary = "failed", data["error"]["message"]
     elif proposal:
         status, summary = "approval_required", "脚本已在确认处结束，确认后执行预览中的操作；后续命令可读取原工作文件。"
-    elif retry:
-        status, summary = "rate_limited", "读取受到本地额度限制；原脚本已暂停，先前回执与文件保留，后续代码未执行。"
+    elif rpc.quota_stop_request is not None:
+        status, summary = "rate_limited", "读取受到本地额度限制，脚本已停止。已保留停止前的输出和回执。"
+        data["stopped_by"] = "read_quota"
     elif resumed_failure:
         status, summary = resumed_failure["status"], "等待的只读调用未取得完整结果；原执行回执已保留。"
     elif rpc.refused_reads:
         status, summary = "partial", "部分读取受到本地额度限制，尚未完成；已保留各项回执。"
     else:
         status, summary = "success", f"命令已退出（退出码 {data['exit_code']}）"
-    content = {"ok": not data.get("error") and retry is None and resumed_failure is None,
+    content = {"ok": not data.get("error") and rpc.quota_stop_request is None and resumed_failure is None,
                "status": status, "summary": summary, "data": data}
     if proposal is not None:
         assert proposal.effect_plan is not None
@@ -684,6 +851,7 @@ def run_code_tool(pipeline: ToolPipeline) -> KernelToolSpec:
                      "返回 stdout/stderr/exit_code；非零退出码需检查错误并修正。长输出仅展示头尾并标记中间省略，全文读取返回的文件。"
                      "sdk_calls 的 response_path 是 JSON 归档：成功响应在 result，失败在 error（code/message）；"
                      "json.load(open(response_path))[\"result\"] 与 SDK 返回值相同。called_at 是 SDK 调用时间，不是数据源刷新时间。"
+                     "查询短回执的 scope 记录实际库范围、截止日、资源站点和规格筛选条件，null 表示范围未确认。按真实条件和来源回执作答。"
                      "任务资料保存到 /work，已验证的长期经验用 mf.skills 保存；远端写入遵循确认授权。"
                      f"\nSDK 范围：\n{namespaces}\n已安装流程文档：\n{skills}"),
         input_schema={"type": "object", "required": ["code"], "additionalProperties": False, "properties": {

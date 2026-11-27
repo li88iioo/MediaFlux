@@ -8,14 +8,18 @@ import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any
+from unicodedata import normalize
 
 from app import database as db
-from app.sensitive_data import redact_sensitive_text
 from app.agent.public_safety import sanitize_public_text
 from app.modules.media_automation_rules import notification_route_settings
 from app.repositories import media_automation_rules as rules
-from app.repositories.download_requests import download_display_title, download_request_public_summary
 from app.repositories.agent_jobs import agent_job_owner_digest
+from app.repositories.download_requests import (
+    download_display_title,
+    download_request_public_summary,
+)
+from app.sensitive_data import contains_sensitive_credential, redact_sensitive_text
 
 _TABLES = {
     "download": "download_requests",
@@ -188,7 +192,7 @@ def search_page(query: str = "", limit: int = 50, offset: int = 0) -> dict[str, 
     }
 
 
-def snapshot(kind: str, identifier: int) -> dict | None:
+def snapshot(kind: str, identifier: int, *, include_download_evidence: bool = False) -> dict | None:
     table = _TABLES.get(kind)
     if table is None:
         raise ValueError("活动类型无效")
@@ -245,6 +249,10 @@ def snapshot(kind: str, identifier: int) -> dict | None:
                 if len(result["local_tasks"]) == 20
                 else {}
             )
+            if include_download_evidence:
+                result["request"] = download_request_public_summary(result["record"])
+                result["destination_evidence"] = _download_destination_evidence(conn, result)
+                result["organize_evidence"] = _download_organize_evidence(conn, result)
 
         elif kind == "organize":
             result["steps"] = [
@@ -327,7 +335,51 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _download_organize_evidence(stored: dict) -> dict:
+_DOWNLOAD_EVIDENCE_LIMIT = 50
+_ACCEPTED_DOWNLOAD_STATES = {"submitted", "downloading", "completed"}
+_UNCONFIRMED_DELETE_STATES = {"pending", "failed", "interrupted"}
+
+
+def _cloud_id(value: object) -> str:
+    return value if (isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", value)
+                     and not contains_sensitive_credential(value)) else ""
+
+
+def _destination_name(value: object) -> str:
+    if not isinstance(value, str) or not 0 < len(value) <= 255:
+        return ""
+    checked = normalize("NFKC", value)
+    if checked.strip() in {".", ".."} or re.search(r"[/\\\x00-\x1f\x7f-\x9f\ud800-\udfff]|%[0-9a-fA-F]{2}", checked):
+        return ""
+    # 安全检查可解码和归一化，但展示保留原始文件名，例如全角括号与书名号。
+    return value if public_text(value, 255) else ""
+
+
+def _organize_receipt_item(item: dict, fields: tuple[str, ...]) -> dict:
+    result: dict[str, Any] = {}
+    for key in fields:
+        if key not in item:
+            continue
+        value = item[key]
+        if not isinstance(value, str):
+            if value is None or type(value) is int:
+                result[key] = value
+        elif key in {"file_id", "parent_id"}:
+            if _cloud_id(value):
+                result[key] = value
+        elif key == "rel_dir":
+            checked = normalize("NFKC", value).lstrip()
+            if (len(value) <= 1024 and not re.match(r"^[a-z][a-z0-9+.-]*:", checked, re.IGNORECASE)
+                    and (not value or all(_destination_name(part) for part in value.split("/")))):
+                result[key] = value
+        elif not value or _destination_name(value) or (
+            key == "media_type" and len(value) <= 40 and set(value.lower().split("/")) <= {"movie", "tv", "series", "episode"}
+        ):
+            result[key] = value
+    return result
+
+
+def _download_organize_evidence(conn: sqlite3.Connection, stored: dict) -> dict:
     """只投影绑定运行中独占该请求的来源，不能按标题或整个批次推断归属。"""
     from app.modules.organize_results import read_organize_result
 
@@ -340,8 +392,9 @@ def _download_organize_evidence(stored: dict) -> dict:
     run = next((run for run in stored["runs"]
                 if run["id"] == row.get("organize_run_id")
                 and run["task_name"] == "guangya_organize"), None)
+    source_id = _cloud_id(row.get("gy_target_dir"))
     if (run is None or not row.get("organize_task_id") or row.get("gy_isolated") != 1
-            or not row.get("gy_target_dir") or row["gy_target_dir"] == "0"):
+            or source_id in {"", "0"}):
         return evidence
     try:
         result = read_organize_result(json.loads(run["result"] or "{}"))
@@ -352,8 +405,7 @@ def _download_organize_evidence(stored: dict) -> dict:
     sources = result.get("sources")
     if not isinstance(sources, list):
         return evidence
-    selected = [source for source in sources if isinstance(source, dict)
-                and source.get("id") == row.get("gy_target_dir")]
+    selected = [source for source in sources if isinstance(source, dict) and source.get("id") == source_id]
     if len(selected) != 1:
         return evidence
     stats = selected[0].get("stats")
@@ -363,28 +415,130 @@ def _download_organize_evidence(stored: dict) -> dict:
     if not isinstance(context, dict) or context.get("download_request_ids") != [row["id"]]:
         return evidence
 
+    receipts = [stats]
+    # 同一批次可能有多个来源，只读取准确绑定本请求及来源的确认执行回执。
+    confirmed = conn.execute(
+        """
+        SELECT c.result_json FROM organize_confirmations c
+        WHERE c.organize_task_id=? AND c.status='completed'
+          AND CASE WHEN json_valid(c.payload_json) THEN
+              COALESCE(json_extract(c.payload_json,'$.kind'),'guangya')='guangya'
+              AND json_extract(c.payload_json,'$.source_dir_id')=?
+              AND json_type(c.payload_json,'$.download_request_ids')='array' AND EXISTS (
+                  SELECT 1 FROM json_each(c.payload_json,'$.download_request_ids')
+                  WHERE type='integer' AND value=?
+              )
+          ELSE 0 END
+        ORDER BY c.id DESC LIMIT ?
+        """, (row["organize_task_id"], source_id, row["id"], _DOWNLOAD_EVIDENCE_LIMIT + 1),
+    ).fetchall()
+    for card in reversed(confirmed[:_DOWNLOAD_EVIDENCE_LIMIT]):
+        try:
+            completed = json.loads(card["result_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(completed, dict):
+            receipts.append(completed)
+
     def project(key: str, fields: tuple[str, ...]) -> tuple[list[dict], int]:
-        items = stats.get(key)
-        items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
-        return [{field: redact_sensitive_text(item[field]) if isinstance(item[field], str)
-                 else item[field] for field in fields if field in item}
-                for item in items[:50]], len(items)
+        items = [item for receipt in receipts if isinstance(receipt.get(key), list)
+                 for item in receipt[key] if isinstance(item, dict)]
+        return [_organize_receipt_item(item, fields) for item in items[:_DOWNLOAD_EVIDENCE_LIMIT]], len(items)
 
     media, media_count = project("media_items", (
         "title", "year", "media_type", "tmdb_id", "season", "episode", "filename",
     ))
-    files, file_count = project("strm_changes", (
-        "file_id", "parent_id", "name", "rel_dir", "kind", "action",
-    ))
+    files, file_count = project("strm_changes", ("file_id", "parent_id", "name", "rel_dir", "kind", "action"))
     return {
         **evidence, "status": "recorded", "run_id": run["id"],
-        "source_dir_id": selected[0]["id"], "recorded_at": _stamp(run["finished_at"]),
-        "historical": row.get("organize_status") == "resubmitted",
-        "message": "以下是该请求的持久整理回执；未实时检查云盘文件或媒体库可见性。",
+        "source_dir_id": source_id, "recorded_at": _stamp(run["finished_at"]),
+        "historical": "resubmitted" in (row.get("gy_status"), row.get("organize_status")),
+        "message": "这是该请求执行整理时的持久回执；当前位置和媒体库可见性需要另行核验。",
         "scan_complete": stats.get("scan_complete") is True,
         "media": media, "media_count": media_count, "files": files, "file_count": file_count,
-        "truncated": media_count > len(media) or file_count > len(files),
+        "truncated": media_count > len(media) or file_count > len(files) or len(confirmed) > _DOWNLOAD_EVIDENCE_LIMIT,
     }
+
+
+def _guangya_receiving(conn: sqlite3.Connection, row: dict) -> dict | None:
+    directory = _cloud_id(row["gy_target_dir"])
+    status = row["gy_status"]
+    isolated = row["gy_isolated"] == 1
+    if not directory or (isolated and directory == "0") or not (isolated or status in _ACCEPTED_DOWNLOAD_STATES):
+        return None
+    cleanup = row["gy_staging_cleanup_status"]
+    parent = _cloud_id(row["gy_staging_parent_dir"])
+    finalized = not isolated and status == "completed" and cleanup == "completed" and bool(parent and row["gy_staging_name"])
+    kind = "staging" if isolated else ("finalized" if finalized else "direct")
+    name = _destination_name(row["gy_staging_name"] if isolated else row["gy_target_name"])
+    # 单项提升后 tracker 的显示名可能来自当前默认配置，目录 ID 才是该次落点。
+    if finalized and directory == parent:
+        name = "根目录" if directory == "0" else ""
+    audit = conn.execute(
+        "SELECT status FROM organize_delete_audit WHERE provider='guangya' AND file_id=? "
+        "AND created_at>=? AND status<>'blocked' ORDER BY id DESC LIMIT 1",
+        (directory, row["created_at"]),
+    ).fetchone()
+    delete_status = audit["status"] if audit else ""
+    state = "recorded"
+    if delete_status == "success":
+        state = "recycled"
+    elif delete_status in _UNCONFIRMED_DELETE_STATES or (isolated and cleanup == "failed"):
+        state = "unverified"
+    elif isolated and cleanup == "completed":
+        state = "closed"
+    elif isolated and cleanup in {"retained", "skipped"}:
+        state = "retained"
+    result = {"kind": kind, "directory_id": directory, "state": state}
+    if name:
+        result["directory_name"] = name
+    elif state in {"closed", "recycled"}:
+        result["historical_path_note"] = "原接收目录编号已记录，原目录名未留存，无法从这份回执还原当时的完整路径。"
+    if parent and (isolated or finalized) and parent != directory:
+        result["parent_id"] = parent
+        if isolated and name:
+            # 投递时保存的是「接收目录名 / 隔离目录名」。它能定位这两级，完整祖先路径仍需核验。
+            parent_label, _, leaf = (row["gy_target_name"] or "").rpartition(" / ")
+            if leaf == name and (parent_name := _destination_name(parent_label)):
+                result["parent_name"] = parent_name
+    return result
+
+
+def _download_destination_evidence(conn: sqlite3.Connection, stored: dict) -> dict:
+    row, request = stored["record"], stored["request"]
+    evidence: dict[str, Any] = {"freshness": "persisted_snapshot"}
+    if "qb" in request["targets"]:
+        status, save_path = request["qb_status"], row["qb_save_path"]
+        qb = {"status": status, "historical": status in {"cancelled", "resubmitted"},
+              "task_bound": bool(row["qb_task_id"]), "local_import_status": request["local_import_status"],
+              "save_path_policy": "unknown" if save_path is None else ("configured" if save_path else "qb_default")}
+        if re.fullmatch(r"[0-9a-fA-F]{40}", row["qb_task_id"] or ""):
+            qb["task_hash"] = row["qb_task_id"]
+        content_path = row["qb_content_path"] or ""
+        if (status == "completed" and re.match(r"^(?:[a-zA-Z]:[\\/]|/(?!/))", content_path)
+                and not contains_sensitive_credential(content_path)):
+            name = _destination_name(content_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1])
+            if name:
+                qb["observed_content_name"] = name
+        evidence["qb"] = qb
+    if "guangya" not in request["targets"]:
+        return evidence
+
+    receiving = _guangya_receiving(conn, row)
+    historical = "resubmitted" in (row["gy_status"], row["organize_status"]) or row["gy_status"] == "cancelled"
+    check_directory_ids = []
+    if (not historical and receiving and receiving["state"] in {"recorded", "retained"}
+            and receiving["directory_id"] != "0"):
+        check_directory_ids.append(receiving["directory_id"])
+    evidence["guangya"] = {
+        "status": request["guangya_status"], "organize_status": _status(row["organize_status"]),
+        "historical": historical, "receiving": receiving,
+        "staging_cleanup_status": _status(row["gy_staging_cleanup_status"]),
+        "check_directory_ids": check_directory_ids,
+    }
+    if requested := _cloud_id(row["gy_requested_target_dir"]):
+        evidence["guangya"]["requested_directory_id"] = requested
+    return evidence
 
 
 def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
@@ -393,7 +547,7 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
         raise ValueError("活动类型无效")
     if type(identifier) is not int or identifier < 1:
         raise ValueError("活动编号必须是正整数")
-    stored = snapshot(kind, identifier)
+    stored = snapshot(kind, identifier, include_download_evidence=True)
     if stored is None:
         return {
             "ok": False,
@@ -512,7 +666,7 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
                 )
             )
         else:
-            gaps.append("未建立媒体库可见性复核记录；下载或 STRM 完成不等于已经入库。")
+            gaps.append("未建立媒体库可见性复核记录；是否已入库未知，当前记录既不能证明已入库，也不能证明未入库。")
         for run in stored["runs"]:
             stages.append(
                 _stage(
@@ -602,8 +756,8 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
         "error": "",
         "data": {
             "title": public_text(download_display_title(row) if kind == "download" else row.get("title"), 120),
-            **({"request": download_request_public_summary(row),
-                "organize_evidence": _download_organize_evidence(stored)} if kind == "download" else {}),
+            **({key: stored[key] for key in ("request", "organize_evidence", "destination_evidence")}
+               if kind == "download" else {}),
             "kind": kind,
             "stages": stages,
             "explanation": explanation,

@@ -21,6 +21,11 @@ from .projection import _arguments_safe
 logger = logging.getLogger(__name__)
 
 def contextual_message(agent_input: AgentInput) -> str:
+    receipts = agent_input.metadata.get("download_request_ids")
+    if agent_input.channel == "web" and receipts and not agent_input.reply_context:
+        return (f"{agent_input.message}\n\n"
+                f"<page_context>本会话页面显示的下载请求号（从早到晚）：{json.dumps(receipts)}。"
+                "仅供指代消解；问题涉及这些下载时按编号核验。此处没有操作授权。</page_context>")
     return with_reply_context(agent_input.message, agent_input.reply_context)
 
 

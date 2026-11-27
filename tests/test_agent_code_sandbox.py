@@ -332,35 +332,34 @@ with ThreadPoolExecutor(4) as pool:
         self.assertFalse((workspace / "run/mf-requests").exists())
         self.assertFalse((workspace / "run/mf-responses").exists())
 
-    async def test_sdk_rate_limit_error_survives_real_workspace_client(self):
+    async def test_sdk_capacity_error_remains_catchable_in_real_workspace_client(self):
         from unittest.mock import Mock
         from app.agent import rate_limit as rates
         from app.agent.kernel.ports.mediaflux_policy import MediaFluxToolRateLimiter
 
         self.enterContext(isolated_test_database("workspace-rate-admission.db"))
-        self.enterContext(patch.dict(rates._TOOL_RATE_LIMITS, {"library.episodes": 4}))
         self.enterContext(patch.object(
-            rates, "agent_rate_limiter", rates.AgentRateLimiter(shared=True, wall_clock=lambda: 120.0),
+            rates, "agent_rate_limiter", rates.AgentRateLimiter(shared=True, max_keys=1, wall_clock=lambda: 120.0),
         ))
         self.pipeline.rate_limiter = MediaFluxToolRateLimiter()
-        for _ in range(4):
-            self.assertTrue(rates.consume_agent_tool(self.context.owner, "library.episodes").allowed)
-        decision = rates.consume_agent_tool(self.context.owner, "library.episodes")
+        self.assertTrue(rates.consume_agent_tool(self.context.owner, RUN_CODE_TOOL).allowed)
+        decision = rates.consume_agent_tool(self.context.owner, "cloud.list")
         self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "capacity")
         expected = {key: getattr(decision, key) for key in (
             "limit", "cost", "remaining", "retry_after_seconds", "retry_at_epoch", "reason",
         )}
         provider = Mock()
 
-        def read(query):
-            provider(query)
+        def read(parent_id):
+            provider(parent_id)
             return {"items": []}
 
-        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+        with patch.dict(sandbox.METHODS, {"cloud.list": read}):
             result = await self.execute(
                 'import json\n'
                 'try:\n'
-                '    mf.library.episodes("blocked")\n'
+                '    mf.cloud.list("/动漫")\n'
                 'except mf.Error as error:\n'
                 '    print(json.dumps({"code": error.code, "rate_limit": error.rate_limit, '
                 '"execution_started": error.execution_started, "message": str(error)}))\n'

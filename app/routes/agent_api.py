@@ -201,6 +201,7 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
             "selection",
             "action_key",
             "reply_to",
+            "download_request_ids",
         }
     ):
         return api_error("请求字段无效", 400)
@@ -224,6 +225,11 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
         reply_context = _reply_context(data.get("reply_to"))
         if reply_context and "action_key" in data:
             raise TransportInputError("工作区行动不能引用回复")
+        receipt_ids = data.get("download_request_ids", [])
+        if (not isinstance(receipt_ids, list) or len(receipt_ids) > 8
+                or any(type(number) is not int or not 0 < number < 2**53 for number in receipt_ids)):
+            raise TransportInputError("下载回执编号无效")
+        use_receipts = receipt_ids and not reply_context and not {"action_key", "selection"}.intersection(data)
         envelope = QueryEnvelope(
             owner=owner,
             session_id=session_id,
@@ -231,6 +237,7 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
             request_id=request_id,
             channel="web",
             reply_context=reply_context,
+            metadata={"download_request_ids": list(dict.fromkeys(receipt_ids))} if use_receipts else {},
             selection=normalize_selection(data["selection"]) if "selection" in data else None,
             initial_read_tool=initial_read_tool,
             initial_read_arguments=initial_read_arguments,

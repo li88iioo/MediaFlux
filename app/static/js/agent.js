@@ -9,6 +9,7 @@
     const transcript = document.getElementById('agentTranscript');
     const composer = document.getElementById('agentComposer');
     const promptInput = document.getElementById('agentPrompt');
+    const promptLimit = Math.max(0, promptInput?.maxLength ?? 0);
     const emptyPlaceholder = promptInput?.placeholder;
     const sendButton = document.getElementById('agentSend');
     const sessionStopButton = document.getElementById('agentStopSession');
@@ -36,6 +37,8 @@
     const DRAFT_PREFIX = 'mediaflux.agent.drafts.v1.';
     const DRAFT_TTL_MS = 6 * 60 * 60 * 1000;
     const MAX_DRAFTS = 20;
+    const REPLY_LIMIT = 2000;
+    const DOWNLOAD_RECEIPT_PREFIX = '下载提交回执：';
     let scopedTrustBar = null;
     let scopedTrustExpiryTimer = null;
 
@@ -80,6 +83,7 @@
     const sessionEdits = new Set();
     let mainSessionId = '';
     let replyDraft = '';
+    let composingPrompt = false;
     let viewingChannel = '';
     // 宽屏常驻会话栏；窄屏收为抽屉。
     const railDocked = window.matchMedia?.('(min-width: 901px)') || null;
@@ -225,7 +229,7 @@
             const value = JSON.parse(sessionStorage.getItem(DRAFT_PREFIX + draftScope) || '{}');
             if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
             return Object.fromEntries(Object.entries(value).filter(([id, draft]) =>
-                SESSION_RE.test(id) && typeof draft?.text === 'string' && draft.text.length <= 1000 &&
+                SESSION_RE.test(id) && typeof draft?.text === 'string' && draft.text.length <= promptLimit &&
                 Number.isFinite(draft.updated_at) && draft.updated_at <= Date.now() &&
                 Date.now() - draft.updated_at < DRAFT_TTL_MS
             ).sort((a, b) => b[1].updated_at - a[1].updated_at).slice(0, MAX_DRAFTS));
@@ -233,7 +237,7 @@
     }
 
     function saveDraft() {
-        const text = clipText(promptInput?.value, 1000);
+        const text = clipText(promptInput?.value, promptLimit);
         memoryDrafts.set(sessionId, text);
         if (memoryDrafts.size > MAX_DRAFTS) memoryDrafts.delete(memoryDrafts.keys().next().value);
         if (!draftScope) return;
@@ -280,6 +284,7 @@
             memoryDrafts.clear();
             typed = '';
             if (promptInput) promptInput.value = '';
+            setReply('');
             clearDownloadCards();
             transcript?.replaceChildren();
             lastUserAt = 0;
@@ -297,7 +302,7 @@
     }
 
     function fillDraft(text, replyTo) {
-        const value = clipText(String(text || '').trim(), 1000);
+        const value = clipText(String(text || '').trim(), promptLimit);
         if (!promptInput || !value) return;
         if ((promptInput.value.trim() && promptInput.value.trim() !== value)
             || (replyTo !== undefined && replyDraft && replyDraft !== replyTo)) {
@@ -451,7 +456,8 @@
             quote.dataset.quoteJump = replyTo.slice(0, 300);
             quote.title = '定位到被回复的消息';
             const label = element('small', '');
-            label.append(icon('reply'), document.createTextNode('回复了 Media Agent'));
+            const caption = replyTo.startsWith(DOWNLOAD_RECEIPT_PREFIX) ? '引用下载回执' : '回复了 Media Agent';
+            label.append(icon('reply'), document.createTextNode(caption));
             quote.append(label, element('span', '', clipText(replyTo.replace(/\s+/g, ' '), 160)));
             view.body.append(quote);
             renderIcons(quote);
@@ -463,9 +469,12 @@
     function jumpToQuoted(text) {
         const needle = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 60);
         if (!needle || !transcript) return;
-        const target = [...transcript.querySelectorAll('.agent-message-assistant')].find(node => {
-            const narrative = [...node.querySelectorAll('.agent-narrative')].map(item => item.innerText).join(' ');
-            return narrative.replace(/\s+/g, ' ').includes(needle);
+        const downloadReceipt = needle.startsWith(DOWNLOAD_RECEIPT_PREFIX);
+        const items = transcript.querySelectorAll(downloadReceipt ? '[data-download-receipt]' : '.agent-message-assistant');
+        const target = [...items].find(node => {
+            const content = downloadReceipt ? node.dataset.downloadReceipt
+                : [...node.querySelectorAll('.agent-narrative')].map(item => item.innerText).join(' ');
+            return content.replace(/\s+/g, ' ').includes(needle);
         });
         if (!target) {
             announce(responseStatus, '被回复的消息已不在当前记录中');
@@ -478,9 +487,14 @@
         setTimeout(() => target.classList.remove('is-quoted'), 1600);
     }
 
-    const MAGNET_RE = /^magnet:\?\S*xt=urn:bt[im]h:/i;
     let downloadCardCount = 0;
+    let downloadReceiptOrder = 0;
     const downloadCards = new Map();
+
+    function standaloneMagnet(text) {
+        const url = text.trim();
+        return /^magnet:\?[^\s<>"`]*$/i.test(url) ? url : '';
+    }
 
     function guangyaShareLink(text) {
         const match = String(text || '').match(/https?:\/\/[^\s<>]+/i);
@@ -508,6 +522,14 @@
 
     function clearDownloadCards() {
         for (const node of downloadCards.keys()) removeTranscriptItem(node);
+    }
+
+    function recentDownloadRequestIds(targetSessionId) {
+        const receipts = [...downloadCards].flatMap(([node, card]) =>
+            node.isConnected && card.sessionId === targetSessionId && card.receipt ? [card.receipt] : []);
+        // 同一编号出现多次时，取最近一次回执的位置，再按回执顺序发送。
+        receipts.sort((first, second) => second.order - first.order);
+        return [...new Set(receipts.map(receipt => receipt.requestId))].slice(0, 8).reverse();
     }
 
     function dismissDownloadCard(node) {
@@ -681,12 +703,13 @@
         return form;
     }
 
-    // + 上传种子或粘贴磁力链接：不经过模型，和 Telegram 发种子一样直接建下载请求，由用户选目标后提交。
+    // 种子附件和独立磁力链接先预检，由用户选目标后提交下载。
     // 目标顺序与名称由服务端统一给出，与 Telegram 选择卡一致（含 NSFW 专用来源）。
     async function createDownloadCard(source) {
         const view = appendMessage('download');
         const controller = new AbortController();
-        const alive = registerDownloadCard(view.item, {dispose: () => controller.abort()});
+        const lifecycle = {sessionId, dispose: () => controller.abort()};
+        const alive = registerDownloadCard(view.item, lifecycle);
         const card = element('section', 'agent-download-card');
         const heading = element('strong', 'agent-download-title', source.file ? source.file.name : '磁力链接');
         const meta = element('p', 'agent-download-meta', '正在解析…');
@@ -800,7 +823,8 @@
             card.classList.add('is-error');
         };
         cancel.addEventListener('click', () => dismissDownloadCard(view.item));
-        submit.addEventListener('click', async () => {
+        submit.addEventListener('click', async (event) => {
+            if (submit.disabled || event.detail > 1 || !alive()) return;
             const option = chosen();
             if (!option) return;
             if (selectFiles) selectFiles.hidden = true;
@@ -812,22 +836,42 @@
                 const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, option)});
                 if (!alive()) return;
                 const status = String(result.status || 'manual_review');
+                const submitted = status === 'submitted' && result.ok === true;
+                const duplicate = status === 'duplicate' && result.duplicate === true;
+                const requestId = Number.isSafeInteger(result.request_id) && result.request_id > 0 ? result.request_id : null;
+                const requestLabel = requestId ? `下载请求 #${requestId}` : '下载请求';
                 const cloudLabel = option.nsfw_source_id ? option.label
                     : targets.find(item => item.target === 'guangya' && !('nsfw_source_id' in item))?.label;
                 const succeeded = (result.succeeded || [])
-                    .map(target => status === 'duplicate' ? ({qb: 'qBittorrent', guangya: '光鸭云盘'})[target]
-                        : ({qb: 'qBittorrent', guangya: cloudLabel})[target])
-                    .filter(Boolean);
-                meta.textContent = [result.summary || `下载请求 #${result.request_id} 受理结果待核对`,
-                    succeeded.length ? `已提交：${succeeded.join('、')}` : '', result.error || ''].filter(Boolean).join(' · ');
-                if (status === 'submitted' && result.ok === true) {
+                    .filter(target => target === 'qb' || target === 'guangya')
+                    .map(target => target === 'qb' ? 'qBittorrent' : (duplicate ? '光鸭云盘' : cloudLabel || '光鸭云盘'));
+                let receiptSummary = '';
+                if (requestId) {
+                    if (submitted) receiptSummary = `${requestLabel} 已提交`;
+                    else if (duplicate) receiptSummary = `已有${requestLabel}`;
+                    else if (status === 'partial' && succeeded.length) receiptSummary = `${requestLabel} 仅部分目标已提交`;
+                }
+                const summary = receiptSummary || result.summary || `${requestLabel} 受理结果待核对`;
+                const targetSummary = succeeded.length ? `${duplicate ? '原请求已提交' : '已提交'}：${succeeded.join('、')}` : '';
+                meta.textContent = [summary, targetSummary, result.error].filter(Boolean).join(' · ');
+                if (submitted) {
                     group.remove();
-                    actions.remove();
+                    actions.replaceChildren();
                     card.classList.add('is-done');
                 } else {
                     review.href = status === 'duplicate' ? '/downloads' : '/downloads?view=issues';
                     showRecovery(status === 'failed' && result.ok === false && !succeeded.length);
                 }
+                if (receiptSummary) {
+                    lifecycle.receipt = {requestId, order: ++downloadReceiptOrder};
+                    const reply = element('button', 'agent-download-cancel', '引用回执');
+                    reply.type = 'button';
+                    reply.dataset.replyMessage = '';
+                    view.item.dataset.downloadReceipt = clipText(
+                        `${DOWNLOAD_RECEIPT_PREFIX}${meta.textContent}\n资源：${result.title || heading.textContent}\n当前进度请按请求号核对。`, REPLY_LIMIT,
+                    );
+                    actions.append(reply);
+                } else if (submitted) actions.remove();
             } catch (error) {
                 if (!alive()) return;
                 const notSubmitted = error?.status === 400 && error?.payload?.code === 'download_not_submitted';
@@ -845,8 +889,6 @@
         });
         scrollToBottom(true);
     }
-
-    const REPLY_LIMIT = 2000;
 
     function setReply(text) {
         replyDraft = String(text || '').trim().slice(0, REPLY_LIMIT);
@@ -2717,26 +2759,52 @@
         syncViewportHeight();
     }
 
+    function canSendQuery() {
+        return !busy && !initialRestore && !viewingChannel && !sessionStopOwners.has(sessionId);
+    }
+
+    function clearPrompt() {
+        promptInput.value = '';
+        saveDraft();
+        resizePrompt();
+    }
+
+    function openMagnetCard(url) {
+        clearPrompt();
+        void createDownloadCard({url});
+    }
+
     function queryRequest(message, requestId, signal, selection = null, targetSessionId = sessionId, actionKey = '', replyTo = '') {
+        const receiptIds = !replyTo && !selection && !actionKey && !viewingChannel && targetSessionId === sessionId
+            ? recentDownloadRequestIds(targetSessionId) : [];
         return fetch('/api/agent/query', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({session_id: targetSessionId, request_id: requestId, stream: true,
                 ...(actionKey ? {action_key: actionKey} : {message, ...(selection ? {selection} : {}),
-                    ...(replyTo ? {reply_to: {text: replyTo}} : {})})}),
+                    ...(replyTo ? {reply_to: {text: replyTo}} : {}),
+                    ...(receiptIds.length ? {download_request_ids: receiptIds} : {})})}),
             signal,
         });
     }
 
     async function sendQuery(text, actionKey = '') {
-        if (busy || sessionStopOwners.has(sessionId) || initialRestore || !text.trim()) return;
-        const shareUrl = !actionKey && !replyDraft && guangyaShareLink(text);
-        if (shareUrl) {
-            promptInput.value = ''; saveDraft(); resizePrompt();
-            void createShareCard(shareUrl);
-            return;
+        const message = text.trim();
+        if (!message || !canSendQuery()) return;
+        if (!actionKey && !replyDraft) {
+            const magnet = standaloneMagnet(message);
+            if (magnet) {
+                openMagnetCard(magnet);
+                return;
+            }
+            // 磁力链接的 tracker 也可能含 HTTP 地址，混合文本仍由对话处理。
+            const shareUrl = !/magnet:\?\S/i.test(message) && guangyaShareLink(message);
+            if (shareUrl) {
+                clearPrompt();
+                void createShareCard(shareUrl);
+                return;
+            }
         }
         clearReceiptObserverForNewRequest();
-        const message = text.trim();
         const replyTo = actionKey ? '' : replyDraft;
         ++sessionLoadGeneration;
         expireCandidateCards();
@@ -2746,12 +2814,9 @@
         turn.requestMessage = message;
         turn.requestReplyTo = replyTo;
         turn.boundSelection = Boolean(actionKey);
-        if (!actionKey) {
-            promptInput.value = '';
-            saveDraft();
-        }
+        if (actionKey) resizePrompt();
+        else clearPrompt();
         scrollToBottom(true);
-        resizePrompt();
         rememberSession(sessionId);
         const targetSessionId = sessionId;
         const controller = new AbortController();
@@ -3214,7 +3279,7 @@
                 button.append(element('span', '', action.title.slice(0, 80)), icon('arrow-up-right'));
                 const draft = element('button', 'agent-retry-draft');
                 draft.type = 'button';
-                draft.dataset.agentDraft = clipText(action.prompt, 1000);
+                draft.dataset.agentDraft = clipText(action.prompt, promptLimit);
                 draft.setAttribute('aria-label', `填入草稿：${action.title.slice(0, 80)}`);
                 draft.title = '填入草稿后修改，不立即执行';
                 draft.append(icon('square-pen'));
@@ -4067,8 +4132,10 @@
 
     composer?.addEventListener('submit', (event) => {
         event.preventDefault();
-        sendQuery(promptInput?.value || '');
+        if (!composingPrompt) void sendQuery(promptInput?.value || '');
     });
+    promptInput?.addEventListener('compositionstart', () => { composingPrompt = true; });
+    promptInput?.addEventListener('compositionend', () => { composingPrompt = false; });
     promptInput?.addEventListener('input', () => { resizePrompt(); saveDraft(); });
     let scrollPillFrame = 0;
     transcript?.addEventListener('scroll', () => {
@@ -4107,10 +4174,9 @@
     window.addEventListener('blur', pauseReceiptObservation);
     window.addEventListener('focus', resumeReceiptObservation);
     promptInput?.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-            event.preventDefault();
-            composer?.requestSubmit();
-        }
+        if (event.key !== 'Enter' || event.shiftKey || event.isComposing || composingPrompt || event.keyCode === 229) return;
+        event.preventDefault();
+        composer?.requestSubmit();
     });
     sessionStopButton?.addEventListener('click', stopSessionTasks);
     newSessionButton?.addEventListener('click', startNewSession);
@@ -4130,11 +4196,13 @@
         void createDownloadCard({file});
     });
     promptInput?.addEventListener('paste', (event) => {
-        const text = String(event.clipboardData?.getData('text') || '').trim();
-        if (!MAGNET_RE.test(text) || /\s/.test(text)) return;
-        // 带 tracker 的磁力链接常超过输入框 1000 字上限，直接转为下载卡片。
+        if (event.defaultPrevented || !canSendQuery() || composingPrompt || replyDraft) return;
+        const url = standaloneMagnet(event.clipboardData?.getData('text/plain') || '');
+        if (!url) return;
+        const {value, selectionStart, selectionEnd} = promptInput;
+        if ((value.slice(0, selectionStart) + value.slice(selectionEnd)).trim()) return;
         event.preventDefault();
-        createDownloadCard({url: text});
+        openMagnetCard(url);
     });
     channelList?.addEventListener('click', (event) => {
         const open = event.target.closest('[data-channel-open]');
@@ -4220,10 +4288,10 @@
     transcript?.addEventListener('click', (event) => {
         const reply = event.target.closest('[data-reply-message]');
         if (reply) {
-            // 只引用回答正文，不带“已完成 · 16秒”等状态行和处理过程。
             const article = reply.closest('.agent-message');
+            // 与回答正文共用可撤销的引用栏，直接下载仅引用实际提交回执。
             const narrative = [...(article?.querySelectorAll('.agent-narrative') || [])].map(node => node.innerText).join('\n').trim();
-            setReply(narrative || article?.querySelector('.agent-message-body')?.innerText || '');
+            setReply(article?.dataset.downloadReceipt || narrative || article?.querySelector('.agent-message-body')?.innerText || '');
         }
         const quote = event.target.closest('[data-quote-jump]');
         if (quote) jumpToQuoted(quote.dataset.quoteJump || '');

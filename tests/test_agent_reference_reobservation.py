@@ -265,9 +265,11 @@ class Case:
             assert self.pipeline is not None
             assert (await self.pipeline.get_pending_plan(owner=self.owner, session_id=self.sid)).plan_id == plan.plan_id
 
-    async def confirm(self, plan, *, owner=None):
-        events = [event async for event in self.session.confirm(owner=owner or self.owner,
-                  session_id=self.sid, plan_id=plan.plan_id, request_id="confirm-" + plan.plan_id)]
+    async def confirm(self, plan, *, owner=None, request_id=""):
+        events = [event async for event in self.session.confirm(
+            owner=owner or self.owner, session_id=self.sid, plan_id=plan.plan_id,
+            request_id=request_id or "confirm-" + plan.plan_id,
+        )]
         self.events.extend(events)
         return events, await self.state()
 
@@ -380,9 +382,25 @@ def test_stale_confirmation_reobserves_then_requires_new_card_and_new_confirmati
         assert any(json.loads(row["content"]).get("status") == "confirmation_stale"
                    for row in case.script.requests[2]["messages"] if row.get("role") == "tool")
         before_duplicate = state.to_payload()
-        duplicate, unchanged = await case.confirm(old)
-        assert duplicate[-1].type is AgentEventType.TURN_FAILED and duplicate[-1].payload["code"] == "confirmation_invalid"
+        scope = {"owner": case.owner, "session_id": case.sid}
+        pending_before = await case.pipeline.get_confirmation_evidence(**scope)
+        assert pending_before is not None and pending_before.plan_id == new.plan_id
+        journal_before = await case.cold_store().list_events(**scope)
+        replay, unchanged = await case.confirm(old, request_id=failure.request_id)
+        assert [event.type for event in replay] == [AgentEventType.EFFECT_FAILED, AgentEventType.TURN_FAILED]
+        assert {(event.turn_id, event.request_id) for event in replay} == {(failure.turn_id, failure.request_id)}
+        receipt = case.assert_stale_receipt(replay, unchanged, old, status="failed")
+        assert receipt.payload["result"] == failure.payload["result"]
+        assert receipt.payload["receipt"] == failure.payload["receipt"]
+        assert replay[-1].payload["code"] == failure.payload["code"] == "confirmation_stale"
         assert unchanged.to_payload() == before_duplicate
+        assert await case.cold_store().list_events(**scope) == journal_before
+
+        rejected, unchanged = await case.confirm(old, request_id="different-confirm-turn")
+        assert [event.type for event in rejected] == [AgentEventType.TURN_FAILED]
+        assert rejected[0].payload["code"] == "confirmation_invalid"
+        assert unchanged.to_payload() == before_duplicate
+        assert await case.pipeline.get_confirmation_evidence(**scope) == pending_before
         case.assert_counts(reads=2, prepares=2, attempts=old_attempts, mutations=0, models=4 + int(direct_write_first))
         completed, final = await case.confirm(new)
         assert any(event.type is AgentEventType.EFFECT_COMPLETED for event in completed)

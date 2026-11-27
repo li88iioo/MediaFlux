@@ -10,7 +10,7 @@
 | --- | --- |
 | 库内检索/计数 | `library.search` 查标题/演员/媒体类型，年份核元数据；count_only 取多源记录数（非去重作品），按每源 next_offset 续页，未知计数保留。 |
 | 收藏更新 | `watchlist.list` 按 next 读全、筛 tv，逐部 `library.audit`。 |
-| 已知缺集资源 | 复用作品/季集/完整 audit，按作品季 `resources.search_missing`，继续剩余/失败目标。 |
+| 查缺集并找资源 | 确认作品身份后一次调用 `resources.search_missing`。每个目标传 query、tmdb_id、season 和用户指定的 library_name；as_of、sites、resolution、dynamic_range 传给本次调用。其 audit 已核对库存与播出日期。 |
 | 指定资源 | `resources.search`；歧义查 `media.search/detail`，本地库存 `library.episodes`，已播对照 `library.audit`。 |
 | 推荐排库 | `media.sources/filters` → `media.catalog`，保留产地/年份，传 limit、exclude_library=True，按 scope 续页；已批量核库。外部片单用 `library.presence`，仅 missing 是核实未入库。 |
 | 周表 | 单平台用 `media.calendar(source="tencent")`（也支持 iqiyi、youku）；全部平台省略 source。按日期和平台代码整理七天，covered_dates 空、产地未取均为未知，partial 不是分页。 |
@@ -27,11 +27,17 @@
 
 普通找资源有可靠匹配即可交付；要求列全、数量不足或无匹配才续页/换来源。按 site_statuses 报告覆盖，has_more 不阻挡交付，不外推全网/官方发行；单集与范围包分列。`exclude_hdr=True` 仅排除已标 HDR，明确 SDR 用 `dynamic_range="SDR"`；未标记不是 SDR。季序未知或与已播进度冲突不推荐；标题、体积、做种不证明实测码率、字幕、官方来源或速度。
 
+补集时，先用返回的 audit 核实库名、日期和实际缺集，再逐条核对候选标题是否标明用户要求的字幕。首选缺少字幕证据或需查下一页时，仅对尚缺的集数补查，沿用已确认的年份、站点和硬规格。全库合计不能证明某个指定库的库存，按今天核对不能证明指定日期的已播范围。
+
 `resources.present` 组合跨查询/页真实 result_id，保留条件/来源；`resources.download` 生成整批预览，显式传用户目标，省略沿偏好。`search_missing` 的 result_ids/verification_targets 整体保留并传下载，覆盖资源包全部集。出确认卡即结束脚本，确认只执行冻结操作，后续核验用新命令。取消待确认用 `session.pending_plan("cancel")`；`resources.present([])` 仅撤候选卡。
 
 ## 下载到入库
 
-候选回执取 `data.items[].request_id`，直链 `downloads.submit` 取顶层 request_id；普通网页/分享不用 submit。光鸭直链需要只选或排除文件时，先用 `cloud.resolve_offline` 取清单，再提交非空 `file_indexes` 与同次 `manifest_digest`。没有剩余项就停下，不能退回默认规则下载。详见 `/skills/cloud-files/references/examples.md` 第 10 节。`activity.timeline("download", request_id)` 查持久 stages/gaps；忘记编号查 `downloads.requests` 的 request_number/next_offset。实时队列用 `downloads.tasks` / `cloud.offline_tasks` 按真实后端身份关联；补库用 `resources.missing_workflows`。明确可重试失败才调 `downloads.retry`，未知受理不重投。
+问“下载到哪了、入库了吗”，直链用提交回执的 `request_id`，候选用 `data.items[].request_id`，先查 `activity.timeline("download", request_id)`。多条分别按编号关联；没有编号而有片名，可用 `activity.search(片名)` 的 download 项找原请求编号。重名时用会话里的标题、目标和时间核对，仍有歧义再请用户选择。
+
+时间线的 `data.destination_evidence` 按光鸭、qB 分别记录去向。`guangya.receiving` 是接收记录，整理后的文件看同一时间线的 `data.organize_evidence.files`，阶段和未核验范围见 `data.stages/gaps`。明确问当前是否还在或缺完整路径时，对有关联的真实 ID 用 `cloud.info(file_id, include_path=True)` 定点核验。暂存、已整理和媒体库可见分别作答；历史记录缺失就说明已知落点及缺口，无需遍历媒体库。用户查询整个实时队列时用 `downloads.tasks` 或 `cloud.offline_tasks`。
+
+普通网页/分享不用 submit；光鸭离线选集先用 `cloud.resolve_offline`，再提交非空 `file_indexes` 和同次 `manifest_digest`，没有剩余项就停下。详见 /skills/cloud-files/references/examples.md 第 10 节。补库用 `resources.missing_workflows`，明确可重试失败才调 `downloads.retry`，未知受理不重投。
 
 光鸭整理/STRM 见 cloud-files；qB 从 timeline 的 `data.activities` 中 local_media 取 id → `local.task`，待人工/失败先 `local.preview` 再按需 `local.retry`。归档用 `local.verify_library`，需精准刷新则 `local.refresh_library` 后再验。其他电影用 `library.presence`、剧用 `library.audit(..., refresh=True)` 核原目标。受理/阶段结束不等于入库；partial/unknown 保留未覆盖范围，索引可见不证明可播放。
 

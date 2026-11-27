@@ -674,7 +674,7 @@ class Settings:
     @staticmethod
     @sdk_method('read')
     def policies() -> dict:
-        """读取13项非敏感策略的当前值、显示值和部署托管标记，不返回凭据或任意配置。"""
+        """读取可管理策略的当前值、显示值和部署托管标记。data.policy_count 是当前数量。"""
         from app.modules.policy_config import policies
         return policies()
 
@@ -687,7 +687,7 @@ class Settings:
     @staticmethod
     @sdk_method('read')
     def features() -> dict:
-        """完整读取11项白名单功能的真实启停、依赖可用性、环境托管标记及安全依赖计数。不返回user.env、配置键、路径、站点或密钥，不访问网络。enabled为已配置状态，availability说明依赖是否允许当前使用。"""
+        """读取可管理的功能和 feature_count。enabled 为配置开关，availability 和 reason_codes 说明当前可用性及原因。仅检查本机配置。"""
         from app.modules.feature_config import features
 
         return features()
@@ -767,7 +767,7 @@ class Recognition:
 
 
 class Library:
-    """Jellyfin/Emby 连接身份、本地媒体库搜索、库存、缺集、观看历史与推荐、用户状态和播放列表。"""
+    """Jellyfin/Emby 本地媒体库搜索、连接、用户状态和片单。核对指定库的已播缺集用 audit(library_name=..., as_of=...)。只看现有库存用 episodes。"""
     @staticmethod
     @sdk_method('read')
     def path_mappings(server: str) -> dict:
@@ -1069,7 +1069,8 @@ class Library:
         电影 data 含 local_match_status/comparison/sources，只核对本地存在性，不证明版本更优。
         批量返回 data.counts 与 data.items，按输入去重后的顺序排列；每项直接含
         query/title/ok/status/missing_count/missing_sample/sources，未知计数为 None。
-        默认刷新，保留未知与部分来源，不自动搜索或下载资源。
+        默认刷新，按全部已配置媒体库核对。指定库的剧集用 library.audit(library_name=..., as_of=...)；
+        同时找缺集资源用 resources.search_missing。省略 as_of 使用当前日期。
 
         >>> single = library.updates(query="目标剧", media_type="tv")
         >>> missing = single["data"].get("missing_sample", [])
@@ -2076,7 +2077,7 @@ class Web:
 
 
 class Activity:
-    """操作历史、整理日志、可撤销操作检查与补偿，以及下载和入库活动跟踪。"""
+    """操作历史、整理日志与撤销。已知下载请求编号，用 activity.timeline("download", request_id) 查接收位置、整理和入库记录。"""
     @staticmethod
     @sdk_method('read')
     def actions(limit: int = 50, outcome: str = "all", before_id: int | None = None) -> dict:
@@ -2153,7 +2154,12 @@ class Activity:
         直接传 timeline("download", request_id)，无需搜索或匹配云盘列表。
         返回 ok/status/message/data；data.title 是已补全的文件名，data.request 是下载请求摘要，
         data.stages 是阶段列表（stage/status/task_bound/progress/updated_at/reason），不是 events。
-        data.organize_evidence 提供本请求绑定来源的媒体身份及文件ID；它是持久整理回执，不是实时云盘/媒体库查询。
+        data.destination_evidence 按实际选择的后端返回持久证据。光鸭 receiving.kind 分为 staging（隔离暂存）、
+        direct（直接接收）和 finalized（未走归档的收口目录）。parent_name/directory_name 为接收时记录的两级名称，requested_directory_id 仅是路由意图。
+        organize_status=requires_manual 时仍需确认。receiving.state 为 recycled、closed 或 unverified 时位置待核验或仅存历史。
+        data.organize_evidence.files 的 file_id/parent_id 是执行当时的记录，action=upsert 表示当时落位，remove 表示移除。
+        需要当前位置时优先对已知文件 ID 或 guangya.check_directory_ids 使用 cloud.info(id, include_path=True)，
+        无可靠 ID 时如实说明。qB 的 save_path_policy 是投递设置，observed_content_name 只显示已记录的内容名。
         下载阶段 task_bound=True 表示该请求已绑定后端任务；False 表示尚未记录关联，不证明后端没有任务。
         data.gaps 标明未复核范围，freshness=persisted_snapshot；下载完成不等于媒体库已入库。
         """
@@ -2245,7 +2251,7 @@ class Activity:
 
 
 class Resources:
-    """公开资源站的资源搜索、版本筛选和季集匹配。"""
+    """公开资源站检索。找指定版本用 search；按库补集用 search_missing，一次核对指定库、截止日和逐集候选。"""
     @staticmethod
     @sdk_method('control')
     def present(result_ids: list[str], *, resolution: str | EllipsisType = ...,

@@ -76,7 +76,7 @@ def _publish(rpc, number, method="resources.download", arguments=None):
 def sqlite_admission():
     with (
         isolated_test_database("sdk-ipc-admission.db"),
-        patch.dict(rates._TOOL_RATE_LIMITS, {"library.episodes": 4}),
+        patch.dict(rates._TOOL_RATE_LIMITS, {"cloud.list": 4}),
         patch.object(rates, "agent_rate_limiter", rates.AgentRateLimiter(shared=True, wall_clock=lambda: 120.0)),
     ):
         yield
@@ -103,23 +103,25 @@ def test_exhausted_sqlite_read_quota_blocks_provider_and_keeps_other_owner_indep
             return {"query": query}
 
         for _ in range(4):
-            assert rates.consume_agent_tool("quota-owner", "library.episodes").allowed
-        decision = rates.consume_agent_tool("quota-owner", "library.episodes")
+            assert rates.consume_agent_tool("quota-owner", "cloud.list").allowed
+        decision = rates.consume_agent_tool("quota-owner", "cloud.list")
         assert not decision.allowed
         expected = {key: getattr(decision, key) for key in (
             "limit", "cost", "remaining", "retry_after_seconds", "retry_at_epoch", "reason",
         )}
-        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+        with patch.dict(sandbox.METHODS, {"cloud.list": read}):
             async with _sqlite_bridge(tmp_path / "exhausted") as (rpc, _):
-                name = _publish(rpc, 1, "library.episodes", {"query": "blocked"})
-                await rpc.dispatch(name)
-                reply = json.loads((rpc.root / "run/mf-responses" / name).read_text())
+                requests = [_publish(rpc, index, "cloud.list", {"query": "blocked"}) for index in range(5)]
+                async with _controlled_poll(rpc) as next_scan:
+                    await asyncio.gather(*rpc.pending.values())
+                    await next_scan()
                 assert invoked == []
-                assert reply["error"]["code"] == "rate_limited"
-                assert reply["error"]["execution_started"] is False
-                assert reply["error"]["rate_limit"] == expected
+                assert rpc.stop_ready.is_set() and rpc.read_retry is None
+                assert not any((rpc.root / "run/mf-responses" / name).exists() for name in requests)
+                assert rpc.calls == [{"method": "cloud.list", "ok": False, "status": "rate_limited",
+                                      "execution_started": False, "rate_limit": expected}]
             async with _sqlite_bridge(tmp_path / "other-owner", owner="other-owner") as (rpc, _):
-                name = _publish(rpc, 1, "library.episodes", {"query": "independent"})
+                name = _publish(rpc, 1, "cloud.list", {"query": "independent"})
                 await rpc.dispatch(name)
                 assert json.loads((rpc.root / "run/mf-responses" / name).read_text())["result"] == {"query": "independent"}
                 assert invoked == ["independent"]
@@ -135,28 +137,31 @@ def test_concurrent_sqlite_read_admission_shares_four_permits_across_bridges(tmp
             invoked.append(query)
             return {"query": query}
 
-        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+        with patch.dict(sandbox.METHODS, {"cloud.list": read}):
             async with (
                 _sqlite_bridge(tmp_path / "first", session="first") as (first, _),
                 _sqlite_bridge(tmp_path / "second", session="second") as (second, _),
             ):
                 requests = [
-                    (rpc, _publish(rpc, index, "library.episodes", {"query": str(index)}))
+                    (rpc, _publish(rpc, index, "cloud.list", {"query": str(index)}))
                     for index, rpc in enumerate((first, second) * 3)
                 ]
                 await asyncio.gather(*(rpc.dispatch(name) for rpc, name in requests))
-                replies = [json.loads((rpc.root / "run/mf-responses" / name).read_text()) for rpc, name in requests]
+                response_paths = [rpc.root / "run/mf-responses" / name for rpc, name in requests]
+                replies = [json.loads(path.read_text()) for path in response_paths if path.exists()]
                 assert len(invoked) == 4 and len(set(invoked)) == 4
-                assert sum("result" in reply for reply in replies) == 4
-                rejected = [reply["error"] for reply in replies if "error" in reply]
-                assert len(rejected) == 2
-                assert all(error["code"] == "rate_limited" and error["execution_started"] is False for error in rejected)
-                assert all(error["rate_limit"]["remaining"] == 0 for error in rejected)
+                assert sorted(reply["result"]["query"] for reply in replies) == sorted(invoked)
+                assert first.stop_ready.is_set() or second.stop_ready.is_set()
+                for rpc in (first, second):
+                    rejected = [call for call in rpc.calls if call["ok"] is False]
+                    assert len(rejected) == int(rpc.stop_ready.is_set())
+                    assert all(call["status"] == "rate_limited" and call["execution_started"] is False
+                               and call["rate_limit"]["remaining"] == 0 for call in rejected)
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("ending", ("cancel", "revoked"))
+@pytest.mark.parametrize("ending", ("cancel", "cancel_before_quota_denial", "revoked"))
 def test_read_admission_rechecks_cancellation_and_lease_after_await(tmp_path, sqlite_admission, ending):
     async def run():
         invoked = []
@@ -165,22 +170,29 @@ def test_read_admission_rechecks_cancellation_and_lease_after_await(tmp_path, sq
             invoked.append(query)
             return {"query": query}
 
-        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+        with patch.dict(sandbox.METHODS, {"cloud.list": read}):
             async with _sqlite_bridge(tmp_path) as (rpc, effects):
                 entered, release = asyncio.Event(), asyncio.Event()
                 acquire = effects.rate_limiter.acquire
+                denied = ending == "cancel_before_quota_denial"
+                if denied:
+                    for _ in range(4):
+                        assert rates.consume_agent_tool(rpc.context.owner, "cloud.list").allowed
 
                 async def delayed_acquire(**kwargs):
-                    await acquire(**kwargs)
+                    if not denied:
+                        await acquire(**kwargs)
                     entered.set()
                     await release.wait()
+                    if denied:
+                        await acquire(**kwargs)
 
                 with patch.object(effects.rate_limiter, "acquire", new=delayed_acquire):
-                    name = _publish(rpc, 1, "library.episodes", {"query": "blocked"})
+                    name = _publish(rpc, 1, "cloud.list", {"query": "blocked"})
                     dispatch = asyncio.create_task(rpc.dispatch(name))
                     try:
                         await asyncio.wait_for(entered.wait(), 2)
-                        if ending == "cancel":
+                        if ending != "revoked":
                             rpc.context.cancellation.cancel()
                         else:
                             await effects.state_store.begin_turn(
@@ -190,9 +202,10 @@ def test_read_admission_rechecks_cancellation_and_lease_after_await(tmp_path, sq
                         release.set()
                         await asyncio.gather(dispatch, return_exceptions=True)
                 assert invoked == []
-                if ending == "cancel":
+                if ending != "revoked":
                     assert dispatch.cancelled()
                     assert not (rpc.root / "run/mf-responses" / name).exists()
+                    assert not rpc.stop_ready.is_set() and not rpc.calls
                 else:
                     reply = json.loads((rpc.root / "run/mf-responses" / name).read_text())
                     assert "error" in reply and "result" not in reply
@@ -212,7 +225,7 @@ def test_approval_request_is_not_dispatched_again_after_task_completion(tmp_path
                 name = _publish(rpc, 1)
                 async with _controlled_poll(rpc) as next_scan:
                     await asyncio.gather(*rpc.pending.values())
-                    assert rpc.proposal is not None and rpc.approval_ready.is_set()
+                    assert rpc.proposal is not None and rpc.stop_ready.is_set()
                     assert not (rpc.root / "run/mf-responses" / name).exists()
                     # 第一轮dispatch已经return，第二轮poll必须能释放槽位而不重派该request。
                     await next_scan()

@@ -74,7 +74,7 @@ HTML = """
             <button type="button" class="agent-attach" id="agentAttach" aria-label="添加种子文件">+</button>
             <input type="file" id="agentAttachFile" accept=".torrent,application/x-bittorrent" hidden>
             <div class="agent-composer-input-wrap">
-              <textarea id="agentPrompt" rows="1" maxlength="1000" placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea>
+              <textarea id="agentPrompt" rows="1" maxlength="12000" placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea>
             </div>
             <span class="agent-submit-slot">
               <button type="submit" class="agent-send" id="agentSend" hidden disabled>发送</button>

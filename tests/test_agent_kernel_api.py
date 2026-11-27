@@ -278,6 +278,27 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         self.assertGreaterEqual(response.status_code, 400)
         self.assertEqual(len(self.web.queries), before)
 
+    def test_direct_card_receipts_are_optional_query_context(self):
+        from app.agent.kernel.conversation_context import contextual_message
+
+        body = {"message": "刚才那两部各下载到哪里了？", "session_id": "session_1234567890",
+                "stream": False, "download_request_ids": [132, 145, 145]}
+        response = self.client.post("/api/agent/query", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        turn = self.web.queries[-1].to_agent_input()
+        self.assertEqual(turn.message, body["message"])
+        self.assertEqual(turn.reply_context, {})
+        self.assertIn("[132, 145]", contextual_message(turn))
+        self.assertFalse(turn.initial_read_tool)
+        response = self.client.post("/api/agent/query", json={**body, "reply_to": {"text": "另一部片"}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("132", contextual_message(self.web.queries[-1].to_agent_input()))
+        for invalid in ([True], [0], ["#132"], [2**53], list(range(1, 10))):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.client.post("/api/agent/query", json={
+                    **body, "download_request_ids": invalid,
+                }).status_code, 400)
+
     def test_non_stream_query_and_confirm_return_canonical_turn_view(self):
         query = self.client.post(
             "/api/agent/query",

@@ -30,6 +30,7 @@ from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import _capture_creation_binding
 
+from app.agent.kernel.adapters import consume_events
 from app.agent.kernel.completion_receipts import _completion_cipher
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.persistence import SQLiteKernelStore
@@ -166,6 +167,17 @@ async def assert_strm_identity(later_count: int, later_source: str):
         assert final["status"] == "failed"
         assert not final["ok"]
         assert seed["tracker"]["value"]["run_id"] == original["id"]
+
+        resumed, resumed_store, resumed_script = completion_session([write], [])
+        events_before = await resumed_store.list_events(**context)
+        runs_before = db.list_task_runs("strm_sync", limit=later_count + 1)
+        replay = await consume_events(resumed.confirm(**context, plan_id=plan_id, request_id="strm-confirm", channel="web"))
+        assert (replay.turn_id, replay.status, replay.error_code) == (seed["turn_id"], "failed", "failed")
+        assert replay.effect_result == final
+        assert await resumed_store.load(**context) == after
+        assert await resumed_store.list_events(**context) == events_before
+        assert db.list_task_runs("strm_sync", limit=later_count + 1) == runs_before
+        assert not resumed_script.requests
 
 
 async def assert_patrol_identity(case):

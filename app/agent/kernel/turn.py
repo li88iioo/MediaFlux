@@ -46,6 +46,7 @@ from app.sensitive_data import contains_sensitive_credential
 from . import telegram_reference
 from .adapters import TurnViewBuilder
 from .capabilities import KernelToolSpec, ToolEffect
+from .completion_receipts import replay_confirmation_receipt
 from .continuation import (
     _ContinuationAction, active_remaining, continuation_record, record_budget, reserve_budget_values,
 )
@@ -244,9 +245,11 @@ class AgentTurn:
                     {"code": "selection_invalid", "message": str(exc), "turn_status": "failed", "task": None},
                 ))
             except SessionBusyError:
-                await self.failure("effect_in_progress", "已确认的写操作正在执行，请等待完成后再继续。")
+                if not await self.replay_confirmation():
+                    await self.failure("effect_in_progress", "已确认的写操作正在执行，请等待完成后再继续。")
             except ToolPipelineError as exc:
-                await self.failure(exc.code, str(exc))
+                if not isinstance(exc, ConfirmationClaimError) or not await self.replay_confirmation(getattr(self, "state", None)):
+                    await self.failure(exc.code, str(exc))
             except ModelConfigurationError as exc:
                 await self.failure("model_not_configured", str(exc))
             except ModelProviderError as exc:
@@ -274,6 +277,29 @@ class AgentTurn:
                             await self.session.coordinator.finish(self.lease, self.token)
                 finally:
                     self.execution_scope.close()
+
+    async def replay_confirmation(self, state: SessionState | None = None) -> bool:
+        if not self.plan_id or self.lease is not None or not hasattr(self, "admission_token"):
+            return False
+        self.scope.close()
+        args = self.agent_input
+        try:
+            if state is None:
+                state = await self.session.state_store.load(owner=args.owner, session_id=args.session_id)
+            if (state.owner, state.session_id) != (args.owner, args.session_id):
+                return False
+            replay = await replay_confirmation_receipt(
+                state, plan_id=self.plan_id, request_id=args.request_id,
+                read_events=getattr(self.session.journal, "list_events", None),
+            )
+            if replay and not await self.session.turn_admission.is_current(self.admission_token, args):
+                return False
+        except Exception as exc:  # noqa: BLE001 - 无法核验回执时沿用原确认准入结果
+            logger.warning("Agent 原确认回执读取失败 type=%s", type(exc).__name__)
+            return False
+        for event in replay:
+            self.emit(event)
+        return bool(replay)
 
     async def admit(self) -> None:
         self.validated_selection = None

@@ -4,23 +4,33 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from app import config, sdk
 from app.agent import rate_limit
 from app.agent.feature_gate import initialize_runtime_fence
-from app.agent.kernel.bootstrap import _capture_creation_binding, build_agent_kernel_runtime
+from app.agent.kernel import sandbox
+from app.agent.kernel.bootstrap import (
+    _capture_creation_binding,
+    build_agent_kernel_runtime,
+)
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel import sandbox
 from app.agent.kernel.sandbox import _workspace_location
 from app.agent.kernel.state_types import AgentInput
 from app.agent.owner_routes import web_kernel_owner
+from app.agent.transports import QueryEnvelope
 from tests import test_agent_generation_profiles as profiles
-from tests.test_agent_sdk_effects import native_library_backend as native_library_backend
+from tests.test_agent_sdk_effects import (
+    native_library_backend as native_library_backend,
+)
+from tests.test_guangya_read_contracts import ReadClient
 
 local_config = profiles.local_config
 no_external_io = profiles.no_external_io
@@ -63,6 +73,332 @@ def runtime(model, clock):
 
 def consume(owner, count):
     assert all(rate_limit.consume_agent_tool(owner, "diagnostics.component").allowed for _ in range(count))
+
+
+@pytest.mark.parametrize("channel", ["web", "telegram"])
+@pytest.mark.parametrize("bound", [True, False], ids=["with-scope", "without-scope"])
+def test_foreground_directory_listing_stops_at_first_quota_denial(local_config, monkeypatch, channel, bound):
+    owner = OWNER if channel == "web" else "tg:v1:-1001\x1f7"
+    route = {} if channel == "web" else {"chat_id": "-1001", "message_thread_id": 9}
+    if route:
+        config.set_and_save({"TG_CHAT_ID": "-1001", "TG_AGENT_ALLOWED_USER_IDS": "7", "TG_AGENT_ENABLED": "1"})
+    clock = [100]
+    monkeypatch.setitem(rate_limit._TOOL_RATE_LIMITS, "cloud.list", 1)
+    monkeypatch.setattr(rate_limit.agent_rate_limiter, "_wall_clock", lambda: clock[0])
+    client = ReadClient({"data": {"total": 1, "list": [{"fileId": "dir-1", "fileName": "动漫", "resType": 2}]}})
+    monkeypatch.setattr(client, "close", lambda: True)
+    monkeypatch.setattr("app.clients.guangya.GuangYaClient", lambda: client)
+    code = (
+        "from pathlib import Path\n"
+        "root = mf.cloud.list()\n"
+        "print(root['items'][0]['name'])\n"
+        "Path('root.txt').write_text(root['items'][0]['name'])\n"
+        "for folder in ('动漫', '剧集', '综艺', '电影', '纪录片'):\n"
+        "    try:\n"
+        "        mf.cloud.list('/' + folder)\n"
+        "    except mf.Error as error:\n"
+        "        print(folder, error.code)\n"
+        "Path('tail-ran').touch()\n"
+    )
+
+    async def run():
+        model = NativeModel([code])
+        active = runtime(model, clock)
+        if not bound:
+            active.session.continuation_binding = None
+        events = [event async for event in active.session.run(AgentInput(
+            message="列出光鸭根目录并核对各分类。", owner=owner, session_id=SESSION,
+            request_id="foreground-list", channel=channel, delivery_route=route))]
+        assert len(model.requests) == 2
+        state = await active.store.load(owner=owner, session_id=SESSION)
+        assert not state.metadata.get("task")
+        assert not state.metadata.get("read_wait")
+        assert events[-1].type.value == "turn.completed" and events[-1].payload["status"] != "waiting"
+        assert await active.store.due_continuations() == []
+        activities = [event.payload["activity"] for event in events
+                      if (event.payload.get("activity") or {}).get("method") == "cloud.list"]
+        assert [activity["summary"] for activity in activities if activity["status"] == "failed"] == ["已达读取额度"]
+        assert [activity["summary"] for activity in activities if activity["status"] == "success"] == ["根目录 · 本次返回 1 项"]
+        receipt = json.loads(next(row.content for row in model.requests[1].messages if row.role == "tool"))
+        assert receipt["status"] == "rate_limited" and receipt["ok"] is False
+        data = receipt["data"]
+        assert data["stopped_by"] == "read_quota"
+        assert data["exit_code"] != 0 and data["timed_out"] is False
+        assert data["stdout"].strip() == "动漫"
+        completed, denied = data["sdk_calls"]
+        assert all(call["method"] == "cloud.list" for call in (completed, denied))
+        assert completed["ok"] is True
+        assert denied["status"] == "rate_limited" and denied["execution_started"] is False
+        assert denied["rate_limit"]["reason"] == "quota" and denied["rate_limit"]["retry_after_seconds"] > 0
+        stored = json.loads(next(row["content"] for row in state.conversation if row.get("tool_call_id") == "native-1"))
+        assert stored["status"] == "rate_limited" and stored["data"]["sdk_calls"] == data["sdk_calls"]
+        client.raw.fs_files.assert_called_once()
+        root, _ = _workspace_location(owner, SESSION)
+        archived = json.loads((root / completed["response_path"].lstrip("/")).read_text())
+        assert [item["name"] for item in archived["result"]["items"]] == ["动漫"]
+        assert (root / "work/root.txt").read_text() == "动漫"
+        assert not (root / "work/tail-ran").exists()
+
+    asyncio.run(run())
+
+
+def test_directory_activities_keep_safe_errors_and_distinguish_returned_paths(local_config, monkeypatch):
+    directories = [{"fileId": "10", "fileName": "动漫", "resType": 2},
+                   {"fileId": "20", "fileName": "剧集", "resType": 2}]
+    client = ReadClient(None)
+    transient_failures = 2
+
+    def files(*, parent_id, **_kwargs):
+        nonlocal transient_failures
+        if parent_id == "20" and transient_failures:
+            transient_failures -= 1
+            raise TimeoutError("光鸭云盘读取超时，请稍后重试")
+        items = directories if parent_id is None else []
+        return {"data": {"total": len(items), "list": items}}
+
+    client.raw.fs_files.side_effect = files
+    monkeypatch.setattr(client, "close", lambda: True)
+    monkeypatch.setattr(client, "_read_retry_delay", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr("app.clients.guangya.GuangYaClient", lambda: client)
+    magnet = "magnet:?xt=urn:btih:" + "a" * 40
+    token = "access_token=offline-directory-token"
+    code = (
+        "try:\n"
+        f"    mf.cloud.list('/动漫', offset=-1, query={magnet!r})\n"
+        "except mf.Error as error:\n"
+        "    print(error.code)\n"
+        "try:\n"
+        "    mf.cloud.list('/剧集')\n"
+        "except mf.Error as error:\n"
+        "    print(error.code)\n"
+        f"first = mf.cloud.list('/动漫', query={magnet!r})\n"
+        f"second = mf.cloud.list('/剧集', query={token!r})\n"
+        "print(first['root']['path'], second['root']['path'])\n"
+    )
+
+    async def run():
+        model = NativeModel([code])
+        active = runtime(model, [100])
+        events = [event async for event in active.session.run(AgentInput(
+            message="分别盘点这两个归档目录。", owner=OWNER, session_id=SESSION,
+            request_id="directory-summaries", channel="web"))]
+        activities = [event.payload["activity"] for event in events
+                      if (event.payload.get("activity") or {}).get("method") == "cloud.list"]
+        assert [row["summary"] for row in activities if row["status"] == "failed"] == [
+            "分页或扫描预算无效", "光鸭云盘读取超时,请稍后重试",
+        ]
+        assert [row["summary"] for row in activities if row["status"] == "success"] == [
+            "动漫 · 本次返回 0 项", "剧集 · 本次返回 0 项",
+        ]
+        summaries = "\n".join(row["summary"] for row in activities)
+        assert "magnet:" not in summaries and "offline-directory-token" not in summaries
+        receipt = json.loads(next(row.content for row in model.requests[1].messages if row.role == "tool"))
+        assert receipt["status"] == "success" and receipt["data"]["exit_code"] == 0
+        assert "stopped_by" not in receipt["data"]
+        assert receipt["data"]["stdout"].splitlines() == ["GuangYaWorkspaceError", "TimeoutError", "/动漫 /剧集"]
+        assert [call["ok"] for call in receipt["data"]["sdk_calls"]] == [False, False, True, True]
+
+    asyncio.run(run())
+
+
+def test_followup_progress_identifies_requested_record_and_scoped_pages(local_config, monkeypatch):
+    from tests.test_rss_delivery_native import entry, feed
+
+    sid = feed()
+    ids = [entry(sid, i) for i in (1, 2)]
+    client = ReadClient({})
+    monkeypatch.setattr(client, "file_info", lambda _: None)
+    monkeypatch.setattr(client, "close", lambda: True)
+    monkeypatch.setattr("app.clients.guangya.GuangYaClient", lambda: client)
+    code = (f"mf.rss.entries(entry_ids={ids}, limit=1)\n"
+            "mf.activity.timeline('download', 987654321)\n"
+            "mf.cloud.info('501')\n")
+
+    async def run():
+        active = runtime(NativeModel([code]), [100])
+        events = [event async for event in active.session.run(AgentInput(
+            message="按这两条回执、下载编号和云盘文件分别核对。", owner=OWNER, session_id=SESSION, channel="web"))]
+        activities = [activity for event in events if (activity := event.payload.get("activity"))
+                      and activity.get("status") != "running"]
+        summaries = {item["method"]: item["summary"] for item in activities}
+        assert "本次返回 1 项" in summaries["rss.entries"] and "还有后续页" in summaries["rss.entries"]
+        assert "下载请求 #987654321" in summaries["activity.timeline"]
+        assert summaries["cloud.info"] == "未找到该文件或目录"
+
+    asyncio.run(run())
+
+
+def workspace_web_receipt(code):
+    async def run():
+        model = NativeModel([code])
+        active = runtime(model, [100])
+        events = [json.loads(chunk) async for chunk in active.web.query(QueryEnvelope(
+            message="核对实际查询范围。", owner=OWNER, session_id=SESSION, channel="web"))]
+        assert events[-1]["type"] == "turn.completed"
+        receipt = json.loads(next(row.content for row in model.requests[1].messages if row.role == "tool"))
+        assert receipt["data"]["exit_code"] == 0, receipt["data"]["stderr"]
+        activities = [activity for event in events if event["type"] == "tool.progress"
+                      and (activity := event["payload"].get("activity")) and activity["status"] != "running"]
+        return receipt["data"], activities
+
+    return asyncio.run(run())
+
+
+def test_workspace_library_scope_follows_real_inventory_cutoff_and_batch(local_config, monkeypatch):
+    from app import services
+    from app.clients.base import (
+        MediaItem,
+        SeriesCandidate,
+        SeriesEpisodeInventory,
+        SeriesSearchResult,
+    )
+    from app.modules import episode_audit, media_identity, media_library
+
+    class MediaServer:
+        def list_virtual_folders(self):
+            return [{"id": "private-folder-a", "name": "A库"}, {"id": "private-folder-b", "name": "B库"}]
+
+        def search_series_candidates(self, query, *, limit, parent_id=""):
+            by_library = {
+                "private-folder-a": [SeriesCandidate("series-a", "同名剧", "2025", "100")],
+                "private-folder-b": [SeriesCandidate("series-b", "同名剧", "2020", "101"),
+                                     SeriesCandidate("series-c", "海角", "2025", "102")],
+            }
+            rows = by_library[parent_id] if parent_id else by_library["private-folder-a"] + by_library["private-folder-b"]
+            matches = [row for row in rows if row.name == query]
+            return SeriesSearchResult(matches, len(matches))
+
+        def list_series_episode_inventory(self, series_id, **_kwargs):
+            numbers = (1, 2) if series_id == "series-b" else (1,)
+            return SeriesEpisodeInventory([(1, number) for number in numbers], len(numbers))
+
+        def close(self):
+            pass
+
+    class TMDB:
+        def detail(self, tmdb_id, _media_type):
+            return {"name": "同名剧" if tmdb_id == "100" else "海角", "first_air_date": "2025-07-01",
+                    "seasons": [{"season_number": 1, "episode_count": 2}]}
+
+        def tv_season_detail(self, _tmdb_id, _season):
+            return {"episodes": [{"episode_number": i, "air_date": f"2025-07-0{i}"} for i in (1, 2)]}
+
+    client = MediaServer()
+    monkeypatch.setattr(media_identity, "datetime", SimpleNamespace(now=lambda: datetime(2025, 7, 2, 12)))
+    monkeypatch.setattr(services, "_configured_media_sources", lambda: [("jellyfin", "Jellyfin", "", client)])
+    monkeypatch.setattr(media_library, "_profile", lambda _server: SimpleNamespace(
+        server_type="emby", create_client=lambda: nullcontext(client)))
+    monkeypatch.setattr(episode_audit, "TMDBClient", TMDB)
+    monkeypatch.setattr(episode_audit, "close_tmdb_client", lambda _client: None)
+    monkeypatch.setattr(episode_audit, "search_media_servers", lambda *_args, **_kwargs: [{
+        "server_type": "jellyfin", "has_more": False, "items": [MediaItem("movie-1", "雨夜", "movie")],
+    }])
+
+    data, progress = workspace_web_receipt(
+        "print(mf.library.episodes('同名剧', library_name=' Ａ库 ')['data']['local_episode_count'])\n"
+        "print(mf.library.episodes('同名剧', library_name='B库')['data']['local_episode_count'])\n"
+        "print(mf.library.episodes('同名剧')['data']['local_episode_count'])\n"
+        "print(mf.library.episodes(series_id='series-b')['data']['count'])\n"
+        "print(mf.library.audit('同名剧', library_name='A库', season=1, as_of=' 2025-07-01 ')['data']['missing_count'])\n"
+        "print(mf.library.audit('同名剧', library_name='A库', season=1)['data']['missing_count'])\n"
+        "print(mf.library.updates('海角', media_type='tv', as_of='2025-07-01')['data']['missing_count'])\n"
+        "print(len(mf.library.updates(queries=['同名剧', '海角', '海角'], media_type='tv')['data']['items']))\n"
+        "print(len(mf.library.updates(queries=['雨夜'], media_type='movie', as_of='2025-07-01')['data']['items']))\n"
+        "print(mf.library.episodes('同名剧', library_name='access_token=private-library')['data']['local_episode_count'])\n"
+        "try:\n"
+        "    mf.library.audit('同名剧', library_name='A库', as_of='access_token=private-cutoff')\n"
+        "except mf.Error:\n"
+        "    pass\n"
+    )
+    assert data["stdout"].splitlines() == ["1", "2", "None", "2", "0", "1", "0", "2", "1", "None"]
+    a, b, across, series, early, default, updates, batch, movie, private, rejected = data["sdk_calls"]
+    inventory_only = {"as_of": None, "as_of_source": "not_applicable"}
+    assert a["scope"] == {"library_scope": "named", "library_name": "A库", **inventory_only}
+    assert b["scope"] == {"library_scope": "named", "library_name": "B库", **inventory_only}
+    assert across["ok"] is False and across["status"] == "ambiguous"
+    assert across["scope"] == {"library_scope": "all_configured", **inventory_only}
+    assert series["scope"] == {"library_scope": "series", "server": "emby", **inventory_only}
+    assert early["scope"] == {"library_scope": "named", "library_name": "A库", "as_of": "2025-07-01", "as_of_source": "specified"}
+    assert default["scope"] == {**early["scope"], "as_of": "2025-07-02", "as_of_source": "default"}
+    assert updates["scope"] == {"library_scope": "all_configured", "as_of": "2025-07-01", "as_of_source": "specified"}
+    assert batch["status"] == "partial"
+    assert batch["scope"] == {"library_scope": "all_configured", "batch_size": 2,
+                              "as_of": "2025-07-02", "as_of_source": "default"}
+    assert movie["scope"] == {"library_scope": "all_configured", "batch_size": 1, **inventory_only}
+    assert private["status"] == "library_not_found"
+    assert private["scope"] == {"library_scope": "named", "library_name": None, **inventory_only}
+    assert rejected["ok"] is False and rejected["scope"] is None
+    assert [row["status"] for row in progress] == [
+        "success", "success", "failed", "success", "success", "success", "success", "partial", "partial", "failed", "failed",
+    ]
+    expected_scopes = ("A库", "B库", "未指定库", "Emby", "2025-07-01", "2025-07-02", "未指定库", "批量 2 项",
+                       "无播出截止日", "名称不公开", "查询范围未确认")
+    for row, expected in zip(progress, expected_scopes, strict=True):
+        assert expected in row["summary"]
+    assert "默认" in progress[5]["summary"] and "未指定库" in progress[7]["summary"]
+    for private_value in ("private-folder", "private-library", "private-cutoff"):
+        assert private_value not in json.dumps([data, progress])
+
+
+def test_workspace_resource_scope_uses_normalized_year_and_actual_site_results(local_config, monkeypatch):
+    from app.indexers import runtime as indexer_runtime
+    from app.indexers.models import IndexerCapabilities, IndexerItem, IndexerPage
+    from app.indexers.providers.base import DirectResultAdapter
+    from app.indexers.registry import IndexerRegistry
+    from app.indexers.result_store import IndexerResultStore
+    from app.indexers.service import IndexerService
+
+    class Site(DirectResultAdapter):
+        default_enabled = True
+        capabilities = IndexerCapabilities(True)
+
+        def __init__(self, site_id):
+            self.site_id = self.site_name = site_id
+
+        async def search(self, request):
+            if self.site_id == "mikan":
+                raise TimeoutError("offline fixture timeout")
+            items = [IndexerItem(self.site_id, self.site_name, f"同名剧 2024 {specs}")
+                     for specs in ("1080p SDR", "2160p HDR10")]
+            return IndexerPage(items, request.page, False, True)
+
+    sites = ("fixture-a", "mikan")
+    service = IndexerService(registry=IndexerRegistry({site: Site(site) for site in sites}), result_store=IndexerResultStore())
+    monkeypatch.setattr(indexer_runtime, "get_indexer_service", lambda: service)
+    try:
+        data, progress = workspace_web_receipt(
+            "print(len(mf.resources.search('同名剧', year=' ２０２４ ', sites=[' Fixture-A ', 'FIXTURE-A'], "
+            "resolution='1080p', dynamic_range='SDR')['items']))\n"
+            "print(len(mf.resources.search('同名剧')['items']))\n"
+            "print(len(mf.resources.search('同名剧', sites=['fixture-a'], resolution='480p', exclude_hdr=True)['items']))\n"
+            "print(len(mf.resources.search('同名剧', year=2020, sites=['mikan'])['items']))\n"
+            "try:\n"
+            "    mf.resources.search('同名剧', sites=['access_token=private-site'])\n"
+            "except mf.Error:\n"
+            "    pass\n"
+        )
+    finally:
+        asyncio.run(service.aclose())
+        indexer_runtime._stop_standalone_runtime()
+
+    assert data["stdout"].splitlines() == ["1", "2", "0", "0"]
+    exact, default, empty, unavailable, rejected = data["sdk_calls"]
+    filter_evidence = {"basis": "release_title_only", "stream_verified": False}
+    site_scope = {"site_scope": "selected", "sites_attempted": ["fixture-a"], "sites_succeeded": ["fixture-a"]}
+    assert exact["scope"] == {**site_scope, "year": 2024, "technical_filter": {
+        "requested": {"resolution": "1080p", "dynamic_range": "SDR"}, **filter_evidence}}
+    assert default["scope"] == {"year": None, "site_scope": "default", "sites_attempted": list(sites), "sites_succeeded": ["fixture-a"]}
+    assert empty["scope"] == {**site_scope, "year": None, "technical_filter": {
+        "requested": {"resolution": "480p", "exclude_hdr": True}, **filter_evidence}}
+    assert unavailable["scope"] == {"year": 2020, "site_scope": "selected", "sites_attempted": ["mikan"], "sites_succeeded": []}
+    assert rejected["scope"] is None
+    assert [row["status"] for row in progress] == ["success", "partial", "success", "partial", "failed"]
+    assert all(text in progress[0]["summary"] for text in ("2024", "fixture-a", "规格筛选条件 1080p、SDR", "未核验文件"))
+    assert "未指定年份" in progress[1]["summary"] and "未指定站点" in progress[1]["summary"]
+    assert "规格筛选条件 480p、排除已标 HDR" in progress[2]["summary"] and "返回 0 项" in progress[2]["summary"]
+    assert "2020" in progress[3]["summary"] and "mikan" in progress[3]["summary"] and "未取得结果" in progress[3]["summary"]
+    assert "查询范围未确认" in progress[4]["summary"]
+    assert "private-site" not in json.dumps(data) and "private-site" not in json.dumps(progress)
 
 
 async def park(clock, *, channel="web", preceding_write=False):
@@ -374,7 +710,7 @@ def test_native_read_only_resume_scope_ends_before_new_model_write(local_config,
     client.refresh_library.assert_called_once()
 
 
-def test_unrestorable_large_sdk_arguments_keep_catchable_error_without_parking(local_config, monkeypatch):
+def test_unrestorable_large_sdk_arguments_stop_without_parking(local_config, monkeypatch):
     clock = [100]
     monkeypatch.setattr(rate_limit.agent_rate_limiter, "_wall_clock", lambda: clock[0])
 
@@ -390,8 +726,10 @@ def test_unrestorable_large_sdk_arguments_keep_catchable_error_without_parking(l
         state = await active.store.load(owner=OWNER, session_id=SESSION)
         assert state.metadata["read_wait"]["state"] == "idle"
         result = json.loads(next(row["content"] for row in state.conversation if row.get("tool_call_id") == "native-2"))
-        assert result["status"] == "partial"
-        assert "rate_limited False" in result["data"]["stdout"]
+        assert result["status"] == "rate_limited" and result["ok"] is False
+        assert result["data"]["stopped_by"] == "read_quota"
+        assert result["data"]["stdout"] == ""
+        assert result["data"]["sdk_calls"][0]["execution_started"] is False
         assert not state.metadata["task"]["verified_facts"]
         assert await active.store.due_continuations() == []
     asyncio.run(run())

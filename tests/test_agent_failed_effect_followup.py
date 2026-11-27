@@ -300,10 +300,10 @@ class NativeCase:
         assert Path(actual_database).resolve() == db.resolve_db_path().resolve()
         return plan_id, self.users(state)
 
-    async def confirm(self, plan_id):
+    async def confirm(self, plan_id, *, request_id="confirm-turn"):
         assert self.session is not None
         events = [event async for event in self.session.confirm(
-            owner=self.owner, session_id=self.sid, plan_id=plan_id, request_id="confirm-turn",
+            owner=self.owner, session_id=self.sid, plan_id=plan_id, request_id=request_id,
         )]
         self.events.extend(events)
         return events, await self.cold_store().load(owner=self.owner, session_id=self.sid)
@@ -461,10 +461,25 @@ def test_successful_business_read_unlocks_only_new_b_confirmation_not_execution(
         assert plan_b and plan_b != plan_a and saved.pending_effect_plan_id == plan_b
         active_b = await case.session.pipeline.get_pending_plan(owner=case.owner, session_id=case.sid)
         assert active_b.plan_id == plan_b and dict(active_b.arguments) == B
-        # 旧确认票据不能抢占 B、发起模型或重放 A。
-        duplicate, unchanged = await case.confirm(plan_a)
-        assert duplicate[-1].payload["code"] == "confirmation_invalid"
+        original = next(e for e in events if e.type is AgentEventType.EFFECT_FAILED)
+        journal_scope = {"owner": case.owner, "session_id": case.sid, "request_id": original.request_id}
+        journal_before = await case.store.list_events(**journal_scope)
+
+        replay, unchanged = await case.confirm(plan_a, request_id=original.request_id)
+        assert [event.type for event in replay] == [AgentEventType.EFFECT_FAILED, AgentEventType.TURN_FAILED]
+        assert {(e.turn_id, e.request_id) for e in replay} == {(original.turn_id, original.request_id)}
+        receipt, terminal = replay
+        assert receipt.payload["plan_id"] == plan_a
+        assert receipt.payload["result"] == failed and receipt.payload["receipt"] == original.payload["receipt"]
+        assert receipt.payload["code"] == terminal.payload["code"] == failed["status"]
+        assert await case.store.list_events(**journal_scope) == journal_before
         assert unchanged.to_payload() == saved.to_payload()
+
+        rejected, unchanged = await case.confirm(plan_a, request_id="different-confirm-turn")
+        assert [event.type for event in rejected] == [AgentEventType.TURN_FAILED]
+        assert rejected[0].payload["code"] == "confirmation_invalid"
+        assert unchanged.to_payload() == saved.to_payload()
+        assert await case.session.pipeline.get_pending_plan(owner=case.owner, session_id=case.sid) == active_b
         case.assert_io(prepares=["A", "B"], executions=["A"], reads=1, requests=3)
     asyncio.run(run())
 
@@ -595,14 +610,14 @@ def test_invalid_or_disallowed_confirmation_never_executes_or_starts_followup_mo
     asyncio.run(run())
 
 
-def test_duplicate_confirmation_after_failed_write_never_replays_or_restarts_model(agent_llm_enabled, case):
+def test_new_request_for_failed_confirmation_never_reexecutes_or_restarts_model(agent_llm_enabled, case):
     async def run():
         case.build(["read_a", "finish"])
         plan_id, source_users = await case.preview()
         first, saved = await case.confirm(plan_id)
-        duplicate, unchanged = await case.confirm(plan_id)
-        assert duplicate[-1].type is AgentEventType.TURN_FAILED
-        assert duplicate[-1].payload["code"] == "confirmation_invalid"
+        rejected, unchanged = await case.confirm(plan_id, request_id="different-confirm-turn")
+        assert [event.type for event in rejected] == [AgentEventType.TURN_FAILED]
+        assert rejected[0].payload["code"] == "confirmation_invalid"
         case.assert_io(prepares=["A"], executions=["A"], reads=1, requests=3)
         assert unchanged.to_payload() == saved.to_payload()
         case.assert_source(unchanged, source_users)

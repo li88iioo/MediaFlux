@@ -178,7 +178,7 @@
 | `cloud.resolve_offline(url)` / `cloud.resolve_offline(artifact_id=…)` | READ | 解析链接或当前会话的种子附件。可选文件带有索引、名称、大小和规则默认选择，同时返回本次清单摘要。 |
 | `downloads.submit(url, target="preferred", …)`（SDK） | DANGER | 提交 Magnet、ED2K 或 HTTP(S) 下载直链。手选光鸭文件时指定 `target="guangya"`，同时传入非空 `file_indexes` 和原清单的 `manifest_digest`。本地种子用会话的 `artifact_id` 指定来源。省略这两项时沿用既有筛选规则。 |
 | `cloud.delete_offline_tasks(task_ids)` | WRITE | 从光鸭离线列表选择已结束且 MF 已停止跟踪的任务。确认后删除这些云端任务记录，保留已下载文件和 MF 下载历史。 |
-| `activity.timeline("download", request_id)`（SDK） | READ | 按原请求编号续查下载、转存、整理与 STRM 状态；受理或转存完成不等于全部后处理成功。 |
+| `activity.timeline("download", request_id)`（SDK） | READ | 按原请求编号查询接收目录、归档记录、STRM 和媒体库核验进度。需要光鸭文件的当前位置时，可按记录中的 ID 回查。 |
 
 原生资源提交使用实际 `result_ids`；候选卡仍保留签名批次与展示序号，提交前转换为同批真实 ID，集号或质量排名不能替代 ID。待核对资源不会自动推荐，但用户明确选择后可以生成预检卡；候选仍需确认才能提交。单次候选卡和确认的业务容量为 50 项，完整搜索观察不因展示容量而截断；推荐摘要和模型上下文预算不裁剪快照、确认范围或批量结果。默认搜索返回 20 项时，可在一次预检和人工确认中提交全部 20 项，无需为尾项再次发指令。
 

@@ -393,7 +393,7 @@ progress = mf.activity.timeline("download", request_id)
 print(progress)
 ```
 
-`data.title` 是已补全的名称；`data.stages` 是下载、整理等各阶段，`data.gaps` 是未复核范围。这是持久快照；`task_bound=False` 只表示未记录绑定，不能说“云盘没有任务”。找历史请求用 `downloads.requests` 的真实 `request_number`，有分页继续读 `next_offset`。只有已确认可重试的失败才走 `downloads.retry(request_id, target="guangya")`。
+`data.title` 是已补全的名称；`data.stages` 是下载、整理等各阶段，`data.gaps` 是未复核范围。这是持久快照；`task_bound=False` 只表示未记录绑定，不能说“云盘没有任务”。问下载到哪里，先看 `data.destination_evidence.guangya.receiving` 的接收目录、`data.organize_evidence.files` 的归档记录。要核实当前完整路径时只检查相应 ID；已回收或已经失去关联的原暂存目录不能靠全盘搜索重建。没有编号可按片名用 `activity.search(片名)` 取 download 项的 id。只有已确认可重试的失败才走 `downloads.retry(request_id, target="guangya")`。
 
 用户要看云盘离线队列时才读完整任务列表：
 

@@ -4285,6 +4285,98 @@ class ConfirmationPendingOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(after.pending_effect_plan_id, view.approval.plan_id)
                 self.assertEqual(writes, [1])
 
+    async def test_disconnected_confirmation_replays_only_original_request(self):
+        from unittest.mock import patch
+
+        from app.agent.kernel.persistence import SQLiteKernelStore
+
+        session, writes = self.runtime(True, [1000.0])
+        store = cast(SQLiteKernelStore, session.state_store)
+        session.journal = store
+        scope = {"owner": "owner", "session_id": "disconnect-receipt"}
+        plan = await self.preview(session, scope["session_id"])
+        request = {**scope, "plan_id": plan, "request_id": "original-confirm"}
+        claim_saved, resume_claim = asyncio.Event(), asyncio.Event()
+        receipt_saved, resume_receipt = asyncio.Event(), asyncio.Event()
+        append, load = store.append, store.load
+        admission_reads = AsyncMock(wraps=load)
+        startup_reads = []
+
+        async def hold_confirmation(event, *, owner):
+            await append(event, owner=owner)
+            if event.request_id != request["request_id"]:
+                return
+            if event.type == AgentEventType.TURN_STARTED:
+                startup_reads.append(admission_reads.await_count)
+            elif event.type == AgentEventType.TOOL_STARTED:
+                claim_saved.set()
+                await resume_claim.wait()
+            elif event.type == AgentEventType.EFFECT_COMPLETED:
+                receipt_saved.set()
+                await resume_receipt.wait()
+
+        with patch.object(store, "append", new=hold_confirmation):
+            stream = session.confirm(**request)
+            try:
+                with patch.object(store, "load", new=admission_reads):
+                    started = await asyncio.wait_for(anext(stream), 10)
+                    self.assertEqual(started.type, AgentEventType.TURN_STARTED)
+                    # 锁内状态和既有计划证据各读一次，不增加回放预读。
+                    self.assertEqual(startup_reads, [2])
+                await asyncio.wait_for(claim_saved.wait(), 10)
+                busy = await consume_events(session.confirm(**request))
+                self.assertEqual(busy.error_code, "effect_in_progress")
+                self.assertFalse(busy.effect_result)
+                self.assertEqual(writes, [])
+
+                await stream.aclose()
+                resume_claim.set()
+                await asyncio.wait_for(receipt_saved.wait(), 10)
+                before = await load(**scope)
+                events_before = await store.list_events(**scope)
+                with patch.object(session.coordinator, "begin", wraps=session.coordinator.begin) as begin:
+                    warm = await consume_events(session.confirm(**request))
+                    begin.assert_not_awaited()
+                self.assertEqual(warm.turn_id, started.turn_id)
+                self.assertEqual(warm.status, "effect_completed")
+                self.assertEqual(warm.effect_result["summary"], "步骤 1 已完成")
+                self.assertEqual(await load(**scope), before)
+                self.assertEqual(await store.list_events(**scope), events_before)
+            finally:
+                resume_claim.set()
+                resume_receipt.set()
+                await stream.aclose()
+                await asyncio.wait_for(asyncio.gather(*session._detached_tasks), 10)
+
+        cold, cold_writes = self.runtime(True, [1000.0])
+        cold_store = cast(SQLiteKernelStore, cold.state_store)
+        cold.journal = cold_store
+        before = await cold_store.load(**scope)
+        events_before = await cold_store.list_events(**scope)
+        self.assertTrue(before.pending_effect_plan_id)
+        self.assertNotEqual(before.pending_effect_plan_id, plan)
+        with patch.object(cold_store, "load", wraps=cold_store.load) as replay_reads, patch.object(
+            cold.coordinator, "begin", wraps=cold.coordinator.begin,
+        ) as begin:
+            recovered = await consume_events(cold.confirm(**request))
+            self.assertEqual(replay_reads.await_count, 1)
+            begin.assert_not_awaited()
+        self.assertEqual((recovered.turn_id, recovered.request_id), (started.turn_id, request["request_id"]))
+        self.assertEqual(recovered.effect_result, warm.effect_result)
+        self.assertEqual(await cold_store.list_events(**scope), events_before)
+        for different in ({"request_id": "different-confirm"}, {"owner": "foreign-owner"},
+                          {"session_id": "foreign-session"}, {"plan_id": "foreign-plan"}):
+            with self.subTest(different=different):
+                attempted = request | different
+                self.assert_rejected(await collect(cold.confirm(
+                    owner=attempted["owner"], session_id=attempted["session_id"],
+                    plan_id=attempted["plan_id"], request_id=attempted["request_id"],
+                )))
+        self.assertEqual(await cold_store.load(**scope), before)
+        self.assertEqual(cast(ScriptedModel, cold.model).requests, [])
+        self.assertEqual(cold_writes, [])
+        self.assertEqual(writes, [1])
+
     async def test_transient_claim_failure_keeps_active_pending_plan(self):
         from unittest.mock import patch
 

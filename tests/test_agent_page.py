@@ -164,7 +164,7 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertIn('id="agentComposer"', response.text)
         self.assertIn('id="agentPrompt"', response.text)
-        self.assertIn('maxlength="1000"', response.text)
+        self.assertIn('maxlength="12000"', response.text)
         self.assertIn('id="agentSend"', response.text)
         self.assertIn('id="agentStopSession"', response.text)
         self.assertNotIn('id="agentStop"', response.text)
@@ -344,8 +344,6 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("正在执行已确认计划", source)
         self.assertIn("执行完成前不会接受另一项写操作。", source)
         self.assertNotIn("confirmationInFlight", source)
-        self.assertIn("event.key === 'Enter'", source)
-        self.assertIn("event.shiftKey", source)
 
         app_source = APP_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('meta[name="csrf-token"]', app_source)

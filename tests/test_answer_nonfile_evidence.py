@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app import sdk
+from app import database as db, sdk
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.ports.sdk_effects import download_submit_tool
 from app.agent.public_view import public_conversation_messages
@@ -23,17 +23,18 @@ def tool_round(*calls):
 def test_native_url_followup_explanation(unresolved, foreign):
     async def scenario():
         args = {"url": "magnet:?xt=urn:btih:" + "a" * 40, "target": "qb"}
-        row = {"id": 43 if foreign else 42, "title": "Offline fixture", "kind": "magnet",
-               "targets": "qb", "status": "downloading", "qb_status": "downloading",
-               "gy_status": "not_started", "organize_status": "pending", "strm_status": "pending",
-               "updated_at": "2026-01-01 00:00:00", "error": "", "source_value": ""}
+        observed_request_id = 43 if foreign else 42
+        with db.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO download_requests(id, request_key, title, kind, targets, status, qb_status, "
+                "gy_status, organize_status, strm_status, created_at, updated_at) "
+                "VALUES(?, 'ingest-fixture', 'Offline fixture', 'magnet', 'qb', 'downloading', 'downloading', "
+                "'not_started', 'pending', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                (observed_request_id,),
+            )
         reads = []
         def inspect(*_):
-            with patch("app.repositories.activity.snapshot", return_value={
-                "record": row, "logs": [], "local_tasks": [], "local_task_status_counts": {},
-                "verification": None, "runs": [],
-            }):
-                result = sdk.activity.timeline("download", row["id"])
+            result = sdk.activity.timeline("download", observed_request_id)
             reads.append(result)
             return result
         def blocked(*_):

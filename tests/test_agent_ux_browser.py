@@ -10,13 +10,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from playwright.sync_api import Browser
+    from playwright.sync_api import Browser, Page
 
 from tests import test_agent_kernel_browser as harness
 
 SCOPE = 'a' * 64
 SESSION_A = 'session_agent_ux_000000001'
 SESSION_B = 'session_agent_ux_000000002'
+MAGNET = 'magnet:?xt=urn:btih:' + 'a' * 40
+TRACKERS = '&tr=udp%3A%2F%2Ftracker.example%3A1337' * 200
 SUBMITTED_276_RESULT = {
     'ok': True, 'status': 'submitted', 'summary': '下载请求 #276 已提交',
     'data': {'target': 'guangya'},
@@ -44,6 +46,24 @@ def _direct_preview(backends: dict, *, nsfw: tuple[tuple[str, str], ...] = (),
 def _target(card, label: str):
     return card.locator('.agent-download-option').filter(
         has=card.page.locator('.agent-download-option-label', has_text=re.compile(f'^{re.escape(label)}$'))).locator('input')
+
+
+def _paste_prompt(page: Page, text: str) -> None:
+    page.evaluate("""text => {
+        const source = document.createElement('textarea');
+        source.id = 'clipboard-fixture';
+        source.style.cssText = 'position:fixed; left:-10000px';
+        source.value = text;
+        document.body.append(source);
+        source.select();
+    }""", text)
+    page.keyboard.press('ControlOrMeta+c')
+    page.locator('#clipboard-fixture').evaluate('node => node.remove()')
+    page.locator('#agentPrompt').press('ControlOrMeta+v')
+
+
+def _query_bodies(page: Page) -> list[dict]:
+    return page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').map(call => JSON.parse(call.body))")
 
 
 def candidate_view(*, expires_at: float | None = None) -> dict:
@@ -920,11 +940,7 @@ class AgentUXBrowserTests(unittest.TestCase):
                           'directSubmit': {'ok': True, 'status': 'submitted', 'succeeded': ['guangya'],
                                            'request_id': 12, 'summary': '下载请求 #12 已提交'}},
                          viewport={'width': 390, 'height': 844})
-        page.locator('#agentPrompt').focus()
-        page.evaluate("""text => {
-            const data = new DataTransfer(); data.setData('text', text);
-            document.querySelector('#agentPrompt').dispatchEvent(new ClipboardEvent('paste', {clipboardData: data, bubbles: true, cancelable: true}));
-        }""", 'magnet:?xt=urn:btih:' + 'b' * 40)
+        _paste_prompt(page, MAGNET)
         card = page.locator('.agent-download-card')
         card.locator('.agent-download-submit').wait_for()
         # 与 Telegram 选择卡同序同名；默认选中第一个可用目标。
@@ -937,6 +953,126 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate('window.__directForms[1]')[1:], [['target', 'guangya'], ['nsfw_source_id', 'adult-1']])
         self.assertEqual(card.locator('.agent-download-option').count(), 0)
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+
+    def test_direct_download_confirms_once_and_supports_plain_or_quoted_followups(self):
+        from playwright.sync_api import expect
+
+        page = self.page({
+            'directPreview': _direct_preview({'qb': True}, kind='magnet', title='Film'),
+            'directSubmit': {'ok': True, 'status': 'submitted', 'succeeded': ['qb'],
+                             'request_id': 23, 'summary': '下载请求 #23 已提交'},
+            'queryEvents': [harness._event(1, 'turn.completed', {'status': 'success', 'answer': '已读取本地记录。'})],
+        })
+        page.evaluate("""() => {
+            const fetch = window.fetch;
+            window.fetch = (url, options) => {
+                const response = fetch(url, options);
+                return url === '/api/downloads/direct/submit' ? new Promise(resolve => {
+                    window.__releaseDirectSubmit = () => resolve(response);
+                }) : response;
+            };
+        }""")
+        _paste_prompt(page, MAGNET + TRACKERS)
+        card = page.locator('.agent-download-card')
+        submit = card.get_by_role('button', name='提交下载')
+        self.assertEqual(page.evaluate('window.__directForms'), [[['url', MAGNET + TRACKERS]]])
+        submit.click()
+        during_submit = card.get_by_role('button', name='正在提交…')
+        expect(during_submit).to_be_disabled()
+        during_submit.dispatch_event('click')
+        self.assertEqual(page.evaluate('window.__directForms.length'), 2)
+        self.assertFalse(_query_bodies(page))
+        page.evaluate('window.__releaseDirectSubmit()')
+        expect(card.locator('.agent-download-meta')).to_contain_text('下载请求 #23 已提交 · 已提交：qBittorrent')
+        expect(during_submit).to_have_count(0)
+        self.assertTrue(page.locator('#agentReplyBar').is_hidden())
+
+        prompt = page.locator('#agentPrompt')
+        quote = card.get_by_role('button', name='引用回执')
+        prompt.fill('下载到哪了？')
+        prompt.press('Enter')
+        followup = _query_bodies(page)[0]
+        self.assertEqual(followup['message'], '下载到哪了？')
+        self.assertEqual(followup['download_request_ids'], [23])
+        self.assertNotIn('reply_to', followup)
+        expect(page.locator('.agent-message-user .agent-message-quote')).to_have_count(0)
+        expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        prompt.fill('今天有什么待办？')
+        quote.click()
+        expect(page.locator('#agentReplyText')).to_contain_text('下载请求 #23')
+        self.assertEqual(prompt.input_value(), '今天有什么待办？')
+        self.assertEqual(len(_query_bodies(page)), 1)
+        page.locator('#agentReplyCancel').click()
+        prompt.press('Enter')
+        unrelated = _query_bodies(page)[1]
+        self.assertEqual(unrelated['message'], '今天有什么待办？')
+        self.assertNotIn('reply_to', unrelated)
+        expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        quote.click()
+        prompt.fill('刚才那条下载现在怎么样？')
+        prompt.press('Enter')
+        request = _query_bodies(page)[2]
+        self.assertEqual(request['message'], '刚才那条下载现在怎么样？')
+        self.assertNotIn('download_request_ids', request)
+        self.assertIn('下载请求 #23 已提交', request['reply_to']['text'])
+        self.assertIn('qBittorrent', request['reply_to']['text'])
+        self.assertIn('Film', request['reply_to']['text'])
+        self.assertNotIn('tracker.example', request['reply_to']['text'])
+        expect(page.locator('#agentReplyBar')).to_be_hidden()
+        page.get_by_role('button', name=re.compile('引用下载回执')).click()
+        expect(card.locator('xpath=../..')).to_have_class(re.compile(r'\bis-quoted\b'))
+        expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        quote.click()
+        page.locator('#agentNewSession').click()
+        expect(page.locator('#agentReplyBar')).to_be_hidden()
+        expect(card).to_have_count(0)
+        prompt.fill('新会话的问题')
+        prompt.press('Enter')
+        after_switch = _query_bodies(page)[3]
+        self.assertNotEqual(after_switch['session_id'], request['session_id'])
+        self.assertNotIn('reply_to', after_switch)
+        self.assertNotIn('download_request_ids', after_switch)
+        self.assertEqual(page.evaluate('window.__directForms.length'), 2)
+
+    def test_download_followup_keeps_only_recent_submitted_receipts_in_the_current_account(self):
+        from playwright.sync_api import expect
+
+        page = self.page({
+            'directPreview': _direct_preview({'qb': True}, kind='magnet', title='Film'),
+            'queryEvents': [harness._event(1, 'turn.completed', {'status': 'success', 'answer': '已读取本地记录。'})],
+        })
+        prompt = page.locator('#agentPrompt')
+        cards = page.locator('.agent-download-card')
+        numbers = [70, 61, 40, 12, 67, 89, 35, 12, 29, 20]
+        for index in range(len(numbers) + 1):
+            prompt.fill(f'{MAGNET}&dn=Film-{index}')
+            prompt.press('Enter')
+        expect(cards).to_have_count(len(numbers) + 1)
+
+        # 两张预检卡倒序确认，一条编号再次出现，最后一张预检卡保持未提交。
+        for index in (1, 0, *range(2, len(numbers))):
+            request_id = numbers[index]
+            page.evaluate("""id => { window.__kernelConfig.directSubmit = {
+                ok: true, status: 'submitted', succeeded: ['qb'], request_id: id,
+            }; }""", request_id)
+            card = cards.nth(index)
+            card.get_by_role('button', name='提交下载').click()
+            expect(card.locator('.agent-download-meta')).to_contain_text(f'下载请求 #{request_id} 已提交')
+
+        prompt.fill('这些下载的进度怎样？')
+        prompt.press('Enter')
+        self.assertEqual(_query_bodies(page)[0]['download_request_ids'], [70, 40, 67, 89, 35, 12, 29, 20])
+        expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        page.evaluate("() => { window.__kernelConfig.sessions.draft_scope = 'b'.repeat(64); }")
+        harness.open_sessions(page)
+        expect(cards).to_have_count(0)
+        prompt.fill('检查当前账号')
+        prompt.press('Enter')
+        self.assertNotIn('download_request_ids', _query_bodies(page)[1])
 
     def test_direct_download_rejection_keeps_retry_and_clears_error_after_acceptance(self):
         page = self.page({'directPreview': _direct_preview({'qb': True, 'guangya': True}, kind='torrent', title='Film', file_count=1),
@@ -1012,33 +1148,78 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate('window.__directForms[1]')[1:], [['target', 'both'], ['expected_gy_target_dir', 'primary']])
 
     def test_direct_download_nonretryable_receipts_keep_facts_and_review_without_resubmission(self):
-        for status, receipt in (
-            ('partial', {'ok': True, 'succeeded': ['qb'], 'failed': ['guangya'], 'error': '光鸭提交失败'}),
-            ('manual_review', {'ok': False, 'error': '受理结果待核对，请勿重复提交'}),
-            ('duplicate', {'ok': False, 'duplicate': True, 'succeeded': ['guangya'], 'error': '已有下载请求正在处理'}),
+        from playwright.sync_api import expect
+
+        partial = {'status': 'partial', 'ok': True, 'request_id': 9, 'succeeded': ['qb'], 'failed': ['guangya'],
+                   'summary': '下载请求 #9 仅部分目标已提交', 'error': '光鸭提交失败'}
+        duplicate = {'status': 'duplicate', 'ok': False, 'request_id': 9, 'duplicate': True, 'succeeded': ['guangya'],
+                     'summary': '下载请求 #9 未完成提交', 'error': '任务正在处理'}
+        for case, receipt, quote_summary in (
+            ('partial', partial, '下载请求 #9 仅部分目标已提交'),
+            ('duplicate', duplicate, '已有下载请求 #9'),
+            ('duplicate_without_target_receipt', {**duplicate, 'succeeded': []}, '已有下载请求 #9'),
+            ('partial_without_acceptance', {**partial, 'succeeded': []}, ''),
+            ('duplicate_without_id', {**duplicate, 'request_id': '9'}, ''),
+            ('manual_review', {'status': 'manual_review', 'ok': False, 'request_id': 9, 'succeeded': ['qb'],
+                               'summary': '下载请求 #9 受理结果待核对', 'error': '受理结果待核对，请勿重复提交'}, ''),
         ):
-            with self.subTest(status=status):
-                page = self.page({'directPreview': _direct_preview({'qb': True, 'guangya': True}, nsfw=(('adult-new', '新选择的来源'),), kind='torrent', title='Film', file_count=1),
-                                  'directSubmit': {**receipt, 'status': status, 'request_id': 9, 'summary': f'下载请求 #9 {status}'}})
-                page.locator('#agentAttachFile').set_input_files(files=[{
-                    'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+            with self.subTest(case=case):
+                page = self.page({
+                    'directPreview': _direct_preview({'qb': True, 'guangya': True}, nsfw=(('adult-new', '新选择的来源'),),
+                                                      kind='magnet', title='Film'),
+                    'directSubmit': receipt,
+                    'queryEvents': [harness._event(1, 'turn.completed', {'status': 'success', 'answer': '已核对记录。'})],
+                }, viewport={'width': 390, 'height': 844})
+                _paste_prompt(page, MAGNET)
                 card = page.locator('.agent-download-card')
-                if status == 'duplicate':
-                    _target(card, '光鸭·NSFW · 新选择的来源').check()
+                duplicate_status = receipt['status'] == 'duplicate'
+                _target(card, '光鸭·NSFW · 新选择的来源' if duplicate_status else '光鸭·离线 + qBittorrent').check()
                 card.locator('.agent-download-submit').click()
-                error = receipt['error']
-                assert isinstance(error, str)
-                card.locator('.agent-download-meta', has_text=error).wait_for()
-                classes = card.get_attribute('class')
-                assert classes is not None
-                self.assertNotIn('is-done', classes)
-                self.assertFalse(card.locator('.agent-download-submit').is_visible())
-                self.assertTrue(card.get_by_role('link', name='查看下载记录').is_visible())
-                if status == 'partial':
-                    self.assertIn('已提交：qBittorrent', card.inner_text())
-                elif status == 'duplicate':
-                    self.assertIn('已提交：光鸭云盘', card.inner_text())
-                    self.assertNotIn('新选择的来源', card.locator('.agent-download-meta').inner_text())
+                meta = card.locator('.agent-download-meta')
+                expect(meta).to_contain_text(str(receipt['error']))
+                expect(card).not_to_have_class(re.compile(r'\bis-done\b'))
+                expect(card.locator('.agent-download-submit')).to_be_hidden()
+                review = card.get_by_role('link', name='查看下载记录')
+                expect(review).to_be_visible()
+                expect(review).to_have_attribute('href', '/downloads' if duplicate_status else '/downloads?view=issues')
+                close = card.get_by_role('button', name='关闭')
+                expect(close).to_be_enabled()
+                if case == 'partial':
+                    expect(meta).to_contain_text('已提交：qBittorrent')
+                    expect(meta).not_to_contain_text('已提交：光鸭')
+                elif case == 'duplicate':
+                    expect(meta).to_contain_text('已提交：光鸭云盘')
+                    expect(meta).not_to_contain_text('新选择的来源')
+
+                prompt = page.locator('#agentPrompt')
+                prompt.fill('下载到哪里了？')
+                prompt.press('Enter')
+                followup = _query_bodies(page)[0]
+                self.assertEqual(followup['message'], '下载到哪里了？')
+                self.assertEqual(followup.get('download_request_ids'), [9] if quote_summary else None)
+                self.assertNotIn('reply_to', followup)
+                expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+                quote = card.get_by_role('button', name='引用回执')
+                if quote_summary:
+                    expect(meta).to_contain_text(quote_summary)
+                    quote.click()
+                    expect(page.locator('#agentReplyText')).to_contain_text(quote_summary)
+                    prompt.fill('核对这条下载')
+                    prompt.press('Enter')
+                    request = _query_bodies(page)[1]
+                    self.assertIn(quote_summary, request['reply_to']['text'])
+                    self.assertNotIn('download_request_ids', request)
+                    expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+                else:
+                    expect(quote).to_have_count(0)
+
+                close.click()
+                expect(card).to_have_count(0)
+                if quote_summary:
+                    prompt.fill('再查一下下载')
+                    prompt.press('Enter')
+                    self.assertNotIn('download_request_ids', _query_bodies(page)[2])
                 self.assertEqual(page.evaluate('window.__directForms.length'), 2)
                 page.close()
 
@@ -1082,18 +1263,132 @@ class AgentUXBrowserTests(unittest.TestCase):
                 page.close()
 
     def test_pasting_a_long_magnet_creates_a_card_instead_of_hitting_the_prompt_limit(self):
-        magnet = 'magnet:?xt=urn:btih:' + 'a' * 40 + '&dn=Show&tr=' + 'udp%3A%2F%2Ftracker.example%3A1337' * 40
+        magnet = MAGNET + '&dn=Show' + TRACKERS
         page = self.page({'directPreview': _direct_preview({'qb': True, 'guangya': True}, kind='magnet', title='Show')})
-        page.locator('#agentPrompt').focus()
-        page.evaluate("""text => {
-            const data = new DataTransfer(); data.setData('text', text);
-            document.querySelector('#agentPrompt').dispatchEvent(new ClipboardEvent('paste', {clipboardData: data, bubbles: true, cancelable: true}));
-        }""", magnet)
+        prompt = page.locator('#agentPrompt')
+        prompt.fill('替换这段草稿')
+        prompt.select_text()
+        _paste_prompt(page, f' \n{magnet}\t ')
         page.locator('.agent-download-card .agent-download-submit').wait_for()
-        self.assertEqual(page.locator('#agentPrompt').input_value(), '')
+        self.assertEqual(prompt.input_value(), '')
         self.assertEqual(page.evaluate('window.__directForms[0]'), [['url', magnet]])
         self.assertIn('磁力链接', page.locator('.agent-download-card').inner_text())
         page.locator('.agent-download-cancel').click()
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
+        self.assertEqual(page.evaluate('window.__directForms.length'), 1)
+
+    def test_invalid_standalone_magnet_reports_preview_error_without_calling_model(self):
+        from playwright.sync_api import expect
+
+        magnet = MAGNET[:-1] + 'g' + TRACKERS
+        page = self.page()
+        prompt = page.locator('#agentPrompt')
+        prompt.fill(magnet)
+        prompt.press('Enter')
+        _paste_prompt(page, magnet)
+        errors = page.locator('.agent-download-card.is-error .agent-download-meta')
+        expect(errors).to_have_text(['无法解析', '无法解析'])
+        self.assertEqual(page.evaluate('window.__directForms'), [[['url', magnet]], [['url', magnet]]])
+        self.assertFalse(_query_bodies(page))
+        self.assertEqual(page.locator('.agent-download-submit').count(), 0)
+
+    def test_sending_a_restored_long_magnet_draft_with_enter_opens_one_preview(self):
+        from playwright.sync_api import expect
+
+        magnet = MAGNET + TRACKERS
+        config = {'sessions': {'sessions': [], 'draft_scope': SCOPE},
+                  'sessionDetails': {SESSION_A: session_snapshot(SESSION_A)},
+                  'directPreview': _direct_preview({'qb': True}, kind='magnet', title='Show')}
+        page = self.page(config, stored_session=SESSION_A)
+        prompt = page.locator('#agentPrompt')
+        prompt.focus()
+        page.keyboard.insert_text(magnet)
+        self.assertEqual(prompt.input_value(), magnet)
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
+        self.reload_ui(page, config)
+        expect(prompt).to_have_value(magnet)
+        expect(page.locator('#agentSend')).to_be_enabled()
+        prompt.press('Shift+Enter')
+        self.assertEqual(prompt.input_value(), magnet + '\n')
+        prompt.press('Enter')
+        prompt.press('Enter')
+        page.get_by_role('button', name='提交下载').wait_for()
+        expect(page.locator('.agent-download-card')).to_have_count(1)
+        self.assertEqual(page.evaluate('window.__directForms'), [[['url', magnet]]])
+        self.assertFalse(_query_bodies(page))
+        self.assertEqual(prompt.input_value(), '')
+        self.assertFalse(page.evaluate("scope => JSON.parse(sessionStorage.getItem('mediaflux.agent.drafts.v1.' + scope))", SCOPE))
+
+    def test_mobile_ime_keeps_magnet_in_composer_until_explicit_send(self):
+        from playwright.sync_api import expect
+
+        magnet = 'MAGNET:?dn=Show&xt=urn%3Abtmh%3A1220' + 'b' * 64 + TRACKERS
+        page = self.page({'directPreview': _direct_preview({'qb': True}, kind='magnet', title='Show')},
+                         viewport={'width': 390, 'height': 844})
+        prompt = page.locator('#agentPrompt')
+        prompt.focus()
+        cdp = page.context.new_cdp_session(page)
+        cdp.send('Emulation.setTouchEmulationEnabled', {'enabled': True})
+        cdp.send('Input.imeSetComposition', {'text': magnet, 'selectionStart': len(magnet), 'selectionEnd': len(magnet)})
+        self.assertEqual(prompt.input_value(), magnet)
+        prompt.press('Enter')
+        page.locator('#agentComposer').evaluate('node => node.requestSubmit()')
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
+        self.assertFalse(_query_bodies(page))
+        cdp.send('Input.insertText', {'text': magnet})
+        self.assertEqual(prompt.input_value().strip(), magnet)
+        # 部分输入法用 229 表示候选确认，此时 isComposing 可能已清除。
+        prompt.dispatch_event('keydown', {'key': 'Enter', 'keyCode': 229})
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
+        self.assertFalse(_query_bodies(page))
+        page.locator('#agentSend').click()
+        card = page.locator('.agent-download-card')
+        expect(card.get_by_role('button', name='提交下载')).to_be_enabled()
+        self.assertEqual(page.evaluate('window.__directForms'), [[['url', magnet]]])
+        self.assertFalse(_query_bodies(page))
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+
+    def test_magnet_with_draft_text_or_explicit_quote_stays_in_chat(self):
+        from playwright.sync_api import expect
+
+        answer = '可继续核对资源。'
+        page = self.page({'queryEvents': [harness._event(1, 'turn.completed', {'status': 'success', 'answer': answer})]})
+        prompt = page.locator('#agentPrompt')
+        magnet = MAGNET + '&tr=https://www.guangyapan.com/s/not-a-share-action'
+        prompt.fill('请解释这个链接 ')
+        _paste_prompt(page, magnet)
+        self.assertEqual(prompt.input_value(), '请解释这个链接 ' + magnet)
+        prompt.press('Enter')
+        self.assertEqual(_query_bodies(page)[0]['message'], '请解释这个链接 ' + magnet)
+        expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        prompt.fill(f'`{MAGNET}`')
+        prompt.press('Enter')
+        self.assertEqual(_query_bodies(page)[1]['message'], f'`{MAGNET}`')
+        expect(page.locator('#agentSend')).to_have_attribute('aria-busy', 'false')
+
+        page.locator('.agent-message-assistant [data-reply-message]').last.click()
+        _paste_prompt(page, MAGNET + TRACKERS)
+        self.assertEqual(prompt.input_value(), MAGNET + TRACKERS)
+        prompt.press('Enter')
+        self.assertEqual(_query_bodies(page)[2]['message'], MAGNET + TRACKERS)
+        self.assertEqual(_query_bodies(page)[2]['reply_to'], {'text': answer})
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
+        self.assertFalse(page.evaluate("window.__kernelCalls.some(call => call.url.startsWith('/api/downloads/direct/') || call.url === '/api/share/inspect')"))
+
+    def test_workspace_action_preserves_the_magnet_draft_and_uses_its_action_key(self):
+        page = self.page({
+            'nextActions': {'actions': [{'id': 'check-1', 'title': MAGNET, 'prompt': '检查下载记录'}]},
+            'queryEvents': [harness._event(1, 'turn.completed', {'status': 'success', 'answer': '已检查。'})],
+        })
+        prompt = page.locator('#agentPrompt')
+        prompt.fill(MAGNET)
+        page.locator('[data-agent-action-key="check-1"]').click()
+        request = _query_bodies(page)[0]
+        self.assertEqual(request['action_key'], 'check-1')
+        self.assertNotIn('message', request)
+        self.assertNotIn('reply_to', request)
+        self.assertEqual(prompt.input_value(), MAGNET)
         self.assertEqual(page.locator('.agent-download-card').count(), 0)
 
     def test_unparseable_attachment_reports_error_and_offers_no_submit(self):
