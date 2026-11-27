@@ -1211,12 +1211,12 @@ class Media:
 
     @staticmethod
     @sdk_method('read')
-    def calendar(refresh: bool = False) -> dict:
-        """返回上海当前周完整 days 与 sources/unscheduled；等待平台排期，不截前20条。
+    def calendar(refresh: bool = False, *, source: str | None = None) -> dict:
+        """返回上海当前周完整 days 与 sources/unscheduled。指定 source 只查询该平台：tencent（腾讯视频）、iqiyi（爱奇艺）、youku（优酷），省略时查询全部。
         days[] 含 date、weekday（1–7）、label 和 items；items[] 含 title、source 和 events。
         items[].origin_country 为 TMDB 产地代码列表；null 表示未取得产地证据，不由平台或语言推断。
         events[] 含 date、update_time、schedule、audience；同一作品可有多个播出事件。
-        sources[].covered_dates 为来源实际读取日期，空列表表示未提供；partial 可为官方样本，不等于漏读日期。
+        sources[] 的 id 是平台代码，对应 items[].source；name 是展示名。covered_dates 为实际读取日期，空列表表示未提供；partial 可为官方样本，不等于漏读日期。
         refreshing 仅表示平台采集，metadata_pending 为可选海报/映射补全，不阻挡使用已发布排期。
         保留VIP/免费事件和来源时间；未知时间不是停更，旧缓存不是刷新。本周外日期无覆盖；Bangumi周历用media.catalog。
         """
@@ -1225,7 +1225,7 @@ class Media:
         if type(refresh) is not bool:
             raise ValueError("refresh 必须是布尔值")
         service = get_calendar_service()
-        return service.get_week(force=refresh, wait_sources=tuple(service.providers), cancelled=_CALL_CANCELLED.get())
+        return service.get_week(force=refresh, source=source, wait_sources=tuple(service.providers), cancelled=_CALL_CANCELLED.get())
 
     @staticmethod
     @sdk_method('read')

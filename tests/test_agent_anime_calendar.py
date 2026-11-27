@@ -141,7 +141,7 @@ def test_sdk_passes_host_cancel_and_refresh_without_model_cancel_argument(calend
     cancelled = lambda: False
     with patch.object(service, "get_week", wraps=service.get_week) as get_week, sdk.call_owner("owner", cancelled=cancelled):
         sdk.media.calendar(refresh=True)
-    get_week.assert_called_once_with(force=True, wait_sources=tuple(service.providers), cancelled=cancelled)
+    get_week.assert_called_once_with(force=True, source=None, wait_sources=tuple(service.providers), cancelled=cancelled)
     private: dict[str, Any] = {"cancelled": lambda: True}
     invalid: dict[str, Any] = {"refresh": "true"}
     with pytest.raises(TypeError):

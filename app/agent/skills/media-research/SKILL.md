@@ -13,7 +13,7 @@
 | 已知缺集资源 | 复用作品/季集/完整 audit，按作品季 `resources.search_missing`，继续剩余/失败目标。 |
 | 指定资源 | `resources.search`；歧义查 `media.search/detail`，本地库存 `library.episodes`，已播对照 `library.audit`。 |
 | 推荐排库 | `media.sources/filters` → `media.catalog`，保留产地/年份，传 limit、exclude_library=True，按 scope 续页；已批量核库。外部片单用 `library.presence`，仅 missing 是核实未入库。 |
-| 周表 | `media.calendar` 完整七天，按平台/日期/来源整理；covered_dates 空、产地未取均为未知，partial 不是分页。 |
+| 周表 | 单平台用 `media.calendar(source="tencent")`（也支持 iqiyi、youku）；全部平台省略 source。按日期和平台代码整理七天，covered_dates 空、产地未取均为未知，partial 不是分页。 |
 
 ## 收藏与缺集
 

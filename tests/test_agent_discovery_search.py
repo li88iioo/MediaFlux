@@ -78,7 +78,7 @@ def test_hidden_discovery_page_keeps_shared_metadata_queries_available(monkeypat
             metadata.describe_media.assert_called_once_with(*args)
         elif method == "calendar":
             assert result["days"][0]["items"][0]["title"] == "影片"
-            calendar.get_week.assert_called_once_with(force=False, wait_sources=("tencent",), cancelled=None)
+            calendar.get_week.assert_called_once_with(force=False, source=None, wait_sources=("tencent",), cancelled=None)
         else:
             assert [item["external_id"] for item in result["items"]] == ["1"]
             if method == "search":

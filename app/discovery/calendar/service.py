@@ -72,9 +72,13 @@ class CalendarService:
         now = self.clock()
         return now.replace(tzinfo=TIMEZONE) if now.tzinfo is None else now.astimezone(TIMEZONE)
 
-    def get_week(self, *, force=False, wait_sources=(), cancelled=None):
+    def get_week(self, *, source: str | None = None, force=False, wait_sources=(), cancelled=None):
         if self.closed:
             raise SourceUnavailable("日历服务正在停止")
+        if source is not None and (not isinstance(source, str) or source not in SOURCE_NAMES):
+            raise ValueError("未知日历来源")
+        source_names = SOURCE_NAMES if source is None else {source: SOURCE_NAMES[source]}
+        enabled_sources = tuple(source_id for source_id in self.providers if source_id in source_names)
         today, week_start = calendar_dates(self._now())
 
         def previous_week(payload):
@@ -83,23 +87,23 @@ class CalendarService:
         def current_facts(payload):
             return payload is not None and not previous_week(payload) and not self._empty_partial(payload)
 
-        for source in self.providers:
-            cached = self.cache.get(self.key(source))
+        for source_id in enabled_sources:
+            cached = self.cache.get(self.key(source_id))
             if (cached.status == "fresh" and not force and not cached.last_error and current_facts(cached.payload)
                     and not self._needs_platform_posters(cached.payload)):
                 if self._needs_metadata(cached.payload):
-                    self._schedule(source, metadata_only=True)
+                    self._schedule(source_id, metadata_only=True)
             elif force or cached.status != "error":
-                self._schedule(source)
+                self._schedule(source_id)
         # 对话等待平台事实发布，页面仍立即返回。共享同一采集任务，不等待可选的海报/TMDB补全。
         deadline = time.monotonic() + self.source_timeout + 1
         with self._guard:
-            waiting = set(wait_sources) & self.providers.keys()
+            waiting = set(wait_sources).intersection(enabled_sources)
             while waiting:
                 if self._closed or (cancelled is not None and cancelled()):
                     raise SourceUnavailable("日历查询已停止")
-                waiting = {source for source in waiting if source in self._pending
-                           and not current_facts(self.cache.get(self.key(source)).payload)}
+                waiting = {source_id for source_id in waiting if source_id in self._pending
+                           and (force or not current_facts(self.cache.get(self.key(source_id)).payload))}
                 remaining = deadline - time.monotonic()
                 if not waiting or remaining <= 0:
                     break
@@ -111,15 +115,15 @@ class CalendarService:
                  "items": []} for i in range(7)]
         sources, unscheduled, updated, identities = [], [], [], set()
         metadata_pending = False
-        for source, name in SOURCE_NAMES.items():
+        for source_id, name in source_names.items():
             with self._guard:
-                cached = self.cache.get(self.key(source))
-                pending = source in self._pending
-                metadata_pending |= source in self._metadata_pending
-            state = {"id": source, "name": name, "status": "unavailable", "message": "尚未获取到平台节目排期",
+                cached = self.cache.get(self.key(source_id))
+                pending = source_id in self._pending
+                metadata_pending |= source_id in self._metadata_pending
+            state = {"id": source_id, "name": name, "status": "unavailable", "message": "尚未获取到平台节目排期",
                      "fetched_at": "", "sampled": 0, "ignored": 0, "covered_dates": []}
             payload = cached.payload if cached.status in {"fresh", "stale"} else None
-            if payload and payload.get("version") == 1 and payload.get("source") == source:
+            if payload and payload.get("version") == 1 and payload.get("source") == source_id:
                 old_week = previous_week(payload)
                 stale = old_week or cached.status == "stale" or bool(cached.last_error)
                 metadata_pending |= not stale and self._needs_metadata(payload)
@@ -142,7 +146,7 @@ class CalendarService:
                         if not isinstance(raw, dict) or raw.get("category") != "animation":
                             continue
                         entry = CalendarEntry(**{key: value for key, value in raw.items() if key in _ENTRY_FIELDS})
-                        if entry.source != source or entry.stable_id in identities:
+                        if entry.source != source_id or entry.stable_id in identities:
                             continue
                     except (ValueError, TypeError):
                         continue
@@ -178,7 +182,7 @@ class CalendarService:
                 state.update(status="loading", message="正在获取平台更新日历")
             elif cached.last_error:
                 state["message"] = cached.last_error
-            if source not in self.providers:
+            if source_id not in self.providers:
                 state["message"] = "该来源尚未启用"
             sources.append(state)
         sort_key = lambda card: (card.get("update_time") or card.get("free_update_time") or "99:99", card["source"], card["title"], card["stable_id"])
@@ -186,7 +190,7 @@ class CalendarService:
             day["items"].sort(key=sort_key)
         unscheduled.sort(key=sort_key)
         with self._guard:
-            refreshing = bool(self._pending)
+            refreshing = any(source_id in self._pending for source_id in source_names)
         return {"timezone": "Asia/Shanghai", "today": today, "week_start": week_start,
                 "days": days, "unscheduled": unscheduled, "sources": sources,
                 "refreshing": refreshing or any(s["status"] == "loading" for s in sources),

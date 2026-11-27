@@ -550,6 +550,33 @@ class CalendarSourceWaitTests(unittest.TestCase):
         self.assertEqual(service.get_week()["days"], week["days"])
         self.assertEqual(source.calls, 1)
 
+    def test_forced_waiter_waits_for_platform_refresh_even_with_current_week_cache(self):
+        source = GatedSource()
+        service = self.service(source)
+        previous = CalendarService(
+            providers={"tencent": Source()}, cache=service.cache, metadata=RawMetadata(),
+            http_factory=NoNetwork, clock=lambda: self.now, submit=lambda job: job(),
+        )
+        self.addCleanup(previous.shutdown)
+        cached = previous.get_week()
+        self.assertEqual(cached["items_count"], 1)
+        source.entries = (entry(source_id="refreshed-show"),)
+
+        entered = self.observe_waiters(service)
+        waiting = self.readers.submit(service.get_week, force=True, wait_sources=("tencent",))
+        self.assertTrue(source.entered.wait(2))
+        self.assertTrue(entered.wait(2), "强刷等待读取不能被本周旧缓存提前放行")
+        self.assertFalse(waiting.done())
+        web = self.readers.submit(service.get_week, force=True).result(timeout=2)
+        self.assertEqual(web["days"], cached["days"])
+        self.assertTrue(web["refreshing"])
+
+        source.release.set()
+        refreshed = waiting.result(timeout=2)
+        self.assertEqual([card["source_id"] for card in refreshed["days"][0]["items"]], ["refreshed-show"])
+        self.assertFalse(refreshed["refreshing"])
+        self.assertEqual(source.calls, 1)
+
     def test_wait_deadline_preserves_ready_facts_while_selected_source_is_blocked(self):
         ready, blocked = GatedSource(), GatedSource("iqiyi")
         service = self.service(ready, blocked, source_timeout=1)
@@ -597,6 +624,7 @@ class CalendarSourceWaitTests(unittest.TestCase):
 
     def test_selected_source_does_not_wait_for_another_inflight_source(self):
         selected, other = GatedSource(), GatedSource("iqiyi")
+        other.entries = (replace(other.entries[0], free_weekdays=(), free_schedule=""),)
         service = self.service(selected, other)
         self.start_refresh(service, selected, other)
         entered = self.observe_waiters(service)
@@ -610,6 +638,15 @@ class CalendarSourceWaitTests(unittest.TestCase):
         assert service._pending['iqiyi'] is not None
         self.assertFalse(service._pending["iqiyi"].done())
         self.assertEqual((selected.calls, other.calls), (1, 1))
+
+        scoped = self.readers.submit(service.get_week, source="tencent", force=True,
+                                     wait_sources=("tencent", "iqiyi")).result(timeout=2)
+        self.assertEqual(scoped["sources"], [data["sources"][0]])
+        self.assertFalse(scoped["refreshing"])
+        self.assertFalse(other.release.is_set())
+        other.release.set()
+        self.assertEqual([row["source"] for row in service.get_week(wait_sources=("iqiyi",))["unscheduled"]], ["iqiyi"])
+        self.assertEqual(service.get_week(source="tencent")["unscheduled"], [])
 
     def test_platform_fact_publication_unblocks_reader_before_metadata_finishes(self):
         metadata_entered, metadata_release = threading.Event(), threading.Event()
@@ -638,6 +675,9 @@ class CalendarSourceWaitTests(unittest.TestCase):
         self.assertTrue(data["metadata_pending"])
         self.assertNotIn("tencent", service._pending)
         self.assertEqual(source.calls, 1)
+        scoped = service.get_week(source="youku")
+        self.assertEqual([state["id"] for state in scoped["sources"]], ["youku"])
+        self.assertFalse(scoped["metadata_pending"])
         self.assertFalse(service.shutdown(), "运行中的可选补全仍须纳入关闭回收")
 
     def test_concurrent_readers_and_web_refresh_share_one_real_source_fetch(self):

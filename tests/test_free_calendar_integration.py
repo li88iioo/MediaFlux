@@ -64,8 +64,8 @@ class FreeCalendarIntegrationTests(_BaseClientTests):
         self.enterContext(patch("app.routes.discovery_api.get_calendar_service", return_value=self.service))
 
     def handle(self, request):
-        self.calls.append(str(request.url))
         host, path = request.headers.get("host"), request.url.path
+        self.calls.append((host, path))
         if host == "pbaccess.video.qq.com" and path.endswith("PageService/getPage"):
             self.assertEqual(request.method, "POST")
             params = json.loads(request.read())["page_params"]
@@ -133,6 +133,51 @@ class FreeCalendarIntegrationTests(_BaseClientTests):
         self.assertEqual(any(card["source"] == "iqiyi" for card in data["days"][6]["items"]), self.iqiyi_covers_sunday)
         self.client.get("/api/discovery/calendar")
         self.assertEqual(len(self.calls), 9)
+
+    def test_selected_source_replay_skips_other_platforms_and_keeps_web_week_full(self):
+        self.fail_youku = True
+        selected = self.service.get_week(source="tencent", wait_sources=("tencent", "iqiyi", "youku"))
+        self.assertEqual([(state["id"], state["status"]) for state in selected["sources"]], [("tencent", "ok")])
+        self.assertEqual(len(self.calls), 7)
+        self.assertEqual({host for host, _ in self.calls}, {"pbaccess.video.qq.com"})
+        self.assertEqual(self.cache.get(self.service.key("iqiyi")).status, "miss")
+        self.assertEqual(self.cache.get(self.service.key("youku")).status, "miss")
+
+        # 随后由 Web 回放另外两站，确认单站请求没有改变全量入口或复用其他站的结果。
+        self.fail_youku = False
+        self.now += timedelta(seconds=1)
+        self.authenticate()
+        week = self.client.get("/api/discovery/calendar").json()
+        self.assertEqual([state["id"] for state in week["sources"]], ["tencent", "iqiyi", "youku"])
+        self.assertEqual(week["items_count"], self.expected_programmes)
+        self.assertEqual([host for host, _ in self.calls[7:]], ["mesh.if.iqiyi.com", "www.youku.com"])
+        self.assertGreater(week["updated_at"], selected["updated_at"])
+
+        for state in week["sources"]:
+            source = state["id"]
+            with self.subTest(source=source):
+                scoped = self.service.get_week(source=source, wait_sources=(source,))
+                self.assertEqual(scoped["sources"], [state])
+                self.assertEqual(scoped["updated_at"], state["fetched_at"])
+                expected = [[card["stable_id"] for card in day["items"] if card["source"] == source]
+                            for day in week["days"]]
+                self.assertEqual([[card["stable_id"] for card in day["items"]] for day in scoped["days"]], expected)
+                self.assertEqual(scoped["items_count"], len({stable_id for day in expected for stable_id in day}))
+        self.assertEqual(len(self.calls), 9)
+        self.assertEqual(self.unexpected, [])
+
+    def test_selected_known_disabled_source_reports_unavailable_without_any_http(self):
+        del self.service.providers["youku"]
+        data = self.service.get_week(source="youku", force=True, wait_sources=("tencent", "youku"))
+        self.assertEqual([(row["id"], row["status"], row["message"]) for row in data["sources"]],
+                         [("youku", "unavailable", "该来源尚未启用")])
+        self.assertEqual(len(data["days"]), 7)
+        self.assertFalse(any(day["items"] for day in data["days"]))
+        self.assertEqual((data["items_count"], data["unscheduled"], data["updated_at"]), (0, [], ""))
+        self.assertFalse(data["refreshing"] or data["metadata_pending"])
+        with self.assertRaisesRegex(ValueError, "未知日历来源"):
+            self.service.get_week(source="unknown")
+        self.assertEqual(self.calls, [])
 
     def test_real_tmdb_replay_and_controlled_secondary_cover_share_existing_watchlist(self):
         headers = self.authenticate()

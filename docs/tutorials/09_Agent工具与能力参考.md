@@ -158,7 +158,7 @@
 | `watchlist.remove` | WRITE | 工作区通过 `mf.watchlist.remove(watchlist_number)` 预检并确认移除精确收藏；不会删除媒体文件或下载任务。 |
 | `library.recommend`（SDK） | READ | 从已配置的 Jellyfin / Emby 本地媒体库分页读取最多5000个候选，结合50条真实历史确定性推荐；仅最终作品列表按limit截取。省略参数采用当前身份已存偏好，显式空数组/0/False优先。库存未读全或总数未知保留partial/None，计数仅代表已扫描范围；返回真实ID及完整元数据。 |
 | `media.catalog`（SDK） | READ | 默认读取一页榜单。显式 `limit` 收集 TMDB/discover 或豆瓣/recommend，支持年份范围、产地和题材；`exclude_library=true` 只保留核验不在库者。未知不是缺失；按 `scope.next_page/next_offset` 续取，达到请求数后不因 `has_more` 继续。 |
-| `media.calendar`（SDK） | READ | 返回上海当前周完整七天的腾讯视频、爱奇艺和优酷排期，保留会员/免费事件、未知时间和来源状态；脚本可按日期、平台、片名筛选，不推断本周外排期。 |
+| `media.calendar`（SDK） | READ | 返回上海当前周七天的排期，保留会员/免费事件、未知时间和来源状态。可用 `source="tencent"`、`"iqiyi"` 或 `"youku"` 单查平台，省略时查全部三站。 |
 | `media.catalog("bangumi", "calendar", "tv")`（SDK） | READ | 读取 Bangumi 周历的一页，`filters={"weekday":"1"}` 可选星期；不表示国内三平台排期，按 `has_more` 续页。 |
 
 ### 2.7 资源索引与统一接入
