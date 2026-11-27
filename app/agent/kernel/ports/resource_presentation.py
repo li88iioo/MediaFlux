@@ -67,7 +67,7 @@ class ResourcePresentation:
                 except ReferenceError:
                     previous = None
                 if method == "resources.rank_episode":
-                    captured = reranked_candidates(previous, result)
+                    captured = reranked_candidates(previous, result, arguments.get("preferences"))
                     if captured is None:
                         return
                 else:

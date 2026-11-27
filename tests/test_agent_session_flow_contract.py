@@ -3,23 +3,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import aclosing
 from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.kernel.ports.resource_presentation import ResourceSelection
 from app.agent.errors import ToolPipelineError
+from app.agent.kernel import sandbox
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
-from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import TERMINAL_EVENT_TYPES, AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
+from app.agent.kernel.ports.resource_presentation import ResourceSelection
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.public_view import public_conversation_messages
 from tests.support import isolated_test_database
 from tests.test_agent_kernel_core import ScriptedModel, collect
@@ -211,6 +213,146 @@ def test_cold_explain_confirm_keep_event_and_plan_contract() -> None:
 
     with isolated_test_database("session-flow-contract.db"):
         asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+
+@pytest.mark.parametrize("followup", ["clarify", "replace", "cancel"])
+def test_cold_confirmation_waits_for_new_pending_plan_turn(tmp_path, followup):
+    async def scenario():
+        scope = {"owner": "rename-owner", "session_id": "rename-from-two-tabs"}
+        source = tmp_path / "原片名.mkv"
+        source.write_bytes(b"offline rename fixture")
+        writes = []
+
+        def rename(arguments, *_):
+            name = arguments["new_name"]
+            writes.append(name)
+            source.rename(source.with_name(name))
+            return {"ok": True, "status": "completed", "summary": f"已改名为 {name}"}
+
+        tool = KernelToolSpec(
+            name="fixture.rename", domain="files", description="改名测试文件",
+            input_schema={"type": "object", "properties": {"new_name": {"type": "string"}},
+                          "required": ["new_name"], "additionalProperties": False},
+            effect=ToolEffect.WRITE,
+            prepare=lambda arguments, _: PreparedEffect(
+                preview={"summary": f"预览改名为 {arguments['new_name']}"},
+                snapshot_fingerprint="rename-fixture"),
+            execute_confirmed=rename,
+        )
+
+        def call(name, call_id, arguments):
+            return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
+                               tool_call=ModelToolCall(call_id, name, arguments)),
+                    ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
+
+        def answer(message):
+            return [ModelEvent(ModelEventType.TEXT_DELTA, text=message),
+                    ModelEvent(ModelEventType.FINISH, finish_reason="stop")]
+
+        def cold_session(model):
+            store = SQLiteKernelStore(secret_provider=lambda: "rename-flow-test-secret")
+            catalog = ToolCatalog([tool])
+            pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
+                                    effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
+            if followup == "cancel":
+                catalog.register(sandbox.run_code_tool(pipeline))
+            return AgentSession(model=model, catalog=catalog, state_store=store, pipeline=pipeline, journal=store)
+
+        original = await collect(cold_session(ScriptedModel([
+            call(tool.name, "preview-original", {"new_name": "周末版.mkv"}),
+        ])).run(AgentInput(**scope, request_id="preview", message="把原片名.mkv改成周末版.mkv。")))
+        assert original[-1].payload["status"] == "approval_required"
+        original_id = original[-1].payload["plan_id"]
+
+        model_started, release_model = asyncio.Event(), asyncio.Event()
+
+        class PausedModel(ScriptedModel):
+            async def stream(self, request, *, cancellation):
+                if not self.requests:
+                    model_started.set()
+                    await release_model.wait()
+                async for event in super().stream(request, cancellation=cancellation):
+                    yield event
+
+        messages = {
+            "clarify": "我还没决定。想保留原名又想用新名字，这个改名操作能同时做到吗？",
+            "replace": "改主意了，把原片名.mkv改成家庭版.mkv，周末版不用了。",
+            "cancel": "算了，取消刚才的改名，保留原片名.mkv。",
+        }
+        rounds = {
+            "clarify": [answer("改名会替换原名。你想保留原名还是改名？")],
+            "replace": [call(tool.name, "preview-revised", {"new_name": "家庭版.mkv"})],
+            "cancel": [call("agent.run_code", "cancel-card", {"code":
+                "from mf import session\nprint(session.pending_plan(operation='cancel')['summary'])"}),
+                answer("改名计划已取消。")],
+        }
+        live = cold_session(PausedModel(rounds[followup]))
+        in_flight = asyncio.create_task(collect(live.run(AgentInput(
+            **scope, request_id="followup", message=messages[followup]))))
+        second_tab_model = ScriptedModel([answer("改名完成。")])
+        second_tab = cold_session(second_tab_model)
+        try:
+            await asyncio.wait_for(model_started.wait(), timeout=5)
+            before_click = await second_tab.state_store.load(**scope)
+            assert before_click.pending_effect_plan_id == original_id
+            assert before_click.conversation[-1]["content"] == messages[followup]
+            clicked = await collect(second_tab.confirm(**scope, plan_id=original_id, request_id="old-tab-click"))
+            assert writes == [], "旧页的确认抢在新用户消息处理前执行了改名"
+            assert [item.type for item in clicked] == [AgentEventType.TURN_FAILED]
+            assert clicked[-1].payload["code"] == "effect_in_progress"
+            warm_click = await collect(live.confirm(**scope, plan_id=original_id, request_id="same-worker-click"))
+            assert [item.type for item in warm_click] == [AgentEventType.TURN_FAILED]
+            assert warm_click[-1].payload["code"] == "effect_in_progress"
+            after_click = await second_tab.state_store.load(**scope)
+        finally:
+            release_model.set()
+            updated = await asyncio.wait_for(in_flight, timeout=10)
+
+        assert after_click == before_click and second_tab_model.requests == []
+        assert source.exists() and writes == []
+
+        recovered = cold_session(ScriptedModel([answer("改名完成。")]))
+        pending = await recovered.pipeline.get_pending_plan(**scope)
+        chosen_id, expected_name = original_id, "周末版.mkv"
+        if followup == "clarify":
+            assert pending is not None and pending.plan_id == original_id
+            assert updated[-1].payload["status"] == "success"
+        else:
+            old = await collect(recovered.confirm(**scope, plan_id=original_id, request_id="stale-click"))
+            assert old[-1].payload["code"] == "confirmation_invalid" and writes == []
+            saved = await recovered.state_store.load(**scope)
+            original_result = next(row for row in saved.conversation
+                                   if row.get("role") == "tool" and row.get("effect_plan_id") == original_id)
+            assert json.loads(original_result["content"])["status"] == "cancelled"
+            if followup == "cancel":
+                assert pending is None and updated[-1].payload["status"] == "success"
+                result = next(row for row in saved.conversation if row.get("tool_call_id") == "cancel-card")
+                data = json.loads(result["content"])["data"]
+                assert data["exit_code"] == 0 and "已取消原确认卡" in data["stdout"]
+                return
+            assert pending is not None and pending.plan_id != original_id
+            assert updated[-1].payload["plan_id"] == pending.plan_id
+            chosen_id, expected_name = pending.plan_id, "家庭版.mkv"
+
+        request = {**scope, "plan_id": chosen_id, "request_id": "current-click"}
+        async with aclosing(recovered.confirm(**request)) as stream:
+            started = await anext(stream)
+            assert started.type is AgentEventType.TURN_STARTED
+        await asyncio.wait_for(asyncio.gather(*recovered._detached_tasks), timeout=10)
+
+        replay_model = ScriptedModel([])
+        restarted = cold_session(replay_model)
+        replay = await collect(restarted.confirm(**request))
+        assert [event.type for event in replay] == [AgentEventType.EFFECT_COMPLETED, AgentEventType.TURN_COMPLETED]
+        assert {(event.turn_id, event.request_id) for event in replay} == {(started.turn_id, "current-click")}
+        assert replay[0].payload["result"]["summary"] == f"已改名为 {expected_name}"
+        duplicate = await collect(restarted.confirm(**scope, plan_id=chosen_id, request_id="duplicate-click"))
+        assert duplicate[-1].payload["code"] == "confirmation_invalid"
+        assert writes == [expected_name] and replay_model.requests == []
+        assert source.with_name(expected_name).read_bytes() == b"offline rename fixture"
+
+    with isolated_test_database("pending-plan-followup.db"):
+        asyncio.run(asyncio.wait_for(scenario(), timeout=20))
 
 
 @pytest.mark.parametrize("cancel_first", [False, True], ids=["complete", "cancel"])

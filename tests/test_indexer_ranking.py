@@ -96,12 +96,17 @@ class IndexerRankingTests(unittest.TestCase):
             ("[7.19GB]", []), ("[7.19 GB]", []), ("[7.19GiB]", []), ("Monarchs", []),
             ("[GB]", ["含简体中文标记"]), ("[GB2312]", ["含简体中文标记"]),
             ("[CHS]", ["含简体中文标记"]), ("[CHT]", ["含繁体中文标记"]),
+            ("[中字]", ["含中文标记（简繁未注明）"]), ("[繁體中字]", ["含繁体中文标记"]),
+            ("[zh-Hans]", ["含简体中文标记"]), ("[无简中][CHT]", ["含繁体中文标记"]),
+            ("[无中文字幕]", []),
         ):
             with self.subTest(suffix=suffix):
                 item = self._item(f"Demo.S01E01.1080p {suffix}")
-                result = rank_episode_search({"items": [item.to_public_dict()]}, season=1, episode=1, media=media)
+                result = rank_episode_search({"items": [item.to_public_dict()]}, season=1, episode=1, media=media,
+                                             preferences={"preferred_subtitles": ["简中"]})
                 reasons = result["items"][0]["quality"]["reasons"]
                 self.assertEqual([reason for reason in reasons if "中文标记" in reason], expected)
+                self.assertEqual("偏好字幕：简中" in reasons, "含简体中文标记" in expected)
 
     def test_other_season_pack_is_conflicting_in_both_ranking_stages(self):
         from app.modules.episode_resource_ranking import rank_episode_search

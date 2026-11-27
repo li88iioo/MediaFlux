@@ -759,7 +759,8 @@ def media_proxy_failure_facts(*, hours: int = 24, instance_id: int | None = None
             "has_more": offset + len(items) < total,
             "next_offset": offset + len(items) if offset + len(items) < total else None,
             "summary_group_limit": 8, "error_representation": "stored_redacted_text",
-            "error_note": "error保留账本中完整已保存文本；写入时已脱敏并最多保留1000字，不能还原上游原文。"}
+            "error_note": "error 是当次请求已脱敏的错误，最多保留1000字，不能还原上游原文。HTTP 404 只说明当次请求未找到对象，云盘文件现状需另行核实。",
+            "latency_note": "耗时按整数毫秒记录。0 可能是取整或未取得计时，不能据此判断请求是否到达上游。"}
 
 
 def _prune_playback_history(conn: sqlite3.Connection, *, retained_rows: int) -> None:

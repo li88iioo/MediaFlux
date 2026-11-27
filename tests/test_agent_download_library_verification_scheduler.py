@@ -752,6 +752,31 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(agent_download_verification_repo.list_agent_download_verification_notifications(), [])
         notifier.assert_not_called()
 
+    def test_cloud_followup_waits_for_confirmation_and_sync_then_verifies_once(self):
+        request_id = self._request("cloud-followup", owner=_TG_OWNER)
+        download_requests_repo.update_download_request(
+            request_id, targets="both", qb_status="failed", gy_status="completed",
+            organize_started=1, organize_status="requires_manual", strm_status="pending",
+        )
+        audit = Mock(return_value=(_audit_visible(), 1))
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=audit, clock=self.clock, terminal_notifier=Mock(return_value=True),
+        )
+        for minute, organize, strm in (
+            (0, "requires_manual", "pending"), (1, "completed", "running"),
+            (2, "completed", "completed"), (3, "completed", "completed"),
+        ):
+            download_requests_repo.update_download_request(request_id, organize_status=organize, strm_status=strm)
+            self.clock.value = datetime(2026, 8, 3, 12, minute)
+            self.assertEqual(scheduler.run_once(), 1)
+            if minute < 3:
+                audit.assert_not_called()
+        job = agent_download_verification_repo.get_agent_download_verification(request_id)
+        assert job is not None
+        self.assertEqual((job["status"], job["attempts"]), ("visible", 1))
+        self.assertEqual(scheduler.run_once(), 0)
+        audit.assert_called_once()
+
     def test_completed_download_becomes_visible_after_exact_audit(self):
         request_id = self._request("visible-auto-verify", owner=_TG_OWNER)
         executor = Mock(return_value=(_audit_visible(), 3))

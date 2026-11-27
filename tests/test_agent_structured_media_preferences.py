@@ -264,6 +264,13 @@ def test_resource_language_hdr_codec_and_group_markers_add_explainable_bonus():
     assert effective_preferences({"excluded_keywords": ["CAM"]}, {"excluded_keywords": []})["excluded_keywords"] == []
 
 
+@pytest.mark.parametrize("key", ["preferred_subtitles", "preferred_audio_languages"])
+def test_language_preferences_match_release_tags_outside_words(key):
+    profile = {key: ["英语"]}
+    assert resource_preference_match(_resource("a", "Avengers.Endgame"), profile)["score"] == 0
+    assert resource_preference_match(_resource("a", "Avengers.Endgame.[ENG]"), profile)["score"] > 0
+
+
 @pytest.mark.parametrize(("suffix", "preference", "matched"), [
     ("H264-ASDRGroup", "sdr", False), ("HDR", "hdr10", False),
     ("H264", "sdr", False), ("SDR", "sdr", True), ("HLG", "sdr", False),

@@ -433,7 +433,8 @@ def build_recent_download_status(
         _backend_projection(name, row=row, log=latest_logs.get(name))
         for name in backend_names
     ]
-    phase, needs_attention = _root_phase(row, backends, target=record.target)
+    processing = _local_processing_projection(row)
+    phase, needs_attention = _root_phase(row, backends, processing)
     terminal = phase in {"completed", "failed", "partial_failed", "manual_review"}
     data: dict[str, Any] = {
         "position": position,
@@ -466,9 +467,8 @@ def build_recent_download_status(
         if value:
             data[key] = value
 
-    local_processing = _local_processing_projection(row)
-    if local_processing:
-        data["local_processing"] = local_processing
+    if processing:
+        data["local_processing"] = processing
 
     automatic_verification = _automatic_verification_projection(record.request_id)
     if automatic_verification:
@@ -695,27 +695,21 @@ def _safe_timestamp(value: Any) -> str:
 def _root_phase(
     row: Any,
     backends: list[dict[str, Any]],
-    *,
-    target: str,
+    processing: dict[str, str],
 ) -> tuple[str, bool]:
     statuses = [str(item["status"]) for item in backends]
     failure_statuses = {"failed", "manual_review", "cancelled"}
     active_statuses = {"pending", "submitting", "submitted", "downloading"}
-    completed = any(status == "completed" for status in statuses)
+    completed = {item["name"] for item in backends if item["status"] == "completed"}
     failed = any(status in failure_statuses for status in statuses)
     active = any(status in active_statuses for status in statuses)
 
-    if int(row["organize_started"] or 0) < 0:
-        return "manual_review", True
-    local_status = str(row["local_import_status"] or "").strip().lower()
-    if local_status in {"requires_manual", "failed"}:
+    if "attention" in processing.values():
         return "manual_review", True
     if statuses and all(status in failure_statuses for status in statuses):
         return "failed", True
     if failed and active:
         return "partial_in_progress", True
-    if completed and failed:
-        return "partial_failed", True
     if active:
         for phase in ("downloading", "submitted", "submitting", "pending"):
             if phase in statuses:
@@ -727,20 +721,16 @@ def _root_phase(
             return root, False
         return "unknown", True
 
-    organize_started = int(row["organize_started"] or 0)
-    guangya_pending_organize = (
-        target in {"guangya", "both"}
-        and any(item["name"] == "guangya" and item["status"] == "completed" for item in backends)
-        and organize_started == 0
-    )
-    if statuses and all(status == "completed" for status in statuses):
-        if (
-            local_status in {"pending", "planned"}
-            or organize_started > 0
-            or guangya_pending_organize
-        ):
-            return "post_processing", False
-        return "completed", False
+    if completed:
+        organize = processing.get("guangya_organize")
+        if "guangya" in completed and organize == "requires_manual":
+            return "awaiting_confirmation", True
+        cloud_pending = "guangya" in completed and (
+            organize not in {"completed", "skipped"} or processing.get("strm") in {"in_progress", "unknown"}
+        )
+        if cloud_pending or ("qb" in completed and processing.get("local_import") == "in_progress"):
+            return ("partial_in_progress", True) if failed else ("post_processing", False)
+        return ("partial_failed", True) if failed else ("completed", False)
 
     if root in active_statuses:
         return root, False
@@ -751,28 +741,31 @@ def _root_phase(
     return "unknown", True
 
 
-def _local_processing_projection(row: Any) -> dict[str, Any] | None:
-    local_status = str(row["local_import_status"] or "").strip().lower()
-    organize_started = int(row["organize_started"] or 0)
-    if not local_status and organize_started == 0:
-        return None
-    if local_status in {"pending", "planned"}:
-        local_phase = "in_progress"
-    elif local_status == "completed":
-        local_phase = "completed"
-    elif local_status == "skipped":
-        local_phase = "skipped"
-    elif local_status in {"requires_manual", "failed"}:
-        local_phase = "attention"
-    else:
-        local_phase = "unknown"
-    if organize_started > 0:
-        organize_phase = "started"
-    elif organize_started < 0:
+def _local_processing_projection(row: Any) -> dict[str, str]:
+    def stage(status: str) -> str:
+        if status in {"completed", "skipped"}:
+            return status
+        if status in {"pending", "planned", "queued", "settling", "starting", "running"}:
+            return "in_progress"
+        if status in {"failed", "partial", "requires_manual", "stopped", "cancelled", "resubmitted", "cleared"}:
+            return "attention"
+        return "unknown"
+
+    local, organize, strm = row["local_import_status"], row["organize_status"], row["strm_status"]
+    started = int(row["organize_started"] or 0)
+    if not (local or organize or strm or started):
+        return {}
+    # 旧记录可能仅保存 tracker 的领取标记；有结算状态时以该请求的结算为准。
+    if organize:
+        organize_phase = "requires_manual" if organize == "requires_manual" else stage(organize)
+    elif started < 0:
         organize_phase = "attention"
     else:
-        organize_phase = "not_started"
-    return {"local_import": local_phase, "guangya_organize": organize_phase}
+        organize_phase = "started" if started else "not_started"
+    result = {"local_import": stage(local), "guangya_organize": organize_phase}
+    if strm:
+        result["strm"] = stage(strm)
+    return result
 
 
 def _phase_summary(phase: str) -> str:
@@ -781,7 +774,8 @@ def _phase_summary(phase: str) -> str:
         "submitting": "最近任务正在提交到下载后端",
         "submitted": "最近任务已提交，正在等待后端确认",
         "downloading": "最近任务正在下载",
-        "post_processing": "下载已完成，正在执行本地导入或云盘整理",
+        "post_processing": "下载已完成，正在等待后处理结束",
+        "awaiting_confirmation": "下载已完成，光鸭整理正在等待人工确认",
         "completed": "最近任务已完成",
         "partial_in_progress": "最近任务部分目标失败，其余目标仍在处理",
         "partial_failed": "最近任务部分目标已完成，部分目标失败",

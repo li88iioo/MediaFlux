@@ -221,6 +221,16 @@ class WorkspaceSearchDataTests(IsolatedDatabaseTestCase):
         assert not result["ok"] and result["status"] == "unavailable"
         assert result["data"]["has_more"] is None
 
+    def test_unconfigured_library_is_reported_alongside_download_findings(self):
+        self._seed_sensitive_records()
+        with patch("app.services._search_sources", return_value=[]):
+            for title, count in (("沙丘2", 1), ("无记录的虚构片名", 0)):
+                result = service.search(title, ["library", "downloads"])
+                assert result["ok"] and result["status"] == "partial"
+                assert result["data"]["returned"] == count
+                assert result["data"]["unavailable_sources"] == ["library"]
+                assert result["data"]["sections"][0]["status"] == "not_configured"
+
     def test_missing_or_null_items_are_not_empty(self):
         for raw in ({}, {"items": None}):
             with patch.object(db, "search_workspace_rss", return_value=raw):

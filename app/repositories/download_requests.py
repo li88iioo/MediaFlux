@@ -1131,7 +1131,7 @@ def get_download_request_status_snapshot(
     with db.get_conn() as conn:
         conn.execute("BEGIN")
         row = conn.execute(
-            "SELECT targets,status,qb_status,gy_status,organize_started,"
+            "SELECT targets,status,qb_status,gy_status,organize_started,organize_status,strm_status,"
             "local_import_status,created_at,updated_at,completed_at "
             "FROM download_requests WHERE id=?",
             (request_id,),

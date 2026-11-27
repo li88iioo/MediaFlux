@@ -92,6 +92,98 @@ async def display(pipeline, context, identities, **arguments):
     return response, rpc.presentation.view
 
 
+@pytest.mark.parametrize('override_method', ['rank_episode', 'search'])
+def test_card_preserves_saved_constraints_and_explicit_temporary_overrides(native, monkeypatch, override_method):
+    from app.database import media_owner_digest
+    from app.repositories.media_experience import (
+        get_media_preferences,
+        set_media_preferences,
+    )
+
+    titles = ['Example.S01E05.2160p.SDR', 'Example.S01E05.2160p.WaterMark',
+              'Example.S01E05.1080p.SDR', 'Example.S01E05.480p.WaterMark', 'Example.S01E05.480p.Dub']
+
+    async def search(request, **kwargs):
+        items = []
+        for number, title in enumerate(titles):
+            item = IndexerItem('nyaa', 'Nyaa', title, download_state='ready',
+                download_kinds=('magnet',), magnet='magnet:?xt=urn:btih:' + f'{number:040x}')
+            items.append(replace(item, result_id=native.service.result_store.put(item)))
+        return AggregatedIndexerResult(query=request.title, page=request.page, items=items,
+            sites_attempted=('nyaa',), sites_succeeded=('nyaa',))
+
+    monkeypatch.setattr(native.service, 'search_media', search)
+
+    async def exercise():
+        pipeline = native.pipeline()
+        context = await context_for(native.store)
+        owner = media_owner_digest(context.owner)
+        saved = set_media_preferences(owner, expected_revision=0, updates={
+            'preferred_resolution': '1080p', 'minimum_resolution': '720p', 'excluded_keywords': ['watermark', 'dub'],
+        })
+        result = await read(pipeline, context, season=1, episode=5)
+        ids_by_title = {item['title']: item['result_id'] for item in result['items']}
+        assert set(ids_by_title) == set(titles)
+        ids = [ids_by_title[title] for title in titles]
+
+        response, view = await display(pipeline, context, ids, resolution='2160p')
+        assert response['result']['result_ids'] == ids[:1]
+        assert response['result']['excluded_count'] == 4
+        assert view and [item['title'] for item in view['items']] == titles[:1]
+
+        response, view = await display(pipeline, context, ids)
+        assert response['result']['result_ids'] == [ids[0], ids[2]]
+        assert view and [item['title'] for item in view['items']] == [titles[0], titles[2]]
+        assert get_media_preferences(owner) == saved
+
+        response, view = await display(pipeline, context, [ids[1]])
+        assert response['result']['result_ids'] == [] and view is None
+        state = await native.store.load(owner=context.owner, session_id=context.session_id)
+        assert await current_candidate_view(state=state, store=native.store) is None
+
+        overrides = {'minimum_resolution': 'any', 'excluded_keywords': ['dub']}
+        if override_method == 'search':
+            temporary = await read(pipeline, context, resolution='480p', preference_overrides=overrides)
+        else:
+            temporary = await read(pipeline, context, season=1, episode=5, resolution='480p')
+            ids = [item['result_id'] for item in temporary['items']]
+            reranked, _ = await rpc_call(pipeline, context, 'resources.rank_episode', {
+                'search': temporary, 'season': 1, 'episode': 5, 'preferences': {'minimum_resolution': 'any'},
+            })
+            assert 'error' not in reranked, reranked
+            response, view = await display(pipeline, context, ids)
+            assert response['result']['result_ids'] == [] and view is None
+            reranked, _ = await rpc_call(pipeline, context, 'resources.rank_episode', {
+                'search': temporary, 'season': 1, 'episode': 5, 'preferences': overrides,
+            })
+            assert 'error' not in reranked, reranked
+        assert {row['title'] for row in temporary['items']} == set(titles[-2:])
+        temporary_ids = [item['result_id'] for item in temporary['items']]
+        response, view = await display(pipeline, context, temporary_ids)
+        assert response['result']['excluded_count'] == 1
+        assert view and [item['title'] for item in view['items']] == [titles[-2]]
+        selection = await validate_selection({'ref': view['selection_ref'], 'positions': [1], 'target': 'guangya'},
+                                             state=await native.store.load(owner=context.owner, session_id=context.session_id),
+                                             store=native.store)
+        assert list(selection.arguments['result_ids']) == response['result']['result_ids']
+
+        if override_method == 'rank_episode':
+            reranked, _ = await rpc_call(pipeline, context, 'resources.rank_episode', {
+                'search': temporary, 'season': 1, 'episode': 5, 'preferences': {'minimum_resolution': '720p'},
+            })
+            assert 'error' not in reranked, reranked
+            response, view = await display(pipeline, context, temporary_ids)
+            assert response['result']['result_ids'] == [] and view is None
+
+        target = {'season': 1, 'episode': 5} if override_method == 'rank_episode' else {}
+        next_search = await read(pipeline, context, resolution='480p', **target)
+        response, view = await display(pipeline, context, [item['result_id'] for item in next_search['items']])
+        assert response['result']['result_ids'] == [] and view is None
+        assert get_media_preferences(owner) == saved
+
+    asyncio.run(exercise())
+
+
 def test_repeated_candidate_reads_load_one_snapshot_and_keep_independent_values(native, monkeypatch):
     import json
     async def exercise():
@@ -333,8 +425,8 @@ def test_rpc_same_query_pages_and_research_keep_every_real_id(native, resource_q
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize(('last_a', 'last_b'), [(2, 1), (3, 1), (2, 2)],
-                         ids=['subset-last-page', 'empty-tail-and-gap', 'other-site-still-open'])
+@pytest.mark.parametrize(('last_a', 'last_b'), [(2, 1), (3, 1), (2, 2), (1, 1)],
+                         ids=['subset-last-page', 'empty-tail-and-gap', 'other-site-still-open', 'retry-failed-site'])
 def test_rpc_site_subset_pagination_coverage(native, monkeypatch, last_a, last_b):
     keep_end_items = (last_a, last_b) == (2, 1)
 
@@ -347,8 +439,12 @@ def test_rpc_site_subset_pagination_coverage(native, monkeypatch, last_a, last_b
             self.base_url = f'https://{site_id}.invalid'
             self.last_page = last_page
             self.hash_prefix = hash_prefix
+            self.offline = False
 
         async def search(self, request: IndexerSearchRequest) -> IndexerPage:
+            if self.offline:
+                from app.indexers.errors import IndexerTimeout
+                raise IndexerTimeout('fixture')
             items = []
             if request.page == 1 or request.page < self.last_page or keep_end_items and request.page == self.last_page:
                 items.append(IndexerItem(self.site_id, self.site_name, 'Example.2024.S01E02.1080p.SDR.WEB-DL',
@@ -359,6 +455,7 @@ def test_rpc_site_subset_pagination_coverage(native, monkeypatch, last_a, last_b
     sites = ['fixture-a', 'fixture-b']
     a = PagedIndexer(sites[0], last_a, 100)
     b = PagedIndexer(sites[1], last_b, 200)
+    b.offline = (last_a, last_b) == (1, 1)
     service = IndexerService(registry=IndexerRegistry({site.site_id: site for site in (a, b)}),
                              result_store=IndexerResultStore())
     monkeypatch.setattr('app.indexers.runtime.get_indexer_service', lambda: service)
@@ -369,6 +466,21 @@ def test_rpc_site_subset_pagination_coverage(native, monkeypatch, last_a, last_b
         conditions = {'year': 2024, 'season': 1, 'episode': 2, 'media_type': 'tv', 'resolution': '1080p',
                       'dynamic_range': 'SDR', 'sort_mode': 'seeders_desc'}
         first = await read(pipeline, context, sites=sites, **conditions)
+        if b.offline:
+            identities = [item['result_id'] for item in first['items']]
+            assert len(identities) == 1 and first['errors'][0]['site_id'] == b.site_id
+            async def remaining_notice():
+                _, view = await display(pipeline, context, identities)
+                assert view
+                return view.get('coverage_notice', '')
+
+            assert '部分来源' in await remaining_notice()
+            b.offline = False
+            await read(pipeline, context, sites=[b.site_id], **{**conditions, 'resolution': '2160p'})
+            assert '部分来源' in await remaining_notice()
+            await read(pipeline, context, sites=[b.site_id], **conditions)
+            assert await remaining_notice() == ''
+            return
         assert {site['site_id']: site['next_page'] for site in first['site_statuses']} == {
             'fixture-a': 2, 'fixture-b': 2 if last_b > 1 else None}
         identities = [item['result_id'] for item in first['items']]
@@ -641,6 +753,7 @@ def test_real_sandbox_rpc_reaches_event_history_and_original_card_consumers(nati
         tool_messages = [item for item in model.requests[-1].messages if item.role == 'tool']
         model_result = json.loads(tool_messages[-1].content)
         assert model_result['candidate_view'] == {'ref': result.candidate_view['ref']}
+        assert '已展示可点选的资源候选卡' in model_result['summary']
         assert 'selection_ref' not in tool_messages[-1].content
         cold = SQLiteKernelStore(secret_provider=lambda: SECRET)
         async def verify():
@@ -884,10 +997,12 @@ def test_rpc_parallel_search_completion_keeps_facts_without_replacing_card(nativ
 
 @pytest.mark.parametrize('choice', ['rejected', 'alternatives'])
 def test_rpc_missing_pack_preserves_every_verification_goal_through_selection_and_effect_preview(native, monkeypatch, choice):
-    from app.modules import missing_resources
+    from app.database import media_owner_digest
     from app.indexers import downloads
-    from tests.test_missing_resources import audit_for
+    from app.modules import missing_resources
+    from app.repositories.media_experience import set_media_preferences
     from tests.support import _prepare_batch
+    from tests.test_missing_resources import audit_for
     async def search(request, site_ids=None, **kwargs):
         items = []
         for number, title in enumerate([
@@ -912,7 +1027,12 @@ def test_rpc_missing_pack_preserves_every_verification_goal_through_selection_an
     async def exercise():
         pipeline = native.pipeline()
         context = await context_for(native.store)
-        response, _ = await rpc_call(pipeline, context, 'resources.search_missing', {'items':[{'query':'First','season':1},{'query':'Second','season':1}]})
+        assert set_media_preferences(media_owner_digest(context.owner), expected_revision=0,
+                                     updates={'excluded_keywords': ['1080p']})
+        response, _ = await rpc_call(pipeline, context, 'resources.search_missing', {
+            'items': [{'query': 'First', 'season': 1}, {'query': 'Second', 'season': 1}],
+            'preference_overrides': {'excluded_keywords': []},
+        })
         assert 'error' not in response, response
         value = response['result']
         assert len(value['result_ids']) == 2 and len(value['verification_targets']) == 4

@@ -11,6 +11,7 @@ from typing import Any
 
 from app.database import media_owner_digest
 from app.modules.media_probe import infer_dynamic_ranges
+from app.modules.subtitle_identity import release_chinese_subtitles
 from app.repositories import media_experience as repository
 from app.repositories.media_experience import default_media_preferences, get_media_preferences
 
@@ -229,12 +230,12 @@ def _contains(text: str, term: str) -> bool:
     return any(part.strip() and part.strip() in text for part in normalized.split("|"))
 
 
+_CHINESE_SUBTITLE_TERMS = {
+    **dict.fromkeys(("zh-hans", "chs", "简中", "簡中", "简体", "簡體", "简体中文", "簡體中文"), "zh-Hans"),
+    **dict.fromkeys(("zh-hant", "cht", "繁中", "繁体", "繁體", "繁体中文", "繁體中文"), "zh-Hant"),
+    **dict.fromkeys(("zh", "中文", "中字", "中文字幕"), "zh"),
+}
 _LANGUAGE_MARKERS = {
-    "zh-hans": ("简体", "简中", "chs", "简繁", "繁简"),
-    "简体中文": ("简体", "简中", "chs", "简繁", "繁简"),
-    "简中": ("简体", "简中", "chs", "简繁", "繁简"),
-    "zh-hant": ("繁体", "繁中", "cht", "简繁", "繁简"),
-    "繁体中文": ("繁体", "繁中", "cht", "简繁", "繁简"),
     "en": ("英文", "英语", "英字", "eng", "english", "简繁英"),
     "英语": ("英文", "英语", "英字", "eng", "english", "简繁英"),
     "ja": ("日语", "日音", "jpn", "japanese"),
@@ -245,8 +246,17 @@ _LANGUAGE_MARKERS = {
 
 
 def _language_match(title: str, term: str) -> bool:
-    aliases = _LANGUAGE_MARKERS.get(term.casefold(), (term,))
-    return any(_contains(title, marker) for marker in aliases)
+    for option in term.casefold().split("|"):
+        option = option.strip()
+        if not option:
+            continue
+        for marker in _LANGUAGE_MARKERS.get(option, (option,)):
+            if marker.isascii():
+                if re.search(r"(?<![a-z0-9])" + re.escape(marker) + r"(?![a-z0-9])", title):
+                    return True
+            elif marker in title:
+                return True
+    return False
 
 
 def resource_preference_match(
@@ -295,7 +305,12 @@ def resource_preference_match(
         ("preferred_release_groups", "发布组", 20),
     ):
         for index, term in enumerate(profile[key]):
-            matches = _contains(title, term) if key == "preferred_release_groups" else _language_match(title, term)
+            if key == "preferred_release_groups":
+                matches = _contains(title, term)
+            elif key == "preferred_subtitles" and (script := _CHINESE_SUBTITLE_TERMS.get(term.casefold())):
+                matches = script in release_chinese_subtitles(title)
+            else:
+                matches = _language_match(title, term)
             if matches:
                 score += max(3, weight - index)
                 reasons.append(f"偏好{label}：{term}")

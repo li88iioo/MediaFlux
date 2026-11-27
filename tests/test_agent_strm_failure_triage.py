@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing, contextmanager
 from unittest.mock import patch
 
 from app import database as db
@@ -88,6 +90,10 @@ class StrmFailureTriageUnitTests(IsolatedDatabaseTestCase):
         serialized = json.dumps(summary, ensure_ascii=False)
         for secret in ("SECRET", "/private", "UUID", "PATH", "source-", ".mkv"):
             self.assertNotIn(secret, serialized)
+        legacy = sdk.strm.failures(source_id="ignored")
+        self.assertEqual(legacy["data"]["failures"], summary)
+        self.assertEqual(legacy["data"]["total"], 1)
+        self.assertEqual(legacy["data"]["matched_failures"], {"total": 1, "open": 1, "retrying": 0, "resolved": 0})
 
     def test_native_reads_full_stored_error_and_real_id_in_each_state(self):
         self.assertEqual(sdk.strm.failures()["status"], "healthy")
@@ -109,6 +115,94 @@ class StrmFailureTriageUnitTests(IsolatedDatabaseTestCase):
             self.assertNotIn("private.invalid", row["error"])
             self.assertEqual(result["data"]["error_representation"], "stored_redacted_text")
             self.assertIn("不能还原", result["data"]["error_note"])
+            self.assertEqual((row["failure_count"], row["retry_count"]), (1, 0))
+            self.assertIn("failure_count=1、retry_count=0", result["data"]["counter_note"])
+
+    def test_native_read_status_uses_all_matches_for_the_selected_filters(self):
+        self._record(source="other", file_id="other", action="metadata", error="other")
+        self._record(source="mixed", file_id="open", action="metadata", error="open")
+        retrying = self._record(source="mixed", file_id="retrying", action="generate", error="retrying")
+        resolved = self._record(source="settled", file_id="settled", action="generate", error="settled")
+        db.claim_strm_failures([retrying])
+        with db.get_conn() as conn:
+            conn.execute("UPDATE strm_failures SET status='resolved',resolved_at=updated_at WHERE id=?", (resolved,))
+        global_summary = db.get_strm_failure_triage_summary()
+
+        generate_counts = {"total": 2, "open": 0, "retrying": 1, "resolved": 1}
+        cases = [
+            ({}, "attention", {"total": 4, "open": 2, "retrying": 1, "resolved": 1}),
+            ({"source_id": " settled "}, "healthy", {"total": 1, "open": 0, "retrying": 0, "resolved": 1}),
+            ({"source_id": "missing"}, "healthy", {"total": 0, "open": 0, "retrying": 0, "resolved": 0}),
+            ({"status": "resolved"}, "healthy", {"total": 1, "open": 0, "retrying": 0, "resolved": 1}),
+            ({"action": "generate"}, "running", generate_counts),
+            ({"source_id": "mixed", "action": "generate", "status": "open"}, "healthy",
+             {"total": 0, "open": 0, "retrying": 0, "resolved": 0}),
+        ]
+        for filters, expected_status, counts in cases:
+            with self.subTest(filters=filters):
+                result = sdk.strm.failures(
+                    status=filters.get("status", "all"),
+                    action=filters.get("action", ""),
+                    source_id=filters.get("source_id", ""),
+                )
+                data = result["data"]
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(data["matched_failures"], counts)
+                self.assertEqual(data["total"], counts["total"])
+                self.assertEqual(data["status_scope"], "filtered")
+                self.assertEqual(data["failures"], global_summary)
+                self.assertEqual(data["summary_scope"], "all")
+
+        # 同一范围内，第一页只有已解决项，第二页有重试项，页外没有返回项。
+        for offset, expected_ids in ((0, [resolved]), (1, [retrying]), (2, [])):
+            with self.subTest(offset=offset):
+                result = sdk.strm.failures(action="generate", limit=1, offset=offset)
+                data = result["data"]
+                self.assertEqual(result["status"], "running")
+                self.assertEqual(data["matched_failures"], generate_counts)
+                self.assertEqual([item["id"] for item in data["items"]], expected_ids)
+                self.assertEqual(data["next_offset"], 1 if offset == 0 else None)
+                if offset == 1:
+                    item, = data["items"]
+                    self.assertEqual((item["failure_count"], item["retry_count"]), (1, 1))
+
+        mixed_page = sdk.strm.failures(source_id="mixed", limit=1)
+        self.assertEqual(mixed_page["status"], "attention")
+        self.assertEqual(mixed_page["data"]["matched_failures"]["open"], 1)
+        self.assertEqual([item["id"] for item in mixed_page["data"]["items"]], [retrying])
+
+    def test_native_read_page_and_counts_share_snapshot_during_resolution(self):
+        identifier = self._record(source="source", file_id="file", action="generate", error="failed")
+        original = db.get_conn
+        resolved = []
+
+        @contextmanager
+        def concurrent_connection():
+            with original() as conn:
+                def trace(statement):
+                    if statement.startswith("SELECT * FROM strm_failures") and not resolved:
+                        with closing(sqlite3.connect(db.DB_PATH)) as writer, writer:
+                            changed = writer.execute(
+                                "UPDATE strm_failures SET status='resolved',resolved_at=updated_at WHERE id=?",
+                                (identifier,),
+                            )
+                            resolved.append(changed.rowcount)
+
+                conn.set_trace_callback(trace)
+                yield conn
+
+        with patch.object(db, "get_conn", concurrent_connection):
+            before = sdk.strm.failures(source_id="source")
+        self.assertEqual(resolved, [1])
+        self.assertEqual(before["status"], "attention")
+        self.assertEqual(before["data"]["items"][0]["status"], "open")
+        self.assertEqual(before["data"]["matched_failures"]["open"], 1)
+        self.assertEqual(before["data"]["failures"]["open"], 1)
+        after = sdk.strm.failures(source_id="source")
+        self.assertEqual(after["status"], "healthy")
+        self.assertEqual(after["data"]["items"][0]["status"], "resolved")
+        self.assertEqual(after["data"]["matched_failures"]["resolved"], 1)
+        self.assertEqual(after["data"]["failures"]["resolved"], 1)
 
     def test_native_read_filters_pages_and_does_not_turn_database_failure_into_empty(self):
         identifiers = [self._record(source="source", file_id=f"file-{i}", action="metadata", error=f"完整错误{i}")
@@ -127,6 +221,8 @@ class StrmFailureTriageUnitTests(IsolatedDatabaseTestCase):
                 break
             offset = data["next_offset"]
         self.assertEqual([item["id"] for item in items], list(reversed(identifiers)))
-        with patch("app.database.list_strm_failures", side_effect=RuntimeError("unavailable")):
-            with self.assertRaises(RuntimeError):
-                sdk.strm.failures()
+        with (
+            patch.object(db, "get_conn", side_effect=sqlite3.OperationalError("unavailable")),
+            self.assertRaises(sqlite3.OperationalError),
+        ):
+            sdk.strm.failures()

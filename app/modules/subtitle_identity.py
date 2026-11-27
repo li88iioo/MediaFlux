@@ -1,6 +1,8 @@
 """字幕文件身份解析与目录级安全归属规划。"""
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +28,22 @@ _LANGUAGE_ALIASES = {
     "kor": "ko",
 }
 _MARKERS = {"forced", "default"}
+
+
+def release_chinese_subtitles(title: str) -> set[str]:
+    """从发布名获取字幕标记，保留只标了中文、未说明简繁的情况。"""
+    title = unicodedata.normalize("NFKC", title).casefold()
+    # 发布组常用 GB 表示简中，也常在名称中标出 GB 容量。
+    title = re.sub(r"\d+(?:[.,]\d+)?\s*[kmgtpe]i?b\b", " ", title)
+    title = re.sub(r"(?:[无無]|不含|不[带帶]|[没沒]有)\s*(?:[简簡繁][体體](?:中文)?|[简簡繁]中|中文|中)(?:字幕|字)?", " ", title)
+    scripts = set()
+    if re.search(r"[简簡][体體中繁英]|繁[简簡]|(?<![a-z0-9])(?:chs|gb(?:2312|k)?|zh[-_]hans)(?![a-z0-9])", title):
+        scripts.add("zh-Hans")
+    if re.search(r"繁[体體中简簡英]|[简簡]繁|(?<![a-z0-9])(?:cht|big5|zh[-_]hant)(?![a-z0-9])", title):
+        scripts.add("zh-Hant")
+    if scripts or re.search(r"中字|中文字幕", title):
+        scripts.add("zh")
+    return scripts
 
 
 @dataclass(frozen=True)

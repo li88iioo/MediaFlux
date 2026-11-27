@@ -93,6 +93,12 @@ async def build_request(
         "\n本次请求的服务器时间：" + turn.request_time
         + "。相对日期以此为基准；旧记录的时间不代表现在。"
     )
+    if turn.state.generation == 1 and not turn.history_end and not turn.agent_input.reply_context:
+        request_system_prompt += (
+            "\n本轮是新会话，没有上一轮的结果列表或提交回执。"
+            "若用户回忆的只有一个不确定含义的序号，直接问片名片段或原回执，停止工具查询。"
+            "消息里有明确的单号、片名或路径时可直接查询。"
+        )
     if parallel_reads:
         request_system_prompt += (
             "\n相互独立且参数已经明确的只读查询，可在同一回复中提出多个调用，避免逐项等待。"

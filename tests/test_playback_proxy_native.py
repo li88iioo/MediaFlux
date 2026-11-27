@@ -163,10 +163,15 @@ def test_failures_read_all_stored_facts_in_pages_without_top_eight_loss(backend)
     old = record(identifier, 1000)
     with db.get_conn() as conn:
         conn.execute("UPDATE media_proxy_playback_records SET created_at=datetime('now','-2 days','localtime') WHERE id=?", (old,))
+    other = add(port=19097)
+    record(other, 502)
+    combined = sdk.playback.failures(hours=24)
+    assert "全部反代实例" in combined["summary"] and combined["data"]["failed"] == 206
     items, offset = [], 0
     while True:
         result = sdk.playback.failures(instance_id=identifier, hours=24, limit=120, offset=offset)
         data = result["data"]
+        assert f"反代实例 #{identifier}" in result["summary"]
         assert data["failed"] == data["total"] == 205 and data["total_recorded"] == 206
         assert data["summary_group_limit"] == len(data["failure_stages"]) == 8
         assert data["coverage"] == "recorded_proxy_requests_only"

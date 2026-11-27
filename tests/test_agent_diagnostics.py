@@ -207,6 +207,21 @@ def test_logs_reject_bad_arguments_and_report_missing_days(logs):
     assert missing["ok"] is False and missing["status"] == "not_found"
 
 
+def test_date_search_before_first_log_write_after_midnight(logs):
+    import os
+    from datetime import date, datetime, time, timedelta
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    path = logs / "app.log"
+    record = f"{yesterday} 23:59:50.000 | ERROR   | app.scan | 扫描失败"
+    path.write_text(record + "\ntraceback")
+    last_write = datetime.combine(yesterday, time(23, 59, 50)).timestamp()
+    os.utime(path, (last_write, last_write))
+    assert search(date=yesterday.isoformat())["data"]["records"] == [record + "\ntraceback"]
+    assert search(date=today.isoformat())["data"]["records"] == []
+
+
 def test_long_log_records_and_database_cells_are_complete_and_redacted(logs):
     detail = "堆栈" * 1000 + "\nValueError: 真正原因 " + SECRET
     (logs / "app.log").write_text("2026-11-03 10:00:00.000 | ERROR | app.x | " + detail)

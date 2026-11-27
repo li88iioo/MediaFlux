@@ -599,6 +599,7 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
                         status,
                         stamp=row.get(prefix + "_finished_at"),
                         error=row.get(prefix + "_error"),
+                        run_id=row.get(prefix + "_run_id"),
                     )
                 )
         if row.get("local_import_status"):

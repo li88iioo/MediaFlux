@@ -348,12 +348,10 @@ def search(
         results.append(result)
     returned = sum(result["returned"] for result in results)
     unavailable = [
-        result["source"] for result in results if result["status"] == "unavailable"
+        result["source"] for result in results if result["status"] in {"unavailable", "not_configured"}
     ]
     partial = [result["source"] for result in results if result["status"] == "partial"]
-    available = any(
-        result["status"] not in {"unavailable", "not_configured"} for result in results
-    )
+    available = len(unavailable) < len(results)
     status = (
         "unavailable"
         if not available

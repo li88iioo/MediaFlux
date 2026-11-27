@@ -53,7 +53,7 @@ _CLIENT = Path(__file__).with_name("workspace_client.py")
 _SKILLS = Path(__file__).parent.parent / "skills"
 _OUTPUT_CHARS = 16_000
 _REQUEST_BYTES = 4 * 1024 * 1024
-_SCOPED_READS = {"library.episodes", "library.audit", "library.updates", "resources.search"}
+_SCOPED_READS = {"library.episodes", "library.audit", "library.updates", "resources.search", "cloud.search_files", "playback.failures", "strm.failures", "strm.status"}
 _SCOPE_UNKNOWN = "查询范围未确认"
 _SITE_ID = re.compile(r"[a-z0-9_-]{1,32}")
 _SCOPE_SITE_LIMIT = 12
@@ -107,7 +107,8 @@ def _resource_scope(result: dict[str, Any]) -> tuple[dict[str, Any] | None, str]
 def _annotate_sdk_scope(call: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any] | None = None) -> str:
     """同一份宿主投影供短回执和处理过程使用，范围不代表读取成功。"""
     method = call["method"]
-    if method not in _SCOPED_READS:
+    download_timeline = method == "activity.timeline" and arguments.get("kind") == "download"
+    if method not in _SCOPED_READS and not download_timeline:
         return ""
     call["scope"] = None
     if result is None or result.get("status") == "cancelled":
@@ -115,11 +116,56 @@ def _annotate_sdk_scope(call: dict[str, Any], arguments: dict[str, Any], result:
     if method == "resources.search":
         call["scope"], summary = _resource_scope(result)
         return summary
+    if method == "cloud.search_files":
+        if (type(result.get("page")) is not int or not isinstance(result.get("items"), list)
+                or type(result.get("has_more")) is not bool):
+            return _SCOPE_UNKNOWN
+        call["scope"] = {"basis": "file_name_index", "inventory_complete": False,
+                         "page": result["page"], "has_more": result["has_more"]}
+        return "仅核对文件名关键词；未命中时，其他命名的文件仍未知"
 
     data = result.get("data")
     if not isinstance(data, dict):
         return _SCOPE_UNKNOWN
-    scope: dict[str, Any]
+    if download_timeline:
+        stages = data.get("stages")
+        if data.get("kind") != "download" or not isinstance(stages, list):
+            return _SCOPE_UNKNOWN
+        scope: dict[str, Any] = {"request_id": arguments["identifier"]}
+        for item in stages:
+            key = {"STRM": "strm_run_id", "光鸭整理": "organize_run_id"}.get(item.get("stage"))
+            run_id = item.get("run_id")
+            if key and type(run_id) is int and run_id > 0:
+                scope[key] = run_id
+        call["scope"] = scope
+        return f"本单关联 STRM 运行 #{scope['strm_run_id']}" if "strm_run_id" in scope else "此单无关联 STRM 运行编号"
+    if method == "strm.status":
+        if arguments.get("run_id") is None and "last_run" in data:
+            call["scope"] = {"basis": "scheduler_snapshot"}
+            return "调度器当前快照，仅摘要最近运行；不能据此统计运行次数或归属"
+        if isinstance(task := data.get("task"), dict) and type(run_id := task.get("run_id")) is int:
+            call["scope"] = {"basis": "bound_run", "run_id": run_id}
+            return f"指定 STRM 运行 #{run_id}"
+        return _SCOPE_UNKNOWN
+    if method == "strm.failures":
+        filters = data.get("filters")
+        if data.get("status_scope") != "filtered" or not isinstance(filters, dict):
+            return _SCOPE_UNKNOWN
+        source_id = filters.get("source_id")
+        action, status = filters.get("action"), filters.get("status")
+        if not isinstance(source_id, str) or action not in {"", "generate", "metadata"} or status not in {"all", "open", "retrying", "resolved"}:
+            return _SCOPE_UNKNOWN
+        source = display_text(source_id, limit=80)
+        call["scope"] = {"source_id": source, "action": action, "status": status}
+        label = f"来源 {source}" if source else "全部来源" if not source_id else "指定来源"
+        return f"{label} · {action or '全部动作'} · {status}"
+    if method == "playback.failures":
+        hours, instance = data.get("window_hours"), data.get("instance_id")
+        if type(hours) is not int or "instance_id" not in data or (instance is not None and type(instance) is not int):
+            return _SCOPE_UNKNOWN
+        call["scope"] = {"instance_id": instance, "window_hours": hours}
+        subject = "全部反代实例" if instance is None else f"反代实例 #{instance}"
+        return f"{subject} · 最近 {hours} 小时的已记录请求"
     if method == "library.episodes" and arguments.get("series_id"):
         server = data.get("server")
         if not data.get("series_id") or server not in ("jellyfin", "emby"):
@@ -822,6 +868,11 @@ async def run_code(pipeline: ToolPipeline, arguments: dict[str, Any], context: T
     model = {key: value for key, value in safe.items() if key != "candidate_view"}
     if "candidate_view" in safe:
         model["candidate_view"] = {"ref": safe["candidate_view"]["ref"]} if safe["candidate_view"] else None
+        if status == "success":
+            card_status = ("已展示可点选的资源候选卡，点选后可预览下载。"
+                           if safe["candidate_view"] else
+                           "当前未展示资源候选卡。若用户要点选且有匹配项，用 mf.resources.present 展示后再答复。")
+            model["summary"] = f"{summary} {card_status}"
     outcome = ToolOutcome(model_content=json.dumps(model, ensure_ascii=False), public_content=safe)
     return PipelineResult(tool=pipeline.catalog.get(tool_calls.RUN_CODE_TOOL), arguments=arguments,
                           outcome=outcome, task_patch=patch,

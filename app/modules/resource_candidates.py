@@ -7,9 +7,11 @@ import unicodedata
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import date, datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.indexers.models import IndexerItem
+
+CANDIDATE_PREFERENCE_FIELDS = ("minimum_resolution", "excluded_keywords")
 
 
 def _observed_sites(result: dict, page: int) -> dict[str, bool | None]:
@@ -87,6 +89,8 @@ def capture_candidates(result: dict, arguments: dict, service, search_id: str) -
     if "groups" in result:
         source["matching_ids"] = [item["result_id"] for item in candidates if item["result_id"] in qualities]
     else:
+        if errors := result.get("errors"):
+            page["_failed_sites"] = sorted({error["site_id"] for error in errors})
         if sites := _observed_sites(result, page["page"]):
             page["_site_pages"] = sites
         if recommendation := result.get("recommendation"):
@@ -155,6 +159,10 @@ def merge_candidates(previous: dict | None, current: dict) -> dict:
                 same["matching_ids"] = list(dict.fromkeys(
                     [identity for identity in same.get("matching_ids", []) if identity not in source["result_ids"]]
                     + source["matching_ids"]))
+            if "_preference_matched_ids" in same or "_preference_matched_ids" in source:
+                observed = set(source["result_ids"])
+                same["_preference_matched_ids"] = [identity for identity in same.get("_preference_matched_ids", [])
+                                                   if identity not in observed] + source.get("_preference_matched_ids", [])
             same["result_ids"] = list(dict.fromkeys(same["result_ids"] + source["result_ids"]))
             same["pages"].extend(source["pages"])
     merged["_sources"] = sources
@@ -179,10 +187,11 @@ def merge_candidates(previous: dict | None, current: dict) -> dict:
     return merged
 
 
-def reranked_candidates(snapshot: dict | None, result: dict) -> dict | None:
+def reranked_candidates(snapshot: dict | None, result: dict, preferences: dict | None = None) -> dict | None:
     """重排只补充已有查询的季集判断；来源覆盖、下载引用和核验目标沿用宿主事实。"""
     from app.agent.domains.resources.selection import candidate_item
     from app.modules.episode_resource_ranking import matched_episode_items
+    from app.modules.media_preferences import validate_preference_updates
 
     if snapshot is None:
         return None
@@ -200,6 +209,12 @@ def reranked_candidates(snapshot: dict | None, result: dict) -> dict | None:
     _set_candidate_target(source, result["recommendation"]["target"])
     source["result_ids"] = [item["result_id"] for item in items]
     source["matching_ids"] = [item["result_id"] for item in matched_episode_items({"items": items})]
+    overrides = {key: preferences[key] for key in CANDIDATE_PREFERENCE_FIELDS if preferences and key in preferences}
+    # 排序已核对原检索条件和显式覆盖，只记住本次实际重排且合格的 ID。
+    source.pop("_preference_matched_ids", None)
+    if overrides:
+        validate_preference_updates(overrides)
+        source["_preference_matched_ids"] = source["matching_ids"]
     source["_display_items"] = [candidate_item({**known[item["result_id"]], "quality": item["quality"]}, position)
                                 for position, item in enumerate(items, 1)]
     return {**snapshot, "_sources": [source],
@@ -207,9 +222,15 @@ def reranked_candidates(snapshot: dict | None, result: dict) -> dict | None:
                for key in ("candidates", "_private_items", "_verification_targets")}}
 
 
+class _SitePage(NamedTuple):
+    order: int
+    has_more: bool | None
+    verified: bool
+
+
 def _coverage_limits(sources: list[dict], considered: set[int]) -> tuple[bool, bool]:
     """跨站点子集只合并原查询条件一致的逐站分页事实。"""
-    site_pages: dict[tuple[str, str], dict[int, tuple[int, bool]]] = {}
+    site_pages: dict[tuple[str, str], dict[int, _SitePage]] = {}
     selected_pages: dict[tuple[str, str], dict[int, dict]] = {}
     for index, source in enumerate(sources):
         for page in source["pages"]:
@@ -224,22 +245,30 @@ def _coverage_limits(sources: list[dict], considered: set[int]) -> tuple[bool, b
                 observed = selected_pages.setdefault((conditions, scope), {})
                 if order >= observed.get(number, {}).get("_observation", 0):
                     observed[number] = page
-            for site, has_more in page.get("_site_pages", {}).items():
-                if has_more is not None:
-                    observed_site = site_pages.setdefault((conditions, site), {})
-                    if order >= observed_site.get(number, (0, False))[0]:
-                        observed_site[number] = (order, has_more)
+            failed = page.get("_failed_sites", ())
+            pagination = page.get("_site_pages", {})
+            attributable = not page.get("partial") or bool(failed)
+            complete = page.get("complete") is True and not page.get("truncated") and attributable
+            for site in set(pagination).union(failed):
+                pages = site_pages.setdefault((conditions, site), {})
+                if number not in pages or order >= pages[number].order:
+                    more = pagination.get(site)
+                    pages[number] = _SitePage(order, more, complete and more is not None and site not in failed)
 
     incomplete = unread = False
     for (conditions, _), observed in selected_pages.items():
-        incomplete |= any(page.get("partial") or page.get("truncated") or page.get("complete") is False
-                          for page in observed.values())
+        for number, page in observed.items():
+            failed = page.get("_failed_sites")
+            unresolved = page.get("partial") and (not failed or any(
+                not site_pages[conditions, site][number].verified for site in failed))
+            incomplete |= bool(unresolved or page.get("truncated") or page.get("complete") is False)
         if all("_site_pages" in page for page in observed.values()):
             sites = {site for page in observed.values() for site in page["_site_pages"]}
             for site in sites:
                 pages = site_pages.get((conditions, site), {})
                 last = max(pages, default=0)
-                unread |= not last or len(pages) != last or pages[last][1]
+                unread |= (not last or len(pages) != last or any(p.has_more is None for p in pages.values())
+                           or pages[last].has_more is True)
         else:
             # 旧快照和批量缺集搜索只保留整批分页，沿用原有判断。
             last = max(observed)
@@ -247,9 +276,18 @@ def _coverage_limits(sources: list[dict], considered: set[int]) -> tuple[bool, b
     return incomplete, unread
 
 
-def select_candidates(snapshot: Mapping[str, Any] | None, result_ids: list[str], specifications: dict) -> dict:
-    """选择会话已观察ID；逐来源保留规格，空列表明确撤卡。"""
-    from app.indexers.ranking import filter_technical_candidates, technical_filter_arguments
+def select_candidates(
+    snapshot: Mapping[str, Any] | None, result_ids: list[str], specifications: dict, *, owner: str = "",
+) -> dict:
+    """从已观察结果筛选可点选候选，按来源沿用检索条件。"""
+    from app.indexers.ranking import (
+        filter_technical_candidates,
+        technical_filter_arguments,
+    )
+    from app.modules.media_preferences import (
+        owner_media_preferences,
+        resource_preference_match,
+    )
 
     if (not isinstance(result_ids, list) or len(result_ids) > MAX_RESOURCE_CANDIDATES
             or any(not isinstance(identity, str) or not _RESULT_ID_PATTERN.fullmatch(identity) for identity in result_ids)
@@ -265,6 +303,7 @@ def select_candidates(snapshot: Mapping[str, Any] | None, result_ids: list[str],
         raise ValueError("result_ids 必须全部来自当前会话实际读取的资源搜索结果")
     queries, allowed, considered, considered_sources = [], set(), set(), set()
     sources = candidate_sources(snapshot)
+    preferences = owner_media_preferences(owner) if any("items" not in source["query"] for source in sources) else {}
     for index, source in enumerate(sources):
         identities = [identity for identity in result_ids if identity in source["result_ids"]]
         if not identities:
@@ -279,9 +318,17 @@ def select_candidates(snapshot: Mapping[str, Any] | None, result_ids: list[str],
         filtered, technical_filter = filter_technical_candidates([by_id[identity] for identity in identities], quality)
         if "matching_ids" in source:
             filtered = [item for item in filtered if item["result_id"] in source["matching_ids"]]
+        # search_missing 的 items 查询已通过 matching_ids 保留当次生效的偏好，包含显式覆盖。
+        if "items" not in query:
+            overrides = query.get("preference_overrides") or {}
+            limits = {key: overrides.get(key, preferences[key]) for key in CANDIDATE_PREFERENCE_FIELDS}
+            if limits["minimum_resolution"] != "any" or limits["excluded_keywords"]:
+                preference_matched = set(source.get("_preference_matched_ids", ()))
+                filtered = [item for item in filtered if item["result_id"] in preference_matched
+                            or resource_preference_match(item, limits)["eligible"]]
         allowed.update(item["result_id"] for item in filtered)
         queries.append({key: deepcopy(value) for key, value in source.items()
-                        if key not in {"_display_items", "matching_ids", "pages"}})
+                        if not key.startswith("_") and key not in {"matching_ids", "pages"}})
         queries[-1].update(query={**query, **quality},
                            result_ids=[item["result_id"] for item in filtered], technical_filter=technical_filter,
                            pages=[{key: value for key, value in page.items() if not key.startswith("_")}
@@ -329,6 +376,9 @@ def presentation_snapshot(scope: dict, selection: dict) -> dict:
                 frozen = {**source, "result_ids": list(query["result_ids"]), "_display_items": chosen}
                 if "matching_ids" in frozen:
                     frozen["matching_ids"] = [identity for identity in frozen["matching_ids"] if identity in query["result_ids"]]
+                if "_preference_matched_ids" in frozen:
+                    frozen["_preference_matched_ids"] = [identity for identity in frozen["_preference_matched_ids"]
+                                                          if identity in query["result_ids"]]
                 snapshot["_sources"].append(frozen)
     snapshot["_display_items"] = list(display.values())
     snapshot["_display_items"].sort(key=lambda item: item["position"])

@@ -447,7 +447,10 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
         snapshot = prepare_set_digest(args, owner=owner)["snapshot"]
         saved = set_digest(args, owner=owner, expected_snapshot=snapshot)["data"]
         due = datetime.fromisoformat(saved["next_run_at"])
-        [ready] = digests(owner=owner)["data"]["items"]
+        observed = digests(owner=owner)["data"]
+        self.assertIsNotNone(datetime.fromisoformat(observed["as_of"]).utcoffset())
+        self.assertFalse(observed["delivery_history_checked"])
+        [ready] = observed["items"]
         self.assertTrue(ready["delivery_ready"])
         self.assertEqual(ready["delivery_blocked_reason"], "")
         original_get = config.get

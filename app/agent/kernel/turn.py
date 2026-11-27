@@ -64,7 +64,7 @@ from .model import (
     ProviderState,
 )
 from .provider_model import ModelConfigurationError, ModelProviderError, OpenAICompatibleModelAdapter, UncommittableModelTurn
-from .session_guard import foreground_execution_guard, session_scope_guard
+from .session_guard import foreground_execution_guard, publication_execution_active, session_scope_guard
 from .task_state import TaskPatch, task_projection
 
 if TYPE_CHECKING:
@@ -332,11 +332,17 @@ class AgentTurn:
                 # 无效/重复点击没有回合所有权，不能先抢占正在运行的续行再拒绝。
                 if not self.plan_id or self.state.pending_effect_plan_id != self.plan_id:
                     raise ConfirmationClaimError()
+                pending_plan = await self.session.pipeline.get_confirmation_evidence(
+                    owner=self.state.owner, session_id=self.state.session_id, scoped=True,
+                )
+                # 新消息处理期间保留旧卡，以便本轮澄清、替换或取消它。
+                if (pending_plan is not None and pending_plan.generation < self.state.generation
+                        and (self.state.metadata.get("active_publication") or {}).get("status") == "running"
+                        and publication_execution_active(self.state)):
+                    self.scope.close()
+                    raise ToolPipelineError("新消息仍在处理，请等本轮结束后核对当前确认卡。", code="effect_in_progress")
                 self.lease = PublicationLease(self.agent_input.owner, self.agent_input.session_id, self.state.generation,
                                          secrets.token_urlsafe(12), self.agent_input.request_id)
-                pending_plan = await self.session.pipeline.get_confirmation_evidence(
-                    owner=self.lease.owner, session_id=self.lease.session_id, scoped=True,
-                )
                 if pending_plan is None:
                     await self.session.pipeline._cancel_effect_scoped(self.plan_id, lease=self.lease)
                     raise ConfirmationClaimError()

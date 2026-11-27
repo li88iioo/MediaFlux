@@ -2384,6 +2384,17 @@ def record_strm_failure(
         return int(row["id"])
 
 
+def _strm_failure_filter_clauses(
+    status: str, source_id: str, action: str,
+) -> tuple[list[str], list[object]]:
+    filters = (
+        ("status", status if status != "all" else ""),
+        ("source_id", source_id),
+        ("action", action),
+    )
+    return [f"{column}=?" for column, value in filters if value], [value for _, value in filters if value]
+
+
 def list_strm_failures(
     *,
     status: str = "open",
@@ -2393,18 +2404,9 @@ def list_strm_failures(
     before_id: int | None = None,
     limit: int = 200,
     offset: int = 0,
+    _conn: sqlite3.Connection | None = None,
 ) -> list[sqlite3.Row]:
-    clauses: list[str] = []
-    values: list[object] = []
-    if status and status != "all":
-        clauses.append("status=?")
-        values.append(status)
-    if source_id:
-        clauses.append("source_id=?")
-        values.append(source_id)
-    if action:
-        clauses.append("action=?")
-        values.append(action)
+    clauses, values = _strm_failure_filter_clauses(status, source_id, action)
     if before_id is not None:
         clauses.append("id<?")
         values.append(before_id)
@@ -2420,7 +2422,7 @@ def list_strm_failures(
     if offset > 0:
         offset_sql = " OFFSET ?"
         values.append(max(0, offset))
-    with get_conn() as conn:
+    with (get_conn() if _conn is None else nullcontext(_conn)) as conn:
         return conn.execute(
             f"SELECT * FROM strm_failures{where} ORDER BY id DESC LIMIT ?{offset_sql}",
             values,
@@ -2461,17 +2463,7 @@ def claim_strm_failures(ids: list[int], *, limit: int = 1000) -> list[sqlite3.Ro
 def count_strm_failures(
     *, status: str = "open", source_id: str = "", action: str = ""
 ) -> int:
-    clauses = []
-    values: list[object] = []
-    if status and status != "all":
-        clauses.append("status=?")
-        values.append(status)
-    if source_id:
-        clauses.append("source_id=?")
-        values.append(source_id)
-    if action:
-        clauses.append("action=?")
-        values.append(action)
+    clauses, values = _strm_failure_filter_clauses(status, source_id, action)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_conn() as conn:
         return int(
@@ -2514,20 +2506,21 @@ def summarize_strm_failures() -> dict:
     }
 
 
-def get_strm_failure_triage_summary() -> dict[str, Any]:
-    """只读聚合 STRM 失败账本，不读取对象标识、路径、文件名或错误正文。"""
+def _strm_failure_triage_summaries(
+    conn: sqlite3.Connection, clauses: list[str], values: list[object],
+) -> tuple[dict[str, Any], dict[str, int]]:
     statuses = ("open", "retrying", "resolved")
     actions = ("generate", "metadata")
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT status,action,COUNT(*) AS count,"
-            "SUM(CASE WHEN status IN ('open','retrying') AND failure_count>=2 THEN 1 ELSE 0 END) AS active_repeated,"
-            "SUM(CASE WHEN status IN ('open','retrying') AND retry_count>=1 THEN 1 ELSE 0 END) AS active_retried "
-            "FROM strm_failures "
-            "WHERE status IN ('open','retrying','resolved') "
-            "AND action IN ('generate','metadata') "
-            "GROUP BY status,action"
-        ).fetchall()
+    predicate = " AND ".join(clauses)
+    matched_count = f"COUNT(CASE WHEN {predicate} THEN 1 END)" if predicate else "COUNT(*)"
+    rows = conn.execute(
+        "SELECT status,action,COUNT(*) AS count,"
+        f"{matched_count} AS matched_count,"
+        "SUM(CASE WHEN status IN ('open','retrying') AND failure_count>=2 THEN 1 ELSE 0 END) AS active_repeated,"
+        "SUM(CASE WHEN status IN ('open','retrying') AND retry_count>=1 THEN 1 ELSE 0 END) AS active_retried "
+        "FROM strm_failures GROUP BY status,action",
+        values,
+    ).fetchall()
 
     by_action = {
         action: {"total": 0, "open": 0, "retrying": 0, "resolved": 0}
@@ -2542,10 +2535,16 @@ def get_strm_failure_triage_summary() -> dict[str, Any]:
         "active_retried": 0,
         "by_action": by_action,
     }
+    matched = dict.fromkeys(("total", *statuses), 0)
     for row in rows:
         status = str(row["status"] or "")
         action = str(row["action"] or "")
-        if status not in statuses or action not in actions:
+        # 匹配总数和分页均保留历史记录。全账本摘要沿用受支持的状态和动作。
+        matched["total"] += row["matched_count"]
+        if status not in statuses:
+            continue
+        matched[status] += row["matched_count"]
+        if action not in actions:
             continue
         count = max(0, int(row["count"] or 0))
         by_action[action][status] += count
@@ -2558,7 +2557,30 @@ def get_strm_failure_triage_summary() -> dict[str, Any]:
         summary["active_retried"] = int(summary["active_retried"]) + max(
             0, int(row["active_retried"] or 0)
         )
+    return summary, matched
+
+
+def get_strm_failure_triage_summary() -> dict[str, Any]:
+    """只读聚合 STRM 失败账本，不返回对象标识、路径、文件名或错误正文。"""
+    with get_conn() as conn:
+        summary, _ = _strm_failure_triage_summaries(conn, [], [])
     return summary
+
+
+def query_strm_failures_page(
+    *, status: str, source_id: str, action: str, limit: int, offset: int,
+) -> tuple[list[sqlite3.Row], dict[str, int], dict[str, Any]]:
+    """在同一 SQLite 读取快照内返回记录页、匹配统计和全账本摘要。"""
+    clauses, values = _strm_failure_filter_clauses(status, source_id, action)
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        summary, matched = _strm_failure_triage_summaries(conn, clauses, values)
+        rows = []
+        if offset < matched["total"]:
+            rows = list_strm_failures(
+                status=status, source_id=source_id, action=action, limit=limit, offset=offset, _conn=conn,
+            )
+    return rows, matched, summary
 
 
 def _resolve_strm_failure_for_item_conn(

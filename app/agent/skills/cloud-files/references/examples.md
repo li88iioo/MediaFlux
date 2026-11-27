@@ -410,7 +410,7 @@ print({"total": len(tasks["items"]), "sample": tasks["items"][:10]})
 
 ## 11 STRM 与媒体库验收
 
-先查看原整理/下载时间线，已有 STRM 联动则跟踪原任务。需诊断同步配置与本地索引时 `strm.diagnose()` 不触发全盘扫描；需补同步时从状态中取得真实来源：
+用户给出 STRM 来源编号查询失败文件时，直接读取下方的失败账本。按下载或整理任务追踪同步时，先查看该任务时间线，找到关联的 STRM 运行。需诊断同步配置与本地索引时 `strm.diagnose()` 不触发全盘扫描；需补同步时从状态中取得真实来源：
 
 ```python
 status = mf.strm.status()
@@ -440,7 +440,7 @@ with open("/work/cloud-strm-failures.json", "w") as stream:
 print(failures)
 ```
 
-`strm_source_id` 同样来自已选来源；按 `data.next_offset` 继续读完所需范围。用户要求重试时，将选定 open 记录的整数 `id` 组成 `failure_ids`：
+`strm_source_id` 可直接用用户指定的 STRM 来源编号。问题是“还有没解决的吗”时，按当前来源的 `matched_failures.open` 与 `retrying` 分开报告。按 `data.next_offset` 继续读完所需范围。用户要求重试时，将选定 open 记录的整数 `id` 组成 `failure_ids`：
 
 ```python
 mf.strm.retry_failures(failure_ids)

@@ -239,9 +239,66 @@ def workspace_web_receipt(code):
         assert receipt["data"]["exit_code"] == 0, receipt["data"]["stderr"]
         activities = [activity for event in events if event["type"] == "tool.progress"
                       and (activity := event["payload"].get("activity")) and activity["status"] != "running"]
-        return receipt["data"], activities
+        return receipt, activities
 
     return asyncio.run(run())
+
+
+def test_download_timeline_receipt_preserves_each_bound_run_across_summary_reads(local_config):
+    from app import database as db
+    from app.modules.scheduler import TASK_NAME
+    from app.repositories import download_requests
+
+    pairs = []
+    for key in ("episode7", "episode8"):
+        rid, _ = download_requests.create_download_request(key, "magnet", title=key)
+        run_id = db.add_task_run(TASK_NAME, "organize")
+        db.finish_task_run(run_id, "success")
+        download_requests.update_download_request(rid, strm_run_id=run_id, strm_status="completed")
+        pairs.append((rid, run_id))
+    code = [f"print(mf.activity.timeline('download', {rid})['status'])" for rid, _ in pairs]
+    code += ["print(mf.strm.status()['status'])", f"print(mf.strm.status({pairs[0][1]})['status'])"]
+    receipt, _ = workspace_web_receipt("\n".join(code))
+    scopes = [call["scope"] for call in receipt["data"]["sdk_calls"]]
+    assert scopes == [
+        *[{"request_id": rid, "strm_run_id": run_id} for rid, run_id in pairs],
+        {"basis": "scheduler_snapshot"}, {"basis": "bound_run", "run_id": pairs[0][1]},
+    ]
+
+
+def test_strm_failure_receipt_keeps_source_and_action_when_script_only_prints_total(local_config):
+    receipt, activities = workspace_web_receipt(
+        "print(mf.strm.failures(source_id='51', action='generate')['data']['total'])"
+    )
+    assert receipt["data"]["sdk_calls"][0]["scope"] == {"source_id": "51", "action": "generate", "status": "all"}
+    assert "来源 51" in activities[0]["summary"] and "generate" in activities[0]["summary"]
+
+
+def test_playback_receipt_keeps_real_window_and_instance_when_script_only_prints_count(local_config):
+    from app.repositories import media_proxy
+
+    media_proxy.record_media_proxy_playback_attempt(
+        instance_id=7, route_class="video", method="GET", status_code=404, source="upstream",
+    )
+    receipt, activities = workspace_web_receipt(
+        "print(mf.playback.failures(instance_id=7, hours=1)['data']['failed'])\n"
+        "print(mf.playback.failures()['data']['failed'])"
+    )
+    scopes = [call["scope"] for call in receipt["data"]["sdk_calls"]]
+    assert scopes == [{"instance_id": 7, "window_hours": 1}, {"instance_id": None, "window_hours": 24}]
+    assert "最近 1 小时" in activities[0]["summary"] and "全部反代实例" in activities[1]["summary"]
+
+
+def test_cloud_name_search_receipt_distinguishes_name_matches_from_drive_inventory(local_config, monkeypatch):
+    client = SimpleNamespace(search_files=lambda keyword, **options: ([], False))
+    monkeypatch.setattr(sdk, "_cloud_client", lambda: nullcontext(client))
+    receipt, progress = workspace_web_receipt("print(len(mf.cloud.search_files('另一种命名')['items']))")
+    data = receipt["data"]
+    assert data["stdout"].strip() == "0"
+    assert data["sdk_calls"][0]["scope"] == {
+        "basis": "file_name_index", "inventory_complete": False, "page": 1, "has_more": False,
+    }
+    assert "其他命名的文件仍未知" in progress[0]["summary"]
 
 
 def test_workspace_library_scope_follows_real_inventory_cutoff_and_batch(local_config, monkeypatch):
@@ -294,7 +351,7 @@ def test_workspace_library_scope_follows_real_inventory_cutoff_and_batch(local_c
         "server_type": "jellyfin", "has_more": False, "items": [MediaItem("movie-1", "雨夜", "movie")],
     }])
 
-    data, progress = workspace_web_receipt(
+    receipt, progress = workspace_web_receipt(
         "print(mf.library.episodes('同名剧', library_name=' Ａ库 ')['data']['local_episode_count'])\n"
         "print(mf.library.episodes('同名剧', library_name='B库')['data']['local_episode_count'])\n"
         "print(mf.library.episodes('同名剧')['data']['local_episode_count'])\n"
@@ -310,6 +367,7 @@ def test_workspace_library_scope_follows_real_inventory_cutoff_and_batch(local_c
         "except mf.Error:\n"
         "    pass\n"
     )
+    data = receipt["data"]
     assert data["stdout"].splitlines() == ["1", "2", "None", "2", "0", "1", "0", "2", "1", "None"]
     a, b, across, series, early, default, updates, batch, movie, private, rejected = data["sdk_calls"]
     inventory_only = {"as_of": None, "as_of_source": "not_applicable"}
@@ -366,7 +424,7 @@ def test_workspace_resource_scope_uses_normalized_year_and_actual_site_results(l
     service = IndexerService(registry=IndexerRegistry({site: Site(site) for site in sites}), result_store=IndexerResultStore())
     monkeypatch.setattr(indexer_runtime, "get_indexer_service", lambda: service)
     try:
-        data, progress = workspace_web_receipt(
+        receipt, progress = workspace_web_receipt(
             "print(len(mf.resources.search('同名剧', year=' ２０２４ ', sites=[' Fixture-A ', 'FIXTURE-A'], "
             "resolution='1080p', dynamic_range='SDR')['items']))\n"
             "print(len(mf.resources.search('同名剧')['items']))\n"
@@ -381,6 +439,8 @@ def test_workspace_resource_scope_uses_normalized_year_and_actual_site_results(l
         asyncio.run(service.aclose())
         indexer_runtime._stop_standalone_runtime()
 
+    assert receipt["candidate_view"] is None and "当前未展示资源候选卡" in receipt["summary"]
+    data = receipt["data"]
     assert data["stdout"].splitlines() == ["1", "2", "0", "0"]
     exact, default, empty, unavailable, rejected = data["sdk_calls"]
     filter_evidence = {"basis": "release_title_only", "stream_verified": False}

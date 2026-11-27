@@ -18,6 +18,7 @@ Python 片段执行前 `import json, mf`。未定义的输入变量取自所在�
 | 创建/撤销分享、检查/转存分享 | 08 |
 | 回收站恢复或清空 | 09 |
 | 光鸭离线解析、选文件下载、清理任务记录与入库进度 | 10，搜资源先读 `/skills/media-research/SKILL.md` |
+| STRM 失败账本 | 已知来源编号直接用 `strm.failures(source_id=...)`，视频链接用 `action="generate"`，伴随文件用 `action="metadata"`。多来源分别查并汇报。 |
 | STRM 同步、失败重试、入库验收 | 11 |
 | 检查或执行有凭据的撤销 | 12 |
 
@@ -44,7 +45,7 @@ sed -n '/^## 06 /,/^## 07 /p' /skills/cloud-files/references/examples.md
 | `cloud.organize` 的 `data.run_id` | `cloud.organize_status(run_id)` |
 | 整理确认记录的 `confirmation_id` / 批次 `batch_id` | `activity.organize_confirmations(confirmation_ids=[confirmation_id], status="all")` / 按 `batch_id` 查询；`execution` 是实际整理回执，`log_ids` 精确关联详细日志 |
 | `activity.organize_logs` 的条目 `id` | `activity.organize_detail(log_id)` / `activity.timeline("organize", log_id)` |
-| 下载/转存回执的 `request_id` | `activity.timeline("download", request_id)` |
+| 下载/转存回执的 `request_id` | `activity.timeline("download", request_id)`；STRM 明细对每个不同的关联 `strm_run_id` 查一次 `strm.status(run_id)` |
 | `strm.run` 的 `data.run_id` | `strm.status(run_id)` 的 `data.task` |
 
 ## 当前能力边界

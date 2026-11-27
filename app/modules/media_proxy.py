@@ -6465,8 +6465,9 @@ def playback_proxy_failures(hours: int = 24, instance_id: int | None = None,
         _proxy_instance_id(instance_id)
     data = media_proxy_failure_facts(hours=hours, instance_id=instance_id, limit=limit, offset=offset)
     data["instance_id"] = instance_id
+    scope = "全部反代实例" if instance_id is None else f"反代实例 #{instance_id}"
     return {"ok": True, "status": "attention" if data["failed"] else "empty" if not data["total_recorded"] else "completed",
-            "summary": f"最近 {hours} 小时已记录 {data['failed']} 次媒体反代失败",
+            "summary": f"{scope}最近 {hours} 小时已记录 {data['failed']} 次播放失败",
             "data": _proxy_public(data, _proxy_credentials(media_proxy_repo.list_media_proxy_instances()))}
 
 

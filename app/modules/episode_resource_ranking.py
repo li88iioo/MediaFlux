@@ -21,6 +21,7 @@ from app.modules.media_preferences import (
 )
 from app.modules.media_probe import release_dynamic_range_evidence
 from app.modules.scraper import TMDBScraper
+from app.modules.subtitle_identity import release_chinese_subtitles
 
 _MAX_REASON_LENGTH = 80
 
@@ -231,14 +232,15 @@ def _tag_score(title: str) -> tuple[int, dict[str, str], list[str]]:
     elif codec == "AV1":
         score += 4
 
-    # 文件体积不是语言标记，拉丁缩写也必须是独立标签。
-    subtitle_title = re.sub(r"\d+(?:\.\d+)?\s*[KMGTPE]i?B\b", "", title, flags=re.IGNORECASE)
-    if re.search(r"简(?:体|中)|中字|简繁|繁简|(?<![A-Za-z0-9])(?:chs|gb(?:2312|k)?)(?![A-Za-z0-9])", subtitle_title, re.IGNORECASE):
+    subtitles = release_chinese_subtitles(title)
+    if "zh-Hans" in subtitles:
         score += 8
         reasons.append("含简体中文标记")
-    elif re.search(r"繁(?:體|体|中)|(?<![A-Za-z0-9])(?:cht|big5)(?![A-Za-z0-9])", subtitle_title, re.IGNORECASE):
+    elif "zh-Hant" in subtitles:
         score += 4
         reasons.append("含繁体中文标记")
+    elif "zh" in subtitles:
+        reasons.append("含中文标记（简繁未注明）")
 
     return score, tags, reasons
 

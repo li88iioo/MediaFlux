@@ -2,23 +2,43 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
+from urllib.parse import urlsplit
 
 from app import database as db
-from app.repositories import rss as rss_repo
+from app.agent.public_safety import sanitize_public_text, sanitize_resource_title
 from app.logger import get_logger
-from app.modules.rss import _release_rss_refresh, _try_acquire_rss_refresh
+from app.modules.rss import RSSEngine, _release_rss_refresh, _try_acquire_rss_refresh
 from app.modules.rss_subscription_config import (
     RSSSubscriptionConfigError,
     normalize_rss_subscription_create,
     normalize_rss_subscription_update,
     wake_rss_scheduler,
 )
+from app.repositories import rss as rss_repo
 from app.sensitive_data import redact_sensitive_text
 
 logger = get_logger(__name__)
 _STALE_SUBMITTING_MINUTES = 15
 _PENDING_BACKLOG_HOURS = 24
+_FILTER_SAMPLE_LIMIT = 4
+_UPDATE_LABELS = {
+    "enabled": "启用状态",
+    "exclude_keywords": "排除词",
+    "refresh_interval_minutes": "刷新间隔",
+    "name": "订阅名称",
+    "urls": "订阅地址",
+    "parser": "解析器",
+    "action": "订阅策略",
+    "download_method": "下载方式",
+    "qb_save_path": "qBittorrent 保存目录",
+    "gy_target_dir": "光鸭目标目录",
+    "gy_target_dir_name": "光鸭目标目录名称",
+    "media_tmdb_id": "TMDB 编号",
+    "media_default_season": "默认季号",
+    "skip_existing_episodes": "跳过已有剧集",
+}
 
 
 class RSSSubscriptionError(ValueError):
@@ -218,6 +238,98 @@ def _snapshot(conn, operation, arguments) -> dict[str, Any]:
     return state
 
 
+def _preview_text(value: Any, limit: int) -> str:
+    if value is None or value == "":
+        return "未设置"
+    raw = str(value)
+    text = sanitize_public_text(raw, limit=len(raw))
+    if not text:
+        return "内容已隐藏"
+    if len(text) <= limit:
+        return text
+    # 保留值的首尾，以便核对在一组现有排除词末尾追加的词。
+    edge = (limit - 1) // 2
+    return f"{text[:edge]}…{text[-edge:]}"
+
+
+def _preview_rss_hosts(value: Any) -> str:
+    hosts: dict[str, None] = {}
+    for url in str(value or "").splitlines():
+        try:
+            parsed = urlsplit(url)
+            host = (parsed.hostname or "").rstrip(".")
+        except ValueError:
+            # 持久化数据可能早于当前的 URL 校验。
+            continue
+        if (parsed.scheme in ("http", "https") and host
+                and sanitize_public_text(host, limit=253) == host):
+            hosts[host] = None
+    if not hosts:
+        return "来源已隐藏"
+    label = "、".join(hosts)
+    if len(label) <= 60:
+        return label
+    suffix = f"…（{len(hosts)} 个主机）" if len(hosts) > 1 else "…"
+    return label[: 60 - len(suffix)].rstrip("、") + suffix
+
+
+def _preview_update_value(field: str, value: Any) -> str:
+    if field in ("enabled", "skip_existing_episodes"):
+        return "启用" if value else "停用"
+    if field == "refresh_interval_minutes":
+        return f"{value} 分钟" if value else "不定时刷新"
+    if field == "urls":
+        return _preview_rss_hosts(value)
+    if field in ("qb_save_path", "gy_target_dir", "gy_target_dir_name"):
+        return "已设置（内容已隐藏）" if value else "未设置"
+    if field == "action" and value in ("subscribe", "download"):
+        return "仅订阅" if value == "subscribe" else "自动下载"
+    return _preview_text(value, limit=64)
+
+
+def _update_preview_details(snapshot: dict[str, Any]) -> tuple[list[dict[str, str]], list[str]]:
+    current, fields = snapshot["config"], snapshot["fields"]
+    resources = [{
+        "title": f"#{snapshot['subscription_id']} · {_preview_text(current['name'], limit=100)}",
+        "site_name": _preview_rss_hosts(current["urls"]),
+    }]
+    ordered = [field for field in _UPDATE_LABELS if field in fields]
+    # 通用 Telegram 卡片最多展示四行执行内容，其中一行用于保存的影响。
+    visible = ordered[:2] if len(ordered) > 3 else ordered
+    details = []
+    for field in visible:
+        before = _preview_update_value(field, current[field])
+        after = _preview_update_value(field, fields[field])
+        summary = f"{before} → {after}" if before != after else "已修改（细节未展示）"
+        details.append(f"{_UPDATE_LABELS[field]} · {summary}")
+    hidden = ordered[len(visible):]
+    if hidden:
+        details.append(f"另有 {len(hidden)} 项变更 · " + "、".join(_UPDATE_LABELS[field] for field in hidden))
+    return resources, details
+
+
+def _filter_preview(identifier: int, exclude_keywords: str) -> tuple[str, list[dict[str, str]]]:
+    try:
+        page = rss_repo.list_rss_entries(sub_id=identifier, limit=_FILTER_SAMPLE_LIMIT, order="received_desc")
+    except sqlite3.Error as exc:
+        logger.warning("RSS 本地标题试算读取失败 type=%s", type(exc).__name__)
+        return "本地标题试算 · 暂不可用", []
+    if not page.items:
+        return "本地标题试算 · 暂无本地条目", []
+
+    keywords = RSSEngine._split_keywords(exclude_keywords)
+    resources = []
+    for row in page.items:
+        title = str(row["title"] or "")
+        result = "试算排除" if RSSEngine._excluded(title, keywords) else "试算保留"
+        label = sanitize_resource_title(title, limit=110) or "标题已隐藏"
+        resources.append({"title": f"{result} · {label}"})
+
+    count = len(resources)
+    scope = f"最近 {count} 条，共 {page.total} 条（抽样）" if count < page.total else f"本地全部 {count} 条"
+    return f"本地标题试算 · {scope}", resources
+
+
 def prepare_change(operation: str, arguments: dict) -> dict:
     try:
         with db.get_conn() as conn:
@@ -226,7 +338,13 @@ def prepare_change(operation: str, arguments: dict) -> dict:
         raise RSSSubscriptionError(str(exc)) from exc
     if operation == "update" and not snapshot["fields"]:
         raise RSSSubscriptionError("RSS 订阅配置没有变化", code="precondition_failed")
+    summary = {
+        "create": "确认创建RSS订阅",
+        "update": "确认更新RSS订阅",
+        "delete": "确认删除RSS订阅",
+    }[operation]
     public: dict[str, Any] = {"operation": operation, "affected": 1}
+    details: list[str] = []
     if operation == "create":
         public.update(
             name=redact_sensitive_text(snapshot["fields"]["name"]),
@@ -235,11 +353,18 @@ def prepare_change(operation: str, arguments: dict) -> dict:
     else:
         public["subscription_id"] = snapshot["subscription_id"]
         if operation == "update":
-            public["changed_fields"] = sorted(snapshot["fields"])
+            fields = snapshot["fields"]
+            public["changed_fields"] = sorted(fields)
+            public["resources"], details = _update_preview_details(snapshot)
+            if "exclude_keywords" in fields:
+                # 条目会持续到达，试算样本只用于展示，不参与配置快照校验。
+                scope, samples = _filter_preview(snapshot["subscription_id"], fields["exclude_keywords"])
+                public["resources"].extend(samples)
+                summary = f"{summary} · {scope}"
         else:
             public["deleted_entries"] = snapshot["entry_count"]
     public["effects"] = (
-        ["保存RSS配置并重新加载调度；不会立即刷新或提交下载。"]
+        [*details, "保存RSS配置并重新加载调度；不会立即刷新或提交下载。"]
         if operation != "delete"
         else ["永久删除订阅及本地条目；不删除下载任务或文件。"]
     )
@@ -248,11 +373,7 @@ def prepare_change(operation: str, arguments: dict) -> dict:
         "preview": {
             "ok": True,
             "status": "confirmation_required",
-            "summary": {
-                "create": "确认创建RSS订阅",
-                "update": "确认更新RSS订阅",
-                "delete": "确认删除RSS订阅",
-            }[operation],
+            "summary": summary,
             "data": public,
         },
     }

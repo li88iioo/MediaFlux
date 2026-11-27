@@ -174,9 +174,19 @@ def query_db(sql: str = "", limit: int = 50) -> dict[str, Any]:
 
 
 def _log_file(day: str | None) -> Path:
+    active = Path(LOG_DIR) / "app.log"
     if day and day != calendar_date.today().isoformat():
-        return Path(LOG_DIR) / f"app.log.{day}"
-    return Path(LOG_DIR) / "app.log"
+        archived = active.with_name(f"{active.name}.{day}")
+        if archived.is_file():
+            return archived
+        # 午夜后的首次写入才会轮转，昨晚最后一条记录可能仍在活动日志中。
+        try:
+            last_write = datetime.fromtimestamp(active.stat().st_mtime).date().isoformat()
+        except FileNotFoundError:
+            return archived
+        if last_write != day:
+            return archived
+    return active
 
 
 def _records(path: Path) -> tuple[list[str], bool]:
@@ -225,6 +235,8 @@ def search_logs(
     records, complete = _records(path)
     matched = 0
     for record in records:
+        if raw_date and not record.startswith(f"{raw_date} "):
+            continue
         parts = record.split(" | ", 2)
         level = parts[1].strip() if len(parts) > 2 else ""
         if level in _LOG_LEVELS and _LOG_LEVELS.index(level) < minimum:

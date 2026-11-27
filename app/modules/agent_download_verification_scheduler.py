@@ -47,6 +47,7 @@ _ACTIVE_PHASES = {
     "submitted",
     "downloading",
     "post_processing",
+    "awaiting_confirmation",
     "partial_in_progress",
     "accepted",
 }

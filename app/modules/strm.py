@@ -3464,17 +3464,33 @@ def strm_failures(status: str = "all", action: str = "", source_id: str = "",
     if type(limit) is not int or not 1 <= limit <= 1000 or type(offset) is not int or offset < 0:
         raise ValueError("limit 必须是 1-1000 的整数，offset 必须是非负整数")
     filters = {"status": status, "action": action, "source_id": source_id.strip()}
-    rows = [dict(row) for row in db.list_strm_failures(**filters, limit=limit, offset=offset)]
-    total = db.count_strm_failures(**filters)
-    failures = db.get_strm_failure_triage_summary()
-    state = "attention" if failures["open"] else "running" if failures["retrying"] else "healthy"
-    return {"ok": True, "status": state, "summary": f"读取 {len(rows)} 条 STRM 失败记录，共 {total} 条匹配",
-            "data": {"items": rows, "total": total, "returned": len(rows),
-                     "has_more": offset + len(rows) < total,
-                     "next_offset": offset + len(rows) if offset + len(rows) < total else None,
-                     "failures": failures, "summary_scope": "all", "filters": filters,
-                     "error_representation": "stored_redacted_text", "error_storage_limit": 500,
-                     "error_note": "error 为账本已保存的完整文本；入库时已脱敏并最多保留500字，不能还原上游原文。"}}
+    rows, matched, failures = db.query_strm_failures_page(**filters, limit=limit, offset=offset)
+    total = matched["total"]
+    returned = len(rows)
+    has_more = offset + returned < total
+    state = "attention" if matched["open"] else "running" if matched["retrying"] else "healthy"
+    return {
+        "ok": True,
+        "status": state,
+        "summary": f"读取 {returned} 条 STRM 失败记录，当前筛选共 {total} 条匹配",
+        "data": {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "returned": returned,
+            "has_more": has_more,
+            "next_offset": offset + returned if has_more else None,
+            "filters": filters,
+            "matched_failures": matched,
+            "status_scope": "filtered",
+            "failures": failures,
+            "summary_scope": "all",
+            "counter_note": "failure_count 是累计记入账本的失败次数，retry_count 是累计被领取重试的次数。"
+                            "首次记录失败时 failure_count=1、retry_count=0。",
+            "error_representation": "stored_redacted_text",
+            "error_storage_limit": 500,
+            "error_note": "error 为账本已保存的完整文本；入库时已脱敏并最多保留500字，不能还原上游原文。",
+        },
+    }
 
 
 class StrmFailureRetryStale(ValueError):

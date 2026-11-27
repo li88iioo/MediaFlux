@@ -160,8 +160,9 @@ def _public_digest(rule: dict[str, Any]) -> dict[str, Any]:
 
 def digests(*, owner: str) -> dict[str, Any]:
     rows = rules.list_rules(agent_job_owner_digest(owner), kind="daily_summary")
-    return {"ok": True, "status": "completed", "summary": "已读取主动摘要规则",
-            "data": {"items": [_public_digest(row) for row in rows]}}
+    return {"ok": True, "status": "completed", "summary": "已读取当前规则和投递条件，历史送达情况未核实",
+            "data": {"as_of": datetime.now().astimezone().isoformat(timespec="seconds"),
+                     "delivery_history_checked": False, "items": [_public_digest(row) for row in rows]}}
 
 
 def prepare_set_digest(arguments: dict[str, Any], *, owner: str,

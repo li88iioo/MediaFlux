@@ -324,6 +324,31 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.data["phase"], "post_processing")
         self.assertFalse(result.data["terminal"])
 
+    def test_guangya_followup_uses_persisted_stage_outcomes(self):
+        request_id = self._request("settled-gy", target="guangya")
+        record = self._record(request_id, target="guangya")
+        for started, organize, strm, phase in (
+            (1, "", "", "post_processing"),
+            (1, "running", "pending", "post_processing"),
+            (1, "completed", "running", "post_processing"),
+            (1, "completed", "completed", "completed"),
+            (1, "completed", "skipped", "completed"),
+            (1, "completed", "", "completed"),
+            (-1, "skipped", "skipped", "completed"),
+            (-1, "failed", "skipped", "manual_review"),
+            (1, "completed", "partial", "manual_review"),
+            (1, "requires_manual", "pending", "awaiting_confirmation"),
+        ):
+            with self.subTest(organize=organize, strm=strm):
+                download_requests_repo.update_download_request(
+                    request_id, status="completed", gy_status="completed",
+                    organize_started=started, organize_status=organize, strm_status=strm,
+                )
+                result = build_recent_download_status(record, position=1)
+                self.assertEqual(result.data["phase"], phase)
+                if organize == "completed":
+                    self.assertEqual(result.data["local_processing"]["guangya_organize"], "completed")
+
     def test_immediate_failure_does_not_read_database(self):
         store = RecentDownloadSubmissionStore()
         store.capture(

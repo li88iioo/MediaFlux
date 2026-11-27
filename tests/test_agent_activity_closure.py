@@ -137,6 +137,8 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
                 expected = "completed" if len(transferred) == 2 else "attention"
                 self.assertEqual((result["status"], result["data"]["terminal"]), (expected, True))
                 stages = {stage["stage"]: stage for stage in result["data"]["stages"]}
+                self.assertEqual(stages["光鸭整理"]["run_id"], runs["organize"])
+                self.assertEqual(stages["STRM"]["run_id"], runs["strm"])
                 for prefix in runs:
                     stage = stages["关联运行 · " + prefix]
                     self.assertEqual(stage["status"], "failed")

@@ -310,12 +310,12 @@ class Subscriptions:
 
 
 class Automation:
-    """每日主动摘要；沿原规则、调度和通知中心，不定时调用模型。媒体追更统一使用subscriptions。"""
+    """每日摘要。digests 读取观测时刻、下次调度与当前阻塞，漏收日期和历史送达须另有记录。媒体追更用 subscriptions。"""
 
     @staticmethod
     @sdk_method('read')
     def digests() -> dict:
-        """读取当前身份的每日摘要规则、时间和修订号。用 delivery_ready 查询当前能否投递，delivery_blocked_reason 解释阻塞原因；实际送达以投递记录为准。"""
+        """以 data.as_of 为准读取当前摘要规则及下次调度。delivery_ready 和 delivery_blocked_reason 描述当前投递条件；delivery_history_checked 为 False，过去哪次漏发及其原因仍待核实。"""
         from app.modules.media_automation_rules import digests
 
         return digests(owner=_owner())
@@ -410,7 +410,7 @@ class Diagnostics:
     @staticmethod
     @sdk_method('read')
     def search_logs(query: str = "", level: str = "", date: str = "", limit: int = 50) -> dict:
-        """查当天或YYYY-MM-DD的最近匹配日志；level为最低级别。返回完整脱敏堆栈、matched_in_scan/scan_complete/truncated；最多扫描末尾32MiB，未命中不保证全文件没有记录。仅Web登录身份。"""
+        """默认查当前日志文件，指定 YYYY-MM-DD 时只返回该日的记录；level 为最低级别。返回完整脱敏堆栈、matched_in_scan/scan_complete/truncated；最多扫描末尾32MiB，未命中不保证全文件没有记录。仅Web登录身份。"""
         from app.modules.diagnostics import search_logs
 
         if not _owner().startswith("webk:v1:"):
@@ -503,7 +503,7 @@ class Preferences:
 
 
 class RSS:
-    """RSS规则订阅的配置与本地状态；条目下载、刷新是独立操作。"""
+    """RSS 源规则配置与本地条目。用户要改排除词并查看影响时，调用 rss.update 生成确认卡，卡面同时显示本地标题试算和抽样范围；只要求试算时读取 rss.entries。"""
     @staticmethod
     @sdk_method('read')
     def subscriptions(limit: int = 100, after_id: int | None = None) -> dict:
@@ -539,7 +539,7 @@ class RSS:
     @sdk_method('read')
     def entries(subscription_id: int | None = None, status: str | None = None, limit: int = 100,
                 offset: int = 0, query: str = "", *, entry_ids: list[int] | None = None) -> dict:
-        """读取本地条目与持久 delivery。普通列表默认 pending；追问已选条目传 entry_ids，默认跨状态，空数组返回零项。其余过滤条件取交集，按 data.next 续页。"""
+        """读取本地条目与持久 delivery。普通列表默认 pending；指定订阅读全部本地条目用 status="all"，按 data.next 续页。试算排除词按逗号（含全角）和空白拆词，任一词不区分大小写匹配标题子串；区分试算结果与条目实际状态。追问已选条目传 entry_ids，默认跨状态，空数组返回零项。其余过滤条件取交集。"""
         from app.modules.rss_delivery import entries
         return entries(subscription_id, status, limit, offset, query, entry_ids=entry_ids)
 
@@ -582,7 +582,7 @@ class RSS:
     @staticmethod
     @sdk_method('write')
     def update(subscription_id: int, *, name: str | EllipsisType = ..., urls: str | list[str] | EllipsisType = ..., exclude_keywords: str | EllipsisType = ..., action: str | EllipsisType = ..., enabled: bool | EllipsisType = ..., refresh_interval_minutes: int | EllipsisType = ..., download_method: str | EllipsisType = ..., media_tmdb_id: str | EllipsisType = ..., media_default_season: int | EllipsisType = ..., skip_existing_episodes: bool | EllipsisType = ..., parser: str | EllipsisType = ..., refresh_cron: str | EllipsisType = ..., qb_save_path: str | EllipsisType = ..., gy_target_dir: str | EllipsisType = ..., gy_target_dir_name: str | EllipsisType = ...) -> dict:
-        """只修改传入字段；False、0、空字符串是有效值。工作区冻结配置后确认，不立即刷新或下载。"""
+        """按已核实的订阅 ID 只修改传入字段；False、0、空字符串是有效值。工作区成功预检由宿主发布 approval_required，冻结配置并结束本轮。更新排除词时卡面附该订阅最近至多四条本地标题的试算。仅有文字方案、匹配清单或预检失败时，按尚未出票交付；查看既有票据用 session.pending_plan("inspect")。确认保存不立即刷新或下载。"""
         values = {key: value for key, value in locals().items() if value is not Ellipsis}
         from app.modules.rss_subscriptions import apply_change
         return apply_change("update", values)
@@ -651,7 +651,7 @@ class Watchlist:
     @staticmethod
     @sdk_method('write')
     def remove(watchlist_id: int) -> dict:
-        """按 watchlist.list 返回的 id 移除收藏；工作区确认后只删除预览中的记录，不删除媒体或取消订阅。"""
+        """按 watchlist.list 的收藏记录 id 生成移除确认卡。用户已明确要求且目标唯一时直接调用，点击确认后才移除该收藏。收藏操作与媒体、追更订阅各自独立。"""
         from app.discovery.service import DiscoveryService
 
         snapshot = DiscoveryService.get_watchlist_snapshot(watchlist_id)
@@ -986,7 +986,7 @@ class Library:
     @sdk_method('read')
     def episodes(query: str = "", tmdb_id: str = "", library_name: str = "", *,
                  series_id: str = "", server: str = "auto", max_episodes: int = 2000, include_specials: bool = False) -> dict:
-        """只读本地库存，两种选择方式互斥，均返回 {ok, status, data}。
+        """只读媒体库库存，两种选择方式互斥，均返回 {ok, status, data}。库存可见仅证实已入库；此查询不测试播放。
         query/tmdb_id 至少一项，library_name 可限定库；data 含 local_episode_count、
         seasons（每项 season/count/episode_ranges）、inventory_complete 和 sources。
         episode_ranges 保留断号；未命中或失败时计数为 None，可能没有 seasons。
@@ -1286,7 +1286,7 @@ def _cloud_client():
 
 
 class Cloud:
-    """光鸭文件、回收站和后台任务。按文件名全盘找用 search_files，盘点指定目录用 list。"""
+    """光鸭文件、回收站和后台任务。找作品用 search_files 按文件名查，没找到时其他命名仍未知；盘点已指定目录用 list。"""
     @staticmethod
     @sdk_method('read')
     def organize_status(run_id: int | None = None) -> dict:
@@ -1397,7 +1397,7 @@ class Cloud:
     @staticmethod
     @sdk_method('read')
     def search_files(keyword: str, *, page: int = 1, page_size: int = 20) -> dict:
-        """按名称查询光鸭全盘索引，一次读取一页；items 保留同名项目的 file_id、parent_id、parent_name，按 next_page 续查。完整路径可对选中的 ID 用 cloud.info(include_path=True) 核验。"""
+        """按文件名关键词查光鸭索引，本次未找到只能说明该命名未命中，改名或使用别名的文件仍未知。items 保留同名项目的 file_id、parent_id、parent_name，按 next_page 续查。完整路径用 cloud.info(include_path=True) 核验。"""
         from app.modules.guangya_workspace import search_files_page
 
         with _cloud_client() as client:
@@ -1408,7 +1408,7 @@ class Cloud:
     def list(parent_id: str = "0", *, recursive: bool = False, query: str = "",
              kinds: builtins.list[str] | None = None, limit: int | None = None, offset: int = 0,
              max_items: int = 100_000, max_depth: int = 64, max_dirs: int = 64) -> dict:
-        """按目录ID或绝对路径读取，如cloud.list('/动漫/某剧', recursive=True)；0或/为根。先按路径逐级定位，只扫描选定目录；返回的parent_id及items均为真实ID。完整读取后按query名称包含过滤/分页，total为匹配总数。默认最多64个目录（含所选根），max_dirs上限5000；预算不足或翻页失败报错。"""
+        """按目录ID或绝对路径读取，如cloud.list('/动漫/某剧', recursive=True)；0或/为根。找一部作品时按已知归档目录核实，递归清点根目录用于用户要求的全盘盘点。完整读取后按query名称过滤/分页，total为匹配总数。默认最多64个目录（含所选根），max_dirs上限5000；预算不足或翻页失败报错。"""
         from app.modules.guangya_workspace import list_files
 
         with _cloud_client() as client:
@@ -1780,7 +1780,7 @@ class Strm:
     @staticmethod
     @sdk_method('read')
     def failures(status: str = "all", action: str = "", source_id: str = "", limit: int = 200, offset: int = 0) -> dict:
-        """只读失败账本，data.items保留真实id/status/action/来源/对象/文件/路径及完整已保存error。error已在入库时脱敏且最多500字，不是可还原的上游原文；无额外摘要截断。status为all/open/retrying/resolved，action为空/generate/metadata；limit为1-1000，按data.next_offset读完。data.failures是全账本聚合，不能替代明细。"""
+        """按用户给出的 STRM 来源编号直接传 source_id，多来源分别查询。无需先读本地来源、运行状态或全账本。data.items保留真实id/status/action/来源/对象/文件/路径及完整已保存error。error已在入库时脱敏且最多500字，不是可还原的上游原文；无额外摘要截断。status为all/open/retrying/resolved，action为空/generate/metadata；limit为1-1000，按data.next_offset读完。status 与 data.matched_failures 按完整筛选结果计算，data.failures 是全账本统计。failure_count 是记账失败次数（首次为 1），retry_count 是领取重试次数（首次为 0）。"""
         from app.modules.strm import strm_failures
 
         return strm_failures(status, action, source_id, limit, offset)
@@ -1788,7 +1788,7 @@ class Strm:
     @staticmethod
     @sdk_method('write')
     def retry_failures(ids: builtins.list[int]) -> dict:
-        """确认后只重试明确的真实失败ID数组，取自failures().data.items中open记录；无scope或100项模型上限。预检冻结选中行及运行配置，变化时需重新预检。回执data保留requested/matched/resolved/failed/missing/stale/deferred及扫描/停止事实；matched小于requested表示并发状态变化，不能宣称全部完成。"""
+        """确认后只重试明确的真实失败ID数组，取自failures().data.items中open记录；无scope或100项模型上限。预检冻结选中行及运行配置，变化时需重新预检。重试按当前索引、路径和内容重新校验；已索引的同一视频同一路径可被修复，不能保证保留人工改写的 STRM。回执data保留requested/matched/resolved/failed/missing/stale/deferred及扫描/停止事实；matched小于requested表示并发状态变化，不能宣称全部完成。"""
         from app.modules.strm import prepare_strm_failure_retry, retry_selected_strm_failures
 
         prepared = prepare_strm_failure_retry(ids)
@@ -1835,7 +1835,7 @@ class Strm:
     @staticmethod
     @sdk_method('read')
     def status(run_id: int | None = None) -> dict:
-        """读取STRM状态；无run_id返回data.sources(真实id/name)、当前进度与last_run；指定正整数返回该原始任务data.task(status/stats/progress)。进度只代表当前进程且仅在run_id匹配时返回；未知记录为unknown，不回退最近任务。"""
+        """读取STRM状态；无run_id返回data.sources(真实id/name)、当前进度与last_run，快照只摘要最近一次，无法证明总次数或归属。要核对下载单须用 timeline 返回的关联 run_id；指定正整数返回该原始任务data.task(status/stats/progress)。进度只代表当前进程且仅在run_id匹配时返回；未知记录为unknown，不回退最近任务。"""
         from app.modules.scheduler import strm_status
 
         return strm_status(run_id)
@@ -1879,7 +1879,7 @@ class Strm:
 
 
 class Playback:
-    """媒体反代实例管理与播放诊断；真实instance_id来自instances，凭据保持脱敏。"""
+    """媒体反代实例管理与播放诊断。查指定入口时，先用 instances 匹配名称，再将对应 instance_id 传给 failures；省略会查询所有实例。"""
     @staticmethod
     @sdk_method('read')
     def instances() -> dict:
@@ -1891,7 +1891,7 @@ class Playback:
     @staticmethod
     @sdk_method('read')
     def failures(hours: int = 24, instance_id: int | None = None, limit: int = 50, offset: int = 0) -> dict:
-        """读取最近1/6/24/72小时的原故障汇总及完整已保存失败记录。data.items保留真实记录/实例ID、状态、阶段、路由、时延和error；error已在入库脱敏并最多1000字，不是上游原文。limit为1-200，按data.next_offset读完；summary_group_limit=8只限制汇总排名，明细可完整分页。coverage仅代表best-effort已记录请求，不代表媒体服务器全部播放。"""
+        """读取指定时间窗的故障汇总及明细。hours 默认 24，用户问最近一小时须传 hours=1，另支持 6 和 72。data.items保留真实记录/实例ID、状态、阶段、路由、时延和error；error已在入库脱敏并最多1000字，不是上游原文。limit为1-200，按data.next_offset读完；summary_group_limit=8只限制汇总排名，明细可完整分页。coverage 仅涵盖已记录的反代请求。按 failure_stage 和 error 说明当次故障，0ms 不能判断请求到达哪一步，404 不能确认文件被删。"""
         from app.modules.media_proxy import playback_proxy_failures
 
         return playback_proxy_failures(hours, instance_id, limit, offset)
@@ -2154,6 +2154,7 @@ class Activity:
         直接传 timeline("download", request_id)，无需搜索或匹配云盘列表。
         返回 ok/status/message/data；data.title 是已补全的文件名，data.request 是下载请求摘要，
         data.stages 是阶段列表（stage/status/task_bound/progress/updated_at/reason），不是 events。
+        整理和 STRM 阶段的 run_id 来自本请求。需核对 STRM 明细时用 strm.status(run_id=该编号)；空值表示未记录关联。
         data.destination_evidence 按实际选择的后端返回持久证据。光鸭 receiving.kind 分为 staging（隔离暂存）、
         direct（直接接收）和 finalized（未走归档的收口目录）。parent_name/directory_name 为接收时记录的两级名称，requested_directory_id 仅是路由意图。
         organize_status=requires_manual 时仍需确认。receiving.state 为 recycled、closed 或 unverified 时位置待核验或仅存历史。
@@ -2251,7 +2252,9 @@ class Activity:
 
 
 class Resources:
-    """公开资源站检索。找指定版本用 search；按库补集用 search_missing，一次核对指定库、截止日和逐集候选。"""
+    """检索公开资源站。点名站点从首查传 sites（蜜柑用 ["mikan"]）。
+    查某画质是否有资源时，从首查传 resolution（4K 用 "2160p"）。仅说优先某画质时按软偏好排序。
+    search 返回查询数据，present 展示可点选候选，download 生成下载预览，search_missing 按库补集。"""
     @staticmethod
     @sdk_method('control')
     def present(result_ids: list[str], *, resolution: str | EllipsisType = ...,
@@ -2259,9 +2262,9 @@ class Resources:
         """展示当前会话读到的候选，支持跨作品、查询和分页选择0–50个唯一 result_id；[] 撤卡。
         此方法只更新Web/TG候选卡；下载预览用 resources.download，取消确认用 session.pending_plan("cancel")。
 
-        省略规格沿用各项原查询，显式规格继续筛选；放宽条件需重新搜索。
+        省略规格沿用各项原查询，显式规格继续筛选。候选遵守已存最低画质和屏蔽词。仅本次的显式覆盖随原查询或重排绑定到对应候选。
         有季集条件时只展示匹配单集/范围包；rank_episode 重排结果也可展示。
-        返回实际 result_ids、queries（各查询条件与来源覆盖）、coverage_notice、excluded_count；
+        工作区回执的 presented 表示实际是否出卡，只有回执里的 result_ids 可点选。另有 queries（条件和覆盖）、coverage_notice、excluded_count。
         单查询另有 effective_query。scope.complete 表示选全会话已观察ID，来源覆盖另行报告。
         search_missing 的 verification_targets 随选中ID保留；原始候选仍可从查询结果研究。
 
@@ -2273,7 +2276,8 @@ class Resources:
 
         return select_candidates(_RESOURCE_CANDIDATES.get(), result_ids,
             {key: value for key, value in {"resolution": resolution, "dynamic_range": dynamic_range,
-                                          "exclude_hdr": exclude_hdr}.items() if value is not Ellipsis})
+                                          "exclude_hdr": exclude_hdr}.items() if value is not Ellipsis},
+            owner=_CALL_OWNER.get())
 
 
     @staticmethod
@@ -2307,18 +2311,24 @@ class Resources:
         media_type: str = "", season: int | None = None, episode: int | None = None,
         page: int = 1, sites: list[str] | None = None, sort_mode: str = "relevance_desc",
         resolution: str = "", dynamic_range: str = "", exclude_hdr: bool = False,
+        *, preference_overrides: dict | None = None,
     ) -> dict:
-        """多站搜索当前页资源；传 season/episode 时同时核对季集，调用保持只读。
+        """在用户指定站点搜索当前页。sites=None 使用默认站点集，只查蜜柑从首查传 sites=["mikan"]。
+        用户问“有没有 4K”或查指定画质时，从首查传 resolution="2160p" 或对应画质，展示也沿用本次规格。
+        “优先 4K”表示排序偏好。检索条件按本次请求生效，传 season/episode 时同时核对季集。
 
         返回 items（result_id/title/site_name/size_bytes/seeders）、request（可复用的完整查询条件）、
         site_statuses（各站状态/next_page）、partial/has_more/complete（覆盖）、technical_filter（画质依据）。
-        体积/做种数为 None 表示未知。items 是全部候选，展示卡片使用 present；新搜索撤下旧卡，
+        体积/做种数为 None 表示未知。items 是全部候选；用 present 展示筛好的候选卡，用户可按卡片序号选择。新搜索撤下旧卡，
         presentation.result_ids 反映当前卡片。指定季集时 items[].quality 给出 match/eligible/tags；
         recommendation 含 target/selected/alternatives/status，selected 可为 None。
         recommendation.matched_count 为 matched_counts 中 exact_episode 单集与 episode_pack 范围包之和，仅计当前范围。
 
         resolution: 2160p/1080p/720p/480p；dynamic_range: SDR/HDR/HDR10/HDR10+/DoVi/HLG，空串不限。
         exclude_hdr 仅排除已标 HDR；明确要求 SDR 用 dynamic_range="SDR"。标题判据不等于实测文件质量。
+        preference_overrides 仅本次生效，支持 minimum_resolution 和 excluded_keywords。
+        minimum_resolution="any" 放宽已存门槛。解除指定词时只从已存 excluded_keywords 移除该词，传入剩余列表。
+        本次覆盖随 request 和候选卡保留，preferences.get 仍返回原设置。
 
             r = resources.search("目标剧", season=1, episode=2, resolution="1080p")
             print(r["recommendation"])
@@ -2328,6 +2338,15 @@ class Resources:
         from app.indexers.ranking import filter_technical_candidates, technical_filter_arguments
         from app.indexers.runtime import get_indexer_service, run_indexer_awaitable_sync
         from app.indexers.service import search_payload
+        from app.modules.media_preferences import validate_preference_updates
+        from app.modules.resource_candidates import CANDIDATE_PREFERENCE_FIELDS
+
+        if preference_overrides is not None and (
+            not isinstance(preference_overrides, dict)
+            or set(preference_overrides) - set(CANDIDATE_PREFERENCE_FIELDS)
+        ):
+            raise ValueError("preference_overrides 只接受 minimum_resolution 和 excluded_keywords")
+        overrides = validate_preference_updates(preference_overrides) if preference_overrides else {}
 
         quality = technical_filter_arguments({
             "resolution": resolution, "dynamic_range": dynamic_range, "exclude_hdr": exclude_hdr,
@@ -2343,6 +2362,8 @@ class Resources:
         payload = search_payload(service, result)
         payload["items"], payload["technical_filter"] = filter_technical_candidates(payload["items"], quality)
         search = {"request": {**asdict(request), "sites": list(sites) if sites is not None else None, **quality}, **payload}
+        if overrides:
+            search["request"]["preference_overrides"] = overrides
         if request.season is not None and request.episode is not None:
             return Resources.rank_episode(search, request.season, request.episode)
         return search
@@ -2405,15 +2426,20 @@ class Resources:
         返回新字典，保留原 request/items/site_statuses/覆盖，更新 items[].quality 和 recommendation。
         recommendation.target 是本次季集，selected/alternatives 是建议；matched_count 为 eligible 单集与
         范围包之和，matched_counts 分列两者，candidate_count 还含编号待核对项。标题匹配不等于文件已验证。
-        preferences 是软排序偏好（preferred_resolution/preferred_codecs/preferred_subtitles），保留 search 硬过滤。
+        preferences 覆盖本次排序及明确调整的最低画质、屏蔽词，其他字段沿用原查询和已存偏好。
+        显式传 minimum_resolution="any" 可仅本次放宽门槛。结果的画质等检索硬条件继续有效。
 
             ranked = resources.rank_episode(r, season=1, episode=3, audit=audit)
             print(ranked["recommendation"])
         """
         from app.indexers.models import IndexerMediaSearchRequest
         from app.modules.episode_resource_ranking import rank_episode_search
+        from app.modules.media_preferences import owner_media_preferences
 
         arguments = dict(search["request"])
+        overrides = arguments.pop("preference_overrides", None)
+        if overrides or preferences:
+            preferences = {**owner_media_preferences(_CALL_OWNER.get()), **(overrides or {}), **(preferences or {})}
         for key in ("sites", "resolution", "dynamic_range", "exclude_hdr"):
             arguments.pop(key, None)
         arguments.update(season=season, episode=episode)
