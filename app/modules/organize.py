@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, overload
 
 from app import database as db
 from app.repositories import media_probe as media_probe_repo
-from app.repositories.organize_history import has_archived_video_from
+from app.repositories.organize_history import has_settled_release_video
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get, get_int
 from app.database import add_organize_log, add_organize_log_items
@@ -7557,6 +7557,7 @@ class Organizer:
         delete_failures = 0
         protected_count: int = 0
         not_empty: int = 0
+        missing_release_receipt: int = 0
         unavailable: int = 0
         stopped = False
         protected = {item for item in (protected_source_ids or set()) if item}
@@ -7620,9 +7621,11 @@ class Organizer:
                     release_source_id and release_source_id != "0" and self._before_plan_write is None
                     and all(is_release_promo_file(f) and f.file_id and f.parent_id == dir_id
                             and (f.etag or f.updated_at) for f in files)
-                    and has_archived_video_from(dir_id, release_source_id)
                 ):
                     not_empty += 1
+                    continue
+                if files and not has_settled_release_video(dir_id, release_source_id):
+                    missing_release_receipt += 1
                     continue
                 # 移动/改名会更新目录版本；删除前必须刷新快照，不能继续使用
                 # 扫描阶段的旧 etag/updated_at，否则空目录会被安全校验保留。
@@ -7650,7 +7653,7 @@ class Organizer:
 
                         execute_recycle_bin_delete(
                             self.client, trigger="organize_release_promo_cleanup",
-                            reason="原目录已有视频入库，仅剩发布站推广文件",
+                            reason="原目录正片已入库或已按同版本策略回收，仅剩发布推广文件",
                             candidate=DeleteCandidate(promo.file_id, promo.name, dir_id, promo.size, promo.etag),
                             delete_operation=recycle_promo,
                         )
@@ -7723,6 +7726,8 @@ class Organizer:
             reasons.append(
                 f"{not_empty} 个目录仍含待确认、跳过、伴随或其他文件"
             )
+        if missing_release_receipt:
+            reasons.append(f"{missing_release_receipt} 个目录仅含推广文件，缺少正片入库或同版本回收记录，已保留")
         if unavailable:
             reasons.append(f"{unavailable} 个目录状态已变化，已安全保留")
         if stopped:
@@ -7736,7 +7741,7 @@ class Organizer:
             "unsupported": 0,
             "candidates": candidates,
             "protected": protected_count,
-            "not_empty": not_empty,
+            "not_empty": not_empty + missing_release_receipt,
             "unavailable": unavailable,
             "reasons": reasons,
         }

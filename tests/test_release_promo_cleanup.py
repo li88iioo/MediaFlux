@@ -154,6 +154,37 @@ def test_generic_empty_cleanup_and_disabled_organize_preserve_old_residue_until_
         assert [item.file_id for item in drive.list_dir("archive")] == ["episode-1"]
 
 
+def test_large_release_ads_require_exact_content_and_preserve_mixed_directories(drive, organizer, monkeypatch):
+    size = 15_089_802
+    gcid = "A" * 40
+    monkeypatch.setattr("app.modules.organize_scan._RELEASE_PROMO_MP4_SIGNATURES", {
+        "b8f961d6f6844c4b3d2fafdaa7e3f0f5dd4f118ac41aa18ca4f2030d39dffa30",
+    })
+    for episode, directory in enumerate(("settled", "mixed", "unproven"), start=1):
+        drive.add(directory, "source", directory, is_dir=True)
+        drive.add(directory + "-clip", directory, "同一短片的另一发行名.MP4", size)
+        drive.live[directory + "-clip"].etag = gcid.lower()
+        if directory != "unproven":
+            record_episode(drive, directory, episode)
+    drive.add("different-content", "mixed", "社 區 最 新 情 報.mp4", size)
+    drive.live["different-content"].etag = "B" * 40
+    drive.add("wrong-size", "mixed", "同名.mp4", size - 1)
+    drive.live["wrong-size"].etag = gcid
+    drive.add("no-fingerprint", "mixed", "社区情报.mp4", size)
+    drive.live["no-fingerprint"].etag = ""
+
+    rules = OrganizeRules(target_dir_id="archive", clean_empty=True, small_file_mb=80, link_strm=False)
+    _, stats = organizer.organize("source", rules, dry_run=False, post_actions=False)
+    assert stats.get("promo_files_recycled", 0) == 1 and stats["empty_dirs_cleaned"] == 1
+    assert drive.recycled == ["settled-clip", "settled"]
+    assert stats["skipped"] == 3
+    assert any("缺少正片入库或同版本回收记录" in reason for reason in stats["empty_dir_cleanup_reasons"])
+    assert len(drive.list_dir("mixed")) == 4 and len(drive.list_dir("unproven")) == 1
+    _, again = organizer.organize("source", rules, dry_run=False, post_actions=False)
+    assert again.get("promo_files_recycled", 0) == again["empty_dirs_cleaned"] == 0
+    assert drive.recycled == ["settled-clip", "settled"]
+
+
 @pytest.mark.parametrize("clean_empty", [True, False], ids=["last-confirmation", "duplicate-cleanup-disabled"])
 def test_confirmed_release_with_permanent_source_and_release_scoped_history(drive, organizer, monkeypatch, clean_empty):
     monkeypatch.setenv("GY_ORGANIZE_SOURCE_DIRS", '[{"id":"source","name":"永久整理源"}]')

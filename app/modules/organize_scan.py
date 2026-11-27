@@ -1,6 +1,7 @@
 """统一整理的只读目录扫描阶段。"""
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -37,14 +38,32 @@ _RELEASE_PROMO_FILENAME = re.compile(
     r"(?P=marker)?\.(?i:doc|mkv|mp4)"
 )
 
+# 光鸭发行包中已识别的推广短片，只保存内容标识和字节数的单向摘要。
+_RELEASE_PROMO_MP4_SIGNATURES = {
+    "337f023e9e5fddd8a3a195630311f10dcbf3eb2809af98658aa7b1490c465332",
+    "49dfdcbf86617c306e1f5a07e79ae0ba0fce0d12ecd6c39bf34058c556d47546",
+    "5dd16f27222c3a10e46db783fb5b0f1b65b0073eee8f45aa82a836b7a9d6a734",
+    "7188c10cb59bb36ef30a6e5ba8e09ad01aeba8ff169fbbc8ef7077f664c72f65",
+    "818af2f4685c4cb0c88b6d28aee0767a09178e002363e5a14b82ef213505d6b5",
+    "826d9470fa345f03b2b512f25f1d75493d78df473771466a3cff592e53c43c52",
+    "8e1134121a4febac76ff1460d9e23c10c65710d5c97d407c6fe84edf4812933e",
+    "995994680f66f821a06b63d98c28666316651f6884fe03f2442dc84925b55f7c",
+    "a641a188d77caa56dfc0312e07cc1ba3cb5081ce125f8ebebaf43584b30ef9ed",
+    "e29a9bcf7eb2a045ecd153da3c11ed94717a4f572226e2ce9d3c45ca4c122855",
+}
+
 
 def is_release_promo_file(item: GuangYaFile) -> bool:
-    """仅匹配小体积、全名由一至两个相同发布站推广标记组成的文件。"""
-    return (
-        item.is_dir is False
-        and type(item.size) is int and 0 < item.size <= 1024 * 1024
-        and _RELEASE_PROMO_FILENAME.fullmatch(item.name) is not None
-    )
+    """识别小体积的完整发布站推广标记，或内容已核实的推广短片。"""
+    if item.is_dir is not False or type(item.size) is not int or item.size <= 0:
+        return False
+    if item.size <= 1024 * 1024 and _RELEASE_PROMO_FILENAME.fullmatch(item.name):
+        return True
+    content_id = item.etag or ""
+    if len(content_id) != 40 or media_extension(item.name) != "mp4":
+        return False
+    signature = hashlib.sha256(f"{content_id.upper()}:{item.size}".encode()).hexdigest()
+    return signature in _RELEASE_PROMO_MP4_SIGNATURES
 
 
 def filter_source_entries(

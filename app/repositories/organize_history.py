@@ -22,15 +22,32 @@ _BUSINESS_LOG_FIELDS = (
 _FINISH_FIELDS = {"status", "operation_type", "current_parent_id", "current_name", "error"}
 
 
-def has_archived_video_from(directory_id: str, source_id: str) -> bool:
-    """以实际归档成功记录证明来源，人工确认的执行记录以原父目录为扫描根。"""
+def has_settled_release_video(directory_id: str, source_id: str) -> bool:
+    """以实际归档或结算的同版本视频回收证明来源，兼顾以原父目录为扫描根的人工确认。"""
     with db.get_conn() as conn:
         return conn.execute(
-            "SELECT 1 FROM organize_log WHERE source='guangya' AND status='success' "
-            "AND operation_type IN ('organize','reorganize') AND legacy_incomplete=0 "
-            "AND original_parent_id=? AND source_dir_id IN (?,?) AND file_id<>'' AND new_path<>'' "
-            "AND target_parent_id<>'' AND current_parent_id=target_parent_id "
-            "AND current_parent_id<>original_parent_id LIMIT 1",
+            """
+            SELECT 1 FROM organize_log l
+            WHERE l.source='guangya' AND l.legacy_incomplete=0
+              AND l.original_parent_id=? AND l.source_dir_id IN (?,?) AND l.file_id<>''
+              AND l.status IN ('success','deleted')
+              AND (
+                (l.status='success' AND l.operation_type IN ('organize','reorganize')
+                 AND l.new_path<>'' AND l.target_parent_id<>''
+                 AND l.current_parent_id=l.target_parent_id AND l.current_parent_id<>l.original_parent_id)
+                OR (l.status='deleted' AND l.operation_type='delete'
+                    AND EXISTS (
+                        SELECT 1 FROM organize_log_items i
+                        WHERE i.log_id=l.id AND i.file_id=l.file_id AND i.role='video' AND i.status='deleted'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM organize_delete_audit a
+                        WHERE a.organize_log_id=l.id AND a.file_id=l.file_id AND a.parent_id=l.original_parent_id
+                          AND a.provider='guangya' AND a.trigger='duplicate_cleanup' AND a.status='success'
+                          AND a.replacement_file_id<>'' AND a.replacement_file_id<>a.file_id
+                    ))
+              ) LIMIT 1
+            """,
             (directory_id, source_id, directory_id),
         ).fetchone() is not None
 
