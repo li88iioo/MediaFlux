@@ -762,7 +762,16 @@
             for(const id of action.ids)selectedFailures.delete(id);
             await loadFailures();
             const deferred=Number(data.deferred||0);
-            failureState.textContent=`重试完成：解决 ${Number(data.resolved||0)}，仍失败 ${Number(data.failed||0)}${deferred?`，扫描未完成暂缓 ${deferred}`:''}，当前剩余 ${Number(data.remaining||0)}`;
+            const unmatched=Number(data.requested)-Number(data.matched);
+            if(data.matched===0){
+                failureState.textContent=action.all?'当前筛选范围已没有可重试的失败项。':'所选记录已不在待重试队列，本次未执行重试。';
+            }else{
+                const counts=[`解决 ${Number(data.resolved||0)}`,`仍失败 ${Number(data.failed||0)}`];
+                if(deferred)counts.push(`暂缓 ${deferred}`);
+                if(unmatched>0)counts.push(`未匹配 ${unmatched}`);
+                counts.push(`当前剩余 ${Number(data.remaining||0)}`);
+                failureState.textContent=`重试结果：${counts.join('，')}`;
+            }
         }catch(error){
             failureState.textContent=error.message||'重试失败';
         }finally{

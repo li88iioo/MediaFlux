@@ -146,7 +146,7 @@ class StrmRunHistoryTests(IsolatedDatabaseTestCase):
             patch.object(runtime, "validate_config", return_value=""),
             patch.object(scheduler, "configured_strm_source_plans", return_value=([], "")),
         ):
-            for status, expected in (("partial", "attention"), ("failed", "attention"), ("success", "ready")):
+            for status, expected in (("partial", "attention"), ("failed", "attention"), ("success", "ready"), ("skipped", "ready")):
                 with self.subTest(status=status):
                     run_id = db.add_task_run("strm_sync", "manual")
                     db.finish_task_run(run_id, status, result=json.dumps({"stats": {"failed": int(status != "success")}}))
@@ -154,3 +154,8 @@ class StrmRunHistoryTests(IsolatedDatabaseTestCase):
                     self.assertEqual(overview["status"], expected)
                     self.assertEqual(overview["ok"], expected == "ready")
                     self.assertEqual(overview["data"]["last_run"], sdk.strm.status(run_id)["data"]["task"])
+                    if status == "skipped":
+                        receipt = sdk.strm.status(run_id)
+                        self.assertEqual(receipt["status"], sdk.strm.history(status="skipped")["items"][0]["status"])
+                        self.assertEqual((receipt["status"], receipt["data"]["task"]["raw_status"]), ("stopped", "skipped"))
+                        self.assertFalse(receipt["error"])

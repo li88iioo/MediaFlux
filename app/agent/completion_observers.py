@@ -53,7 +53,7 @@ _TERMINAL_STATUSES = {
     "agent_job": frozenset(
         {"updates_available", "up_to_date", "inconclusive", "cancelled", "failed"}
     ),
-    "strm_run": frozenset({"completed", "partial", "failed", "outcome_unknown"}),
+    "strm_run": frozenset({"completed", "partial", "failed", "stopped", "outcome_unknown"}),
     "library_patrol": frozenset(
         {
             "cancelled",

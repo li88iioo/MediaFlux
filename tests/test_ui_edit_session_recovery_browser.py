@@ -670,6 +670,16 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
     def test_strm_single_retry_keeps_other_selection_mobile(self):
         self.strm_single_retry_selection(390)
 
+    def test_strm_retry_of_a_settled_selection_explains_that_nothing_ran(self):
+        page = self.make_strm_page(390, count=2)
+        row = page.locator("#strmFailureList tr[data-id]").first
+        row.wait_for()
+        self.strm_selected_retry.side_effect = lambda ids, trigger: {"ok": True, "requested": len(ids), "matched": 0}
+        row.locator("[data-retry-single]").click()
+        page.locator("#appConfirmSubmit").click()
+        page.wait_for_function("document.querySelector('#strmFailureState').textContent.includes('本次未执行重试')")
+        self.strm_selected_retry.assert_called_once()
+
     def strm_all_retry_snapshot(self, width):
         from app import database as db
 

@@ -2928,7 +2928,7 @@ def submit_strm_run(source_ids: list[str] | None = None, *, expected_fingerprint
 
 def _public_strm_run(row: dict, runtime: dict) -> dict:
     states = {"success": "completed", "completed": "completed", "partial": "partial", "failed": "failed",
-              "skipped": "failed", "running": "running"}
+              "skipped": "stopped", "running": "running"}
     raw_status = str(row.get("status") or "").strip().casefold()
     status = states.get(raw_status, "unknown")
     trigger = str(row.get("trigger_type") or "").strip().casefold()
@@ -2986,7 +2986,8 @@ def strm_status(run_id: int | None = None) -> dict:
         task = _public_strm_run(dict(row), runtime)
         status = task["status"]
         summary = {"running": "STRM同步任务正在运行", "completed": "STRM同步已完成", "partial": "STRM同步部分完成",
-                   "failed": "STRM同步执行失败", "unknown": "STRM同步状态暂时无法确认"}[status]
+                   "stopped": "本次 STRM 同步已停止", "failed": "STRM同步执行失败",
+                   "unknown": "STRM同步状态暂时无法确认"}[status]
         return {"ok": status in {"running", "completed"}, "status": status, "summary": summary,
                 "data": {"task": task, "runtime_scope": "current_process"},
                 "error": "STRM同步未成功完成。" if status in {"partial", "failed"} else ""}

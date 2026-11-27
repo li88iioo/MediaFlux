@@ -137,3 +137,15 @@ class CompletionUpgradeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(wait["final_result"]["status"], status)
             self.assertTrue(wait["final_result"]["ok"])
             self.assertTrue(wait["delivered"])
+
+    async def test_stopped_strm_is_a_terminal_warning_with_original_progress(self):
+        run_id = db.add_task_run("strm_sync", "manual")
+        db.finish_task_run(run_id, "skipped", result=json.dumps({"stats": {"generated": 7}}))
+        await self.register("original-sync", "strm_run", {"run_id": run_id})
+        await self.make_due()
+        self.assertEqual(await effects.poll_effect_receipts(SQLiteKernelStore(), limit=1), 1)
+        wait = (await self.store.load(**self.scope)).metadata["effect_waits"]["original-sync"]
+        receipt = wait["final_result"]
+        self.assertTrue(wait["delivered"])
+        self.assertEqual((wait["state"], receipt["status"], public_result_state(receipt)), ("terminal", "stopped", "warning"))
+        self.assertEqual(receipt["data"]["background_job"]["stats"]["generated"], 7)
