@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from datetime import timedelta
 from typing import TypedDict
 
 from app import config
@@ -11,6 +12,8 @@ from app.agent.owner_routes import (
     telegram_owner_route_is_currently_authorized,
 )
 from app.notifier import TelegramSendResult
+
+VERIFICATION_HISTORY_WINDOW = timedelta(days=7)
 
 
 class DownloadVerificationTarget(TypedDict):
@@ -100,8 +103,9 @@ def notify_download_verification_terminal_result(
     from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 
     outcome = publish_download_lifecycle(request_id, expected_chat_id=target)
-    return TelegramSendResult(
-        ok=bool(outcome),
-        error="" if outcome else (outcome.status or "DeliveryFailed"),
-        status_code=0 if outcome else (403 if outcome.status == "InvalidRoute" else 503),
-    )
+    if outcome.status == "HistoricalVerification":
+        return TelegramSendResult(False, error=outcome.status, status_code=410)
+    if outcome:
+        return TelegramSendResult(True)
+    return TelegramSendResult(False, error=outcome.status or "DeliveryFailed",
+                              status_code=403 if outcome.status == "InvalidRoute" else 503)

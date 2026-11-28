@@ -677,6 +677,7 @@ def _dispatch_item(item: dict) -> bool:
             )
             return False
 
+    edit_only = False
     if str(item.get("topic") or "") == NotificationTopic.DOWNLOAD.value:
         try:
             from app.modules.telegram_download_lifecycle import (
@@ -684,6 +685,7 @@ def _dispatch_item(item: dict) -> bool:
             )
 
             stale = download_notification_obsolescence(str(item.get("thread_key") or ""), event)
+            edit_only = stale == "edit_only"
         except Exception as exc:
             retry_notification(
                 notification_id, lease_generation=generation, claimed_revision=claimed_revision,
@@ -744,6 +746,8 @@ def _dispatch_item(item: dict) -> bool:
                 notification_id, lease_generation=generation, message_id=message_id,
             ):
                 return TelegramSendResult(ok=False, error="NotificationLeaseLost")
+        if edit_only:
+            return TelegramSendResult(ok=False, error="HistoricalVerification", status_code=410)
         return send_event_result(event, **send_kwargs)
 
     try:
@@ -784,6 +788,11 @@ def _dispatch_item(item: dict) -> bool:
             lease_generation=generation,
             claimed_revision=claimed_revision,
             message_id=outcome.message_id or 0,
+        )
+    if edit_only and outcome.error == "HistoricalVerification":
+        return suppress_notification(
+            notification_id, lease_generation=generation, claimed_revision=claimed_revision,
+            reason=outcome.error,
         )
     if (
         not outcome.outcome_unknown
@@ -979,6 +988,8 @@ def _publish(
         status = str(row.get("status") or status)
     if allowed and status in {"pending", "retry_wait", "sending"}:
         wake_telegram_notification_dispatcher()
+    if status == "suppressed" and row.get("last_error") == "HistoricalVerification":
+        return NotificationPublishResult(True, status="HistoricalVerification", event_key=key)
     return NotificationPublishResult(
         True,
         delivered=status == "sent",

@@ -33,6 +33,7 @@ from app.agent.owner_routes import (
 )
 from app.logger import get_logger
 from app.modules.agent_download_verification_notifications import (
+    VERIFICATION_HISTORY_WINDOW,
     dump_download_verification_payload,
     load_download_verification_payload,
     notify_download_verification_terminal_result,
@@ -57,7 +58,6 @@ _VERIFICATION_LEASE_HEARTBEAT_SECONDS = 60.0
 _NOTIFICATION_LEASE_SECONDS = 5 * 60
 _NOTIFICATION_RETRY_DELAYS = (60, 180, 600, 1800, 3600)
 _NOTIFICATION_MAX_ATTEMPTS = len(_NOTIFICATION_RETRY_DELAYS)
-_HISTORY_RETENTION_DAYS = 7
 _HISTORY_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 _HISTORY_CLEANUP_RETRY_SECONDS = 5 * 60
 _HISTORY_CLEANUP_BATCH_SIZE = 500
@@ -215,7 +215,7 @@ class DownloadLibraryVerificationScheduler:
         self._next_cleanup_at = current + timedelta(
             seconds=_HISTORY_CLEANUP_INTERVAL_SECONDS
         )
-        cutoff = self._format(current - timedelta(days=_HISTORY_RETENTION_DAYS))
+        cutoff = self._format(current - VERIFICATION_HISTORY_WINDOW)
         next_cleanup = self._format(self._next_cleanup_at)
         private_maintainers = (
             (
@@ -713,6 +713,7 @@ class DownloadLibraryVerificationScheduler:
                 "NotificationsDisabled",
                 "AuthorizationRevoked",
                 "InvalidRoute",
+                "HistoricalVerification",
             }:
                 agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,

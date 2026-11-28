@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 
 from app import config
@@ -13,6 +14,7 @@ from app.repositories import local_media as local_media_repo
 from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.modules.agent_download_verification_notifications import (
     _RESULT_LABELS as _VERIFICATION_RESULT_LABELS,
+    VERIFICATION_HISTORY_WINDOW,
 )
 from app.modules.local_media_outcomes import (
     LOCAL_REFRESH_LABELS,
@@ -409,8 +411,17 @@ def build_download_lifecycle_event(
     )
 
 
+def _historical_settlement(row) -> bool:
+    # 复核可能晚于实际入库数月；按最后一次业务结算区分刚入库的长下载。
+    settled_at = max(row[field] or "" for field in (
+        "completed_at", "organize_finished_at", "strm_finished_at", "local_import_completed_at",
+    )) or row["updated_at"] or row["created_at"]
+    cutoff = (datetime.now() - VERIFICATION_HISTORY_WINDOW).strftime("%Y-%m-%d %H:%M:%S")
+    return bool(settled_at) and settled_at < cutoff
+
+
 def download_notification_obsolescence(thread_key: str, event: NotificationEvent) -> str:
-    """投递前仅核对撤销后的下载字段；重建仍回到唯一生命周期生产者。"""
+    """用请求台账核对待投递的生命周期卡，包括重启前已排队的旧卡。"""
     prefix = "download:"
     if not thread_key.startswith(prefix):
         return ""
@@ -421,16 +432,19 @@ def download_notification_obsolescence(thread_key: str, event: NotificationEvent
         return ""
     row = download_requests_repo.get_download_request(int(raw_id))
     # 历史纯通知未必绑定请求，不凭记录缺失推断其业务已撤销。
-    if row is None or _status(_value(row, "qb_status")) != "cancelled":
+    if row is None:
         return ""
-    if _status(_value(row, "status")) in {"cancelled", "resubmitted"}:
-        return "cancelled"
-    if _previous_field(event, "下载") == _download_label(row):
-        return ""
-    from app.repositories.download_requests import request_download_notification_refresh
+    if _status(_value(row, "qb_status")) == "cancelled":
+        if _status(_value(row, "status")) in {"cancelled", "resubmitted"}:
+            return "cancelled"
+        if _previous_field(event, "下载") != _download_label(row):
+            from app.repositories.download_requests import request_download_notification_refresh
 
-    request_download_notification_refresh(int(raw_id))
-    return "stale"
+            request_download_notification_refresh(int(raw_id))
+            return "stale"
+    if _previous_field(event, "入库复核") in _VERIFICATION_RESULT_LABELS.values() and _historical_settlement(row):
+        return "edit_only"
+    return ""
 
 
 def publish_download_lifecycle(
@@ -460,6 +474,12 @@ def publish_download_lifecycle(
             # 复用旧请求的复核不能进入另一会话的下载消息；原请求路由不变。
             # 旧通知载荷、STRM 回调和 tracker 重试都不能覆盖当前复核代际。
             verification_status = _status(verification["status"])
+            if verification_status in {"visible", "attention"} and _historical_settlement(row):
+                # 已排队的首卡需要更新为当前复核结果，交给投递器按原消息 ID 处理。
+                if snapshot is None or (
+                    not snapshot.message_id and snapshot.status not in {"pending", "retry_wait", "sending"}
+                ):
+                    return NotificationPublishResult(True, status="HistoricalVerification")
             verification_result = (
                 _VERIFICATION_RESULT_LABELS.get(
                     _status(verification["result"]), _VERIFICATION_RESULT_LABELS["inconclusive"],
