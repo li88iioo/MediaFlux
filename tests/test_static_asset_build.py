@@ -83,7 +83,7 @@ class StaticAssetBuildTests(unittest.TestCase):
         self.assertEqual(package["packageManager"], "npm@12.2.3")
         self.assertEqual(package["devDependencies"]["terser"], "5.51.4")
         self.assertEqual(package["devDependencies"]["lightningcss"], "1.33.0")
-        self.assertEqual(package["devDependencies"]["lucide"], "1.80.0")
+        self.assertEqual(package["devDependencies"]["lucide"], "1.83.0")
         self.assertEqual(package["devDependencies"]["gsap"], "3.15.1")
         lock = json.loads((self.ROOT / "package-lock.json").read_text(encoding="utf-8"))
         for name, entry in lock["packages"].items():

@@ -4,7 +4,7 @@ uvicorn[standard]>=0.35
 jinja2>=3.1
 itsdangerous>=2.2
 python-multipart>=0.0.20
-httpx>=0.28
+httpx>=0.29.0
 httpx2>=2.0.0
 requests>=2.32
 schedule>=1.2
@@ -23,7 +23,7 @@ beautifulsoup4>=4.12
 guessit>=3.8
 pypinyin>=0.55
 feedparser>=6.0
-lxml>=5.2
+lxml>=6.2.0
 
 # ===== 下载器 =====
 qbittorrent-api>=2024.3
