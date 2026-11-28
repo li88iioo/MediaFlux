@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-28
+
+### Added
+
+- 光鸭通过云盘索引分页搜索，保留同名结果和所在目录。批量文件操作记录源对象、目标和逐项结果，方便核对操作是否已执行。 [光鸭搜索与批量回执](https://github.com/li88iioo/MediaFlux/commit/2da13f9355633630b2cf852ae9b8e6dcd3dbf524)
+- RSS 条目保留对应的投递记录，追更订阅可从已保存的候选发起下载确认。Telegram 订阅确认显示作品与季号，修改 RSS 排除词时可核对前后值和近期条目的匹配结果。 [订阅与投递](https://github.com/li88iioo/MediaFlux/commit/f3c2ee45d65e7b97b1648999a1dfddc07761bbfa) · [RSS 确认预览](https://github.com/li88iioo/MediaFlux/commit/5bf193f4191578ba62d5a637e89abdfc4b6f66aa)
+
+### Fixed
+
+- 缺少季号的发布文件可复用同篇章成功的人工季号纠正，归档前复核当前 TMDB 季集。历史冲突或目标季集失效时保留待确认，用户可从原确认组补填季号。 [篇章季号与纠正](https://github.com/li88iioo/MediaFlux/commit/54a4be7fee243b0c7e861d918051da72c00d3bfe)
+- 同一发布目录有正片归档或重复版本回收记录时，光鸭可回收已核实内容签名的推广短片。 [发布目录清理](https://github.com/li88iioo/MediaFlux/commit/dcbc7d187ddbef1374832f7ccedb05cc4f3ccd2f)
+- 缺集查询按指定作品版本核对库存，资源按发布年份和质量条件筛选，各索引站保留自己的翻页进度和查询结果。标题匹配优先使用完整片名或别名，Nyaa 文件大小按原始字节数读取。 [缺集与分站结果](https://github.com/li88iioo/MediaFlux/commit/52bc4c4589d4109c9f80a8ad12c3e46e59674d29) · [标题匹配与大小](https://github.com/li88iioo/MediaFlux/commit/602be5a7ca4da595ae1317fe6b18c0203cbf9679)
+- Web Agent 发送单独的磁力链接时进入下载预检，可选择目标并引用提交回执。断线重连可回读原确认结果，处理后续消息期间会暂缓旧卡片的确认操作。 [磁力链接与回执](https://github.com/li88iioo/MediaFlux/commit/f5a61d296f8d7e65a14e6688225ebff8a0f1ca5f) · [确认与对话](https://github.com/li88iioo/MediaFlux/commit/5bf193f4191578ba62d5a637e89abdfc4b6f66aa)
+- 追更日历按请求的平台刷新。等待刷新时，以所选平台的完成状态为准。 [追更日历](https://github.com/li88iioo/MediaFlux/commit/6e8014cf621ee9bb9e97d3eb6a3a062e7afae15e)
+- STRM 同步保留已停止状态，无符合条件的失败项可重试时给出说明。播放列表核对实际保存顺序，播放反代显示所选实例的监听状态。 [STRM 同步](https://github.com/li88iioo/MediaFlux/commit/16c1d8c1696ee60c27b0bc85babcdd8357142a21) · [播放列表与反代](https://github.com/li88iioo/MediaFlux/commit/1c95a18c6f047bdaa0505647c4351d83cd161651)
+- 历史下载的媒体库验收会更新原 Telegram 消息或在本地结算，服务重启后恢复的旧验收也遵循同一规则。日报诊断可查看当前投递受阻原因，历史投递状态按已有记录核实。 [历史下载验收](https://github.com/li88iioo/MediaFlux/commit/a42c0cd9f809a2643f5383cfed33c06207824fb2) · [诊断与投递状态](https://github.com/li88iioo/MediaFlux/commit/5bf193f4191578ba62d5a637e89abdfc4b6f66aa)
+
+### Changed
+
+- 更新 HTTPX、lxml 和 Lucide 图标库，同步发布依赖锁与前端图标资源。 [依赖更新](https://github.com/li88iioo/MediaFlux/commit/54c0b114818114937c79e03c85e98006a80d0be4)
+
+### 升级说明
+
+- 从 v0.1.19 升级的数据库跨度为 schema 47 → 47，无数据库版本迁移。升级前请备份完整数据目录。回退时先停止服务，使用离线恢复还原升级前的备份，再启动旧版。
+
 ## [0.1.19] - 2026-11-26
 
 ### Added
@@ -541,7 +566,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/li88iioo/MediaFlux/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/li88iioo/MediaFlux/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/li88iioo/MediaFlux/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/li88iioo/MediaFlux/compare/v0.1.16...v0.1.17
