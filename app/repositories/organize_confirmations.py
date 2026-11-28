@@ -12,6 +12,7 @@ from app.repositories import telegram_notifications
 
 # 重试确认绑定原候选的 payload 键；仓储与确认服务共用。
 RETRY_SELECTED_INDEX_KEY = "_retry_selected_index"
+MANUAL_SEASON_CORRECTION_KEY = "_manual_season_correction"
 MAX_REVIEW_FILES = 80
 _MAX_CORRECTION_LOGS = 50
 
@@ -115,6 +116,8 @@ def _log_confirmation_owners(
             GROUP BY 1
         )
         SELECT l.id AS log_id,c.token,c.status,c.expires_at,
+               CASE WHEN json_valid(c.payload_json) THEN json_type(c.payload_json,?) IS NOT NULL ELSE 0 END
+                   AS manual_season_correction,
                NOT EXISTS (
                    SELECT 1 FROM organize_log newer
                    WHERE newer.source='guangya' AND newer.file_id=l.file_id AND newer.id>l.id
@@ -127,7 +130,7 @@ def _log_confirmation_owners(
                 AND l.id<=json_extract(c.payload_json,'$._organize_log_upper_bound') AND l.updated_at<=c.created_at)
                OR (json_type(c.payload_json,'$._organize_log_upper_bound') IS NULL AND l.updated_at<c.created_at))
           ELSE 0 END
-        """, (json.dumps(log_ids), minimum_confirmation_id),
+        """, (json.dumps(log_ids), minimum_confirmation_id, f"$.{MANUAL_SEASON_CORRECTION_KEY}"),
     )
     return {row["log_id"]: row for row in rows}
 
@@ -343,6 +346,7 @@ def can_discover_candidates(payload: dict) -> bool:
     return (
         (payload.get("kind") or "guangya") == "guangya"
         and not payload.get("candidates") and RETRY_SELECTED_INDEX_KEY not in payload
+        and MANUAL_SEASON_CORRECTION_KEY not in payload
         and isinstance(rules, dict) and not rules.get("nsfw_exclusive")
         and isinstance(files, list) and 0 < len(files) <= MAX_REVIEW_FILES
         and all(isinstance(item, dict) and isinstance(item.get("name"), str)
@@ -683,6 +687,7 @@ def claim_organize_confirmation(
                 "WHEN ?='human' AND review_status IN ('waiting','pending','running') THEN ? "
                 "ELSE review_completed_at END,updated_at=? "
                 "WHERE id=? AND status='pending' "
+                "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,?) IS NULL ELSE 1 END "
                 "AND (?<>'agent' OR ? OR (review_status='running' AND review_started_at=? "
                 "AND COALESCE(json_extract(payload_json,'$.review_only'),0)=0))",
                 (
@@ -690,7 +695,8 @@ def claim_organize_confirmation(
                     normalized_actor, normalized_actor,
                     normalized_actor, timestamp,
                     normalized_actor, timestamp,
-                    timestamp, int(row["id"]), normalized_actor, explicit_approval, expected_review_started_at,
+                    timestamp, int(row["id"]), f"$.{MANUAL_SEASON_CORRECTION_KEY}",
+                    normalized_actor, explicit_approval, expected_review_started_at,
                 ),
             )
             if cursor.rowcount != 1:
@@ -991,24 +997,28 @@ def fail_organize_confirmation_with_delivery(
     event_json: str,
     chat_id: str,
     message_id: int | None,
-    retryable: bool,
     enqueue_delivery: bool = True,
-    retry_expires_at: str = "",
+    season_correction_expires_at: str = "",
 ) -> None:
-    """原子保存失败/可重试状态与待投递回执。"""
+    """原子保存失败状态或回到待人工选季，并登记同一条回执。"""
     timestamp = db.now()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        if retryable:
+        if season_correction_expires_at:
+            # 写前预演停在未知季号时，保留作品身份和原日志边界，撤销所有候选执行与复核入口。
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='pending',selected_index=NULL,"
-                "queued_at=NULL,task_id='',error=?,completed_at=NULL,rollup_applied=0,"
-                "expires_at=CASE WHEN ?<>'' THEN ? ELSE expires_at END,updated_at=? "
-                "WHERE token=? AND status IN ('queued','running')",
+                "payload_json=json_remove(json_set(payload_json,?,"
+                "json_extract(payload_json,'$.candidates[' || selected_index || ']'),"
+                "'$.candidates',json('[]')),'$._explicit_approval'),"
+                "review_status='',review_result_json='',review_started_at=NULL,review_completed_at=NULL,"
+                "queued_at=NULL,task_id='',result_json='',error=?,completed_at=NULL,rollup_applied=0,"
+                "expires_at=?,updated_at=? "
+                "WHERE token=? AND status='running'",
                 (
+                    f"$.{MANUAL_SEASON_CORRECTION_KEY}",
                     (error or ""),
-                    (retry_expires_at or ""),
-                    (retry_expires_at or ""),
+                    season_correction_expires_at,
                     timestamp,
                     (token or ""),
                 ),

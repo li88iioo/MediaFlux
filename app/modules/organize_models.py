@@ -79,7 +79,7 @@ class OrganizePlan:
     multipart_index: int | None = None
     multipart_token: str = ""
     multipart_ambiguous: bool = False
-
+    confirmation_constraint: str = ""
 
     def require_confirmation(self, reason: str, *, constraint: str = "") -> None:
         """将身份/位置拒绝统一投影到识别结果和执行计划，不覆盖位置证据。"""
@@ -87,6 +87,7 @@ class OrganizePlan:
         self.match.need_confirm = True
         self.match.status = "low_confidence"
         self.match.error = reason
+        self.confirmation_constraint = constraint
         if constraint:
             rejected = getattr(self.match, "rejected_constraints", None)
             if isinstance(rejected, list) and constraint not in rejected:
@@ -100,6 +101,7 @@ class OrganizePlan:
         self.match.need_confirm = False
         self.match.status = "matched"
         self.match.error = ""
+        self.confirmation_constraint = ""
 
 
 @dataclass(frozen=True)

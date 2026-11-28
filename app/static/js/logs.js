@@ -851,8 +851,9 @@ function _renderOrganizeDetail(data){
     document.getElementById('organizeTmdbQuery').value=data.title||data.original_name||'';
     document.getElementById('organizeTmdbYear').value=data.year||'';
     document.getElementById('organizeTmdbType').value=onOrganizeDetailClose?profiledBatchMediaType(data):data.media_type==='tv'?'tv':'movie';
-    document.getElementById('organizeSeasonOverride').value=data.season??'';
-    document.getElementById('organizeEpisodeOverride').value=data.episode??'';
+    // 只有用户填写的位置才是本次人工覆盖，历史记录由预览重新核对。
+    document.getElementById('organizeSeasonOverride').value='';
+    document.getElementById('organizeEpisodeOverride').value='';
     syncOrganizeRecognitionFields();
     syncOrganizePositionFields();
     document.getElementById('organizeCorrectionPanel').hidden=!data.allowed_actions.search;

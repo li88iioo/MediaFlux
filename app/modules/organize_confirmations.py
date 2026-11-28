@@ -63,6 +63,10 @@ WEB_CORRECTION_GUIDE = (
     "在 Web「整理日志 → 批量审阅光鸭待确认」勾选媒体组，"
     "点击「纠正识别」为整组文件一次选择作品。"
 )
+_WEB_SEASON_CORRECTION_GUIDE = (
+    "请在 Web「整理日志 → 批量审阅光鸭待确认」勾选此组，"
+    "点击「纠正识别」，按上面的 TMDB ID 选择作品、填写季号并预览。"
+)
 _CONFIRMATION_TTL_HOURS = 24
 _MAX_CANDIDATES = 3
 _DISPATCH_POLL_SECONDS = 1.0
@@ -88,6 +92,10 @@ _NOTIFICATION_SUPPRESSED_KEY = "_notification_suppressed"
 
 class ConfirmationRetryableError(RuntimeError):
     """外部服务瞬时失败；可基于同一快照签发新的显式重试票据。"""
+
+
+class _ChapterSeasonCorrectionRequired(DirectoryScrapeConflictError):
+    """固定作品后，写入前的完整预演仍无法确定篇章所属季。"""
 
 
 def _timestamp(value: datetime) -> str:
@@ -1414,7 +1422,6 @@ def _dispatch_confirmation_token(token: str) -> dict:
             event_json=serialize_notification_event(failure_event),
             chat_id=chat_id,
             message_id=None,
-            retryable=False,
             enqueue_delivery=delivery_enabled,
         )
         if delivery_enabled:
@@ -1928,6 +1935,8 @@ def start_confirmation(
     _raise_if_confirmation_expired(preview)
 
     payload = decode_row(preview)
+    if preview["status"] == "pending" and organize_confirmations_repo.MANUAL_SEASON_CORRECTION_KEY in payload:
+        raise ValueError(str(preview["error"] or _WEB_SEASON_CORRECTION_GUIDE))
     candidates = list(payload.get("candidates") or [])
     if selected_index < 0 or selected_index >= len(candidates):
         raise ValueError("候选参数无效")
@@ -2554,7 +2563,6 @@ def _execute_local_media_confirmation(
             event_json=serialize_notification_event(failure_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
-            retryable=False,
             enqueue_delivery=delivery_enabled,
         )
         if delivery_enabled:
@@ -2933,6 +2941,14 @@ def _execute_guangya_confirmation(
             # 人工按钮只确认媒体身份，并不授权绕过 TMDB 季集边界。固定
             # 候选若仍无法为全部文件形成安全计划，必须在任何写入前失败
             # 关闭；否则会出现“已完成 / 已移动 0”且父汇总吞掉文件的假成功。
+            chapter_blocked = sum(
+                getattr(plan, "confirmation_constraint", "") == "unresolved_chapter_season" for plan in plans
+            )
+            if chapter_blocked == _preview_stats["need_confirm"] and not _preview_stats.get("failed"):
+                identity = f"{_candidate_display_name(candidate)}（{_candidate_identity_label(candidate)}）"
+                raise _ChapterSeasonCorrectionRequired(
+                    f"已选作品 {identity}，仍无法安全确定 TMDB 季号。文件保持原位。{_WEB_SEASON_CORRECTION_GUIDE}"
+                )
             raise DirectoryScrapeConflictError(unresolved_error)
 
         if write_boundary is not None:
@@ -3066,6 +3082,31 @@ def _execute_guangya_confirmation(
             except Exception as exc:
                 logger.warning("人工确认后下载事务通知刷新失败 type=%s", type(exc).__name__)
         return {"candidate": candidate, "stats": stats}
+    except _ChapterSeasonCorrectionRequired as exc:
+        event = NotificationEvent(
+            "⚠️ 已选作品，待确认季号",
+            fields=(
+                ("目标媒体", f"{_candidate_display_name(candidate)} · {_candidate_identity_label(candidate)}"),
+                ("所在目录", _confirmation_source_display(payload)),
+                ("处理状态", "文件保持原位"),
+            ),
+            footer=_WEB_SEASON_CORRECTION_GUIDE,
+            layout="relaxed",
+        )
+        organize_confirmations_repo.fail_organize_confirmation_with_delivery(
+            token,
+            error=str(exc),
+            event_json=serialize_notification_event(event),
+            chat_id=chat_id,
+            message_id=_confirmation_message_id(payload),
+            season_correction_expires_at=_timestamp(
+                datetime.now().astimezone() + timedelta(hours=_CONFIRMATION_TTL_HOURS)
+            ),
+            enqueue_delivery=delivery_enabled,
+        )
+        if delivery_enabled:
+            _dispatch_due_confirmation_delivery(token)
+        raise
     except Exception as exc:
         current = organize_confirmations_repo.get_organize_confirmation(token)
         if current is not None and str(current["status"] or "") in (
@@ -3146,7 +3187,6 @@ def _execute_guangya_confirmation(
             event_json=serialize_notification_event(failure_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
-            retryable=False,
             enqueue_delivery=delivery_enabled,
         )
         if delivery_enabled:

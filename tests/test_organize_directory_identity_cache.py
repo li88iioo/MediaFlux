@@ -7,9 +7,11 @@ import copy
 import unicodedata
 import unittest
 from datetime import date, timedelta
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from app import database as db
 from app.clients.guangya import GuangYaFile
+from app.clients.tmdb import TMDBClient
 from app.modules.directory_scrape import FixedMatchScraper
 from app.modules.episode_mapping import DirectoryEpisodeEvidence
 from app.modules.organize import (
@@ -18,6 +20,7 @@ from app.modules.organize import (
     _directory_episode_identity_hint,
     _recognition_identity_year,
 )
+from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.organize_identity import _usable_filename_identity_hint
 from app.modules.organize_scan import ScannedVideo
 from app.modules.scraper import (
@@ -28,7 +31,7 @@ from app.modules.scraper import (
     RecognitionResult,
     TMDBScraper,
 )
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import InitializedWebTestCase, IsolatedDatabaseTestCase, isolated_test_database
 
 
 class _TreeClient:
@@ -2374,6 +2377,185 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
         self.assertIn("超出 TMDB", plans[11].note)
         self.assertEqual(stats["directory_package_identity_bindings"], 1)
         self.assertEqual(stats["need_confirm"], 1)
+
+
+class ReleaseChapterSeasonHistoryTests(InitializedWebTestCase):
+    tmdb_id = "424242"
+    title = "桃源暗鬼"
+    chapter = "日光·華嚴瀑布篇"
+    source_name = "待整理"
+
+    def setUp(self):
+        super().setUp()
+        # 每个场景从无历史和无识别缓存的 SQLite 开始。
+        self.enterContext(isolated_test_database("release-chapter.db"))
+        for method in ("connect", "connect_ex"):
+            offline = self.enterContext(patch(
+                f"socket.socket.{method}", side_effect=AssertionError("不允许外联"),
+            ))
+            self.addCleanup(offline.assert_not_called)
+        self.rules = DirectoryIdentityCacheTests._rules()
+        self.detail = {
+            "id": int(self.tmdb_id), "name": self.title, "original_name": self.title,
+            "media_type": "tv", "first_air_date": "2025-07-12",
+            "genres": [{"id": 16}], "origin_country": ["JP"],
+            # 通用季名不解释篇章。两季均可容纳 E09，避免靠集数猜季。
+            "seasons": [
+                {"season_number": 1, "name": "Season 1", "episode_count": 24},
+                {"season_number": 2, "name": "Season 2", "episode_count": 12},
+            ],
+        }
+
+    def _filename(self, episode: int, *, group: str = "ANi", chapter: str | None = None) -> str:
+        return (
+            f"[{group}] {self.title}：{chapter or self.chapter} - {episode:02d} "
+            "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        )
+
+    def _history(self, *, conflict: bool = False) -> None:
+        for episode, day in ((4, 1), (5, 8), (7, 15), (8, 22)):
+            season = 1 if conflict and episode == 8 else 2
+            target_name = f"{self.title}.2025.S{season:02d}E{episode:02d}.mp4"
+            target_parent = f"season-{season}"
+            with patch.object(db, "now", return_value=f"2026-11-{day:02d} 12:00:00"):
+                db.add_organize_log(
+                    "guangya", self.source_name,
+                    f"动漫/{self.title}/Season {season}/{target_name}",
+                    f"history-{episode}", "success", self.tmdb_id,
+                    provider="tmdb", external_id=self.tmdb_id, operation_type="reorganize",
+                    source_dir_id="source", original_parent_id="source",
+                    original_name=self._filename(episode), current_name=target_name,
+                    current_parent_id=target_parent, target_parent_id=target_parent,
+                    media_type="tv", title=self.title, year="2025", season=season, episode=episode,
+                    release_parse={"manual_position": {
+                        "version": 1, "source": "manual_correction", "season": season, "episode": episode,
+                    }},
+                )
+
+    def _scraper(self) -> TMDBScraper:
+        tmdb = Mock(spec=TMDBClient)
+        tmdb.api_key, tmdb.base_url, tmdb.config_error = "synthetic", "https://synthetic.invalid", ""
+        tmdb.search.side_effect = lambda _title, _year, media_type: [self.detail] if media_type == "tv" else []
+        tmdb.detail.return_value = tmdb.detail_with_alternative_titles.return_value = self.detail
+        scraper = TMDBScraper(client=cast(TMDBClient, tmdb))
+        self.addCleanup(scraper.close)
+        return scraper
+
+    def _source(self, filename: str) -> tuple[GuangYaClient, GuangYaFile]:
+        video = GuangYaFile("video", filename, False, 1024, "etag-video", "source")
+        cloud = _TreeClient(
+            {"source": [video], "archive": []},
+            {
+                "source": GuangYaFile("source", self.source_name, True, parent_id="0"),
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+                "video": video,
+            },
+        )
+        return cast(GuangYaClient, cloud), video
+
+    def _plan(self, filename: str, *, automatic: bool):
+        cloud, _video = self._source(filename)
+        delegate = self._scraper()
+        scraper: TMDBScraper | FixedMatchScraper = delegate
+        if not automatic:
+            selected = delegate.match_from_tmdb(self.tmdb_id, "tv")
+            self.assertFalse(selected.need_confirm)
+            # 同待确认候选执行入口，只传原始位置快照和选定作品。
+            scraper = FixedMatchScraper(
+                delegate, selected, self.detail, preserve_specials=True,
+                position_overrides={filename: delegate.parse_source_position(filename, self.source_name)},
+                map_source_positions=True,
+            )
+        organizer = Organizer(client=cloud, scraper=scraper)
+        self.addCleanup(organizer.close)
+        plans, stats = organizer.organize(
+            "source", self.rules, dry_run=True, automatic=automatic,
+        )
+        self.assertEqual([plan.file_id for plan in plans], ["video"])
+        return plans[0], stats
+
+    def _assert_season_unresolved(self, filename: str) -> None:
+        for automatic in (True, False):
+            with self.subTest(automatic=automatic):
+                plan, stats = self._plan(filename, automatic=automatic)
+                self.assertEqual(plan.action, "skip", (plan.season, plan.episode, plan.new_name))
+                self.assertNotEqual(plan.season, 1)
+                self.assertEqual(plan.new_name, "")
+                self.assertEqual(stats["need_confirm"], 1)
+
+    def _assert_archive_season_two(self, episode: int, *, automatic: bool) -> None:
+        plan, stats = self._plan(self._filename(episode), automatic=automatic)
+        self.assertEqual((plan.action, plan.season, plan.episode), ("move", 2, episode), plan.note)
+        self.assertTrue(plan.target_path.endswith("/Season 2"), plan.target_path)
+        self.assertIn(f"S02E{episode:02d}", plan.new_name)
+        self.assertEqual(stats["need_confirm"], 0)
+
+    def test_same_release_chapter_keeps_episode_and_uses_agreed_history(self):
+        self._history()
+        for automatic in (True, False):
+            for episode in (9, 10):
+                with self.subTest(automatic=automatic, episode=episode):
+                    self._assert_archive_season_two(episode, automatic=automatic)
+
+    def test_automatic_history_recovers_episode_outside_season_one(self):
+        self._history()
+        self.detail["seasons"][0]["episode_count"] = 8
+        self._assert_archive_season_two(9, automatic=True)
+
+    def test_release_chapter_without_history_does_not_fall_back_to_season_one(self):
+        self._assert_season_unresolved(self._filename(9))
+        self.detail["seasons"][1].pop("episode_count")
+        self._assert_season_unresolved(self._filename(9))
+
+    def test_conflicting_history_does_not_choose_either_season(self):
+        self._history(conflict=True)
+        self._assert_season_unresolved(self._filename(9))
+
+    def test_history_does_not_cross_chapter_or_release_group(self):
+        self._history()
+        for filename in (
+            self._filename(9, chapter="京都·鬼門篇"),
+            self._filename(9, group="LoliHouse"),
+        ):
+            with self.subTest(filename=filename):
+                self._assert_season_unresolved(filename)
+
+    def test_history_cannot_move_episode_beyond_the_target_season(self):
+        self._history()
+        self.detail["seasons"][1]["episode_count"] = 8
+        self._assert_season_unresolved(self._filename(9))
+
+    def test_history_for_removed_season_does_not_fall_back_to_season_one(self):
+        self._history()
+        self.detail["seasons"].pop()
+        self._assert_season_unresolved(self._filename(9))
+
+    def test_explicit_season_correction_overrides_matching_history(self):
+        self._history()
+        cloud, video = self._source(self._filename(9))
+        log_id = db.add_organize_log(
+            "guangya", self.source_name, "", video.file_id, "manual", self.tmdb_id,
+            provider="tmdb", source_dir_id="source", media_type="tv",
+            original_parent_id=video.parent_id, original_name=video.name,
+            current_parent_id=video.parent_id, current_name=video.name, episode=9,
+        )
+        db.add_organize_log_items(log_id, [{
+            "file_id": video.file_id, "role": "video", "size": video.size, "etag": video.etag,
+            "original_parent_id": video.parent_id, "original_name": video.name,
+            "current_parent_id": video.parent_id, "current_name": video.name, "status": "manual",
+        }])
+        self.enterContext(patch.object(OrganizeRules, "from_config", return_value=self.rules))
+        service = OrganizeCorrectionService(client=cloud, scraper=self._scraper())
+        self.addCleanup(service.close)
+
+        preview = service.preview_reorganize(log_id, self.tmdb_id, "tv", season=1)
+
+        self.assertEqual((preview["season"], preview["episode"]), (1, 9))
+        self.assertEqual(preview["manual_position"], {
+            "version": 1, "source": "manual_correction", "season": 1, "episode": 9,
+        })
+        self.assertIn("S01E09", preview["file_name"])
+        self.assertFalse(preview["cloud_write"])
 
 
 if __name__ == "__main__":

@@ -40,6 +40,12 @@ CANDIDATE = {
     "title": "Selected Series",
     "year": "2024",
 }
+CHAPTER_CANDIDATE = {**CANDIDATE, "title": "桃源暗鬼"}
+CHAPTER_DIRECTORY = "桃源暗鬼：日光·華嚴瀑布篇"
+
+
+def _chapter_name(episode: int, title: str = CHAPTER_DIRECTORY) -> str:
+    return f"[ANi] {title} - {episode:02d} [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
 
 
 class _OfflineScraper:
@@ -790,6 +796,16 @@ def logs_api_client(
         yield client
 
 
+@pytest.fixture
+def chapter_tmdb(harness: _Harness, monkeypatch: pytest.MonkeyPatch):
+    detail = {"id": 4242, "name": CHAPTER_CANDIDATE["title"], "first_air_date": "2024-01-01",
+              "seasons": [{"season_number": n, "name": f"Season {n}", "episode_count": 16} for n in (1, 2)]}
+    monkeypatch.setattr(TMDBScraper, "get_detail", lambda self, *_args, **_kwargs: detail)
+    monkeypatch.setattr(TMDBScraper, "get_detail_with_credits", lambda self, *_args: detail)
+    monkeypatch.setattr(harness, "scraper", TMDBScraper())
+    return detail
+
+
 def test_selected_confirmation_poll_skips_pending_log_resolution(
     logs_api_client, harness: _Harness, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -882,6 +898,196 @@ def test_pending_group_handoff_and_retry_settle_all_eight_logs(
             assert member["status"] == "success"
             remote = harness.cloud.files[member["file_id"]]
             assert (remote["parent_id"], remote["name"]) == (member["current_parent_id"], member["current_name"])
+
+
+@pytest.mark.parametrize(("channel", "mixed"), [
+    pytest.param("web", False, id="web"),
+    pytest.param("telegram", False, id="telegram"),
+    pytest.param("web", True, id="mixed-failures"),
+])
+def test_unresolved_chapter_confirmation_can_be_corrected_from_original_group(
+    channel, mixed, logs_api_client, harness: _Harness, archive_rules, chapter_tmdb, monkeypatch: pytest.MonkeyPatch,
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from app.agent import feature_gate
+    from app.bot.handlers import _handle_organize_confirmation_callback
+    from app.modules import (
+        organize_confirmations,
+        organize_correction,
+        organize_tasks,
+        telegram_notification_center,
+    )
+    from app.routes import logs_api
+
+    archive_rules.clean_empty = archive_rules.link_strm = archive_rules.notify_enabled = False
+    archive_rules.small_file_mb = 0
+    directory = CHAPTER_DIRECTORY
+    filenames = [_chapter_name(1), "桃源暗鬼.S01E40.mkv" if mixed else _chapter_name(2)]
+    log_ids = [_add_log(harness.cloud, name, status="manual", original_path=f"/incoming/{directory}")
+               for name in filenames]
+    originals = [dict(assert_present(db.get_organize_log(log_id))) for log_id in log_ids]
+    files = [{"file_id": file_id, "season": None, "episode": episode,
+              **{key: item[key] for key in ("name", "parent_id", "size", "etag")}}
+             for episode, (file_id, item) in enumerate(harness.cloud.files.items(), 1)]
+    if mixed:
+        files[1].update(season=1, episode=40)
+
+    def file_info(file_id):
+        cloud = harness.cloud
+        if file_id in cloud.directories:
+            name = directory if file_id == "source" else cloud.directory_names[file_id]
+            return GuangYaFile(file_id, name, True, parent_id=cloud.directory_parents[file_id] or "0")
+        return _MemoryCloud.file_info(cloud, file_id)
+
+    monkeypatch.setattr(harness.cloud, "file_info", file_info)
+    monkeypatch.setattr(organize_confirmations, "GuangYaClient", lambda: harness.cloud)
+    monkeypatch.setattr(organize_confirmations, "wake_confirmation_dispatcher", lambda: False)
+    monkeypatch.setattr(feature_gate, "recognition_review_enabled", lambda: True)
+    publish = Mock(return_value=telegram_notification_center.NotificationPublishResult(
+        True, delivered=True, status="sent",
+    ))
+    monkeypatch.setattr(telegram_notification_center, "publish_notification_thread", publish)
+    operations = []
+
+    def accept(_name, _reference, callback, **_kwargs):
+        operations.append(callback)
+        return {"ok": True, "task_id": "chapter-operation"}
+
+    manager = SimpleNamespace(start_operation=accept)
+    monkeypatch.setattr(organize_tasks, "get_organize_manager", lambda: manager)
+    monkeypatch.setattr(logs_api, "get_organize_manager", lambda: manager)
+    monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", harness.service)
+    monkeypatch.setattr(organize_tasks.Organizer, "trigger_post_actions", Mock())
+
+    action, _skip = organize_confirmations.create_confirmation_actions({
+        "source_dir_id": "source-config", "source_parent_id": "source", "directory": directory,
+        "files": files, "candidates": [CHAPTER_CANDIDATE],
+    }, archive_rules, source_name="incoming", chat_id="100", notification_suppressed=channel == "web")
+    token = action.callback_data.split(":")[1]
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    single = f"/api/logs/organize/{log_ids[0]}/reorganize"
+    later_season = chapter_tmdb["seasons"].pop()
+    stale = client.post(f"{single}/preview", json=CHAPTER_CANDIDATE).json()
+    assert stale["season"] == 1
+    response = client.post(single, json={**CHAPTER_CANDIDATE, "operation_token": "stale-before-handoff",
+                                        "expected_version": stale["version"], "preview_digest": stale["preview_digest"]})
+    assert response.status_code == 200, response.text
+    stale_operation = operations.pop()
+    chapter_tmdb["seasons"].append(later_season)
+    confirmations = "/api/logs/organize/confirmations"
+    choices = {"entries": [{"confirmation_id": token, "candidate_index": 0}]}
+    choice_preview = client.post(f"{confirmations}/preview", json=choices).json()
+    submit_choice = {**choices, "digest": choice_preview["digest"]}
+    bot = Mock()
+    click = SimpleNamespace(id="click", data=action.callback_data, from_user=SimpleNamespace(id=9),
+                            message=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=77))
+    if channel == "web":
+        assert client.post(f"{confirmations}/submit", json=submit_choice).json()["accepted"] == 1
+        assert organize_confirmations._dispatch_next_queued_confirmation()["ok"]
+    else:
+        _handle_organize_confirmation_callback(bot, click)
+        bot.answer_callback_query.assert_called_once_with("click", "已开始确认整理")
+    assert len(operations) == 1
+    failure = "仍有 2 个文件无法完成安全规划" if mixed else "无法安全确定 TMDB 季号"
+    with pytest.raises(DirectoryScrapeConflictError, match=failure):
+        operations.pop()()
+    assert harness.cloud.write_calls == []
+
+    selection = {"confirmation_ids": [token], "include_correction_logs": True}
+    item, = client.post(f"{confirmations}/query", json=selection).json()["items"]
+    if mixed:
+        assert item["status"] == "failed" and item["log_ids"] == []
+        assert all(assert_present(db.get_organize_log(log_id))["status"] == "failed" for log_id in log_ids)
+        assert not operations and item["execution"] is None
+        return
+    assert item["status"] == "pending" and item["log_ids"] == log_ids
+    assert [dict(assert_present(db.get_organize_log(log_id))) for log_id in log_ids] == originals
+    assert item["candidates"] == [] and not item["can_discover_candidates"]
+    assert "纠正识别" in item["error"] and "季号" in item["error"]
+    assert item["execution"] is None
+    review = client.post(f"{confirmations}/review", json={"confirmation_ids": [token]}).json()
+    assert (review["requested"], review["unavailable"]) == (0, 1)
+    assert client.post(f"{confirmations}/submit", json=submit_choice).status_code == 400
+    with pytest.raises(DirectoryScrapeConflictError, match="填写季号"):
+        stale_operation()
+    blocked_single = client.post(f"{single}/preview", json={**CHAPTER_CANDIDATE, "confirmation_id": token})
+    assert blocked_single.status_code == 409 and "季号" in blocked_single.json()["error"]
+    if channel == "telegram":
+        event = publish.call_args.args[1]
+        assert "纠正识别" in event.footer and "季号" in event.footer and not event.actions
+        assert publish.call_args.kwargs["preferred_message_id"] == 77
+        _handle_organize_confirmation_callback(bot, click)
+        assert bot.answer_callback_query.call_args.kwargs["show_alert"]
+        assert "纠正识别" in bot.answer_callback_query.call_args.args[1]
+    assert not operations and not harness.cloud.write_calls
+
+    entries = [{**entry, "confirmation_id": token} for entry in _entries(log_ids)]
+    batch = "/api/logs/organize/batch"
+    body = {"action": "reorganize", "entries": entries,
+            "candidate": {**CHAPTER_CANDIDATE, "season": 2}}
+    blocked = client.post(f"{batch}/preview", json={**body, "candidate": CHAPTER_CANDIDATE}).json()
+    assert not blocked["can_execute"] and "季号" in blocked["errors"][0]["error"]
+    preview = client.post(f"{batch}/preview", json=body).json()
+    assert preview["can_execute"], preview
+    assert [(row["season"], row["episode"]) for row in preview["items"]] == [(2, 1), (2, 2)]
+    assert harness.cloud.write_calls == []
+    accepted = client.post(batch, json={**body, "preview_digest": preview["preview_digest"]})
+    assert accepted.status_code == 200, accepted.text
+    assert operations.pop()()["success"]
+    write_count = len(harness.cloud.write_calls)
+    assert client.post(batch, json={**body, "preview_digest": preview["preview_digest"]}).status_code == 409
+    assert not operations and len(harness.cloud.write_calls) == write_count
+    row = assert_present(confirmation_repo.get_organize_confirmation(token))
+    assert row["status"] == "completed"
+    result = json.loads(row["result_json"])
+    assert (result["resolution"], result["moved"], result["organize_log_ids"]) == ("reorganized", 2, log_ids)
+    assert {record["name"] for record in harness.cloud.files.values()} == {
+        row["file_name"] for row in preview["items"]
+    }
+    if channel == "telegram":
+        assert organize_confirmations._dispatch_due_confirmation_delivery(token)
+        assert publish.call_args.args[1].title == "✅ Web 重新整理完成"
+        assert publish.call_args.kwargs["preferred_message_id"] == 77
+        assert not organize_confirmations._dispatch_due_confirmation_delivery(token)
+        assert publish.call_count == 3
+
+
+def test_direct_web_chapter_correction_requires_proof_or_an_explicit_season(
+    logs_api_client, harness: _Harness, chapter_tmdb,
+):
+    client = logs_api_client
+    assert client.post("/__test/login").status_code == 200
+    source_path = f"/incoming/{CHAPTER_DIRECTORY}"
+    pending = _add_log(harness.cloud, _chapter_name(9), original_path=source_path, status="failed")
+    assert db.update_organize_log(pending, season=1, episode=9)
+    url = f"/api/logs/organize/{pending}/reorganize/preview"
+    blocked = client.post(url, json=CHAPTER_CANDIDATE)
+    assert blocked.status_code == 409 and "填写季号" in blocked.json()["error"]
+    explicit = client.post(url, json={**CHAPTER_CANDIDATE, "season": 2}).json()
+    assert (explicit["season"], explicit["episode"]) == (2, 9)
+
+    confirmed = _add_log(
+        harness.cloud, _chapter_name(10), original_path=source_path, status="failed",
+        release_parse={"manual_position": {"version": 1, "source": "manual_correction", "season": 2, "episode": 10}},
+    )
+    previous = client.post(f"/api/logs/organize/{confirmed}/reorganize/preview", json=CHAPTER_CANDIDATE).json()
+    assert (previous["season"], previous["episode"]) == (2, 10)
+    ordinary = _add_log(harness.cloud, _chapter_name(11, CHAPTER_CANDIDATE["title"]), status="failed")
+    ordinary_preview = client.post(f"/api/logs/organize/{ordinary}/reorganize/preview", json=CHAPTER_CANDIDATE).json()
+    assert (ordinary_preview["season"], ordinary_preview["episode"]) == (1, 11)
+
+    db.add_organize_log(
+        "guangya", source_path, "/archive/Season 2/桃源暗鬼.S02E08.mp4", "history-episode-8", "success",
+        CHAPTER_CANDIDATE["tmdb_id"], provider="tmdb", media_type="tv", operation_type="reorganize",
+        original_name=_chapter_name(8), season=2, episode=8,
+        release_parse={"manual_position": {"version": 1, "source": "manual_correction", "season": 2, "episode": 8}},
+    )
+    inferred = client.post(url, json=CHAPTER_CANDIDATE).json()
+    assert (inferred["season"], inferred["episode"], inferred["manual_position"]) == (2, 9, None)
+    assert not harness.cloud.write_calls
 
 
 def test_pending_log_handoff_is_bounded_across_selected_tokens_and_pages(

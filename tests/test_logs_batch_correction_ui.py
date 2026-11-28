@@ -531,6 +531,7 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.assertNotIn('episode', payload)
 
     def test_single_search_reset_and_season_debounce_revoke_preview(self):
+        self.page.evaluate("window.__testConfig.detailOverrides = {season: 1, episode: 9}")
         self.prepare_single_preview()
         execute = self.page.locator("#organizeReorganizeBtn")
         self.assertTrue(execute.is_enabled())
@@ -550,6 +551,8 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.page.locator(".organize-candidate").nth(1).click()
         self.page.locator("#organizeNamingPreview:not([hidden])").wait_for()
         self.assertTrue(execute.is_enabled())
+        self.assertNotIn("season", self.single_previews()[-1]["body"])
+        self.assertNotIn("episode", self.single_previews()[-1]["body"])
         self.page.locator("#organizeSeasonOverride").fill("3")
         self.assertTrue(execute.is_disabled())
         execute.click(force=True)
@@ -559,6 +562,7 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         latest = self.single_previews()[-1]["body"]
         self.assertEqual(latest["tmdb_id"], "222")
         self.assertEqual(latest["season"], 3)
+        self.assertNotIn("episode", latest)
         self.page.locator("#organizeTmdbType").select_option("movie")
         self.assertTrue(execute.is_disabled())
         self.assertTrue(self.page.locator("#organizeNamingPreview").evaluate("el => el.hidden"))

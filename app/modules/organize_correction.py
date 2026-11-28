@@ -58,6 +58,7 @@ from app.modules.scraper import (
     MatchResult,
     TMDBScraper,
     extract_recognition_context,
+    resolve_chapter_position,
 )
 from app.modules.strm import cleanup_deleted_cloud_files, configured_strm_source_plans, safe_path_component
 
@@ -238,7 +239,9 @@ class OrganizeCorrectionService:
         return data
 
     @staticmethod
-    def _reorganize_confirmation_id(log_id: int, status: str, *, expected: str | None = None, conn=None) -> str:
+    def _reorganize_confirmation_id(
+        log_id: int, status: str, *, expected: str | None = None, missing_season: bool = False, conn=None,
+    ) -> str:
         owner = (organize_confirmations_repo.correction_log_confirmation(log_id, expected_token=expected or "", conn=conn)
                  if status == "manual" else None)
         if owner is not None and (
@@ -249,6 +252,8 @@ class OrganizeCorrectionService:
                  and owner["status"] == "pending" and owner["expires_at"] > db.now() else "")
         if expected is not None and token != expected:
             raise DirectoryScrapeConflictError("原待确认组已变化，请刷新后重新选择")
+        if missing_season and token and owner is not None and owner["manual_season_correction"]:
+            raise DirectoryScrapeConflictError("这组文件仍缺少可用季号，请填写季号后重新预览")
         return token
 
     @staticmethod
@@ -625,7 +630,10 @@ class OrganizeCorrectionService:
         *, provider: str = "", external_id: str = "", confirmation_id: str = "",
     ) -> dict:
         detail = self.detail(log_id, confirmation_id=confirmation_id) if confirmation_id else self.detail(log_id)
-        owner = confirmation_id or self._reorganize_confirmation_id(log_id, detail["status"])
+        owner = self._reorganize_confirmation_id(
+            log_id, detail["status"], expected=confirmation_id or None,
+            missing_season=media_type == "tv" and season is None,
+        )
         if not detail["allowed_actions"]["preview"]:
             raise ValueError(detail.get("safety_notice") or "当前状态不能重新整理")
         items = self._load_items(log_id)
@@ -652,17 +660,13 @@ class OrganizeCorrectionService:
             )
             if multipart is not None and multipart.part_index is not None:
                 parsed["part"] = multipart.part_index
-        position = None
         try:
             release_parse = self.scraper.parse_media(source_name, parent_path, match)
-            position = (
-                release_parse.effective_season, release_parse.effective_episode
-            )
+            parsed_season = normalize_media_number(release_parse.effective_season)
+            parsed_episode = normalize_media_number(release_parse.effective_episode)
         except (AttributeError, TypeError, ValueError):
-            position = None
-        if isinstance(position, (tuple, list)) and len(position) == 2:
-            parsed_season = normalize_media_number(position[0])
-            parsed_episode = normalize_media_number(position[1])
+            release_parse = None
+        else:
             if parsed_season is not None:
                 parsed["season"] = parsed_season
             if parsed_episode is not None:
@@ -682,17 +686,34 @@ class OrganizeCorrectionService:
         if episode is not None:
             parsed["episode"] = normalize_media_number(episode)
         if match.media_type == "tv":
-            if parsed.get("episode") is None:
+            parsed_episode = normalize_media_number(parsed.get("episode"))
+            if parsed_episode is None:
                 raise ValueError("无法确定该文件集号，请在单条详情中补填集号后重新预览")
+            tmdb_detail = (
+                self.scraper.get_detail(match.tmdb_id, match.media_type)
+                if Organizer._match_provider(match) == "tmdb" and isinstance(self.scraper, TMDBScraper)
+                else None
+            )
+            if (tmdb_detail is not None and season is None and confirmed is None and release_parse is not None
+                    and release_parse.source_season is None and release_parse.effective_season is None):
+                # 裸集的历史日志可能已假定 S01。沿统一解析重新核实篇章，再使用原记录的季号。
+                chapter, unresolved = resolve_chapter_position(
+                    release_parse.context, match, tmdb_detail, episode=parsed_episode,
+                    source_episode=release_parse.source_episode, source_season=release_parse.source_season,
+                    tmdb_identity=True,
+                )
+                if unresolved:
+                    raise DirectoryScrapeConflictError(f"{unresolved}。请填写季号后重新预览")
+                if chapter is not None:
+                    parsed["season"], parsed["episode"] = chapter.target_season, chapter.target_episode
             if parsed.get("season") is None:
                 parsed["season"] = 1
-        if Organizer._match_provider(match) == "tmdb" and isinstance(self.scraper, TMDBScraper) and match.media_type == "tv":
-            tmdb_detail = self.scraper.get_detail(match.tmdb_id, match.media_type)
-            validation = self.scraper.validate_position(
-                tmdb_detail, match.media_type, parsed.get("season"), parsed.get("episode")
-            )
-            if validation.get("required") and not validation.get("passed"):
-                raise ValueError(self.scraper.position_validation_error(validation))
+            if tmdb_detail is not None:
+                validation = self.scraper.validate_position(
+                    tmdb_detail, match.media_type, parsed.get("season"), parsed.get("episode")
+                )
+                if validation.get("required") and not validation.get("passed"):
+                    raise ValueError(self.scraper.position_validation_error(validation))
         parsed["type"] = match.media_type
         current_file = GuangYaFile(
             video.file_id, video.current_name or video.original_name, False,
@@ -725,6 +746,7 @@ class OrganizeCorrectionService:
             "log_id": log_id,
             "version": int(detail.get("version") or 1),
             "confirmation_id": owner,
+            **({"_season_selected": True} if owner and match.media_type == "tv" and season is not None else {}),
             "match": {
                 "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
                 "media_type": match.media_type,
@@ -1757,7 +1779,11 @@ class OrganizeCorrectionService:
             release_parse.pop("manual_position", None)
         with db.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            self._reorganize_confirmation_id(log_id, previous_log["status"], expected=owner, conn=conn)
+            # 同一确认单可从运行恢复到待选季。旧预览即使日志版本未变化，也不能沿用默认季号写入。
+            self._reorganize_confirmation_id(
+                log_id, previous_log["status"], expected=owner, conn=conn,
+                missing_season=match["media_type"] == "tv" and not preview.get("_season_selected"),
+            )
             if not db.claim_organize_log_operation(
                 log_id, operation_token, "reorganizing", tuple(REORGANIZE_STATUSES), expected_version, _conn=conn,
             ):

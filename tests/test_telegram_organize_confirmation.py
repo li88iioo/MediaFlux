@@ -937,7 +937,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                             organize_confirmations_repo.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
                         else:
                             organize_confirmations_repo.fail_organize_confirmation_with_delivery(
-                                token, error="specific failure", retryable=False, **common,
+                                token, error="specific failure", **common,
                             )
                         self.assertTrue(confirmation_module._dispatch_due_confirmation_delivery(token))
                         event_key = notification_thread_event_key(
@@ -998,7 +998,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                         organize_confirmations_repo.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
                     else:
                         organize_confirmations_repo.fail_organize_confirmation_with_delivery(
-                            token, error="specific failure", retryable=False, **common,
+                            token, error="specific failure", **common,
                         )
                     confirmation_module._dispatch_due_confirmation_delivery(token)
 
@@ -1792,7 +1792,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                         organize_confirmations_repo.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
                     else:
                         organize_confirmations_repo.fail_organize_confirmation_with_delivery(
-                            token, error="specific failure", retryable=False, **common,
+                            token, error="specific failure", **common,
                         )
                     confirmation_module._dispatch_due_confirmation_delivery(token)
                     return {}

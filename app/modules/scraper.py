@@ -13,10 +13,12 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import threading
 import time
 import unicodedata
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date
 from difflib import SequenceMatcher
@@ -2737,12 +2739,8 @@ def _season_name_is_significant(value: str) -> bool:
     )
 
 
-def infer_tmdb_season_from_title_evidence(
-    filename: str,
-    parent_path: str,
-    detail: dict | None,
-    *,
-    episode: int | str | float | None = None,
+def _named_tmdb_season(
+    context: RecognitionContext, detail: dict, episode: int,
 ) -> int | None:
     """用发布名中的篇章名保守映射唯一 TMDB 季。
 
@@ -2750,14 +2748,14 @@ def infer_tmdb_season_from_title_evidence(
     出现；繁简体通过受限拼音键辅助。它不会把“第二季”或任意副标题直接换算
     成季号，也不会在多个季名同时命中时猜测。
     """
-    if not isinstance(detail, dict):
+    named_seasons = [
+        item for item in detail.get("seasons") or []
+        if isinstance(item, dict) and _season_name_is_significant(str(item.get("name") or ""))
+    ]
+    if not named_seasons:
         return None
-    try:
-        source_episode = int(episode) if episode is not None else None
-    except (TypeError, ValueError):
-        source_episode = None
 
-    context = extract_recognition_context(filename, parent_path)
+    parent_path = context.parent_path
     nearest_parent = next((
         part.strip()
         for part in reversed(re.split(r"[\\/]+", (parent_path or "")))
@@ -2784,22 +2782,11 @@ def infer_tmdb_season_from_title_evidence(
     ]
 
     matched: list[int] = []
-    for item in detail.get("seasons") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in named_seasons:
         season = _strict_non_negative_int(item.get("season_number"))
         count = _strict_non_negative_int(item.get("episode_count"))
         name = str(item.get("name") or "").strip()
-        if (
-            season is None or season <= 1
-            or not _season_name_is_significant(name)
-            or (
-                source_episode is not None
-                and count is not None
-                and count > 0
-                and source_episode > count
-            )
-        ):
+        if season is None or season <= 1 or (count is not None and count > 0 and episode > count):
             continue
         name_key = compact_evidence_key(name)
         name_pinyin = compact_evidence_key(name, pinyin=True)
@@ -2817,10 +2804,68 @@ def infer_tmdb_season_from_title_evidence(
     return unique[0] if len(unique) == 1 else None
 
 
+def _matching_manual_positions(
+    context: RecognitionContext, tmdb_id: str,
+) -> Iterator[tuple[RecognitionContext, sqlite3.Row]]:
+    def release_groups(value: RecognitionContext) -> set[str]:
+        return {
+            _comparison_key(_bracket_content(item))
+            for key in ("release_prefixes", "release_groups")
+            for item in value.cleaned_components.get(key, [])
+        }
+
+    groups = release_groups(context)
+    title = _comparison_key(context.normalized_title)
+    if not groups or not title:
+        return
+    for row in list_manual_episode_confirmations(tmdb_id):
+        previous = extract_recognition_context(row["original_name"], row["original_path"])
+        if (
+            previous.season == context.season
+            and _comparison_key(previous.normalized_title) == title
+            and release_groups(previous) == groups
+        ):
+            yield previous, row
+
+
+def _confirmed_chapter_season(
+    context: RecognitionContext, tmdb_id: str, detail: dict,
+) -> tuple[EpisodeMappingPlan | None, str]:
+    """同篇章的人工纠正只补季号，历史原集号必须与归档集号一致。"""
+    episode = context.episode
+    if context.season is not None or not episode or str(detail.get("id") or "") != tmdb_id:
+        return None, ""
+    # 实际用于匹配历史的标题本身必须包含篇章，不能仅凭目录中的其他别名命中。
+    if not any(
+        _has_distinctive_title_remainder([context.normalized_title], name)
+        for name in (detail.get("name"), detail.get("original_name"), *_candidate_aliases(detail))
+        if name
+    ):
+        return None, ""
+    counts = season_episode_counts(detail)
+    mapping = None
+    for previous, row in _matching_manual_positions(context, tmdb_id):
+        season = row["season"]
+        if (
+            previous.episode != row["episode"]
+            or max(row["episode"], episode) > counts.get(season, 0)
+            or (mapping is not None and mapping.target_season != season)
+        ):
+            # 有同篇章经验，但不能转用。即使当前 TMDB 只返回第一季，也不能回落 S01。
+            return None, "同篇章的人工编号记录与其他记录或当前 TMDB 季集不一致，需人工确认"
+        if mapping is None:
+            mapping = EpisodeMappingPlan(
+                None, episode, season, episode, mode="season_title",
+                reason=f"manual_confirmed_chapter:confirmation:{row['log_id']}",
+            )
+    return mapping, ""
+
+
 def has_unresolved_candidate_title_remainder(
     context: RecognitionContext,
     match: MatchResult | None,
     detail: dict | None = None,
+    *, include_directory_remainders: bool = True,
 ) -> bool:
     """判断已命中系列基础名后，发布标题是否仍残留未解释的篇章语义。"""
     primary_queries = generate_query_variants(context)
@@ -2851,10 +2896,59 @@ def has_unresolved_candidate_title_remainder(
         default=0.0,
     ) >= 0.97:
         return False
+    remainder_titles = primary_queries if include_directory_remainders else [context.normalized_title]
     return any(
-        _has_distinctive_title_remainder(primary_queries, candidate)
+        _has_distinctive_title_remainder(remainder_titles, candidate)
         for candidate in candidates
     )
+
+
+def resolve_chapter_position(
+    context: RecognitionContext, match: MatchResult, detail: dict, *,
+    episode: int, source_episode: int | None, source_season: int | None, tmdb_identity: bool,
+    include_directory_remainders: bool = True,
+) -> tuple[EpisodeMappingPlan | None, str]:
+    """为缺季号的发布位置核对官方季名与人工篇章记录，返回映射或待确认原因。"""
+    season = _named_tmdb_season(context, detail, episode)
+    if season is not None:
+        if not tmdb_identity:
+            return None, "检测到季标题线索，但当前候选不是 TMDB 身份，无法安全换算季号，需人工确认"
+        if _validate_tmdb_position(detail, match.media_type, season, episode)["passed"]:
+            return EpisodeMappingPlan(
+                source_season, source_episode or episode, season, episode,
+                mode="season_title", reason="tmdb_season_title_evidence", confidence=0.98,
+            ), ""
+    if has_unresolved_season_hint(context.filename, context.parent_path):
+        return None, "检测到续作/分部标记但无法安全确定 TMDB 季号，需人工确认"
+    if has_unresolved_candidate_title_remainder(
+        context, match, detail, include_directory_remainders=include_directory_remainders,
+    ):
+        if tmdb_identity and source_season is None and source_episode == context.episode == episode:
+            mapping, reason = _confirmed_chapter_season(context, match.tmdb_id, detail)
+            if mapping or reason:
+                return mapping, reason
+        # 季已经登记但尚未公布集数时，不能据此把另一季当作唯一选择。
+        regular_seasons = {
+            season for item in detail.get("seasons") or [] if isinstance(item, dict)
+            if (season := _strict_non_negative_int(item.get("season_number"))) is not None and season > 0
+        }
+        if len(regular_seasons) > 1:
+            return None, "发布标题仍包含未解释的篇章信息，无法安全确定 TMDB 季号，需人工确认"
+    return None, ""
+
+
+def _recognition_position_mapping(
+    context: RecognitionContext, match: MatchResult, detail: dict, mapping: EpisodeMappingPlan,
+) -> EpisodeMappingPlan:
+    # 识别证明要核验本集实际目标。保留原始输入，让执行时重新检查当前篇章经验。
+    if match.media_type == "tv" and not mapping.changed and context.season is None and context.episode:
+        chapter, _ = resolve_chapter_position(
+            context, match, detail, episode=context.episode, source_episode=context.episode,
+            source_season=None, tmdb_identity=True,
+        )
+        if chapter:
+            return chapter
+    return mapping
 
 
 def implicit_season_conflicts_with_candidate_title(
@@ -3965,9 +4059,7 @@ def _build_verified_automatic_identity_proof(
         return None
     if str(position.get("reason") or "") != "episode_verified":
         return None
-    # 裸集号（Title - 06）在现有 TMDB 校验与 Organizer 中都按 S01
-    # 解释。mapping 的 identity 结果会保留 season=None，因此 proof 必须
-    # 采用已经通过 TMDB 校验的有效目标季号，避免同一语义在证明层自我否决。
+    # 普通裸集号使用通过校验的默认季，篇章及其他映射使用已验证的目标位置。
     target_season_raw = (
         mapping.target_season
         if mapping.target_season is not None
@@ -5619,27 +5711,8 @@ class TMDBScraper:
         if detail is not None and context.episode <= season_episode_counts(detail).get(context.season, 0):
             return None  # 普通季内编号不受连续编号历史影响。
 
-        def groups(value: RecognitionContext) -> set[str]:
-            return {
-                _comparison_key(_bracket_content(item))
-                for key in ("release_prefixes", "release_groups")
-                for item in value.cleaned_components.get(key, [])
-            }
-
-        source_groups = groups(context)
-        source_title = _comparison_key(context.normalized_title)
-        if not source_groups or not source_title:
-            return None
         evidence_id = None
-        for row in list_manual_episode_confirmations(tmdb_id):
-            # 从独立经验的原始文件名重建源编号，不使用已归档的新文件名。
-            previous = extract_recognition_context(row["original_name"], row["original_path"])
-            if (
-                previous.season != context.season
-                or groups(previous) != source_groups
-                or _comparison_key(previous.normalized_title) != source_title
-            ):
-                continue
+        for previous, row in _matching_manual_positions(context, tmdb_id):
             if detail is None:
                 detail = self.get_detail(tmdb_id, "tv")
             if str(detail.get("id") or "") != tmdb_id:
@@ -6161,9 +6234,10 @@ class TMDBScraper:
                         ):
                             mapping = cour_mapping
 
+            proof_mapping = _recognition_position_mapping(context, result, detail, mapping)
             position = _validate_tmdb_position(
                 detail, result.media_type,
-                mapping.target_season, mapping.target_episode,
+                proof_mapping.target_season, proof_mapping.target_episode,
             )
             if mapping.changed and position.get("passed"):
                 result.metadata = {
@@ -6175,7 +6249,7 @@ class TMDBScraper:
                 context=context,
                 scored=scored,
                 decision_constraints=decision_constraints,
-                mapping=mapping,
+                mapping=proof_mapping,
                 position=position,
                 expected_year=expected_year,
             )
@@ -7093,11 +7167,12 @@ class TMDBScraper:
                 detail=detail,
                 mode="auto",
             )
+            proof_mapping = _recognition_position_mapping(context, second, detail, mapping)
             position = _validate_tmdb_position(
                 detail,
                 second.media_type,
-                mapping.target_season,
-                mapping.target_episode,
+                proof_mapping.target_season,
+                proof_mapping.target_episode,
             )
             passed = bool(
                 detail
@@ -7576,25 +7651,26 @@ class TMDBScraper:
                         ):
                             episode_mapping = cour_mapping
 
+            proof_mapping = _recognition_position_mapping(context, second, detail, episode_mapping)
             position = _validate_tmdb_position(
                 detail, second.media_type,
-                episode_mapping.target_season, episode_mapping.target_episode,
+                proof_mapping.target_season, proof_mapping.target_episode,
             )
             position_validation = position
             source_year_verified, source_year_mode = _source_year_matches_tmdb(
                 detail,
                 second.media_type,
                 source_year,
-                target_season=episode_mapping.target_season,
+                target_season=proof_mapping.target_season,
             )
             if (
                 not source_year_verified
                 and source_year_mode == "target_season_year_mismatch"
                 and second.media_type == "tv"
-                and isinstance(episode_mapping.target_season, int)
-                and episode_mapping.target_season >= 0
-                and isinstance(episode_mapping.target_episode, int)
-                and episode_mapping.target_episode >= 1
+                and isinstance(proof_mapping.target_season, int)
+                and proof_mapping.target_season >= 0
+                and isinstance(proof_mapping.target_episode, int)
+                and proof_mapping.target_episode >= 1
             ):
                 # AI 慢路径必须与确定性候选消歧使用相同的跨年季证据。
                 # 仅在季年份冲突时补取逐集详情，避免为常规识别增加请求。
@@ -7602,10 +7678,10 @@ class TMDBScraper:
                     detail,
                     second.media_type,
                     source_year,
-                    target_season=episode_mapping.target_season,
-                    target_episode=episode_mapping.target_episode,
+                    target_season=proof_mapping.target_season,
+                    target_episode=proof_mapping.target_episode,
                     season_episodes=self._season_episodes(
-                        second.tmdb_id, episode_mapping.target_season,
+                        second.tmdb_id, proof_mapping.target_season,
                     ),
                 )
             if episode_mapping.changed and position.get("passed"):

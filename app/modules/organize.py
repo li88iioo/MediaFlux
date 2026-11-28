@@ -171,11 +171,9 @@ from app.modules.scraper import (
     ReleaseParseResult,
     TMDBScraper,
     extract_recognition_context,
-    has_unresolved_candidate_title_remainder,
-    has_unresolved_season_hint,
     implicit_season_conflicts_with_candidate_title,
-    infer_tmdb_season_from_title_evidence,
     parse_release_position,
+    resolve_chapter_position,
     target_season_year_evidence_matches_detail,
     verified_automatic_identity_proof,
 )
@@ -6056,69 +6054,23 @@ class Organizer:
             return None
 
         if match.media_type == "tv" and parsed_episode is not None and parsed_season is None:
-            # 季标题来自 TMDB seasons 结构，只能用于已确认的 TMDB 候选。
-            # TVDB/BGM 等 provider 的 detail 结构可能恰好含同名字段，但不能
-            # 因此跨 provider 套用 TMDB 季号语义。
-            season_title_hint = infer_tmdb_season_from_title_evidence(
-                file.name,
-                parent_path,
-                detail,
-                episode=parsed_episode,
-            )
             tmdb_identity = self._supports_tmdb_position_validation(match)
-            if season_title_hint is not None and not tmdb_identity and automatic:
-                message = "检测到季标题线索，但当前候选不是 TMDB 身份，无法安全换算季号，需人工确认"
-                plan.require_confirmation(message)
-                plan.episode = parsed_episode
-                return None
-            inferred_season = season_title_hint if tmdb_identity else None
-            if inferred_season is not None:
-                inferred_validation = (
-                    self.scraper.validate_position(
-                        detail,
-                        match.media_type,
-                        inferred_season,
-                        parsed_episode,
-                    )
-                    if self._supports_tmdb_position_validation(match)
-                    else {"required": False, "passed": True}
+            if automatic or tmdb_identity:
+                season_title_mapping, unresolved = resolve_chapter_position(
+                    release_parse.context, match, detail, episode=parsed_episode,
+                    source_episode=source_episode_value, source_season=source_season_value,
+                    tmdb_identity=tmdb_identity,
+                    # 整包手动整理已有连续编号证据，目录中的发布说明不应额外阻断跨季映射。
+                    include_directory_remainders=(
+                        automatic or self._uses_fixed_match_identity() or directory_sequence_evidence is None
+                    ),
                 )
-                if (
-                    not inferred_validation.get("required")
-                    or inferred_validation.get("passed")
-                ):
-                    parsed_season = inferred_season
-                    season_title_mapping = EpisodeMappingPlan(
-                        source_season_value,
-                        source_episode_value or parsed_episode,
-                        inferred_season,
-                        parsed_episode,
-                        mode="season_title",
-                        reason="tmdb_season_title_evidence",
-                        confidence=0.98,
-                    )
-            if (
-                parsed_season is None
-                and automatic
-                and has_unresolved_season_hint(file.name, parent_path)
-            ):
-                message = "检测到续作/分部标记但无法安全确定 TMDB 季号，需人工确认"
-                plan.require_confirmation(message)
-                plan.episode = parsed_episode
-                return None
-            if (
-                parsed_season is None
-                and automatic
-                and release_parse is not None
-                and len(season_episode_counts(detail)) > 1
-                and has_unresolved_candidate_title_remainder(
-                    release_parse.context, match, detail
-                )
-            ):
-                message = "发布标题仍包含未解释的篇章信息，无法安全确定 TMDB 季号，需人工确认"
-                plan.require_confirmation(message)
-                plan.episode = parsed_episode
-                return None
+                if unresolved:
+                    plan.require_confirmation(unresolved, constraint="unresolved_chapter_season")
+                    plan.episode = parsed_episode
+                    return None
+            if season_title_mapping is not None:
+                parsed_season = season_title_mapping.target_season
             if (
                 parsed_season is None
                 and automatic
