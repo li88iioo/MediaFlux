@@ -665,11 +665,13 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         import json
 
         log_id, _cloud, service = self._fixture()
-        with patch.object(
-            service.scraper,
-            "parse_media",
-            return_value=SimpleNamespace(effective_season=2, effective_episode=3),
-        ):
+        match = service.scraper.match_from_tmdb("1", "tv")
+        match.metadata["episode_mapping"] = {
+            "changed": True,
+            "source_season": 1, "source_episode": 7,
+            "target_season": 2, "target_episode": 3,
+        }
+        with patch.object(service.scraper, "match_from_tmdb", return_value=match):
             preview = service.preview_reorganize(log_id, "1", "tv")
             service._execute_reorganize(log_id, "inferred", preview["version"], preview)
             preview = service.preview_reorganize(log_id, "1", "tv")
